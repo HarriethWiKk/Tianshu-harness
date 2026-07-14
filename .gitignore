@@ -139,3 +139,8 @@ docs/*.docx
 # 测试临时目录（测试中断时可能残留，不应进入 git status）
 src/**/__tests__/.scoped-commit-tmp/
 src/**/__tests__/.undo-test-backup/
+
+# Website
+website/.next/
+website/dist/
+website/node_modules/
