@@ -53,6 +53,8 @@ export interface PlanDocument {
   title: string
   content: string
   status: string
+  /** 多方案候选（≥2 时审批需选其一，对齐桌面端 PlanPanel）。 */
+  options?: { id: string; label: string }[]
 }
 
 export type HostMsg =
@@ -70,6 +72,7 @@ export type HostMsg =
   | { type: 'providerSetupResult'; ok: boolean; message?: string }
   | { type: 'plan'; sessionId: string; plan: PlanDocument }
   | { type: 'planDecisionResult'; sessionId: string; slug: string; decision: 'approve' | 'reject'; ok: boolean; message?: string }
+  | { type: 'planEditResult'; sessionId: string; slug: string; ok: boolean; message?: string }
 
 interface VsCodeApi {
   postMessage(msg: unknown): void

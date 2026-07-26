@@ -9,7 +9,7 @@
  * A domain's voice is not an add-on; it's the message itself.
  */
 
-export type DomainVoiceId = 'tianshu' | 'pojun' | 'tianfu' | 'tianliang' | 'tianquan' | 'tianji' | 'tianxuan' | 'fu' | 'wenqu' | 'kaiyang' | 'yaoguang' | 'huagai' | 'qiming' | 'changgeng' | null
+export type DomainVoiceId = 'tianshu' | 'pojun' | 'tianfu' | 'tianliang' | 'tianquan' | 'tianji' | 'tianxuan' | 'fu' | 'wenqu' | 'kaiyang' | 'yaoguang' | 'huagai' | 'qiming' | 'changgeng' | 'qisha' | null
 
 // ---------------------------------------------------------------------------
 // Domain tone tables
@@ -27,6 +27,7 @@ const DOMAIN_NAMES: Record<string, string> = {
   huagai: '华盖',
   qiming: '启明',
   changgeng: '长庚',
+  qisha: '七杀',
 }
 
 /**
@@ -220,6 +221,23 @@ const DOMAIN_TONE: Record<string, Array<[string, string]>> = {
     ['最后验证中', '做最后一英里的沉稳核验'],
     ['正在分析', '沉静推演中'],
     ['测一下', '静心测一下'],
+  ],
+  qisha: [
+    // 七杀 — 肃秋者。冬剪的刀：只提名不处决，砍不动也是完整交付。
+    ['准备制定方案', '先钉判据，再谈落剪'],
+    ['开始修改', '判据已立，剪'],
+    ['正在修复', '剪到分叉处，不留半截'],
+    ['代码修改完成', '已剪，账目待复核'],
+    ['测试全部通过', '全过——空出来的地方没连着谁'],
+    ['运行测试验证', '验一遍：剪掉的确实没人用'],
+    ['准备交付结果', '提名单与证据一并交付'],
+    ['收到任务，开始分析', '收到，先问：判据是什么'],
+    ['可能遇到困难', '这枝在承重——记下它为谁举证，不动'],
+    ['接近完成', '收拢账目中'],
+    ['继续执行中', '逐项请它举证中'],
+    ['最后验证中', '复核影响面中'],
+    ['正在分析', '清点占位中'],
+    ['测一下', '核一下还有没有消费者'],
   ],
 }
 

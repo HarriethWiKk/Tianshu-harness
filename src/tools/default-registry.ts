@@ -16,6 +16,7 @@ import { BROWSER_TOOL } from './browser.js'
 import { createComputerUseTool } from './computer-use/tool.js'
 import { BASH_TOOL } from './bash.js'
 import { JOB_TOOL } from './job-tool.js'
+import { MONITOR_TOOL } from './monitor-tool.js'
 import { DIFF_TOOL } from './diff.js'
 import { EDIT_FILE_TOOL } from './edit.js'
 import { HASH_EDIT_TOOL } from './hash-edit.js'
@@ -36,6 +37,8 @@ import { ToolRegistry } from './registry.js'
 import type { Tool } from './types.js'
 import { WEB_FETCH_TOOL, createWebFetchTool } from './web-fetch.js'
 import type { WebFetchOptions } from './web-fetch/tool.js'
+import { createWebCrawlTool } from './web-crawl/tool.js'
+import { createWebMapTool } from './web-crawl/map-tool.js'
 import { WEB_SEARCH_TOOL, createWebSearchTool } from './web-search.js'
 import type { SearchBackend } from './web-search.js'
 import { WRITE_FILE_TOOL } from './write-file.js'
@@ -44,7 +47,7 @@ import { presetIncludes, resolveToolPreset, type ToolPreset } from './tool-prese
 export interface DefaultRegistryOptions {
   /** T8 桌面化办公工具（create_document/spreadsheet/image/presentation/pdf + export_file/open_path）。
    *  默认关闭：EXTENDED 层（工具预算由 tool-preset 三档控制——minimal 30 /
-   *  frontend 31 / full 44，见 tool-preset.ts；旧"kernel ≤26"口径已被
+   *  frontend 31 / full 45，见 tool-preset.ts；旧"kernel ≤26"口径已被
    *  2026-07-19 工具审计废止，实测完整装配 44）。 */
   desktopTools?: boolean
   /** N4 桌面浏览器验证工具。默认关闭：新攻击面 + 占 kernel budget，仅桌面 sidecar 开启。 */
@@ -98,6 +101,7 @@ export function createDefaultToolRegistry(extraTools: Tool[] = [], options: Defa
   registry.register(PLAN_SUBMIT_TOOL)
   registry.register(BASH_TOOL)
   registry.register(JOB_TOOL)
+  if (presetIncludes(preset, 'monitor')) registry.register(MONITOR_TOOL)
   registry.register(EDIT_FILE_TOOL)
   registry.register(HASH_EDIT_TOOL)
   registry.register(GREP_TOOL)
@@ -113,6 +117,15 @@ export function createDefaultToolRegistry(extraTools: Tool[] = [], options: Defa
       ? createWebFetchTool(undefined, options.fetchOptions)
       : WEB_FETCH_TOOL,
   )
+  // 冷门整站工具：full preset 含；RIVET_WEB_CRAWL/RIVET_WEB_MAP=1 可单独强制开启
+  if (presetIncludes(preset, 'web_crawl') || process.env.RIVET_WEB_CRAWL === '1') {
+    registry.register(createWebCrawlTool({}, options.fetchOptions ?? {}))
+  }
+  if (presetIncludes(preset, 'web_map') || process.env.RIVET_WEB_MAP === '1') {
+    registry.register(
+      createWebMapTool({ searchBackends: options.searchBackends }, options.fetchOptions ?? {}),
+    )
+  }
   registry.register(
     options.searchBackends && options.searchBackends.length > 0
       ? createWebSearchTool({ backends: options.searchBackends })

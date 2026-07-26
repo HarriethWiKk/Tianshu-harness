@@ -3,6 +3,7 @@ import { decomposeObjective, renderTaskGraphSummary } from '../agent/task-planne
 import { taskGraphToUnifiedPlan, unifiedPlanToTeamTasks, serializeUnifiedPlan, renderUnifiedPlanSummary, validateUnifiedPlan } from '../agent/unified-plan.js'
 import type { DelegationCoordinator } from '../agent/coordinator.js'
 import { executePlan, type PlanExecutorDeps, type PlanExecutorRun } from '../agent/plan-executor.js'
+import { extractRequiredSkills } from '../agent/skill-gate.js'
 import { storePlan } from '../agent/plan-store.js'
 import { classifyTaskDepth, type TaskContract } from '../context/task-contract.js'
 import { setTodos } from './todo.js'
@@ -15,7 +16,10 @@ const LIGHTWEIGHT_TEMPLATE_PATH = 'docs/superpowers/plans/2026-06-14-plan-method
 
 // ── Plan file detection & checklist parsing (plan_task → team_orchestrate fast path) ──
 
-const PLAN_PATH_RE = /(?:\.rivet\/knowledge\/|docs\/superpowers\/plans\/)[^\s]+\.md/
+// .rivet/plans/ 是 plan_submit 批准计划的落盘位置（kickoff 明确指示走
+// plan_task(execute=true)）——此前漏在识别之外，批准计划会绕过 checklist
+// 快速路径与技能门禁（2026-07-25 技能门禁波补齐）。
+const PLAN_PATH_RE = /(?:\.rivet\/(?:knowledge|plans)\/|docs\/superpowers\/plans\/)[^\s]+\.md/
 
 /** Extract a plan file path from objective text or files array.
  *  Returns null if no recognized plan file path is found. */
@@ -155,10 +159,14 @@ export function createPlanTaskTool(deps: {
       // Markdown plan, parse its checklist directly into patcher tasks instead of
       // running the generic decomposeObjective pipeline (scout→architect→…).
       let graph: TaskGraph
+      // 技能门禁：读到计划文件时提取点名 skill，透传给 executePlan 入口硬拦
+      // （tasks 路径没有 planMarkdown，executePlan 无从自行提取）。
+      let requiredSkills: string[] | undefined
       const planPath = extractPlanPath(objective, files)
       if (planPath) {
         try {
           const markdown = await readFile(planPath, 'utf-8')
+          requiredSkills = extractRequiredSkills(markdown)
           const items = parseChecklistItems(markdown)
           if (items.length > 0) {
             graph = buildTasksFromChecklist(items, objective)
@@ -237,6 +245,7 @@ export function createPlanTaskTool(deps: {
             mode: 'standard',
             objective,
             tasks,
+            requiredSkills,
             fromWave: 0,
             maxParallel: 3,
             sessionId: params.sessionId,

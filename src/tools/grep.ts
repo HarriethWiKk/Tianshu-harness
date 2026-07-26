@@ -101,7 +101,7 @@ Bad: grep(pattern="x") (too broad — will match too many lines)`,
     const maxResults = (params.input.max_results as number) ?? MAX_RESULTS_DEFAULT
     const literal = (params.input.literal as boolean) ?? false
     const contextLines = (params.input.context_lines as number) ?? 0
-    const modelCap = computeModelReadCap({
+    const modelCap = params.readCapOverride ?? computeModelReadCap({
       contextWindow: params.contextWindow,
       providerProfile: params.providerProfile,
     })

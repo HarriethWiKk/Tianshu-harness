@@ -37,6 +37,7 @@ import { createPostCommitReviewPreTurnHook, createPostCommitReviewPostToolHook }
 import { createTypecheckReminderHook } from './hooks/typecheck-reminder-hook.js'
 import { createTodoReminderHook } from './hooks/todo-reminder-hook.js'
 import { createBackgroundJobsHook } from './hooks/background-jobs-hook.js'
+import { createMonitorHook } from './hooks/monitor-hook.js'
 import { createEditToolAdvisoryHook } from './hooks/edit-tool-advisory-hook.js'
 import { createEditFailureRecoveryHook } from './hooks/edit-failure-recovery-hook.js'
 import { createLossyObservationHook } from './hooks/lossy-observation-hook.js'
@@ -86,6 +87,9 @@ export interface RuntimeHookDeps {
   stigmergyDeposit: (deposit: any) => Promise<void>
   stigmergyQuery: () => Promise<any>
   getEvidenceState: () => EvidenceState
+  /** W3 债龄阶梯：验证债判据（EvidenceTracker.hasVerificationDebt()）。
+   *  缺省 → self-verify 阶梯禁用，priority 恒为基线。 */
+  getVerificationDebt?: () => boolean
   /** 证据义务状态机（evidence-driven reasoning loop）。缺省 → hooks 只发
    *  advisory 不做义务归账（行为与旧版一致）。 */
   obligations?: import('./obligation-tracker.js').ObligationTracker
@@ -228,6 +232,9 @@ export interface RuntimeHookDeps {
   /** Background job registry accessor — enables the preTurn background-jobs
    *  awareness nudge. Absent → hook not installed. */
   getJobs?: () => import('../tools/job-store.js').JobRegistry | undefined
+  /** Monitor registry accessor — enables the preTurn monitor-events delivery
+   *  hook. Absent → hook not installed. */
+  getMonitors?: () => import('./monitor-registry.js').MonitorRegistry | undefined
   /** 多会话隔离：读取本会话 TodoStore（透传给 todo-reminder 做快照/活跃度判断）。
    *  缺省时 todo-reminder 回退全局 getTodos()。 */
   getTodos?: () => import('../tools/todo-store.js').TodoItem[]
@@ -531,6 +538,8 @@ export function createDefaultRuntimeHooks(deps: RuntimeHookDeps): RuntimeHook[] 
       // 是唯一声音，泛化 self-verify advisory 不再叠发）。
       submitControlSignal: deps.submitControlSignal,
       obligations: deps.obligations,
+      // W3 债龄阶梯：债连续在场越久，advisory priority 越高（债越陈越贵）
+      getVerificationDebt: deps.getVerificationDebt,
     }))
   }
 
@@ -860,6 +869,11 @@ export function createDefaultRuntimeHooks(deps: RuntimeHookDeps): RuntimeHook[] 
   // Background-jobs awareness — preTurn nudge while jobs run (requires bus + registry).
   if (deps.advisoryBus && deps.getJobs) {
     hooks.push(createBackgroundJobsHook({ advisoryBus: deps.advisoryBus, getJobs: deps.getJobs }))
+  }
+
+  // Monitor events — preTurn delivery of subscribed job-output events (requires bus + registry).
+  if (deps.advisoryBus && deps.getMonitors) {
+    hooks.push(createMonitorHook({ advisoryBus: deps.advisoryBus, getMonitors: deps.getMonitors }))
   }
 
   if (deps.companionPresenceEnabled && deps.companionPresenceCwd && deps.sessionId) {

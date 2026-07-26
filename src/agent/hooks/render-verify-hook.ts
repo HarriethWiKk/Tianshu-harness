@@ -63,6 +63,22 @@ export function createRenderVerifyHook(deps: RenderVerifyHookDeps): PostTurnRunt
         tier: 'operational',
         content: advice,
         ttl: 1,
+        // 没有 expect 的条目 adopted 恒 0，会被 efficacy 负反馈环当成零采纳
+        // 逐步冷却直至本会话静默——这条提醒一直走在被系统自己掐掉的轨道上。
+        // 精度局限：tool_appears 只认工具名，`browser_debug open`/`navigate`
+        // 这种操作类调用也会记成采纳（谓词表达不了 isVerifyCall 的 action 过滤），
+        // 所以它的 lift 数据偏高，够用来免于静音，别当精确读数。
+        // 工具不可用的分支催的是人工过目，没有工具痕迹可核销，故不挂 expect
+        // （该分支有 fireCount 上限兜底）。
+        ...(visualAvailable
+          ? {
+              expect: {
+                kind: 'tool_appears' as const,
+                tools: ['browser_debug', 'browser', 'computer_use'],
+                withinTurns: 3,
+              },
+            }
+          : {}),
       })
     },
   }

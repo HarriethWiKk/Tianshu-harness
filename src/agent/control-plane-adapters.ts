@@ -246,8 +246,13 @@ export function signalsFromVerifiedResults(
 // ── Obligation adapters (Wave 3, evidence-driven reasoning loop) ─────────────
 
 /** Families whose next step is a verification run (focus → verify);
- *  everything else routes to inspect (read/probe/cross-check). */
-const VERIFY_FAMILIES: ReadonlySet<EvidenceObligation['family']> = new Set(['bugfix', 'delivery', 'regression'])
+ *  everything else routes to inspect (read/probe/cross-check).
+ *
+ *  ⚠️ 这是 `ReadonlySet` 不是 `Record<ObligationFamily, …>`——新增义务家族时
+ *  typecheck **不会**暴露此站点，漏补会静默降级成 `inspect` 动词。 */
+const VERIFY_FAMILIES: ReadonlySet<EvidenceObligation['family']> = new Set([
+  'bugfix', 'delivery', 'regression', 'acceptance',
+])
 
 /**
  * Project the obligation store onto the control plane. Deterministic and

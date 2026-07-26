@@ -8,10 +8,14 @@ import { PrewarmCache } from './prewarm.js'
 import { invalidateSessionReadDedup } from '../tools/read-file.js'
 import { getTodos } from '../tools/todo.js'
 import { gateToolDefinitions, isExtendedTool } from './tool-tiers.js'
+import { applyDescriptionMode } from '../tools/description-compact.js'
+import { resolvePromptBlocks } from '../prompt/block-policy.js'
+import { buildBudgetReport } from '../prompt/prefix-budget.js'
 import type { CompactCircuitBreakerState, ContextAnchor } from '../context/types.js'
 import type { ToolErrorClass } from '../tools/types.js'
 import { EvidenceTracker } from './evidence.js'
 import { ObligationTracker } from './obligation-tracker.js'
+import { decideAcceptanceOutcome } from './evidence-obligation.js'
 import { computeVerifyFailStreak, createCvmVectorEvaluator, cvmVectorMode, type CvmVectorMode } from './hooks/cognitive-capsule-router.js'
 import { ProblemAttackStore } from './problem-attack-loop.js'
 import { TurnHarness } from './turn-harness.js'
@@ -19,6 +23,7 @@ import { TrajectoryRecorder } from './trajectory.js'
 import { createTraceStore, type TraceStore } from './trace-store.js'
 import { getDoomLoopLevel, getClassDoomLoopLevel, combineDoomLoopLevels, getDoomLoopThresholds } from './trace-store.js'
 import { classifyActivityMode, computeFlowBeacon, evaluateConvergence, FLOW_MIN_SAMPLES, PRODUCTIVE_TOOLS } from './convergence-detector.js'
+import { isInProductionFlow } from './production-flow.js'
 import type { PhaseClass, ConvergenceResult } from './convergence-detector.js'
 import { computeStructureFlowControl } from './structure-flow-controller.js'
 import type { StructureFlowSnapshot } from './structure-flow-controller.js'
@@ -53,13 +58,15 @@ import { TurnPerceptionController } from './turn-perception.js'
 import { TurnIntentController } from './turn-intent.js'
 import { ContextInjectionController } from './context-injection.js'
 import { CompactionController } from './compaction-controller.js'
-import { buildActiveDomain, type ActiveStarDomain } from './star-domain.js'
+import { buildActiveDomain, type ActiveStarDomain, type StarDomainId } from './star-domain.js'
+import { starDomainRegistry } from './star-domain-registry.js'
 import { buildDomainKnowledgeBlock } from './domain-knowledge-block.js'
 import { mintNumericId, buildAgentMark, VOID_SYMBOL } from './void-identity.js'
 import { buildDepartureMilestone } from '../constellation/milestone.js'
 import { appendMilestone } from '../constellation/store.js'
 import { ArtifactStore } from '../artifact/store.js'
 import { SessionJobs } from '../tools/job-store.js'
+import { MonitorRegistry } from './monitor-registry.js'
 import { COMPACT_HISTORY_TOOL } from '../compact/recall-marker.js'
 import { createWriteEvidenceProbe } from '../context/write-evidence-probe.js'
 import { compactPolicyRatios } from '../compact/constants.js'
@@ -221,6 +228,9 @@ export class AgentLoop {
   askModeState: AskModeState = 'off'
   /** 主动 plan mode 建议的 one-shot 记忆：已建议过的 contract id（选「直接执行」后不复问）。 */
   planModeSuggestedContracts = new Set<string>()
+  /** 「请声明验收面」的 one-shot 记忆：已催过的 contract id。义务块每轮都在
+   *  渲染 `next=user_acceptance` 作被动通道，advisory 只负责响一次，不逐轮催。 */
+  readonly acceptanceAdvisedContracts = new Set<string>()
   /** W3：A 前置对齐 advisory 已触发过的契约 key（collab:align:<contractId>）——
    *  每契约至多一次，澄清（新契约）后可再次触发。 */
   collabAlignFiredContracts = new Set<string>()
@@ -558,6 +568,9 @@ export class AgentLoop {
    *  Self-created for TUI; the server replaces it via setJobs() with an instance
    *  it subscribes to for SSE + REST. */
   private _jobs: import('../tools/job-store.js').SessionJobs | undefined
+  /** Session-scoped monitor registry（monitor 工具 + monitor-hook 共享；
+   *  经 getter 晚绑定 _jobs——server setJobs 替换实例后自动重绑）。 */
+  private _monitors: import('./monitor-registry.js').MonitorRegistry | undefined
   sessionStateManager: SessionStateManager | undefined
   stigmergyStore: StigmergyStore
   loadedPheromones: Pheromone[] = []
@@ -704,14 +717,8 @@ export class AgentLoop {
     }
     // Phase 2 阶段抑制：产出流 = 近期编辑+验证交替且无失败（navigator 沉默规则）。
     // 只影响 encouragement/typecheck/informational 白名单——守护类不受抑制。
-    this.advisoryBus.setFlowStateProvider(() => {
-      const recent = this.recentToolHistory.slice(-6)
-      if (recent.length < 3) return false
-      const hasEdit = recent.some(h => ['edit_file', 'hash_edit', 'write_file', 'apply_patch'].includes(h.tool))
-      const hasVerify = recent.some(h => h.tool === 'run_tests' || (h.tool === 'bash' && /\b(test|typecheck|tsc)\b/i.test(h.target ?? '')))
-      const hasFailure = recent.some(h => h.status === 'failed')
-      return hasEdit && hasVerify && !hasFailure
-    })
+    // 判据本体在 production-flow.ts（EFE/affordance 的 wuwei 让位共用同一处）。
+    this.advisoryBus.setFlowStateProvider(() => isInProductionFlow(this.recentToolHistory))
     this.harness = new TurnHarness(
       { maxRetries: 2, retryableClasses: ['timeout', 'flaky'] },
       this.trajectory,
@@ -734,6 +741,8 @@ export class AgentLoop {
       this.sessionStateManager = stateManager
       this._jobs = new SessionJobs(join(artifactDir, 'jobs'))
     }
+    // MonitorRegistry 无条件创建（无会话时 getJobs 返回 undefined，subscribe 优雅降级）。
+    this._monitors = new MonitorRegistry(() => this._jobs, { telemetry: this.telemetryWriter })
 
     this.cacheAdvisor = new CacheAdvisor({
       providerProfile: this.config.providerProfile ?? { cacheType: 'none', persistent: false },
@@ -789,7 +798,7 @@ export class AgentLoop {
         this.pressureMonitor.recordCvmInjection(Math.ceil(message.length / 4), 'runtime-payload')
       },
       requestThetaCheck: reason => { this.requestThetaCheck(reason) },
-      setReasoningEffort: effort => { this.setReasoningEffort(effort) },
+      setReasoningEffort: effort => { this.setReasoningEffort(effort, 'programmatic') },
       getFingerprint: () => this.config.promptEngine.getFingerprint(),
       submitControlSignal: signal => { this.controlPlane.submit(signal) },
     })
@@ -989,6 +998,50 @@ export class AgentLoop {
     this.planTraceCoordinator.capturePlanSteps(steps)
   }
 
+  /**
+   * 用户级验收面的声明与核销（todo 的 acceptance 字段）。这是 acceptance 义务
+   * **唯一**的核销入口——它刻意不在 `applyVerificationEvent` 的自动满足集合里，
+   * 跑多少测试都关不掉，只有 agent 显式回写验收结果才能关。
+   *
+   * 状态机：任一项 pending → 义务保持 open；有 met 但缺 evidence → 只记 attempt
+   * （逼出「实际做了什么」，两次后升级为 ask_user）；有 blocked 且无 pending →
+   * block（走 honest_blocked，交付时强制披露）；全部 met 且有据 → satisfy。
+   */
+  captureAcceptance(items: import('../tools/types.js').AcceptanceItemInput[]): void {
+    if (items.length === 0) return
+
+    // 声明落进契约：successCriteria 在 tail 区被渲染进提示词，替换默认套话。
+    // 只在文本真变了才赋值——状态回写（pending→met）不该翻转提示词字节。
+    const criteria = items.map(i => i.criterion)
+    if (this.taskContract) {
+      const prev = this.taskContract.successCriteria
+      const changed = prev.length !== criteria.length || criteria.some((c, i) => c !== prev[i])
+      if (changed) this.taskContract = { ...this.taskContract, successCriteria: criteria }
+    }
+
+    const ob = this.obligations.getStore().obligations.find(
+      o => o.family === 'acceptance' && o.state !== 'satisfied' && o.state !== 'superseded',
+    )
+    if (!ob) return
+
+    const outcome = decideAcceptanceOutcome(items)
+    if (!outcome) return
+    switch (outcome.kind) {
+      case 'declared':
+        // 留痕即可，让「请声明验收面」的 advisory 闭嘴；义务保持未决。
+        this.obligations.recordAttempt(ob.id, { evidenceRef: `acceptance-declared:${criteria.length}` })
+        return
+      case 'missing_evidence':
+        this.obligations.recordAttempt(ob.id, { failureClass: 'acceptance_no_evidence' })
+        return
+      case 'blocked':
+        this.obligations.block(ob.id, outcome.reason)
+        return
+      case 'met':
+        this.obligations.satisfy(ob.id, outcome.evidenceRef)
+    }
+  }
+
   /** U6: build a StepResult from the tool events recorded for a given turn. */
   private buildStepResultFromTurn(turn: number): StepResult | null {
     return this.planTraceCoordinator.buildStepResultFromTurn(turn)
@@ -1024,15 +1077,44 @@ export class AgentLoop {
 
   bindSessionDomain(taskDescription: string): void {
     if (this.sessionDomain !== undefined) return
-    // domainKeywordRouting 默认 true：Auto 按消息在 DOMAIN_AUTO_POOL（五个均衡
+    // 首次绑定前检查 defaultDomain 配置——非 auto 时钉定，让所有入口
+    //（TUI/headless/server/外部）统一在此钉定，不再依赖入口层各显神通。
+    if (isStarSoulEnabled()) {
+      const key = this.config.defaultDomain ?? 'qiming'
+      if (key !== 'auto') {
+        const pinned = starDomainRegistry.get(key) ?? starDomainRegistry.get('qiming')
+        if (pinned) {
+          this.sessionDomain = {
+            id: pinned.id as StarDomainId,
+            name: pinned.name,
+            volatileBlock: pinned.volatileBlock,
+            motto: pinned.motto,
+            courageThreshold: pinned.courageThreshold,
+          }
+          this.config.promptEngine.setActiveDomain(this.withDomainKnowledge(this.sessionDomain))
+          this.persistSessionDomain()
+          return
+        }
+      }
+    }
+    // domainKeywordRouting 默认 true：Auto 按消息在 DOMAIN_AUTO_POOL（四个均衡
     // 工程域 + 自定义域）内 matchDomain，未命中回退天权（DEFAULT_DOMAIN）；
-    // 显式 false 时固定落到 DEFAULT_DOMAIN。池外特化域仅手动/钉定/委派进入。
+    // 显式 false 时固定落到 DEFAULT_DOMAIN。池外特化域（含华盖）仅手动/钉定/
+    // 委派进入。仅 defaultDomain='auto' 的会话走到这里，其余已被钉定。
     this.sessionDomain = isStarSoulEnabled()
       ? buildActiveDomain(taskDescription, {
           keywordRouting: this.config.domainKeywordRouting !== false,
         })
       : null
     this.config.promptEngine.setActiveDomain(this.withDomainKnowledge(this.sessionDomain))
+    this.persistSessionDomain()
+  }
+
+  /** 域变更即写 meta.domain——TUI /resume 恢复原域的依据（bootstrap
+   *  switchAgentSession 读取；shutdown 时 buildSessionHandoff 旁另有兜底重写）。
+   *  best-effort：持久化失败不阻断域切换。 */
+  private persistSessionDomain(): void {
+    try { this.persist?.updateMetadata({ domain: this.sessionDomain?.id }) } catch { /* best-effort */ }
   }
 
   /**
@@ -1212,13 +1294,23 @@ export class AgentLoop {
     } catch { /* best-effort */ }
   }
 
-  setReasoningEffort(effort: import('./auto-reasoning.js').ReasoningEffort | 'auto'): void {
+  /**
+   * source 分流（2026-07-25 advisory-ecology-repair W1）：
+   * 只有用户路径（/effort 斜杠命令、CLI、桌面端设置）才动 userReasoningOverride；
+   * 程序化路径（perception strategy effort、autoReasoning 档位调整）只透传
+   * reasoningEffort.set()。此前程序化调用每轮把 override 置真，
+   * 自会话第 2 轮起永久架空关键词 autoReasoning（用户从未 /effort 却被当作已手动设置）。
+   */
+  setReasoningEffort(
+    effort: import('./auto-reasoning.js').ReasoningEffort | 'auto',
+    source: 'user' | 'programmatic' = 'user',
+  ): void {
     if (effort === 'auto') {
       // 用户显式选 auto → autoReasoning 接管后续每轮 effort，清除 override 标志。
-      this.userReasoningOverride = false
+      if (source === 'user') this.userReasoningOverride = false
       return
     }
-    this.userReasoningOverride = true
+    if (source === 'user') this.userReasoningOverride = true
     this.reasoningEffort.set(effort)
   }
 
@@ -1249,7 +1341,13 @@ export class AgentLoop {
   private gatedToolDefinitions(): import('../api/types.js').ToolDefinition[] {
     const all = this.config.toolRegistry.getDefinitions()
     const gating = this.config.toolGating
-    if (!gating) return all
+    // 描述档位：优先读会话启动期冻结的快照（config.blockPolicy）——长驻进程里
+    // 进程级 memo 会被新会话创建时 invalidate，live 读会让描述从 compact 回弹
+    // 成 full，system 字节中途翻转 → 整段前缀缓存 miss。快照缺省（手工构造
+    // config 的测试路径）才回退 live 解析。
+    const toolDescriptions = (this.config.blockPolicy
+      ?? resolvePromptBlocks(this.config.cwd ?? process.cwd())).toolDescriptions
+    if (!gating) return applyDescriptionMode(all, toolDescriptions)
     return gateToolDefinitions(all, {
       enabled: gating.enabled,
       coreOverride: gating.coreOverride,
@@ -1257,6 +1355,7 @@ export class AgentLoop {
       domainTier: gating.domainTier,
       mountedExtras: [...this.mountedExtras],
       disabledTools: gating.disabledTools,
+      toolDescriptions,
     })
   }
 
@@ -1344,12 +1443,14 @@ export class AgentLoop {
   setSessionDomain(domain: ActiveStarDomain | null): void {
     this.sessionDomain = domain
     this.config.promptEngine.setActiveDomain(this.withDomainKnowledge(domain))
+    this.persistSessionDomain()
   }
 
   /** Reset domain to undefined so the next run() will auto-detect from user input. */
   resetSessionDomain(): void {
     this.sessionDomain = undefined
     this.config.promptEngine.setActiveDomain(undefined)
+    this.persistSessionDomain()
   }
 
   /**
@@ -1703,6 +1804,11 @@ export class AgentLoop {
     return this._jobs
   }
 
+  /** Session-scoped monitor registry (always present; degrades without jobs). */
+  get monitors(): import('./monitor-registry.js').MonitorRegistry | undefined {
+    return this._monitors
+  }
+
   /** Replace the background job registry. The server injects an instance it owns
    *  (subscribed for SSE + REST). Any prior self-created jobs are terminated. */
   setJobs(jobs: import('../tools/job-store.js').SessionJobs): void {
@@ -1788,6 +1894,17 @@ export class AgentLoop {
 
   getFileHistory() { return this.config.fileHistory }
 
+  /** 本会话 frozen 前缀的分块归因（`/prefix-budget`）。档位来自会话启动时
+   *  解析的策略——中途改配置不会反映在这里，正如它也不会反映在前缀里。 */
+  getPrefixBudget(): { profile: string; toolDescriptions: string; report: import('../prompt/prefix-budget.js').PrefixBudgetReport } {
+    const policy = this.config.blockPolicy ?? resolvePromptBlocks(this.config.cwd ?? process.cwd())
+    return {
+      profile: policy.profile,
+      toolDescriptions: policy.toolDescriptions,
+      report: buildBudgetReport(this.config.promptEngine.getPrefixBudgetInputs()),
+    }
+  }
+
   getDebugInfo() {
     const fp = this.config.promptEngine.getFingerprint()
     const sysPrompt = this.config.promptEngine.getSystemPrompt()
@@ -1798,6 +1915,13 @@ export class AgentLoop {
       toolNames: this.config.toolRegistry.getDefinitions().map(t => t.name),
       volatilePayloadReport: this.config.promptEngine.getVolatilePayloadReport(this.recentToolHistory),
       cacheAdvisor: this.cacheAdvisor.getDiagnostic() }
+  }
+
+  /** Drain pending async persist writes — public for /cd pre-migration
+   *  (moving session files while a queued append is in flight would recreate
+   *  a dangling jsonl at the old path). */
+  async drainPersistWrites(): Promise<void> {
+    await this._persistDrain?.()
   }
 
   async runPostSession(callbacks: AgentCallbacks): Promise<void> {
@@ -2105,12 +2229,12 @@ export class AgentLoop {
       else if (status === 'success') break
     }
 
-    // 验证债务 = 验证实际失败过，或未验证编辑积累到 TDD gate 硬闸阈值（3）。
+    // 验证债务判据统一走 EvidenceTracker.hasVerificationDebt()（W3 单一口径，
+    // self-verify 债龄计数共用），语义不变：验证失败过或未验证编辑 ≥3。
     // 不用「存在任何未验证编辑」——正常的编辑→验证节奏会瞬时经过该状态，
     // 拿它 hardTighten 等于取消 P1 对健康构建流的保护。
     const gateState = this.evidence.getGateState()
-    const hasVerificationDebt = this.evidence.getState().deliveryStatus === 'failed'
-      || gateState.editsSinceLastTest >= 3
+    const hasVerificationDebt = this.evidence.hasVerificationDebt()
 
     return assembleCognitiveFrame({
       turn,

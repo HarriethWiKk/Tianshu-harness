@@ -118,6 +118,8 @@ export interface GlanceBarInput {
   planMode?: boolean
   /** 当前 goal 状态快照 */
   goal?: GoalStateSnapshot
+  /** Goal 计划倒计时自动批准的剩余秒数（armed 时每秒刷新；undefined = 未武装） */
+  planAutoApproveSec?: number
   /** todo 摘要 */
   todoSummary?: TodoSummary
   /** todo 徽章瞬时高亮（done 增加 / total 变化后 ~1s，app 侧计时；
@@ -153,6 +155,13 @@ export function formatGlanceLeft(input: GlanceBarInput, theme: RivetTheme): stri
   // worker 视图徽章：切入子代理视图时提示当前输入路由目标
   const workerPart = input.workerBadge ? ` ${color(`[${input.workerBadge}]`, theme.secondary)}` : ''
   return `${glyphPart}${color(domainLabel, accentColor)}${color(branchPart, theme.dim)}${workerPart}`
+}
+
+/** 过半成本提示（2026-07-25）：上下文 ≥50% 在底栏常驻建议开新会话——继续推进
+ *  到 70%+ 会触发压缩（前缀缓存全量重建，成本高）。compact 档用短文案。 */
+function contextNewSessionHint(ratio: number, theme: RivetTheme, compact: boolean): string {
+  if (ratio < 0.5) return ''
+  return color(compact ? '·建议新会话' : ' · 过半建议开新会话（70%+ 压缩成本高）', theme.warning)
 }
 
 export function formatGlanceRight(input: GlanceBarInput, theme: RivetTheme): string {
@@ -211,7 +220,7 @@ export function formatGlanceRight(input: GlanceBarInput, theme: RivetTheme): str
       ? input.estimatedTokens / input.maxTokens : 0
     if (input.maxTokens && input.maxTokens > 0 && input.estimatedTokens !== undefined) {
       const tokenColor = cRatio >= 0.9 ? theme.error : cRatio >= 0.75 ? theme.warning : theme.muted
-      parts.push(color(`◧${(cRatio * 100).toFixed(0)}%`, tokenColor))
+      parts.push(color(`◧${(cRatio * 100).toFixed(0)}%`, tokenColor) + contextNewSessionHint(cRatio, theme, true))
     }
     const zone = parts.join('  ')
     const elapsedStr = input.elapsedMs !== undefined ? formatElapsed(input.elapsedMs) : ''
@@ -227,6 +236,11 @@ export function formatGlanceRight(input: GlanceBarInput, theme: RivetTheme): str
       : `◆ ${g.iteration}/${g.maxIterations} · ${formatElapsed(g.elapsedMs)}`
     const goalColor = g.status === 'blocked' ? theme.error : g.status === 'paused' ? theme.warning : theme.secondary
     parts.push(color(goalText, goalColor))
+  }
+
+  // Goal 计划倒计时自动批准（overlay 收起后仍有持续可见性，goal 不"假死"）
+  if (input.planAutoApproveSec !== undefined) {
+    parts.push(color(narrow ? `⏳${input.planAutoApproveSec}s` : `⏳ 自动批准 ${input.planAutoApproveSec}s`, theme.warning))
   }
 
   if (input.modelName) {
@@ -261,7 +275,7 @@ export function formatGlanceRight(input: GlanceBarInput, theme: RivetTheme): str
   if (!narrow && displayTokens !== undefined && input.maxTokens && input.maxTokens > 0) {
     const tokenColor = ratio >= 0.9 ? theme.error : ratio >= 0.75 ? theme.warning : theme.muted
     const pct = `${(ratio * 100).toFixed(0)}%`
-    parts.push(color(`◧${formatTokensK(displayTokens)}/${formatTokensK(input.maxTokens)} ${pct}`, tokenColor))
+    parts.push(color(`◧${formatTokensK(displayTokens)}/${formatTokensK(input.maxTokens)} ${pct}`, tokenColor) + contextNewSessionHint(ratio, theme, false))
   }
   if (input.cost !== undefined && input.cost > 0) {
     // cost > 0 用 secondary 高亮，让用户感知到花费

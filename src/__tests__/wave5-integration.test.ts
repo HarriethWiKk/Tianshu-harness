@@ -11,7 +11,9 @@ import { tmpdir } from 'os'
 
 describe('Wave 5 integration', () => {
   it('default registry includes repo_map, inspect_project, related_tests', () => {
-    const reg = createDefaultToolRegistry()
+    // 显式 full 档——无参调用会读本机 .rivet/config.json 的 tools.preset
+    // （minimal 档排除 inspect_project/related_tests），测试需与用户配置隔离。
+    const reg = createDefaultToolRegistry([], { preset: 'full' })
     const defs = reg.getDefinitions()
     const names = defs.map(d => d.name)
     assert.ok(names.includes('repo_map'))

@@ -5,7 +5,7 @@ import { gitStatusCache } from './volatile-git.js'
 import { getTargetPlatform, getShellCommand, type ShellCommand } from '../platform.js'
 import type { ContextLedger } from '../context/types.js'
 import type { TaskState } from '../agent/task-state.js'
-import { renderActiveClaimsBlock, type ContextClaim } from '../context/claims.js'
+import type { ContextClaim } from '../context/claims.js'
 import { selectRelevantClaims, type ClaimRelevanceInput } from '../context/claim-relevance.js'
 import { summarizeGitStatus } from './git-status-summary.js'
 import type { PlaybookBullet } from '../agent/playbook.js'
@@ -14,6 +14,9 @@ import type { TaskDepthLayer } from '../context/task-contract.js'
 import { loadDeclaredVerify } from '../config/verify-config.js'
 import type { VerifyConfig } from '../config/schema.js'
 import { detectRuntimeEnvBlock } from './runtime-env.js'
+import { FROZEN_BLOCK_CAPS, type FrozenBlockCaps, type PromptBlockToggles } from './block-policy.js'
+
+export { FROZEN_BLOCK_CAPS, type FrozenBlockCaps }
 
 const DEPTH_ADVISORY: Record<Exclude<TaskDepthLayer, 'unit'>, string> = {
   wiring: '<task-depth layer="wiring">此任务跨越模块边界。mock 单测会掩盖接线缺陷。写集成测试时实例化真实依赖（非 mock），RED 必须先证明边界断裂，GREEN 才证明已修复。</task-depth>',
@@ -128,9 +131,10 @@ flowchart LR
 
 提交 \`plan\` 后，等待用户批准或驳回。未经批准不要继续推进。
 
-用户会回复：
-- /plan-approve <slug> [方案名] — 批准（可选指定方案），开始执行
-- /plan-reject <slug> <反馈> — 驳回并给出修订意见，plan mode 保持激活
+用户在审批卡/审批面板上操作（不要求手输任何命令）：
+- 批准（可选指定方案）— 自动退出 plan mode 并开始执行
+- 驳回（附修订意见）— 按意见修订后同 title 重提，plan mode 保持激活
+若审批后写操作仍被拦（系统未自动退出），调 \`plan action=exit_mode\` 手动退出；要放弃规划直接动手时也调它（无需用户批准）。只在文本里宣布「退出」不会真正退出——模式只认工具调用。不要用 \`plan close\` 退模式（close 只标记任务完成，不解锁）。
 </plan-mode>`
 }
 
@@ -193,6 +197,13 @@ export interface ToolHistoryEntry {
 
 export interface VolatileContext {
   cwd: string
+  /** 各 frozen 块的字符上限。缺省 = {@link FROZEN_BLOCK_CAPS}（standard 档）。
+   *  由 block-policy 按 profile 缩放后经 createVolatileSnapshot 传入；
+   *  会话内冻结，中途变更不生效。 */
+  blockCaps?: Partial<Record<keyof FrozenBlockCaps, number>>
+  /** 参考类块开关。缺省全开。只影响 appendix 侧的可选块——frozen 侧的块
+   *  由 createVolatileSnapshot 直接决定是否加载（不生成就不渲染）。 */
+  blockToggles?: Partial<PromptBlockToggles>
   /** Whether cwd reaches 天枢's own body (self / home / self-evolution) or the
    *  world's project (emissary). Session-constant → safe in FROZEN base (same
    *  class as rivetMd; never per-turn). Computed by detectCwdRelation. */
@@ -507,7 +518,9 @@ export function buildDynamicAppendixParts(ctx: VolatileContext, maxChars?: numbe
   // Historical lessons: session-constant pool (loaded once by refreshPlaybookLessons,
   //  ranked by matchBullets). No per-boundary re-ranking — the pool is already
   //  domain-filtered and top-K=3; re-sorting adds churn without information gain.
-  if (ctx.playbookLessons && ctx.playbookLessons.length > 0) {
+  // lean 档关掉它：这是 appendix 里唯一按 recentQuery 每边界重排的 churner，
+  // 且同样的教训可经 memory recall 拿到。
+  if (ctx.blockToggles?.historicalLessons !== false && ctx.playbookLessons && ctx.playbookLessons.length > 0) {
     const lessons = ctx.playbookLessons
       .map(b => {
         const base = `- ${escapeXml(b.lesson)} (${escapeXml(b.context)})`
@@ -977,13 +990,17 @@ function buildVolatileBlockInternal(ctx: VolatileContext): string {
     parts.push(`<star-domain name="${d.name}" motto="${d.motto}">${d.volatileBlock}${sharedDiscipline}${knowledge}</star-domain>`)
   }
 
+  // 档位化上限：缺省回落 standard，保证无 policy 的调用方（worker / 测试 /
+  // 直接构造 ctx 的路径）与历史输出逐字节一致。
+  const caps = { ...FROZEN_BLOCK_CAPS, ...ctx.blockCaps }
+
   const md = ctx.rivetMd ?? readRivetMd(ctx.cwd)
   if (md) {
     // When codebase-index is present it already contains the module directory table
     // (seeded from AGENTS.md via loadProjectModuleMap). Strip the redundant table
     // from project-instructions to avoid ~600-800 chars of duplication.
     const stripped = ctx.projectIndexBlock ? stripFirstMarkdownTable(md) : md
-    parts.push(truncateBlock(`<project-instructions>\n${escapeXml(stripped)}\n</project-instructions>`, 8_000, 'project-instructions'))
+    parts.push(truncateBlock(`<project-instructions>\n${escapeXml(stripped)}\n</project-instructions>`, caps.projectInstructions, 'project-instructions'))
   }
 
   // A3: declared verify commands (from .rivet-config.json) rendered as the
@@ -997,27 +1014,27 @@ function buildVolatileBlockInternal(ctx: VolatileContext): string {
   // Rendered into frozen base so it benefits from prefix cache (turn 2+ cost = 0).
   // A3: budget cap at 3K chars — beyond that it's stale noise.
   if (ctx.projectMemoryBlock) {
-    parts.push(truncateBlock(ctx.projectMemoryBlock, 3_000, 'project-memory'))
+    parts.push(truncateBlock(ctx.projectMemoryBlock, caps.projectMemory, 'project-memory'))
   }
 
   // Knowledge manifest routing map（Wave 4b）——字节稳定索引，snapshot 时生成。
   // 只告诉模型"何时召回什么"，知识本文经 memory recall 按需取。
   if (ctx.knowledgeManifestBlock) {
-    parts.push(truncateBlock(ctx.knowledgeManifestBlock, 2_200, 'knowledge-manifest'))
+    parts.push(truncateBlock(ctx.knowledgeManifestBlock, caps.knowledgeManifest, 'knowledge-manifest'))
   }
 
   // Seed capsule — 前辈星域封存的经验方法（天璇胶囊等）。
   // Rendered into frozen base so it benefits from prefix cache (turn 2+ cost = 0).
   // A3: budget cap at 3K chars.
   if (ctx.seedCapsuleBlock) {
-    parts.push(truncateBlock(ctx.seedCapsuleBlock, 3_000, 'seed-capsule'))
+    parts.push(truncateBlock(ctx.seedCapsuleBlock, caps.seedCapsule, 'seed-capsule'))
   }
 
   // Codebase index — module summaries + CLI entries.
   // Rendered into frozen base after projectMemoryBlock for prefix cache stability.
   // A3: budget cap at 4K chars — oversized index is a trained-mode noise source.
   if (ctx.projectIndexBlock) {
-    parts.push(truncateBlock(ctx.projectIndexBlock, 4_000, 'codebase-index'))
+    parts.push(truncateBlock(ctx.projectIndexBlock, caps.codebaseIndex, 'codebase-index'))
   }
 
   if (ctx.workingSet && ctx.workingSet.length > 0) {
@@ -1043,9 +1060,9 @@ function buildVolatileBlockInternal(ctx: VolatileContext): string {
 }
 
 /**
- * A3 前缀预算：截断超出上限的 frozen 块。
- * - projectIndexBlock: 4K → 超出折叠为 repo 工具指引
- * - seedCapsuleBlock / projectMemoryBlock: 3K → 超出截断但保持 XML 标签闭合
+ * A3 前缀预算：截断超出上限的 frozen 块。上限见 {@link FROZEN_BLOCK_CAPS}。
+ * - codebaseIndex → 超出折叠为 repo 工具指引
+ * - seedCapsule / projectMemory → 超出截断但保持 XML 标签闭合
  */
 function truncateBlock(block: string, maxChars: number, kind: string): string {
   if (block.length <= maxChars) return block

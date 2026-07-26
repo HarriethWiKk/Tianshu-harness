@@ -451,6 +451,17 @@ If Tianshu has been useful and you'd like to say thanks, you can. It stays a cof
 
 <img src="docs/brand/assets/wechat-pay.jpg" width="240" alt="WeChat Pay">
 
+## ✨ Contributors
+
+Thank you to everyone who has contributed to Tianshu (ordered by first contribution):
+
+| Contributor | Contributions |
+|-------------|---------------|
+| [@banxia](https://github.com/banxia) | Project creator · Core development |
+| [@qiaodier](https://github.com/qiaodier) | CC Switch provider preset (PR #8) |
+
+> Contributions are welcome — see CONTRIBUTING.md.
+
 ## License
 
 Licensed under the [Apache License, Version 2.0](LICENSE). Copyright 2025-2026 Tianshu Contributors.

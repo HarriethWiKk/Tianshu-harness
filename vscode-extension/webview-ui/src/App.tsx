@@ -168,6 +168,9 @@ export function App() {
             send({ type: 'setApprovalMode', sessionId: activeId, mode })
             setSessions((prev) => prev.map((s) => (s.id === activeId ? { ...s, approvalMode: mode } : s)))
           }}
+          onTogglePlanMode={() =>
+            send({ type: 'setPlanMode', sessionId: activeId, state: chat.planMode === 'planning' ? 'off' : 'planning' })
+          }
         />
       )}
       {sidecar === 'dead' && (
@@ -256,6 +259,7 @@ function Toolbar(props: {
   running: boolean
   approvalMode: string
   onApprovalMode: (mode: string) => void
+  onTogglePlanMode: () => void
 }) {
   const currentModel = props.models.find((m) => m.current)
   const currentDomain = props.domains.find((d) => d.current)
@@ -306,6 +310,13 @@ function Toolbar(props: {
           </option>
         ))}
       </select>
+      <button
+        className={`plan-toggle ${props.planMode === 'planning' ? 'active' : ''}`}
+        title={props.planMode === 'planning' ? '退出计划模式，恢复正常执行' : '进入计划模式（只读规划，产出计划待审批）'}
+        onClick={props.onTogglePlanMode}
+      >
+        📋 {props.planMode === 'planning' ? '退出计划' : '计划'}
+      </button>
       {props.planMode === 'planning' && (
         <span className="badge plan">📋 Plan Mode{props.planDrafting ? ' · 起草中…' : ''}</span>
       )}
@@ -508,32 +519,7 @@ function Item({
       )
     }
     case 'approval':
-      return (
-        <div className="msg approval">
-          <div>
-            🛡 <b>{item.toolName}</b> 请求执行
-          </div>
-          <pre>{truncate(safeJson(item.input), 1200)}</pre>
-          {item.decision ? (
-            <div className="decision">{item.decision === 'approve' ? '✓ 已批准' : `✗ ${item.decision}`}</div>
-          ) : (
-            <div className="actions">
-              <button
-                className="approve"
-                onClick={() => sessionId && send({ type: 'approval', sessionId, requestId: item.requestId, decision: 'approve' })}
-              >
-                批准
-              </button>
-              <button
-                className="deny"
-                onClick={() => sessionId && send({ type: 'approval', sessionId, requestId: item.requestId, decision: 'deny' })}
-              >
-                拒绝
-              </button>
-            </div>
-          )}
-        </div>
-      )
+      return <ApprovalCard item={item} sessionId={sessionId} />
     case 'question':
       return <QuestionCard toolUseId={item.toolUseId} questions={item.questions} sessionId={sessionId} running={running} />
     case 'plan':
@@ -558,8 +544,111 @@ function AssistantMarkdown({ text }: { text: string }) {
 }
 
 /**
+ * 工具审批卡。批准/拒绝之外对齐桌面端 handleApproval 的两个深度能力：
+ * 「改参数后批准」（editedInput，JSON 解析失败 fail-closed 不发送）与
+ * 「记住本次会话同类决策」（remember）。
+ */
+function ApprovalCard({ item, sessionId }: { item: Extract<ChatItem, { kind: 'approval' }>; sessionId?: string }) {
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState('')
+  const [parseError, setParseError] = useState('')
+  const [remember, setRemember] = useState(false)
+
+  const answer = (decision: 'approve' | 'deny', editedInput?: Record<string, unknown>) => {
+    if (!sessionId) return
+    send({
+      type: 'approval',
+      sessionId,
+      requestId: item.requestId,
+      decision,
+      ...(editedInput ? { editedInput } : {}),
+      ...(remember ? { remember: true } : {}),
+    })
+  }
+
+  const approveEdited = () => {
+    try {
+      const parsed: unknown = JSON.parse(draft)
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        setParseError('参数必须是 JSON 对象')
+        return
+      }
+      setParseError('')
+      answer('approve', parsed as Record<string, unknown>)
+    } catch (err) {
+      setParseError(`JSON 解析失败：${(err as Error).message}`)
+    }
+  }
+
+  return (
+    <div className="msg approval">
+      <div>
+        🛡 <b>{item.toolName}</b> 请求执行
+      </div>
+      {editing ? (
+        <textarea
+          className="approval-edit"
+          value={draft}
+          rows={Math.min(14, draft.split('\n').length + 1)}
+          onChange={(e) => setDraft(e.target.value)}
+        />
+      ) : (
+        <pre>{truncate(safeJson(item.input), 1200)}</pre>
+      )}
+      {item.decision ? (
+        <div className="decision">{item.decision === 'approve' ? '✓ 已批准' : `✗ ${item.decision}`}</div>
+      ) : (
+        <>
+          {parseError && <div className="approval-error">{parseError}</div>}
+          <label className="approval-remember">
+            <input type="checkbox" checked={remember} onChange={(e) => setRemember(e.target.checked)} />
+            记住本次会话同类决策
+          </label>
+          <div className="actions">
+            {editing ? (
+              <>
+                <button className="approve" onClick={approveEdited}>
+                  以修改后参数批准
+                </button>
+                <button
+                  onClick={() => {
+                    setEditing(false)
+                    setParseError('')
+                  }}
+                >
+                  取消
+                </button>
+              </>
+            ) : (
+              <>
+                <button className="approve" onClick={() => answer('approve')}>
+                  批准
+                </button>
+                <button
+                  onClick={() => {
+                    setDraft(JSON.stringify(item.input ?? {}, null, 2))
+                    setEditing(true)
+                  }}
+                >
+                  改参数…
+                </button>
+                <button className="deny" onClick={() => answer('deny')}>
+                  拒绝
+                </button>
+              </>
+            )}
+          </div>
+        </>
+      )}
+    </div>
+  )
+}
+
+/**
  * Plan 审批卡：plan_submitted 帧出卡 → 展开时按需拉正文（GET /plans/:slug）
  * → 批准/驳回走 plans REST。驳回意见组装为普通文本输入。
+ * 对齐桌面端 PlanPanel：多方案（options≥2）radio 选择随批准回传 selectedApproach；
+ * submitted 状态可编辑正文（PUT /plans/:slug，保存后宿主重推 plan 刷新）。
  */
 function PlanCard(props: {
   slug: string
@@ -571,6 +660,10 @@ function PlanCard(props: {
 }) {
   const [rejecting, setRejecting] = useState(false)
   const [comment, setComment] = useState('')
+  const [selectedApproach, setSelectedApproach] = useState<string | null>(null)
+  const [editing, setEditing] = useState(false)
+  const [editDraft, setEditDraft] = useState('')
+  const [editError, setEditError] = useState('')
   const requested = useRef(false)
 
   const fetchPlan = () => {
@@ -579,8 +672,23 @@ function PlanCard(props: {
     send({ type: 'readPlan', sessionId: props.sessionId, slug: props.slug })
   }
 
+  // 编辑保存结果回流（宿主保存成功后会紧跟重推 plan，props.plan 自动刷新）
+  useEffect(() => {
+    return onHostMessage((msg) => {
+      if (msg.type === 'planEditResult' && msg.slug === props.slug) {
+        if (msg.ok) {
+          setEditing(false)
+          setEditError('')
+        } else {
+          setEditError(msg.message ?? '保存失败')
+        }
+      }
+    })
+  }, [props.slug])
+
   const decided = props.decision ?? (props.status !== 'submitted' ? props.status : undefined)
   const html = useMemo(() => (props.plan ? renderMarkdown(props.plan.content) : ''), [props.plan])
+  const options = props.plan?.options ?? []
 
   return (
     <div className="msg plan-card">
@@ -598,7 +706,57 @@ function PlanCard(props: {
         <summary>查看计划正文</summary>
         {props.plan ? <div className="md" dangerouslySetInnerHTML={{ __html: html }} /> : <div className="empty">加载中…</div>}
       </details>
-      {!decided && props.sessionId && (
+      {editing && (
+        <>
+          <textarea
+            className="plan-edit"
+            value={editDraft}
+            rows={Math.min(24, editDraft.split('\n').length + 1)}
+            onChange={(e) => setEditDraft(e.target.value)}
+          />
+          {editError && <div className="approval-error">{editError}</div>}
+          <div className="actions">
+            <button
+              className="approve"
+              onClick={() => {
+                if (!editDraft.trim()) {
+                  setEditError('计划内容不能为空')
+                  return
+                }
+                setEditError('')
+                send({ type: 'editPlan', sessionId: props.sessionId!, slug: props.slug, content: editDraft })
+              }}
+            >
+              保存修改
+            </button>
+            <button
+              onClick={() => {
+                setEditing(false)
+                setEditError('')
+              }}
+            >
+              取消
+            </button>
+          </div>
+        </>
+      )}
+      {!decided && !editing && options.length >= 2 && props.sessionId && (
+        <div className="plan-options">
+          <div className="plan-options-label">选择执行方案</div>
+          {options.map((opt) => (
+            <label key={opt.id} className={`plan-option ${selectedApproach === opt.label ? 'active' : ''}`}>
+              <input
+                type="radio"
+                name={`plan-option-${props.slug}`}
+                checked={selectedApproach === opt.label}
+                onChange={() => setSelectedApproach(opt.label)}
+              />
+              <span>{opt.label}</span>
+            </label>
+          ))}
+        </div>
+      )}
+      {!decided && !editing && props.sessionId && (
         <div className="actions">
           {rejecting ? (
             <>
@@ -621,9 +779,30 @@ function PlanCard(props: {
             <>
               <button
                 className="approve"
-                onClick={() => send({ type: 'planDecision', sessionId: props.sessionId!, slug: props.slug, decision: 'approve' })}
+                onClick={() =>
+                  send({
+                    type: 'planDecision',
+                    sessionId: props.sessionId!,
+                    slug: props.slug,
+                    decision: 'approve',
+                    ...(options.length >= 2 && selectedApproach ? { selectedApproach } : {}),
+                  })
+                }
               >
                 批准并执行
+              </button>
+              <button
+                onClick={() => {
+                  if (!props.plan) {
+                    fetchPlan()
+                    return
+                  }
+                  setEditDraft(props.plan.content)
+                  setEditing(true)
+                }}
+                title={props.plan ? '修改计划正文' : '先加载计划正文'}
+              >
+                编辑…
               </button>
               <button className="deny" onClick={() => setRejecting(true)}>
                 驳回…

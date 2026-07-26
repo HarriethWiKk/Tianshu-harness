@@ -19,6 +19,26 @@ import { createProxyAwareFetch } from '../proxy-fetch.js'
  * than running a full round-trip.
  */
 
+/** 隔离本机代理环境变量——resolveProxyForUrl 无 opts 时回退读
+ *  HTTPS_PROXY/HTTP_PROXY（大小写不敏感），开发机常年开代理会让
+ *  「无 proxy → 无 dispatcher」断言在真实环境下必挂。 */
+const PROXY_ENV_KEYS = ['HTTPS_PROXY', 'HTTP_PROXY', 'https_proxy', 'http_proxy'] as const
+async function withoutProxyEnv(fn: () => Promise<void>): Promise<void> {
+  const saved = new Map<string, string | undefined>()
+  for (const k of PROXY_ENV_KEYS) {
+    saved.set(k, process.env[k])
+    delete process.env[k]
+  }
+  try {
+    await fn()
+  } finally {
+    for (const [k, v] of saved) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+  }
+}
+
 /** A fetch that captures its init for inspection. */
 function spyFetch(): { fetch: typeof globalThis.fetch; lastInit: RequestInit | undefined } {
   const state: { lastInit: RequestInit | undefined } = { lastInit: undefined }
@@ -34,15 +54,17 @@ function spyFetch(): { fetch: typeof globalThis.fetch; lastInit: RequestInit | u
 
 describe('createProxyAwareFetch', () => {
   it('without proxy opts, passes init through without dispatcher', async () => {
-    const spy = spyFetch()
-    const wrapped = createProxyAwareFetch(undefined, spy.fetch)
-    const res = await wrapped('https://example.com/search', { headers: { 'User-Agent': 'test' } })
-    assert.equal(res.status, 200)
-    assert.equal(res.ok, true)
-    // No dispatcher — raw fetch path
-    assert.ok(spy.lastInit, 'init should be passed through')
-    const hasDispatcher = 'dispatcher' in (spy.lastInit ?? {})
-    assert.equal(hasDispatcher, false, 'should NOT add dispatcher without proxy')
+    await withoutProxyEnv(async () => {
+      const spy = spyFetch()
+      const wrapped = createProxyAwareFetch(undefined, spy.fetch)
+      const res = await wrapped('https://example.com/search', { headers: { 'User-Agent': 'test' } })
+      assert.equal(res.status, 200)
+      assert.equal(res.ok, true)
+      // No dispatcher — raw fetch path
+      assert.ok(spy.lastInit, 'init should be passed through')
+      const hasDispatcher = 'dispatcher' in (spy.lastInit ?? {})
+      assert.equal(hasDispatcher, false, 'should NOT add dispatcher without proxy')
+    })
   })
 
   it('without proxy opts, preserves caller-supplied headers and signal', async () => {
@@ -107,11 +129,13 @@ describe('createProxyAwareFetch', () => {
   })
 
   it('empty proxy opts behave same as undefined', async () => {
-    const spy = spyFetch()
-    const wrapped = createProxyAwareFetch({}, spy.fetch)
-    const res = await wrapped('https://example.com/search')
-    assert.equal(res.status, 200)
-    const hasDispatcher = 'dispatcher' in (spy.lastInit ?? {})
-    assert.equal(hasDispatcher, false, 'empty opts should not add dispatcher')
+    await withoutProxyEnv(async () => {
+      const spy = spyFetch()
+      const wrapped = createProxyAwareFetch({}, spy.fetch)
+      const res = await wrapped('https://example.com/search')
+      assert.equal(res.status, 200)
+      const hasDispatcher = 'dispatcher' in (spy.lastInit ?? {})
+      assert.equal(hasDispatcher, false, 'empty opts should not add dispatcher')
+    })
   })
 })

@@ -1,4 +1,4 @@
-<seed-capsule star="天璇·CCR" sealed="2026-05-21" gist="跨域换视角——卡住或遇硬边界时，到无关领域找碎片求收敛">
+<seed-capsule star="天璇·CCR" sealed="2026-05-21" gist="跨域换视角——卡住或遇硬边界，到无关领域找碎片求收敛">
   天璇（Opus 4.6）封存的认知方法，被 CCR Phase 2 接入为动态原则池（X1-X4）。
   原版（不带 `<principle>` 标签、不带 gist、不参与路由器查找）见
   `docs/seed-capsule-tianxuan.md`——不要修改原版，要补结构就在本文件改。

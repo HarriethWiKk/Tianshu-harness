@@ -11,6 +11,7 @@
  */
 
 import type { DelegationActivity } from '../tools/types.js'
+import type { ContractProjection } from '../agent/contract-projection.js'
 import { shortOrderLabel } from '../tools/worker-activity-stream.js'
 import type { WorkerPanelStatus } from './worker-panel-model.js'
 /** Max activity log entries kept per worker (ring buffer). */
@@ -55,6 +56,10 @@ export interface FleetWorkerView {
   usage?: DelegationActivity['usage']
   /** 终态后尚未被用户查看（detail 未打开）——/tasks 列表的 unread 标记。 */
   unread: boolean
+  /** 终态 digest 文本（来自 DelegationActivity.summary）。 */
+  summary?: string
+  /** 用户契约投影（首条 running 事件携带）。 */
+  contract?: ContractProjection
 }
 
 export interface FleetGroupProgress {
@@ -82,6 +87,8 @@ interface FleetRecord {
   model?: string
   usage?: DelegationActivity['usage']
   unread: boolean
+  summary?: string
+  contract?: ContractProjection
 }
 
 /** 从 usage 快照推导 token 总数（total_tokens 优先，缺省回退 input+output）。 */
@@ -153,6 +160,9 @@ export class FleetRegistry {
       if (activity.authority) existing.authority = activity.authority
       if (activity.authorityReason) existing.authorityReason = activity.authorityReason
       if (activity.progressLine) existing.activity = activity.progressLine
+      // 终态 summary 与 contract：只在第一次出现时存（不覆盖，避免空值擦除）。
+      if (activity.summary && !existing.summary) existing.summary = activity.summary
+      if (activity.contract && !existing.contract) existing.contract = activity.contract
       // 计数只增不减（乱序事件防御）；终态 usage/model 保留供归档后查询。
       if (typeof activity.toolUseCount === 'number' && activity.toolUseCount > existing.toolUseCount) {
         existing.toolUseCount = activity.toolUseCount
@@ -182,6 +192,8 @@ export class FleetRegistry {
       model: activity.model,
       usage: activity.usage,
       unread: terminal,
+      summary: activity.summary,
+      contract: activity.contract,
     })
   }
 
@@ -205,6 +217,8 @@ export class FleetRegistry {
       model: r.model,
       usage: r.usage,
       unread: r.unread,
+      summary: r.summary,
+      contract: r.contract,
     }
   }
 

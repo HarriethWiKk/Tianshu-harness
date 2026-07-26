@@ -192,6 +192,16 @@ export function color(text: string, fgHex: string, opts?: { bold?: boolean; dim?
   return `${prefix}${text}${ANSI.RESET}`
 }
 
+// ── OSC 52 剪贴板 ─────────────────────────────────────────────
+
+/**
+ * OSC 52 写系统剪贴板（终端支持时；不支持者无害忽略——内部剪贴板 Alt+Y 兜底）。
+ * 剪贴选区/复制后由 app 在渲染循环 drain 写出。
+ */
+export function osc52Clipboard(text: string): string {
+  return `\x1B]52;c;${Buffer.from(text, 'utf8').toString('base64')}\x07`
+}
+
 // ── OSC 8 超链接 ──────────────────────────────────────────────
 
 let hyperlinkOverride: boolean | null = null

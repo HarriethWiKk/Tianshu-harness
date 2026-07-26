@@ -9,6 +9,7 @@
 import type { RouteHandler } from './index.js'
 import type { RuntimeSessionManager } from './session-manager.js'
 import type { LoopLagSnapshot } from './loop-health.js'
+import { PROTOCOL_VERSION } from './protocol.js'
 
 export function buildHealthRoute(
   manager: RuntimeSessionManager,
@@ -30,6 +31,7 @@ export function buildHealthRoute(
         body: {
           ok: registryOk && configuredOk,
           version,
+          protocolVersion: PROTOCOL_VERSION,
           uptimeMs: Date.now() - startedAt,
           sessionCount,
           runningCount,

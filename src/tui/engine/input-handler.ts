@@ -69,6 +69,8 @@ export type KeyName =
   | 'ctrl_f'
   | 'ctrl_x'
   | 'ctrl_]'
+  | 'ctrl_minus'
+  | 'ctrl_y'
   | 'shift_tab'
   | 'unknown'
 
@@ -115,8 +117,10 @@ const CTRL_CODES: Record<number, KeyName> = {
   0x16: 'ctrl_v',
   0x17: 'ctrl_w',
   0x18: 'ctrl_x',
+  0x19: 'ctrl_y', // Ctrl+Y — redo（fish undo 的对偶）
   0x1a: 'ctrl_z',
   0x1d: 'ctrl_]',
+  0x1f: 'ctrl_minus', // Ctrl+- / Ctrl+_（部分终端 Ctrl+/ 同码）——fish 式 undo
   0x1b: 'escape',
   0x7f: 'backspace',
 }
@@ -307,7 +311,11 @@ export class InputHandler {
         const endIdx = this.inputBuffer.indexOf(PASTE_END)
         if (endIdx !== -1) {
           this.pasteBuffer += this.inputBuffer.slice(0, endIdx)
-          const text = this.pasteBuffer.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
+          // 归一化换行；剥离 C0 控制符（保留 \n \t）与 ESC——防终端转义注入
+          //（粘贴携带的 SGR/控制序列原样进 buffer 会改色/移动光标，2026-07-23 P1-3）。
+          const text = this.pasteBuffer
+            .replace(/\r\n/g, '\n').replace(/\r/g, '\n')
+            .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '')
           this.pasteActive = false
           this.pasteBuffer = ''
           for (const handler of this.pasteHandlers) handler(text)
@@ -371,6 +379,24 @@ export class InputHandler {
             this.inputBuffer = ''
             this.dispatch({ raw: '\x1B', char: '', name: 'escape', ctrl: false, meta: false, shift: false })
           }
+        }, this.escapeTimeoutMs)
+      }
+    } else if (!this.pasteActive && (this.inputBuffer.startsWith('\x1B[') || this.inputBuffer.startsWith('\x1BO'))) {
+      // 不完整 CSI/SS3 超时兜底（2026-07-23 P1-4）：半个转义序列后终端不再
+      // 发字节时，inputBuffer 会永久滞留、后续按键全部卡死。超时按 unknown
+      // 消费首字节（ESC）并重试剩余——正常分 chunk 序列因新字节到达会
+      // clearTimeout（handleData），不会误触发。
+      const flushPartial = (): void => {
+        if (this.pasteActive || (!this.inputBuffer.startsWith('\x1B[') && !this.inputBuffer.startsWith('\x1BO'))) return
+        this.dispatch({ raw: '\x1B', char: '', name: 'unknown', ctrl: false, meta: false, shift: false })
+        this.inputBuffer = this.inputBuffer.slice(1)
+        this.processInputBuffer()
+      }
+      if (this.escapeImmediate) flushPartial()
+      else if (!this.escapeTimer) {
+        this.escapeTimer = setTimeout(() => {
+          this.escapeTimer = null
+          flushPartial()
         }, this.escapeTimeoutMs)
       }
     }

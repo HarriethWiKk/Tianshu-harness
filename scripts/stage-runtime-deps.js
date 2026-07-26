@@ -51,6 +51,7 @@ const ROOTS = [
   '@ast-grep/lang-python',
   'web-tree-sitter', // tree-sitter chunker (wasm loader)
   'tree-sitter-wasms', // grammar .wasm files (loaded by path)
+  'playwright-core', // headless chromium driver (variable-specifier dynamic import — tsup 无法内联)
 ]
 
 function pkgDir(name) {

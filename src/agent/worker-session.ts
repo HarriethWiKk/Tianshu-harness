@@ -28,6 +28,20 @@ import { createWorkerMailboxSender } from './worker-mailbox.js'
 const MAX_TRANSIENT_RETRIES = 2
 const TRANSIENT_BACKOFF_BASE_MS = 2_000
 
+/** Worker read cap (2026-07-24 max-turns 诊断): workers run compact-disabled
+ *  on 1M windows, where the window-derived cap is 120K chars — one uncapped
+ *  full-file read (50K chars observed) stays in history and is re-sent every
+ *  turn until the turn budget dies. 16K (~主控 cap 的 1/7.5) still fits any
+ *  focused offset/limit slice; oversized full reads degrade to the fold
+ *  skeleton + navigation hints instead (see read-file.ts), teaching the model
+ *  where to re-read precisely. Head/tail split mirrors computeModelReadCap
+ *  (60% / 30%, 10% marker buffer). */
+const WORKER_READ_CAP: import('../tools/model-read-cap.js').ModelReadCap = {
+  maxChars: 16_000,
+  headChars: 9_600,
+  tailChars: 4_800,
+}
+
 /** Checkpoint saved from a previous worker run — allows Flash workers to resume
  *  from their last successful turn instead of redoing all work on retry. */
 export interface WorkerCheckpoint {
@@ -373,6 +387,59 @@ export function salvageAbortedReport(
   return { ...salvaged, failureReason: abortSource }
 }
 
+/** Deterministic handling for a run cut off by maxTurns (2026-07-24 假 summary 事故).
+ *
+ *  When the initial run exhausts its turn budget without a final turn, the
+ *  accumulated text is exploratory prose — NOT a report. The repair ladder is
+ *  actively harmful here: `repairWithJsonMode` is a context-free single-shot
+ *  request (no conversation history), so the model fabricates a plausible
+ *  report like "No work order context provided" — which then parses cleanly
+ *  and masks the real budget failure as a fake missing-context failure
+ *  (observed on 5 review workers, 7-21~7-24; see
+ *  docs/审查子代理max-turns耗尽与大read诊断.md).
+ *
+ *  Ladder: full contract parse (the report may have landed on the final turn
+ *  via soft-landing) → return null so the caller proceeds normally; else
+ *  field-level salvage (honest "salvaged" summary, findings downgraded); else
+ *  a structured blocked result whose summary carries the
+ *  "max-turns: exhausted without a final turn" marker that
+ *  classifyInfraFailure keys on for 'budget' retry-routing. Never repair. */
+export function buildMaxTurnsExhaustedResult(
+  order: WorkOrder,
+  transcript: WorkerTranscript,
+  latestText: string,
+  maxTurns: number,
+): WorkerResult | null {
+  try {
+    parseWorkerResult(latestText, order.id)
+    return null // 终轮已产出合法报告(soft-landing 成功)——走正常路径
+  } catch {
+    // fall through — the run genuinely ended without a report
+  }
+  const salvaged = salvageWorkerResult(latestText, order.id)
+  if (salvaged) {
+    return {
+      ...salvaged,
+      risks: [...salvaged.risks, `max-turns: exhausted without a final turn (budget ${maxTurns} turns, ${transcript.toolUses.length} tool calls) — findings salvaged from a mid-work report, treat as unverified leads`],
+      failureReason: 'max_turns',
+    }
+  }
+  const blocked = buildBlockedWorkerResult(
+    order,
+    `max-turns: exhausted without a final turn. Worker used its full ${maxTurns}-turn budget while still exploring (${transcript.toolUses.length} tool calls issued, no verdict JSON produced). This is a deterministic budget failure — do NOT trust any prose the model wrote about missing context; re-dispatch with a bigger budget or a narrower scope.`,
+    'max_turns',
+  )
+  return latestText.trim()
+    ? {
+        ...blocked,
+        artifacts: [
+          ...blocked.artifacts,
+          { kind: 'note' as const, title: 'Max-turns worker partial output', content: latestText.slice(0, 2000) },
+        ],
+      }
+    : blocked
+}
+
 /** Run a single agent turn, retrying transient network/API errors with backoff.
  *  Exported for direct testing with an injected mock agent. */
 export async function runOnceWithTransientRetry(
@@ -445,6 +512,9 @@ export async function runWorkerSession(config: WorkerSessionConfig): Promise<Wor
     maxTurns: clampWorkerMaxTurns(config.maxTurns, config.order.budget.maxTurns),
     contextWindow: config.contextWindow,
     compact: config.compact,
+    // 紧 read cap:worker 关压缩 + 1M 窗口跳过请求时修剪,首次全量大 read
+    // 会永久占据后续每轮 prompt——用摘要骨架替代全文,精读走 offset/limit。
+    readCapOverride: WORKER_READ_CAP,
     sessionId: deriveWorkerSessionId(config.order.id, config.sessionNonce),
     // Headless: no human answers approval prompts for a worker. The tool pipeline
     // auto-approves in-workspace writes (worktree/claim isolation) and fast-denies
@@ -519,6 +589,33 @@ export async function runWorkerSession(config: WorkerSessionConfig): Promise<Wor
     const transcript = emptyTranscript()
     let latestText = await runOnceWithTransientRetry(agent, prompt, transcript, config.onActivity, steerDrain)
     mbox?.progress(1, config.order.budget.maxRetries + 1, 'initial run')
+
+    // Max-turns 熔断闸门：初始 run 被 maxTurns 切断时绝不进修复梯——
+    // 无上下文的 json-mode 修复会捏造"缺上下文"假报告(见 helper 注释)。
+    const initialStop = agent.latestStopReason
+    if (initialStop?.source === 'max-turns' && !initialStop.voluntary) {
+      const exhausted = buildMaxTurnsExhaustedResult(
+        config.order,
+        transcript,
+        latestText,
+        clampWorkerMaxTurns(config.maxTurns, config.order.budget.maxTurns),
+      )
+      if (exhausted) {
+        mbox?.escalate(`Worker exhausted max-turns budget (${transcript.toolUses.length} tool calls, no verdict)`)
+        return {
+          result: exhausted,
+          transcript,
+          session,
+          usage: session.getTotalUsage(),
+          checkpoint: {
+            turnIndex: 0,
+            partialResult: latestText.slice(0, 8000),
+            completedTools: [...transcript.toolUses],
+          },
+        }
+      }
+      // null → 终轮已产出合法报告,落入下方正常 parse 路径
+    }
 
     for (let attempt = 0; attempt <= config.order.budget.maxRetries; attempt++) {
       // Abort wins over repair: never re-run an aborted worker.

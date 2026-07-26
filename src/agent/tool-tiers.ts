@@ -9,6 +9,7 @@
  */
 
 import type { StarDomain } from './star-domain.js'
+import { applyDescriptionMode, type ToolDescriptionMode } from '../tools/description-compact.js'
 
 /**
  * CORE 层 — 主控常驻工具（~25）。
@@ -154,6 +155,10 @@ export interface ToolGatingState {
   mountedExtras?: readonly string[]
   /** config.toolGating.disabledTools — session 启动时生效，运行中不变（缓存约束）。 */
   disabledTools?: readonly string[]
+  /** prompt.toolDescriptions —— compact 压缩超长描述，保留硬门禁行。
+   *  放在门控里而不是各调用点，是为了让构造期与 updateTools() 天然共用
+   *  同一变换：两处不一致会让 MCP 注册后的描述回弹、翻转前缀字节。 */
+  toolDescriptions?: ToolDescriptionMode
 }
 
 /**
@@ -163,11 +168,11 @@ export interface ToolGatingState {
  * @param state   门控状态
  * @returns 过滤后的工具定义（不修改入参）
  */
-export function gateToolDefinitions<T extends { name: string }>(
+export function gateToolDefinitions<T extends { name: string; description?: string }>(
   allDefs: readonly T[],
   state: ToolGatingState,
 ): T[] {
-  if (!state.enabled) return [...allDefs]
+  if (!state.enabled) return applyDescriptionMode(allDefs, state.toolDescriptions)
 
   const exempt = new Set<string>([...(state.extraCore ?? []), ...(state.mountedExtras ?? [])])
 
@@ -181,7 +186,7 @@ export function gateToolDefinitions<T extends { name: string }>(
 
   if (allowList) {
     const allow = new Set<string>([...allowList, ...exempt])
-    return allDefs.filter(d => allow.has(d.name))
+    return applyDescriptionMode(allDefs.filter(d => allow.has(d.name)), state.toolDescriptions)
   }
 
   // deny-list 模式（默认）：只摘 EXTENDED，保留 CORE + 未分类（MCP/LSP/自定义）
@@ -194,7 +199,7 @@ export function gateToolDefinitions<T extends { name: string }>(
     filtered = filtered.filter(d => !disabled.has(d.name))
   }
 
-  return filtered
+  return applyDescriptionMode(filtered, state.toolDescriptions)
 }
 
 /** 判断工具是否在 CORE 层 */

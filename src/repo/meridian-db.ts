@@ -167,7 +167,10 @@ export class MeridianDb {
         // Packaged sidecar with a broken native bundle: fail loud, never degrade.
         if ((err as { code?: string })?.code === 'ESQLITE_BUNDLE_BROKEN') throw err
         const reason = err instanceof Error ? err.message : String(err)
-        console.warn(`⚠ better-sqlite3 not available. Code index (MeridianDb) disabled. Reason: ${reason}`)
+        const hint = process.platform === 'win32'
+          ? 'Run: npm install -g windows-build-tools (as admin), then: npm rebuild better-sqlite3 -g tianshu-tui'
+          : 'Run: npm rebuild better-sqlite3 -g tianshu-tui'
+        console.warn(`⚠ better-sqlite3 not available. Code index (MeridianDb) disabled — repo symbol search & cross-file analysis will be unavailable. Reason: ${reason}\n  Fix: ${hint}`)
         this._available = false
         this.conn = createNullDb()
       }

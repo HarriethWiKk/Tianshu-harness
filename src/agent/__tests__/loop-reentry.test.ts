@@ -13,6 +13,8 @@ test('run claims the instance synchronously before awaiting idle compaction', as
     _pendingAbort: false,
     _watchdogAborted: false,
     abortController: null,
+    // 64c692e4：run() 在 drain 前调用 session.resetSrCount()（SR 每轮上限）
+    session: { resetSrCount: () => {} },
     cancelIdleCompaction: async () => {
       cancelCalls++
       await idleGate

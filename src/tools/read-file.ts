@@ -475,6 +475,14 @@ export interface ReadFilePayloadOptions {
    * return) — path validation, gitignore, binary, and cap truncation still run.
    */
   prefetchedContent?: string
+  /**
+   * When a no-range read overflows the cap, serve the fold-skeleton PARTIAL
+   * view (navigable: teaches the model where to re-read with offset/limit)
+   * instead of a blunt head/tail slice. Set by the tool layer only when a
+   * readCapOverride is active (worker sessions) — main sessions keep the
+   * legacy head/tail behavior byte-for-byte.
+   */
+  preferFoldOnOverflow?: boolean
 }
 
 export interface ReadFilePayload {
@@ -613,8 +621,26 @@ export async function readFilePayload(cwd: string, options: ReadFilePayloadOptio
     content = lines.slice(startIdx, endIdx).join('\n')
   }
 
-  // full-with-hint: append editing guidance for medium-sized files
-  const modelContent = truncateContent(content, cap.maxChars, cap.headChars, cap.tailChars)
+  // full-with-hint: append editing guidance for medium-sized files.
+  // preferFoldOnOverflow (worker readCapOverride active): a no-range read that
+  // overflows the tightened cap serves the fold skeleton (partial view with
+  // navigation) instead of a blunt head/tail slice — the skeleton teaches the
+  // model WHERE to re-read with offset/limit, the slice doesn't. Gated on the
+  // flag so main sessions keep legacy head/tail behavior byte-for-byte.
+  // Guard: buildPartialView is line-based and keeps at least one line, so a
+  // single over-budget line (minified/one-liner) can blow past the cap —
+  // fall back to char-exact head/tail truncation in that case. 20% slack
+  // absorbs the navigation header (its HEADER_OVERHEAD underestimates long
+  // paths) without letting the pathological single-line case through.
+  let modelContent: string
+  if (options.preferFoldOnOverflow && !hasExplicitRange && content.length > cap.maxChars) {
+    const folded = applyFoldThenPartial(content, filePath, cap)
+    modelContent = folded.length <= Math.floor(cap.maxChars * 1.2)
+      ? folded
+      : truncateContent(content, cap.maxChars, cap.headChars, cap.tailChars)
+  } else {
+    modelContent = truncateContent(content, cap.maxChars, cap.headChars, cap.tailChars)
+  }
   const hint = policy.action === 'full-with-hint'
     ? `\n\n── Note: this file is ${content.split('\n').length} lines. For editing, consider: grep to locate target → hash_edit with anchors. ──`
     : ''
@@ -664,7 +690,9 @@ export const READ_FILE_TOOL: Tool = {
 
     let payload: ReadFilePayload
 
-    const computedCap = computeModelReadCap({
+    // Per-agent override wins (worker sessions: compact-disabled + 1M window
+    // means an uncapped read permanently occupies every later turn's prompt).
+    const computedCap = params.readCapOverride ?? computeModelReadCap({
       contextWindow: params.contextWindow,
       providerProfile: params.providerProfile,
     })
@@ -822,12 +850,20 @@ export const READ_FILE_TOOL: Tool = {
           debugLog(`[prewarm-hit] file=${canonical} cached=${cached.content.length} bytes`)
         }
       }
+      // Explicit-range fidelity (2026-07-24): only forward offset/limit when
+      // the model actually provided them. The old unconditional `offset`
+      // (defaulted to 1) made readFilePayload's hasExplicitRange永真 on this
+      // path — the entire decideReadPolicy layer (PARTIAL view for >80KB
+      // source, log preview, >100KB guard) was dead wiring for single-file
+      // tool reads, so a no-arg read of a 144KB file returned a 108K-char
+      // slice straight into history.
       payload = await readFilePayload(params.cwd, {
         filePath,
-        offset,
-        limit,
+        ...(params.input.offset !== undefined ? { offset } : {}),
+        ...(params.input.limit !== undefined ? { limit } : {}),
         modelCap: computedCap,
         prefetchedContent,
+        preferFoldOnOverflow: params.readCapOverride !== undefined,
       })
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
@@ -944,7 +980,7 @@ export const READ_FILE_TOOL: Tool = {
 /** Handle multi-file read: file_paths array. Reads up to 5 files, each with
  *  an independent per-file budget derived from the overall model read cap. */
 async function handleMultiRead(params: ToolCallParams, paths: string[]): Promise<import('./types.js').ToolResult> {
-  const computedCap = computeModelReadCap({
+  const computedCap = params.readCapOverride ?? computeModelReadCap({
     contextWindow: params.contextWindow,
     providerProfile: params.providerProfile,
   })
@@ -962,7 +998,7 @@ async function handleMultiRead(params: ToolCallParams, paths: string[]): Promise
     const trimmed = rawPath.trim()
     if (!trimmed) continue
     try {
-      const payload = await readFilePayload(params.cwd, { filePath: trimmed, modelCap: perFileCap })
+      const payload = await readFilePayload(params.cwd, { filePath: trimmed, modelCap: perFileCap, preferFoldOnOverflow: params.readCapOverride !== undefined })
       const relPath = relative(params.cwd, payload.canonicalPath)
       sections.push(`── ${relPath} ──\n${payload.modelContent}`)
       totalBytes += payload.rawContent.length

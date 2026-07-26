@@ -190,7 +190,7 @@ test('intent note appends a non-blocking timeline event (no pending state)', asy
   assert.equal(noteEvent.data.summary, 'about to delete')
   // 文案翻译：high commit threshold → 大白话
   assert.ok(Array.isArray(noteEvent.data.reasons))
-  assert.ok((noteEvent.data.reasons as string[]).some((r) => r.includes('把握偏低')))
+  assert.ok((noteEvent.data.reasons as string[]).some((r) => r.includes('交付门槛')))
   // 非阻塞：intent_note 不携带 requestId（无 pending intervention 可回复）
   assert.equal(noteEvent.data.requestId, undefined)
 })

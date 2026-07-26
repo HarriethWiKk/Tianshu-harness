@@ -30,9 +30,14 @@ const MAX_INTENT_NOTES = 3
  * pauses the turn — it just emits a passive note so the user can see the
  * agent's reasoning and steer if they want. Capped per turn-sequence to avoid
  * spamming the timeline.
+ *
+ * 去重纪律（2026-07-28）：同一组 warning 在相邻 turn 不重复渲染。
+ * commitThreshold > 0.8 常由 verification debt / pressureRelative / momentum
+ * 等环境信号驱动，连续多轮不变时反复弹「方向提示」是噪音，不是信号。
  */
 export class TurnIntentController {
   private shown = 0
+  private lastFingerprint: string | null = null
 
   evaluate(input: IntentEvalInput): void {
     if (!input.onIntentNote || this.shown >= MAX_INTENT_NOTES) return
@@ -55,12 +60,18 @@ export class TurnIntentController {
     })
     if (!preview) return
 
+    // 与上轮相同 warning+summary 组去重——连续多轮不变不是新信号
+    const fingerprint = `${preview.summary}|${(preview.warnings ?? []).sort().join('|')}`
+    if (fingerprint === this.lastFingerprint) return
+
+    this.lastFingerprint = fingerprint
     this.shown++
     input.onIntentNote(preview)
   }
 
   reset(): void {
     this.shown = 0
+    this.lastFingerprint = null
   }
 
   getShownCount(): number {

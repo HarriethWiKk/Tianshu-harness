@@ -100,3 +100,19 @@ test('text_delta 中插入 tool 后新 delta 开新气泡', () => {
   assert.equal(s.items.length, 3)
   assert.deepEqual(s.items[2], { kind: 'assistant', text: '后' })
 })
+
+test('done 事件落终态，status 不再滞留 running（下条消息走 prompt 而非 steer）', () => {
+  const running = feed([
+    { type: 'user', data: { text: 'hi' } },
+    { type: 'status', data: { status: 'running' } },
+  ])
+  assert.equal(running.status, 'running')
+
+  const settled = reduceEvent(running, { seq: 9, ts: 9, type: 'done', data: { status: 'completed' } })
+  assert.equal(settled.status, 'completed')
+  assert.notEqual(settled.status, 'running')
+
+  // 旧内核极端情况：done 缺 status 字段也不能卡 running
+  const fallback = reduceEvent(running, { seq: 9, ts: 9, type: 'done', data: {} })
+  assert.equal(fallback.status, 'idle')
+})

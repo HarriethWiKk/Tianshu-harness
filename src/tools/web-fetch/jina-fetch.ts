@@ -22,7 +22,10 @@ export function isJinaQualityHeuristic(md: string): boolean {
   const trimmed = md.trim()
   // Empty / near-empty after extraction
   if (trimmed.length < 200) return true
-  // Classic JS-rendered page hints
+  // Classic JS-rendered page hints. These signals indicate the server returned
+  // a shell/error/challenge page instead of real content — trigger Jina
+  // re-fetch rather than hand the user garbage. Keep this list to phrases that
+  // would not appear in legitimate article content.
   const jsPageSignals = [
     'Please enable JavaScript',
     'Enable JavaScript',
@@ -32,6 +35,11 @@ export function isJinaQualityHeuristic(md: string): boolean {
     'Just a moment',
     'DDOS protection',
     'id="challenge-form"',
+    // GitHub and similar SPA error shells — the page "loaded" but the app
+    // failed to hydrate, leaving a stub error banner as the only content.
+    'error while loading',
+    'please reload this page',
+    'uh oh',
   ]
   const lower = trimmed.toLowerCase()
   return jsPageSignals.some(s => lower.includes(s.toLowerCase()))

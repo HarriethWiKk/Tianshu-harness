@@ -169,6 +169,11 @@ export function reduceEvent(state: ChatState, ev: SessionEvent): ChatState {
     case 'status':
       return { ...state, status: asText(d.status) || state.status }
 
+    case 'done':
+      // Run 收束——落终态（completed/failed/aborted）。缺了这一分支 status 会
+      // 永远停在 'running'，下一条消息被误当 steer 发送（server 409）。
+      return { ...state, status: asText(d.status) || 'idle' }
+
     case 'error':
       return push(state, { kind: 'info', text: `⚠ ${asText(d.message) || asText(d.error) || '未知错误'}` })
 

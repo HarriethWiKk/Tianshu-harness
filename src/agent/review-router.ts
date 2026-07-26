@@ -91,8 +91,10 @@ export interface ReviewOutcome {
 // budgets are dead wiring — the old fixed 90s cap killed every reviewer
 // long before its 600s budget could matter.
 
-/** Auto in-task review: short and predictable — never stalls the main loop. */
-export const AUTO_REVIEW_BUDGET_MS = 300_000
+/** Auto in-task review: short and predictable — never stalls the main loop.
+ *  必须压过内层 AUTO_WIRING_WORKER_TIMEOUT_MS(360s)——2026-07-24 随 worker
+ *  预算 240s→360s 同步放宽,否则内层 timer 永远打不响(死接线)。 */
+export const AUTO_REVIEW_BUDGET_MS = 420_000
 /** Extra slack so worker-internal timers fire before the workflow cap. */
 const REVIEW_BUDGET_GRACE_MS = 60_000
 

@@ -1132,3 +1132,53 @@ describe('/skill install — copy skills from .claude/skills into .rivet/skills'
     }
   })
 })
+
+describe('/cd 命令守卫', () => {
+  it('无参显示当前工作目录与用法', async () => {
+    const entries: string[] = []
+    const handled = await handleSlashCommand(makeCtx({
+      parts: ['/cd'],
+      pushStatic: (entry) => entries.push(entry.content),
+    }))
+    assert.equal(handled, true)
+    assert.ok(entries[0]!.includes('/cwd'), `expected current cwd: ${entries[0]}`)
+    assert.ok(entries[0]!.includes('Usage: /cd <path>'))
+  })
+
+  it('onCwdSwitch 未接线时提示不可用', async () => {
+    const entries: string[] = []
+    const handled = await handleSlashCommand(makeCtx({
+      parts: ['/cd', '/somewhere'],
+      onCwdSwitch: undefined,
+      pushStatic: (entry) => entries.push(entry.content),
+    }))
+    assert.equal(handled, true)
+    assert.ok(entries[0]!.includes('不支持'), `expected unsupported hint: ${entries[0]}`)
+  })
+
+  it('切换失败（目录不存在/worker 运行中）原样透出错误', async () => {
+    const entries: string[] = []
+    const handled = await handleSlashCommand(makeCtx({
+      parts: ['/cd', '/nonexistent'],
+      onCwdSwitch: async () => ({ ok: false, error: '目录不存在：/nonexistent' }),
+      pushStatic: (entry) => entries.push(entry.content),
+    }))
+    assert.equal(handled, true)
+    assert.ok(entries[0]!.includes('目录不存在'), `expected error passthrough: ${entries[0]}`)
+  })
+
+  it('切换成功输出 from→to 与缓存提示', async () => {
+    const entries: string[] = []
+    const handled = await handleSlashCommand(makeCtx({
+      parts: ['/cd', '/new/proj'],
+      onCwdSwitch: async (target) => {
+        assert.equal(target, '/new/proj')
+        return { ok: true, from: '/old/proj', to: '/new/proj', movedFiles: ['s.jsonl'] }
+      },
+      pushStatic: (entry) => entries.push(entry.content),
+    }))
+    assert.equal(handled, true)
+    assert.ok(entries[0]!.includes('/old/proj → /new/proj'), `expected from→to: ${entries[0]}`)
+    assert.ok(entries[0]!.includes('历史前缀缓存保留'), `expected cache note: ${entries[0]}`)
+  })
+})

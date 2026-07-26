@@ -1,6 +1,7 @@
 /**
  * @mention parser — extract @file:, @folder:, @symbol: references from user input.
  */
+import { resolve as resolvePath, relative as relativePath } from 'node:path'
 
 export interface MentionReference {
   type: 'file' | 'folder' | 'symbol' | 'codebase'
@@ -24,6 +25,18 @@ export function parseMentions(input: string): MentionReference[] {
 
 export function stripMentions(input: string): string {
   return input.replace(MENTION_RE, '').replace(/\s+/g, ' ').trim()
+}
+
+/** 把 mention 路径规范为相对 cwd 的相对路径（cwd 外的保持原样，便于识别外部引用）。 */
+export function normalizeMentionPath(cwd: string, p: string): string {
+  const abs = resolvePath(cwd, p)
+  const rel = relativePath(cwd, abs)
+  return rel.startsWith('..') ? p : rel
+}
+
+/** 批量规范化（turn-step-producer 组装 mentions context 时调用）。 */
+export function normalizeMentionRefs(refs: MentionReference[], cwd: string): MentionReference[] {
+  return refs.map(r => ({ ...r, value: normalizeMentionPath(cwd, r.value) }))
 }
 
 export function renderMentionContext(refs: MentionReference[]): string | null {

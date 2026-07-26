@@ -250,7 +250,7 @@ describe('AgentLoop — multi-turn tool_use', () => {
 
     // 关键词路由是被测特性（默认开，auto 池内匹配，未命中回退天权）；显式传 true 使意图自明。
     // 2026-07-23 auto 池收窄后改用池内域（开阳/天梁）验证"绑定一次、后续消息不换域"。
-    const agent = new AgentLoop({ client, promptEngine: engine, toolRegistry: registry, maxTurns: 2, contextWindow: 1_000_000, domainKeywordRouting: true, compact: { enabled: false, autoThreshold: 800_000, autoFloor: 500_000, model: 'flash' } }, session, TEST_CWD)
+    const agent = new AgentLoop({ client, promptEngine: engine, toolRegistry: registry, maxTurns: 2, contextWindow: 1_000_000, domainKeywordRouting: true, defaultDomain: 'auto', compact: { enabled: false, autoThreshold: 800_000, autoFloor: 500_000, model: 'flash' } }, session, TEST_CWD)
 
     await agent.run('对账插桩定位这个偏差', makeCallbacks())
     await agent.run('按计划实现用户注册', makeCallbacks())
@@ -2129,5 +2129,55 @@ describe('AgentLoop — plan mode lifecycle (2026-07-03 缺陷复盘)', () => {
     } finally {
       cleanup()
     }
+  })
+})
+
+describe('AgentLoop — setReasoningEffort 调用来源分流（2026-07-25 advisory-ecology W1）', () => {
+  function makeAgent(autoReasoning = false) {
+    const session = new SessionContext()
+    const registry = new ToolRegistry()
+    registry.register(READ_FILE_TOOL)
+    const client = mockClient([makeTextBlock('ok')])
+    const agent = new AgentLoop({
+      client,
+      promptEngine: makeEngine(),
+      toolRegistry: registry,
+      maxTurns: 2,
+      contextWindow: 1_000_000,
+      autoReasoning,
+      compact: { enabled: false, autoThreshold: 800_000, autoFloor: 500_000, model: 'flash' },
+    }, session, TEST_CWD)
+    return agent
+  }
+
+  it('user 路径置 override，/effort auto 清除（既有行为不回归）', () => {
+    const agent = makeAgent()
+    assert.equal(agent.userReasoningOverride, false)
+    agent.setReasoningEffort('high')
+    assert.equal(agent.userReasoningOverride, true, '/effort high → override 置真')
+    agent.setReasoningEffort('auto')
+    assert.equal(agent.userReasoningOverride, false, '/effort auto → 交还 autoReasoning')
+  })
+
+  it('programmatic 路径不动 override（strategy effort 每轮透传不架空 autoReasoning）', () => {
+    const agent = makeAgent()
+    agent.setReasoningEffort('medium', 'programmatic')
+    assert.equal(agent.userReasoningOverride, false, '程序化设置不得伪装成用户手动')
+
+    // 用户已 override 后，程序化 'auto' 也不得偷偷清除用户选择
+    agent.setReasoningEffort('max')
+    agent.setReasoningEffort('auto', 'programmatic')
+    assert.equal(agent.userReasoningOverride, true, '程序化 auto 不清用户 override')
+  })
+
+  it('S4a 回归：跑完一整轮后 override 仍为 false（perception 每轮的 effort 路由不再污染）', async () => {
+    const agent = makeAgent(true)
+    assert.equal(agent.userReasoningOverride, false)
+    await agent.run('hello', makeCallbacks())
+    assert.equal(
+      agent.userReasoningOverride, false,
+      'perception → routeRoutineEffort → setReasoningEffort 是程序化路径；' +
+      '此前它每轮把 override 置真，自第 2 轮起永久架空关键词 autoReasoning',
+    )
   })
 })

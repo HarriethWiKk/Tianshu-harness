@@ -28,7 +28,9 @@ export function describeIntentNote(intent: IntentPreview): IntentNoteCopy {
   const reasons: string[] = []
   for (const w of intent.warnings ?? []) {
     if (w.includes('high commit threshold')) {
-      reasons.push('我对当前方向把握偏低')
+      // commitThreshold > 0.8 根因是验证债务 / 相对压力 / 动量为零，
+      // 不是模型对方向没把握。文案指回系统状态而非认知状态。
+      reasons.push('验证覆盖率低或上下文压力偏高，交付门槛已自动提高')
     } else if (w.startsWith('历史 dead-end')) {
       const detail = w.replace(/^历史 dead-end:\s*/, '').trim()
       reasons.push(detail ? `这个目标之前走过死路（${detail}）` : '这个目标之前走过死路')

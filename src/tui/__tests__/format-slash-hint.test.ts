@@ -4,6 +4,7 @@ import {
   filterSlashCommands,
   formatSlashHint,
   slashCompletionTarget,
+  slashArgsHint,
   SLASH_HINT_MAX_VISIBLE,
 } from '../format/slash-hint.js'
 import { getTheme } from '../theme.js'
@@ -144,5 +145,39 @@ describe('formatSlashHint scroll window', () => {
   it('footer shows ↵ run hint', () => {
     const lines = formatSlashHint({ input: '/he', commands: COMMANDS }, theme).map(stripAnsi)
     assert.ok(lines[lines.length - 1]!.includes('↵'), 'footer has Enter hint')
+  })
+})
+
+describe('slashArgsHint（P3-2 ghost text 匹配）', () => {
+  const CMDS = [
+    { name: '/effort', description: 'Set reasoning effort', argsHint: 'off|low|medium|high|max' },
+    { name: '/model', description: 'Switch model', argsHint: 'list|<model-id>' },
+    { name: '/model list', description: 'List models' },
+    { name: '/help', description: 'Show all commands' },
+  ]
+
+  it('「命令名+单个空格」精确形态 → 返回 argsHint', () => {
+    assert.equal(slashArgsHint(CMDS, '/effort '), 'off|low|medium|high|max')
+    assert.equal(slashArgsHint(CMDS, '/model '), 'list|<model-id>')
+  })
+
+  it('命令名未完整（前缀）→ null', () => {
+    assert.equal(slashArgsHint(CMDS, '/eff '), null)
+    assert.equal(slashArgsHint(CMDS, '/effort'), null, '无尾随空格不提示')
+  })
+
+  it('继续输入参数即失配（第二字符出现 → null）', () => {
+    assert.equal(slashArgsHint(CMDS, '/effort m'), null)
+    assert.equal(slashArgsHint(CMDS, '/effort  '), null, '多个空格不提示')
+  })
+
+  it('无 argsHint 的命令 / 非斜杠输入 / 多行输入 → null', () => {
+    assert.equal(slashArgsHint(CMDS, '/help '), null)
+    assert.equal(slashArgsHint(CMDS, 'effort '), null)
+    assert.equal(slashArgsHint(CMDS, '/effort \n'), null)
+  })
+
+  it('名含参数的命令条目在「裸名+空格」不误匹配（/model list 不吃 /model 的提示）', () => {
+    assert.equal(slashArgsHint(CMDS, '/model list '), null)
   })
 })

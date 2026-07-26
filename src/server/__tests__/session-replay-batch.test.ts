@@ -17,6 +17,8 @@ function mockRes() {
   let corkBuffer: string[] = []
   const res = {
     writeHead() {},
+    // SseStream 构造时立即 flushHeaders()（送出响应头，避免空闲会话骨架屏卡住）。
+    flushHeaders() {},
     write(chunk: string) {
       if (corked) corkBuffer.push(chunk)
       else writes.push(chunk)
@@ -37,11 +39,15 @@ function mockRes() {
   return { res: res as unknown as ServerResponse, writes }
 }
 
-/** Parse SSE frames from accumulated writes into seq numbers. */
+/** Parse SSE frames from accumulated writes into seq numbers.
+ *  跳过 seq=0——那是 /stream 回放最前的 replay_window 合成元事件（冷热
+ *  双通道窗口信息），不属于回放主体（见 session-history-page.test.ts）。 */
 function parseSeqs(writes: string[]): number[] {
   const seqs: number[] = []
   for (const w of writes) {
-    for (const m of w.matchAll(/"seq":(\d+)/g)) seqs.push(Number(m[1]))
+    for (const m of w.matchAll(/"seq":(\d+)/g)) {
+      if (m[1] !== '0') seqs.push(Number(m[1]))
+    }
   }
   return seqs
 }
@@ -317,5 +323,6 @@ test('replay stops writing and uncorks when the peer dies mid-slice', async () =
 
   assert.equal(writeCalls, 3, 'closed replay must stop attempting writes')
   assert.equal(uncorkCalls, 1, 'the interrupted slice must still be uncorked')
-  assert.deepEqual(parseSeqs(writes), [1, 2])
+  // 第 1 次 write 是 replay_window 元事件，第 2 次是 seq 1，第 3 次抛 EPIPE。
+  assert.deepEqual(parseSeqs(writes), [1])
 })

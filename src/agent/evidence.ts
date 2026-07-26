@@ -1,7 +1,11 @@
 import type { VerificationMetadata } from '../tools/types.js'
 import { buildDeliveryGate } from './delivery-gate.js'
 
-export type DeliveryVerificationStatus = 'verified' | 'failed' | 'blocked' | 'unverified'
+// wire 侧类型已抽至 evidence-types.ts（叶子，桌面端经 server/ui-shared 共享）；
+// 此处 re-export 保持内核调用方不变。
+export type { DeliveryVerificationStatus, EvidenceSummary } from './evidence-types.js'
+import type { DeliveryVerificationStatus, EvidenceSummary } from './evidence-types.js'
+
 export type VerificationLevel = 'tested' | 'typed' | 'linted' | 'pending'
 
 /**
@@ -40,22 +44,6 @@ export interface VerificationSummary {
   verified: number
   pending: number
   files: Array<{ path: string; level: VerificationLevel }>
-}
-
-export interface EvidenceSummary {
-  filesRead: string[]
-  filesModified: string[]
-  verificationStatus: DeliveryVerificationStatus
-  verifications: VerificationMetadata[]
-  gate: {
-    state: 'GREEN' | 'YELLOW' | 'RED' | 'ok' | 'warn' | 'error'
-    label: string
-    reason?: string
-    blockingReason?: string
-    nextAction?: string
-  }
-  impactedFiles: string[]
-  impactedTests: string[]
 }
 
 const MAX_VERIFICATIONS = 50
@@ -185,6 +173,29 @@ export class EvidenceTracker implements EvidenceTrackerPublic {
       .map(path => ({ path, level: this.state.fileVerificationLevels?.get(path) ?? 'pending' }))
     const verified = files.filter(f => f.level !== 'pending').length
     return { total: files.length, verified, pending: files.length - verified, files }
+  }
+
+  /**
+   * 验证债判据（单一口径，2026-07-25 advisory-ecology W3）：验证实际失败过，
+   * 或未验证编辑积累到 TDD gate 硬闸阈值（3）。不用「存在任何未验证编辑」——
+   * 正常的编辑→验证节奏会瞬时经过该状态。cognitive frame 与 self-verify
+   * 债龄计数共用本方法，避免两处判据漂移。
+   */
+  hasVerificationDebt(): boolean {
+    return this.state.deliveryStatus === 'failed' || this.#editsSinceLastTest >= 3
+  }
+
+  /**
+   * 交付就绪判据（2026-07-25，YOLO 证据门专用）：最近一条验证 passed 且绿后
+   * 没再动过代码。与 deliveryStatus 的全窗口口径刻意不同——那个口径对「先红
+   * 后绿」的正常 TDD 节奏是粘滞的（近两天 12 会话回放：80 个绿灯时刻 91% 被
+   * 窗口内历史 failed 挡住），反向又在绿后编辑期（均值 6.2 次编辑）虚开。
+   * 本判据两个粘滞都治：红→绿即就绪；绿后首次代码编辑即失效。
+   * deliveryStatus 语义不动——它还有 hasVerificationDebt / delivery gate
+   * 等消费者，粘滞 failed 在那些场景是刻意的保守。
+   */
+  deliveryReady(): boolean {
+    return this.state.verifications.at(-1)?.status === 'passed' && this.#editsSinceLastTest === 0
   }
 
   /** Gate state for the TDD gate — pure-values snapshot, no Set refs. */

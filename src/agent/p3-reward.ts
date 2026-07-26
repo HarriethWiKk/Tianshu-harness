@@ -103,6 +103,20 @@ export function computeEffortReward(input: RewardInput): number {
   return clamp(reward, -1, 1)
 }
 
+/** 无轮次上限时 turnDepth 的固定分母（沿用 tool-execution 既有口径）。 */
+const NO_CAP_TURN_DEPTH_SCALE = 50
+
+/**
+ * 任务深度（0-1），effort bandit 上下文的第 3 维。
+ *
+ * maxTurns<=0 是 YOLO 的「无上限」哨兵。按比例算会让分母塌成 0/1，深度从第一轮
+ * 起就饱和到 1、该维度失去区分度——无上限时改用固定分母，让深度仍随轮次爬升。
+ */
+export function computeTurnDepth(turnCount: number, maxTurns?: number): number {
+  if (maxTurns !== undefined && maxTurns > 0) return turnCount / maxTurns
+  return Math.min(1, turnCount / NO_CAP_TURN_DEPTH_SCALE)
+}
+
 /**
  * Build a 6-dim context vector for the effort bandit.
  *

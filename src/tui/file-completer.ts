@@ -56,6 +56,9 @@ export function applyCompletion(text: string, cursorPos: number, completion: str
   const before = text.slice(0, cursorPos)
   const after = text.slice(cursorPos)
   const atIdx = before.lastIndexOf('@')
-  const newText = before.slice(0, atIdx) + '@' + completion + ' ' + after
-  return { text: newText, cursor: atIdx + 1 + completion.length + 1 }
+  // 规范形 @file:（含空格路径用引用形）——mention-parser 只认该协议；
+  // 此前插入裸 @path 提交后不会被解析成引用（静默断链，2026-07-24 修复）。
+  const mention = completion.includes(' ') ? `@file:"${completion}" ` : `@file:${completion} `
+  const newText = before.slice(0, atIdx) + mention + after
+  return { text: newText, cursor: atIdx + mention.length }
 }

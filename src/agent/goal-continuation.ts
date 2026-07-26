@@ -15,6 +15,9 @@ import { DELIVERY_SIGNAL_RE } from './action-intent-detector.js'
 
 export interface GoalContinuationDeps {
   getGoalTracker: () => GoalTracker | null
+  /** 待批计划探针（2026-07-24 goal 审批感知）：最新计划为 submitted（等用户审批）
+   *  时返回 true。读取失败必须 fail-open 返回 false——宁可空转不可假死。 */
+  hasPendingPlanApproval?: () => Promise<boolean>
   getGoalJudgeDeps?: () => GoalJudgeDeps | undefined
   getGoalJudgeEvidence?: () => { text: string; modifiedFiles: string[] }
   getStreamedText: () => string
@@ -66,6 +69,14 @@ export class GoalContinuationController {
   async handleGoalCheck(params: GoalCheckParams): Promise<GoalCheckResult> {
     const tracker = this.deps.getGoalTracker()
     if (!tracker?.isActive()) return { kind: 'finalize' }
+
+    // 待批计划闸门（2026-07-24）：计划已提交等用户审批时 goal 循环不空转——
+    // 空转既白烧 iteration，又让 session.running 恒 true 把批准 API 409 到死
+    //（goal 看起来假死，用户想批都批不了）。保持 goal active 直接 finalize；
+    // 批准后 kickoff 轮末自然恢复续跑，驳回（rejected ≠ submitted）同样放行。
+    if (this.deps.hasPendingPlanApproval && (await this.deps.hasPendingPlanApproval())) {
+      return { kind: 'finalize' }
+    }
 
     const signal = params.signal
     const goalResult = tracker.check(

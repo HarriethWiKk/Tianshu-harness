@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, utimesSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { cleanupStaleWorkerSessionDirs, restorePlanModeFromMeta } from '../bootstrap.js'
+import { cleanupStaleWorkerSessionDirs, restorePlanModeFromMeta, switchAgentCwd, type BootstrapContext } from '../bootstrap.js'
 import type { AgentLoop } from '../agent/loop.js'
 
 describe('cleanupStaleWorkerSessionDirs', () => {
@@ -123,6 +123,71 @@ describe('restorePlanModeFromMeta（计划模式跨重启恢复）', () => {
       assert.equal(calls[0]!.planFilePath, rel)
     } finally {
       rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('switchAgentCwd 守卫', () => {
+  // 守卫（目录存在 → worker 存活 → plan mode）都在重建 machinery 之前，
+  // 用最小假 ctx 即可驱动——guard 拒绝时函数不触碰其余字段。
+
+  function fakeCtx(overrides: {
+    cwd: string
+    planModeState?: 'off' | 'planning' | 'approved'
+    hasRunningWork?: boolean
+  }): BootstrapContext {
+    return {
+      cwd: overrides.cwd,
+      sessionId: 'guard-test',
+      agent: {
+        getPlanModeState: () => overrides.planModeState ?? 'off',
+      },
+      refs: {
+        coordinator: overrides.hasRunningWork ? { hasRunningWork: () => true } : null,
+      },
+    } as unknown as BootstrapContext
+  }
+
+  it('目标目录不存在 → 拒绝', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'rivet-cd-guard-'))
+    try {
+      const res = await switchAgentCwd(fakeCtx({ cwd }), join(cwd, 'no-such-dir'))
+      assert.equal(res.ok, false)
+      assert.match(res.error!, /目录不存在/)
+    } finally {
+      rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+
+  it('worker 运行中 → 拒绝', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'rivet-cd-guard-a-'))
+    const target = mkdtempSync(join(tmpdir(), 'rivet-cd-guard-b-'))
+    try {
+      const res = await switchAgentCwd(fakeCtx({ cwd, hasRunningWork: true }), target)
+      assert.equal(res.ok, false)
+      assert.match(res.error!, /worker/)
+    } finally {
+      rmSync(cwd, { recursive: true, force: true })
+      rmSync(target, { recursive: true, force: true })
+    }
+  })
+
+  it('plan mode 进行中（planning/approved）→ 拒绝，off 不拦', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'rivet-cd-guard-c-'))
+    const target = mkdtempSync(join(tmpdir(), 'rivet-cd-guard-d-'))
+    try {
+      for (const state of ['planning', 'approved'] as const) {
+        const res = await switchAgentCwd(fakeCtx({ cwd, planModeState: state }), target)
+        assert.equal(res.ok, false, `${state} should be refused`)
+        assert.match(res.error!, /Plan Mode/)
+      }
+      // 'off' 会穿过守卫进入后续迁移/重建流程——本测试只验证守卫不拦：
+      // 用相同的 cwd 当 target，触发「已经在该目录中」提前返回即可证明越过了 plan 守卫。
+      const res = await switchAgentCwd(fakeCtx({ cwd, planModeState: 'off' }), cwd)
+      assert.match(res.error!, /已经在该目录中/)
+    } finally {
+      rmSync(cwd, { recursive: true, force: true })
+      rmSync(target, { recursive: true, force: true })
     }
   })
 })

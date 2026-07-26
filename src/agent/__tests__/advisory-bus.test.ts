@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { AdvisoryBus, DISCIPLINE_REANCHOR_INTERVAL, disciplineReanchorEntry } from '../advisory-bus.js'
+import { AdvisoryBus, DISCIPLINE_REANCHOR_INTERVAL, disciplineReanchorEntry, virtueEncouragementEntry, KEY_COOLDOWN_TURNS } from '../advisory-bus.js'
 
 describe('AdvisoryBus', () => {
   it('renders empty when no entries', () => {
@@ -770,5 +770,91 @@ describe('priority tier (constitutional/operational/informational)', () => {
       srs = bus.drainSystemReminders()
       assert.equal(srs.length, 1, 'P3 RED: only 1 entry — render dedup must prevent double injection')
     })
+  })
+})
+
+describe('W2 表扬治理（2026-07-25 advisory-ecology-repair）', () => {
+  it('virtueEncouragementEntry 归 encouragement——产出流中被阶段抑制', () => {
+    const entry = virtueEncouragementEntry()
+    assert.equal(entry.category, 'encouragement', 'category 挂 discipline 会绕过 flow 抑制白名单（C-C 洪流根因）')
+
+    const bus = new AdvisoryBus()
+    bus.setFlowStateProvider(() => true)
+    bus.submit(virtueEncouragementEntry())
+    const out = bus.render(undefined, 1)
+    assert.ok(!out.includes('virtue-encouragement'), '产出流中表扬被推迟，不与产出争注意力')
+  })
+
+  it('key 级送达冷却：送达后 N 轮内重复提交被吞掉并计入 dropped', () => {
+    const cooldown = KEY_COOLDOWN_TURNS.get('virtue-encouragement')!
+    assert.ok(cooldown >= 1, 'virtue-encouragement 必须在冷却注册表内')
+
+    const bus = new AdvisoryBus()
+    // 第 1 轮：正常送达
+    bus.submit(virtueEncouragementEntry())
+    const r1 = bus.render(undefined, 1)
+    assert.ok(r1.includes('virtue-encouragement'), '首轮正常送达')
+    bus.drainLedger()
+
+    // 冷却窗内（第 2 轮起）：每轮结算重复提交，全部被吞
+    for (let turn = 2; turn < 1 + cooldown; turn++) {
+      bus.submit(virtueEncouragementEntry())
+      const out = bus.render(undefined, turn)
+      assert.ok(!out.includes('virtue-encouragement'), `第 ${turn} 轮仍在冷却窗内（距送达 ${turn - 1} < ${cooldown}）`)
+    }
+    const delta = bus.drainLedger()
+    assert.equal(delta.dropped, cooldown - 1, '冷却吞掉的条目逐条计入 dropped 遥测')
+    assert.ok(delta.droppedKeys.includes('virtue-encouragement'), '丢弃 key 可从遥测回放')
+
+    // 冷却期满：恢复送达
+    bus.submit(virtueEncouragementEntry())
+    const rAfter = bus.render(undefined, 1 + cooldown)
+    assert.ok(rAfter.includes('virtue-encouragement'), '冷却期满恢复送达——治理的是洪流不是消灭')
+  })
+
+  it('冷却只约束注册 key——其他条目不受影响', () => {
+    const bus = new AdvisoryBus()
+    bus.submit({ key: 'guard', priority: 0.6, category: 'discipline', content: '先验证' })
+    bus.render(undefined, 1)
+    bus.submit({ key: 'guard', priority: 0.6, category: 'discipline', content: '先验证' })
+    const out = bus.render(undefined, 2)
+    assert.ok(out.includes('guard'), '未注册 key 每轮照常竞争')
+  })
+})
+
+describe('W3 穿透让位：验证债 MUTEX 对（2026-07-25 advisory-ecology-repair）', () => {
+  const debtKeys = ['self-verify', 'self-verify-scope-mismatch', 'ccr-天权-P3', 'ccr-天权-P7']
+
+  for (const winner of debtKeys) {
+    it(`${winner} 在场时 virtue-encouragement 让位`, () => {
+      const bus = new AdvisoryBus()
+      bus.submit({ key: winner, priority: 0.58, category: 'discipline', content: '验证债在场' })
+      bus.submit(virtueEncouragementEntry())
+      const out = bus.render(undefined, 1)
+      assert.ok(out.includes(winner), 'winner 正常送达')
+      assert.ok(!out.includes('virtue-encouragement'), '「你有债」和「干得好」不该同屏')
+    })
+  }
+
+  it('验证债不在场时表扬照常送达（让位是条件性的，不是封杀）', () => {
+    const bus = new AdvisoryBus()
+    bus.submit(virtueEncouragementEntry())
+    const out = bus.render(undefined, 1)
+    assert.ok(out.includes('virtue-encouragement'))
+  })
+
+  it('winner 带 observe 挂起观察时 loser 仍须让位（复盘修复：MUTEX × pendingWatch）', () => {
+    // 生产的 self-verify 带 observe:{turns:1}——挂起窗内不进竞争池 all，
+    // 只扫 all 会让表扬在债观察窗内照常送达。挂起 ≠ 不在场。
+    const bus = new AdvisoryBus()
+    bus.submit({
+      key: 'self-verify', priority: 0.58, category: 'discipline',
+      content: '验证债在场', ttl: 1,
+      expect: { kind: 'verify_attempted', withinTurns: 2 }, observe: { turns: 1 },
+    })
+    bus.submit(virtueEncouragementEntry())
+    const out = bus.render(undefined, 1)
+    assert.ok(!out.includes('self-verify'), '前提自检：winner 本轮在挂起观察，不渲染')
+    assert.ok(!out.includes('virtue-encouragement'), '观察窗内「你有债」事实已被指认，表扬必须让位')
   })
 })

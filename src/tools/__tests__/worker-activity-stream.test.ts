@@ -142,4 +142,70 @@ describe('createDelegationActivityMapper', () => {
     assert.equal(acts[2]!.objective, 'from coordinator')
     assert.equal(acts[3]!.objective, undefined)
   })
+
+  it('contract 仅在首条事件携带（event.contract 首选，contractOf 兜底）——死接线回归防线', () => {
+    const contract = {
+      objective: 'audit auth flow',
+      profile: 'code_scout',
+      scope: {},
+      constraints: [],
+      budget: { maxTurns: 8, timeoutMs: 120_000 },
+      allowedToolsDigest: 'grep,read_file +2',
+    }
+    const acts: DelegationActivity[] = []
+    const map = createDelegationActivityMapper('p', a => acts.push(a), {
+      contractOf: (id) => id === 'wo_fallback' ? contract : undefined,
+    })
+    // coordinator 随事件携带（生产主路径：objective 恒存在）
+    map(ev({ workOrderId: 'wo_a', kind: 'tool_use', objective: 'audit auth flow', contract }))
+    map(ev({ workOrderId: 'wo_a', kind: 'tool_use', objective: 'audit auth flow', contract }))
+    assert.deepEqual(acts[0]!.contract, contract)
+    assert.equal(acts[1]!.contract, undefined, 'contract 只随首条事件转发')
+    // 工具侧兜底查表（event.contract 缺席时）
+    map(ev({ workOrderId: 'wo_fallback', kind: 'tool_use', objective: 'x' }))
+    assert.deepEqual(acts[2]!.contract, contract)
+  })
+
+  it('objective 为空时 contract 仍只发一次——两者分开记账', () => {
+    // objective 的「查不到就下条再试」是有意的（objectiveOf 首条可能还没就绪），
+    // 但那道守卫曾连 contract 一起管：objective 恰好为空时 contract 跟着每条重发，
+    // 下游按「首条才带」去重就会为同一 worker 反复打派发卡。
+    const contract = {
+      objective: 'audit auth flow',
+      profile: 'code_scout',
+      scope: {},
+      constraints: [],
+      budget: { maxTurns: 8, timeoutMs: 120_000 },
+      allowedToolsDigest: 'grep,read_file +2',
+    }
+    const acts: DelegationActivity[] = []
+    const map = createDelegationActivityMapper('p', a => acts.push(a))
+    // objective 全程缺席（coordinator 未附带、无 objectiveOf 兜底）
+    map(ev({ workOrderId: 'wo_a', kind: 'tool_use', contract }))
+    map(ev({ workOrderId: 'wo_a', kind: 'tool_use', contract }))
+    map(ev({ workOrderId: 'wo_a', kind: 'text', contract }))
+    assert.deepEqual(acts[0]!.contract, contract, '首条仍带 contract')
+    assert.equal(acts[1]!.contract, undefined)
+    assert.equal(acts[2]!.contract, undefined)
+    assert.ok(acts.every(a => a.objective === undefined), 'objective 始终缺席（不影响 contract 记账）')
+  })
+
+  it('contract 晚到时补发一次（首条无、次条有）', () => {
+    const contract = {
+      objective: 'x',
+      profile: 'code_scout',
+      scope: {},
+      constraints: [],
+      budget: { maxTurns: 4, timeoutMs: 60_000 },
+      allowedToolsDigest: 'grep +1',
+    }
+    const acts: DelegationActivity[] = []
+    const map = createDelegationActivityMapper('p', a => acts.push(a))
+    map(ev({ workOrderId: 'wo_a', kind: 'tool_use', objective: 'x' }))
+    map(ev({ workOrderId: 'wo_a', kind: 'tool_use', objective: 'x', contract }))
+    map(ev({ workOrderId: 'wo_a', kind: 'tool_use', objective: 'x', contract }))
+    assert.equal(acts[0]!.contract, undefined)
+    assert.deepEqual(acts[1]!.contract, contract, '晚到的 contract 补发，不因 objective 已记账而被吞')
+    assert.equal(acts[2]!.contract, undefined)
+  })
 })

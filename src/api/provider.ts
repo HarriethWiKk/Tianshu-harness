@@ -188,6 +188,18 @@ export const WELL_KNOWN_DEFAULTS: Record<string, ProviderCapabilities> = {
     supportsResponseFormat: false,
     mapUsage: mapDeepSeekUsage,
   },
+  ccswitch: {
+    // cc-switch 是 OpenAI 兼容代理，透传 reasoning_effort 参数。
+    // 后端模型不认识时按 OpenAI 兼容约定静默忽略（降级）。
+    supportsThinking: false,
+    thinkingFormat: 'none',
+    supportsCacheControl: false,
+    stripParams: ['top_k', 'metadata', 'service_tier', 'cache_control'],
+    hasToolJsonInContentBug: false,
+    effortFormat: 'reasoning_effort',
+    prefixCacheStrategy: 'none',
+    supportsResponseFormat: false,
+  },
 }
 
 /**

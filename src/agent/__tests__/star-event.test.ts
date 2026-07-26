@@ -163,6 +163,34 @@ describe('mapSensoriumToPhase', () => {
     const ctx = makeCtx()
     assert.equal(mapSensoriumToPhase(s, ctx), 'tianshu-planning')
   })
+
+  // ─── W4 momentum no-data 三态消费（2026-07-25 advisory-ecology-repair）──
+
+  it('W4: no-data momentum 不进 delivering 臂——即使数值巧合越过 0.8', () => {
+    const s = makeSensorium({ momentum: 0.9, quality: { confidence: 'measured', momentum: 'no-data', stability: 'measured', decisiveness: 'measured' } })
+    const ctx = makeCtx({ isFinalTurn: true })
+    assert.notEqual(mapSensoriumToPhase(s, ctx), 'yaoguang-delivering', 'no-data 不得作为交付相证据')
+  })
+
+  it('YOLO 证据门：readyByEvidence 为真时非最终轮也可归航（复盘修复 2026-07-25）', () => {
+    const s = makeSensorium({ momentum: 0.9 })
+    const ctx = makeCtx({ isFinalTurn: false, readyByEvidence: true })
+    assert.equal(mapSensoriumToPhase(s, ctx), 'yaoguang-delivering')
+  })
+
+  it('YOLO 证据门：无交付证据且非最终轮 → 不归航（YOLO 原语义保持）', () => {
+    const s = makeSensorium({ momentum: 0.9 })
+    const ctx = makeCtx({ isFinalTurn: false, readyByEvidence: false })
+    assert.notEqual(mapSensoriumToPhase(s, ctx), 'yaoguang-delivering')
+  })
+
+  it('W4: 实测高动量照常进 delivering（quality 缺省 = measured 兼容旧构造点）', () => {
+    const measured = makeSensorium({ momentum: 0.9, quality: { confidence: 'measured', momentum: 'measured', stability: 'measured', decisiveness: 'measured' } })
+    const legacy = makeSensorium({ momentum: 0.9 })
+    const ctx = makeCtx({ isFinalTurn: true })
+    assert.equal(mapSensoriumToPhase(measured, ctx), 'yaoguang-delivering')
+    assert.equal(mapSensoriumToPhase(legacy, ctx), 'yaoguang-delivering')
+  })
 })
 
 // ─── createStarEvent ────────────────────────────────────────────────

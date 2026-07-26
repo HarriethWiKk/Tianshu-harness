@@ -77,6 +77,15 @@ describe('computeAffordanceScores', () => {
     assert.ok(wfNorm.instrumental >= wfWw.instrumental, 'wuwei should dampen instrumental')
   })
 
+  // 2026-07-25：产出流（编辑+验证推进中）撞上 wuwei 时，抑执行惩罚让位。
+  it('产出流中 wuwei 不再压低 instrumental', () => {
+    const idle = computeAffordanceScores({ ...baseState, season: 'wuwei' })
+    const flowing = computeAffordanceScores({ ...baseState, season: 'wuwei', inProductionFlow: true })
+    const genesis = computeAffordanceScores({ ...baseState, season: 'genesis' })
+    assert.ok(flowing['write_file']!.instrumental > idle['write_file']!.instrumental)
+    assert.equal(flowing['write_file']!.instrumental, genesis['write_file']!.instrumental)
+  })
+
   it('contextual boosts file tools when working set is non-empty', () => {
     const emptyWs = computeAffordanceScores({ ...baseState, workingSetSize: 0 })
     const fullWs = computeAffordanceScores({ ...baseState, workingSetSize: 5 })

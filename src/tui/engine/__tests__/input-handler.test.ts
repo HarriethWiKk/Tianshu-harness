@@ -384,3 +384,49 @@ describe('InputHandler · CPR（cursor position report）通道', () => {
     handler.dispose()
   })
 })
+
+describe('InputHandler · 粘贴控制符过滤（P1-3）', () => {
+  it('剥离 ESC 与 C0 控制符，保留 \\n \\t 与 CJK', () => {
+    const stdin = makeStdin()
+    const handler = new InputHandler({ stdin })
+    let pasted: string | null = null
+    handler.onPaste((t) => { pasted = t })
+
+    stdin.emitData('\x1B[200~a\x1B[31m红\x07b\n\ttail\x01\x1B[201~')
+    assert.equal(pasted, 'a[31m红b\n\ttail', 'ESC/\\x07/\\x01 被剥离，ESC 后的 [31m 退化为纯文本')
+    handler.dispose()
+  })
+})
+
+describe('InputHandler · 不完整 CSI 超时兜底（P1-4）', () => {
+  it('半个 CSI 超时后按 unknown 消费首字节，后续按键不卡死', async () => {
+    const stdin = makeStdin()
+    const handler = new InputHandler({ stdin, escapeTimeoutMs: 20 })
+    const keys: KeyPress[] = []
+    handler.onKey('*', (k) => keys.push(k))
+
+    stdin.emitData('\x1B[')
+    await delay(50)
+    const tombstone = keys.filter(k => k.raw === '\x1B')
+    assert.equal(tombstone.length, 1, '滞留的半个 CSI 超时被消费（ESC 墓碑）')
+
+    stdin.emitData('x')
+    await delay(10)
+    assert.ok(keys.some(k => k.char === 'x'), '后续普通按键不被卡死')
+    handler.dispose()
+  })
+
+  it('正常分 chunk 的完整序列不误触发兜底', async () => {
+    const stdin = makeStdin()
+    const handler = new InputHandler({ stdin, escapeTimeoutMs: 50 })
+    const keys: KeyPress[] = []
+    handler.onKey('*', (k) => keys.push(k))
+
+    stdin.emitData('\x1B[')
+    stdin.emitData('A') // 方向键序列分两块背靠背到达
+    await delay(80)
+    assert.ok(keys.some(k => k.name === 'up'), '完整序列解析为 up')
+    assert.ok(!keys.some(k => k.raw === '\x1B' && k.name === 'unknown'), '不得产生 ESC 墓碑')
+    handler.dispose()
+  })
+})

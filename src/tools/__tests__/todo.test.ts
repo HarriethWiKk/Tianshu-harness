@@ -267,7 +267,102 @@ describe('TODO_TOOL onPlanSteps (U6/C1)', () => {
     })
     assert.equal(result.isError, undefined)
   })
+})
 
+// ─── 交付前行为验收闸门：acceptance 字段是 acceptance 义务唯一的核销入口 ──
+
+describe('TODO_TOOL acceptance 字段', () => {
+  beforeEach(() => setTodos([]))
+
+  const oneTodo = [{ id: '1', content: '改弹窗取消逻辑', status: 'pending' }]
+
+  it('声明经 onAcceptance 原样流出（criterion + status + evidence）', async () => {
+    const captured: unknown[][] = []
+    await TODO_TOOL.execute({
+      input: {
+        action: 'write',
+        todos: oneTodo,
+        acceptance: [
+          { criterion: '按 ESC 后弹窗 isVisible() 为 False', status: 'pending' },
+          { criterion: '流程状态为 cancelled', status: 'met', evidence: 'state == cancelled' },
+        ],
+      },
+      toolUseId: 'tu_1',
+      cwd: '/repo',
+      onAcceptance: items => captured.push(items),
+    })
+    assert.equal(captured.length, 1)
+    assert.deepEqual(captured[0], [
+      { criterion: '按 ESC 后弹窗 isVisible() 为 False', status: 'pending' },
+      { criterion: '流程状态为 cancelled', status: 'met', evidence: 'state == cancelled' },
+    ])
+  })
+
+  it('不带 acceptance 时不触发回调（既有调用方零行为变化）', async () => {
+    let calls = 0
+    await TODO_TOOL.execute({
+      input: { action: 'write', todos: oneTodo },
+      toolUseId: 'tu_1',
+      cwd: '/repo',
+      onAcceptance: () => { calls++ },
+    })
+    assert.equal(calls, 0)
+  })
+
+  it('未接 onAcceptance 时不抛（worker/非任务上下文 no-op）', async () => {
+    const result = await TODO_TOOL.execute({
+      input: {
+        action: 'write',
+        todos: oneTodo,
+        acceptance: [{ criterion: '按 ESC 后弹窗消失', status: 'pending' }],
+      },
+      toolUseId: 'tu_1',
+      cwd: '/repo',
+    })
+    assert.equal(result.isError, undefined)
+  })
+
+  it('回执里报达标进度，受阻项点名要披露', async () => {
+    const result = await TODO_TOOL.execute({
+      input: {
+        action: 'write',
+        todos: oneTodo,
+        acceptance: [
+          { criterion: 'a', status: 'met', evidence: '跑过了' },
+          { criterion: 'b', status: 'pending' },
+          { criterion: 'c', status: 'blocked', evidence: '无 GUI 环境' },
+        ],
+      },
+      toolUseId: 'tu_1',
+      cwd: '/repo',
+    })
+    assert.match(result.content, /验收面 1\/3 达标/)
+    assert.match(result.content, /1 项待执行/)
+    assert.match(result.content, /1 项受阻/)
+  })
+
+  it('非法 status 被 schema 拒绝，不静默吞掉', async () => {
+    const result = await TODO_TOOL.execute({
+      input: {
+        action: 'write',
+        todos: oneTodo,
+        acceptance: [{ criterion: 'a', status: 'done' }],
+      },
+      toolUseId: 'tu_1',
+      cwd: '/repo',
+    })
+    assert.equal(result.isError, true)
+  })
+
+  it('schema 里写死了信号级反例——防止验收面退化成 delivery 的替身', () => {
+    const schema = JSON.stringify(TODO_TOOL.definition.input_schema)
+    assert.match(schema, /passed/)
+    assert.match(schema, /所有测试通过/)
+    assert.match(TODO_TOOL.definition.description, /验收面/)
+  })
+})
+
+describe('TODO_TOOL description', () => {
   // ── P1-1: description + continuation reminder ─────────────────
 
   it('description includes when-to-use and when-not-to-use guidance', () => {

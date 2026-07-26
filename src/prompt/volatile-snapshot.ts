@@ -8,9 +8,13 @@ import { renderResidentCapsuleBlock } from '../agent/seed-capsule-store.js'
 import { generateCodebaseIndexBlock, getHeadSha } from '../repo/codebase-index.js'
 import { detectCwdRelation } from './self-recognition.js'
 import type { VolatileContext } from './volatile.js'
+import { standardPromptBlocks, type PromptBlockPolicy } from './block-policy.js'
 
 export interface SnapshotInput {
   cwd: string
+  /** 前缀块策略（缺省 = standard，与历史行为逐字节一致）。
+   *  只作用于参考类块；行为护栏不受它影响，见 block-policy.ts。 */
+  blockPolicy?: PromptBlockPolicy
   getGitStatus?: () => string | undefined
   rivetMd?: string
   sessionMemoryBlock?: string
@@ -51,26 +55,41 @@ export function createVolatileSnapshot(input: SnapshotInput): VolatileContext {
     ? Object.freeze([...input.workingSet])
     : undefined
 
-  const projectMemoryBlock = input.projectMemoryBlock ?? loadProjectMemory(input.cwd).content
+  // 缺省 standard —— 无 policy 的调用方（worker / 测试 / sidecar 早期路径）
+  // 必须拿到与历史版本逐字节一致的快照。
+  const policy = input.blockPolicy ?? standardPromptBlocks()
+
+  // 显式传入的块（调用方已备好内容）不受档位开关影响——档位只管「自动加载什么」，
+  // 不越权丢弃调用方明确要求注入的内容。
+  const projectMemoryBlock = input.projectMemoryBlock
+    ?? (policy.blocks.projectMemory ? loadProjectMemory(input.cwd).content : undefined)
 
   // Wave 4b（知识重构）：manifest 路由地图——"何时该召回什么"的索引，
   // 会话启动快照一次，进 frozen base，知识本文一律走 recall。
-  const knowledgeManifestBlock = input.knowledgeManifestBlock ?? loadKnowledgeManifestBlock(input.cwd)
+  const knowledgeManifestBlock = input.knowledgeManifestBlock
+    ?? (policy.blocks.knowledgeManifest ? loadKnowledgeManifestBlock(input.cwd) : undefined)
 
-  // 常驻注入：核心护栏置顶 + 5 星 principles 全文。行为护栏必须常驻——
-  // 撤入 recall 后行动跑偏（V3.1 回归）。ledger 仍经 recall_capsule 按需拉取。
-  const seedCapsuleBlock = renderResidentCapsuleBlock(input.cwd)
+  // 常驻注入的是 gist 索引，不是正文（943414c2）：每星一行摘要进 frozen，
+  // 完整方法论经 recall_capsule 按需拉取。行为护栏本身不在这里——V3.1
+  // (0c776b9→17b496a) 证明护栏撤成按需召回会漂移，因此已蒸馏进 static.ts
+  // 的 evidence-scope / external-source-verification / delivery-contract。
+  // 改动此处前先确认要撤的是「参考资料」而非「刹车」。
+  const seedCapsuleBlock = policy.blocks.seedCapsule
+    ? renderResidentCapsuleBlock(input.cwd, policy.capsuleIndexLimit)
+    : undefined
 
   // Codebase index — generated from MeridianDB at snapshot time.
   // Frozen: placed in stable prefix alongside projectMemoryBlock.
   const projectIndexBlock = input.projectIndexBlock ?? (
-    input.meridianDb
+    input.meridianDb && policy.blocks.codebaseIndex
       ? generateCodebaseIndexBlock(input.meridianDb, getHeadSha())
       : undefined
   )
 
   return Object.freeze({
     cwd: input.cwd,
+    blockCaps: policy.caps,
+    blockToggles: policy.blocks,
     cwdRelation: detectCwdRelation(input.cwd),
     rivetMd,
     gitStatus,

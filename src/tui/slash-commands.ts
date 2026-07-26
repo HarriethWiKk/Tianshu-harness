@@ -63,7 +63,7 @@ import { isProFeatureEnabled } from '../config/pro-license.js'
 import { loadConfig, saveConfig } from '../config/manager.js'
 import { installPlugin, removePlugin, getInstalledPlugins, isPluginInstalled } from '../plugins/plugin-installer.js'
 import { PLUGIN_PRESETS } from '../plugins/plugin-presets.js'
-import { switchAgentRuntime, switchAgentSession, restorePlanModeFromMeta } from '../bootstrap.js'
+import { switchAgentRuntime, switchAgentSession, switchAgentCwd, restorePlanModeFromMeta } from '../bootstrap.js'
 import { loadTodos, setTodoSession } from '../tools/todo.js'
 import { restoreGoalTracker } from '../agent/goal-persist.js'
 import { setPlanSession } from '../agent/plan-store.js'
@@ -92,7 +92,6 @@ const HELP_TEXT = `Available commands:
 /undo [<number>|preview <number>] — Undo file changes with preview
 /clear — Clear screen
 /sessions — List all saved sessions
-/resume <number> — Restore a saved session
 /fork [name] — Fork current session into a new copy and switch to it
 /fork at <N> [name] — Fork from message line N (truncate after)
 /branch — Show branch tree (parent + children)
@@ -129,7 +128,10 @@ const HELP_TEXT = `Available commands:
 /mirror [status|on|off|china|default] — Toggle domestic mirrors for GitHub/npm/pip/go/rust downloads
 /python [status|setup] — Check Python/uv/Git environment or auto-setup a Python project with uv
 /doctor — Environment health check (Node/Git/Python/uv) + which shell the bash tool uses
+/init [verify] — 交互式项目初始化（verify 声明 / skills / hooks 脚手架）；verify 子命令直执行声明补缺
+/cd [<path>] — 会话中途切换工作目录（无参显示当前目录）；历史前缀缓存保留，会话归属迁往新项目
 /tools — Show available tools and their descriptions
+/prefix-budget — 前缀预算归因：各块字符/token 占比 + 当前档位
 /compact — Compact context (summarize old messages)
 /workflow [list|<name>|replay <id>] — YAML workflow orchestration + trace replay
 /todo [list|add <content>|done <id>|skip <id>|move <id> up|down] — Manage task list
@@ -180,6 +182,15 @@ export interface SlashHandlerContext {
    *  /resume with no argument opens it instead of printing usage (Claude Code
    *  parity). Undefined → fall back to the usage hint (tests / headless). */
   openSessionPicker?: () => void
+  /** Open the interactive /init scaffolding wizard (verify / skills / hooks).
+   *  Wired by the TUI; undefined → /init prints a hint to use /init verify. */
+  openInitFlow?: () => void
+  /** Runtime cwd switch for /cd <path>. Rebuilds the agent runtime against the
+   *  new working directory with frozen-snapshot inheritance (prefix cache only
+   *  tail-cuts at the next user boundary). Async: drains pending persist writes
+   *  before migrating session files. Undefined → /cd prints current cwd
+   *  and a hint that switching is unavailable (tests / headless). */
+  onCwdSwitch?: (target: string) => Promise<{ ok: boolean; error?: string; from?: string; to?: string; movedFiles?: string[] }>
   cost: number
   cacheHitRate: number
   autoSafeRef: MutableRefLike<boolean>
@@ -949,7 +960,24 @@ const TUI_SLASH_COMMANDS: readonly TuiSlashCommandDef[] = [
     name: '/init',
     immediate: true,
     handler(ctx) {
-      const { pushStatic, setIsStreaming, agent } = ctx
+      const { parts, pushStatic, setIsStreaming, agent } = ctx
+      const sub = parts[1]?.toLowerCase()
+      // 无参 → 交互式初始化向导（verify / skills / hooks 脚手架，分步确认）。
+      if (!sub) {
+        if (ctx.openInitFlow) {
+          ctx.openInitFlow()
+        } else {
+          pushStatic(createLogEntry({ type: 'system', content: '交互式初始化在当前界面不可用。脚本/无头场景请用 /init verify（直执行 verify 声明补缺）。' }))
+        }
+        setIsStreaming(false)
+        return true
+      }
+      if (sub !== 'verify') {
+        pushStatic(createLogEntry({ type: 'system', content: 'Usage: /init [verify] — 无参打开交互式初始化向导；verify 直执行 verify 声明补缺。', isError: true }))
+        setIsStreaming(false)
+        return true
+      }
+      // /init verify — 直执行路径（脚本/无头可用，向后兼容）。
       // A4: (re)generate the project verify declaration from the fingerprint.
       // config → md single direction: .rivet-config.json is authoritative,
       // the .rivet.md Stack section is rendered from it.
@@ -985,6 +1013,39 @@ const TUI_SLASH_COMMANDS: readonly TuiSlashCommandDef[] = [
       } catch (err) {
         pushStatic(createLogEntry({ type: 'system', content: `/init 失败: ${err instanceof Error ? err.message : String(err)}` }))
       }
+      setIsStreaming(false)
+      return true
+    },
+  },
+  {
+    name: '/cd',
+    immediate: true,
+    async handler(ctx) {
+      const { parts, pushStatic, setIsStreaming, agent } = ctx
+      const target = parts.slice(1).join(' ').trim()
+      // 无参 → 显示当前工作目录。
+      if (!target) {
+        pushStatic(createLogEntry({ type: 'system', content: `当前工作目录: ${agent.cwd}\n\nUsage: /cd <path> — 会话中途切换工作目录（历史前缀缓存保留，下一边界起按新项目计费）。` }))
+        setIsStreaming(false)
+        return true
+      }
+      if (!ctx.onCwdSwitch) {
+        pushStatic(createLogEntry({ type: 'system', content: '当前界面不支持 /cd 切换（测试/无头环境）。', isError: true }))
+        setIsStreaming(false)
+        return true
+      }
+      const res = await ctx.onCwdSwitch(target)
+      if (!res.ok) {
+        pushStatic(createLogEntry({ type: 'system', content: `/cd 失败: ${res.error ?? '未知错误'}`, isError: true }))
+        setIsStreaming(false)
+        return true
+      }
+      const lines = [
+        `工作目录已切换: ${res.from} → ${res.to}`,
+        `会话归属已迁移（${res.movedFiles?.length ?? 0} 个文件）——新项目的 /resume 与 --continue 可见本会话。`,
+        '历史前缀缓存保留；下一条消息起按新项目重建边界（同 /domain 切换代价）。',
+      ]
+      pushStatic(createLogEntry({ type: 'system', content: lines.join('\n') }))
       setIsStreaming(false)
       return true
     },
@@ -1872,6 +1933,25 @@ const TUI_SLASH_COMMANDS: readonly TuiSlashCommandDef[] = [
     },
   },
   {
+    name: '/prefix-budget',
+    immediate: true,
+    async handler(ctx) {
+      const { pushStatic, setIsStreaming } = ctx
+      const { formatBudgetReport } = await import('../prompt/prefix-budget.js')
+      const { profile, toolDescriptions, report } = ctx.agent.getPrefixBudget()
+      const lines = [
+        formatBudgetReport(report),
+        '',
+        `档位 ${profile}（工具描述 ${toolDescriptions}）。切档在下个会话生效——改前缀等于全量重建缓存。`,
+        '配置：prompt.profile = standard | lean | full，或 RIVET_PROMPT_PROFILE 环境变量。',
+        'token 为 chars/4 粗估，中文内容实际偏高；用于跨块对比，勿与 API usage 直接比对。',
+      ]
+      pushStatic(createLogEntry({ type: 'system', content: lines.join('\n') }))
+      setIsStreaming(false)
+      return true
+    },
+  },
+  {
     name: '/debug',
     immediate: true,
     handler(ctx) {
@@ -2149,7 +2229,7 @@ const TUI_SLASH_COMMANDS: readonly TuiSlashCommandDef[] = [
         : ''
       pushStatic(createLogEntry({
         type: 'system',
-        content: `会话列表(按最近更新排序):\n${list}\n\n/resume <id前缀 或 序号> 切换会话${forkSection}`,
+        content: `会话列表(按最近更新排序):\n${list}${forkSection}`,
       }))
       setIsStreaming(false)
       return true
@@ -3443,6 +3523,8 @@ export function registerTuiSlashCommands(app: TuiApp, ctx: BootstrapContext): vo
         return res
       },
       openSessionPicker: () => { app.activateOverlay('chronicle') },
+      openInitFlow: () => { app.openInitFlow(ctx.agent.cwd) },
+      onCwdSwitch: (target: string) => switchAgentCwd(ctx, target),
       allProviders,
       currentProvider: ctx.provider.name,
       currentSessionId: ctx.sessionId,

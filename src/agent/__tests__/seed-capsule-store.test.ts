@@ -375,6 +375,86 @@ describe('renderAllCapsulesBlock', () => {
     cleanup()
   })
 
+  // lean 档（prompt.profile=lean）只展开前 N 条 gist。被略去的星仍要列出星名——
+  // 丢摘要可以，丢可发现性不行，否则 recall_capsule 变成盲调。
+  // gist 长度决定截断是否划算——用接近真实胶囊的长度（仓库内 40-80 字符）。
+  function writeCapsules(dir: string, stars: readonly string[], gistLen = 60): void {
+    mkdirSync(dir)
+    stars.forEach((star, i) => {
+      const day = String(i + 1).padStart(2, '0')
+      writeFileSync(join(dir, `seed-capsule-${i}.md`), [
+        `<seed-capsule star="${star}" sealed="2026-01-${day}" gist="${star}${'之道'.repeat(gistLen / 2)}">`,
+        '  正文',
+        '</seed-capsule>',
+      ].join('\n'))
+    })
+  }
+
+  it('renderCapsuleIndexBlock caps expanded gists at `limit`', () => {
+    writeCapsules(join(tmpDir, 'docs'), ['甲', '乙', '丙', '丁', '戊'])
+
+    const idx = renderCapsuleIndexBlock(tmpDir, 2)!
+    assert.ok(idx.length < renderCapsuleIndexBlock(tmpDir)!.length, 'truncation must shrink the block')
+    assert.ok(idx.includes('甲 — 甲之道'))
+    assert.ok(!idx.includes('丙 — 丙之道'), 'gist beyond the limit must be dropped')
+    cleanup()
+  })
+
+  it('renderCapsuleIndexBlock keeps omitted stars discoverable by name', () => {
+    writeCapsules(join(tmpDir, 'docs'), ['甲', '乙', '丙', '丁', '戊'])
+
+    const idx = renderCapsuleIndexBlock(tmpDir, 2)!
+    assert.ok(idx.includes('其余 3 位'))
+    for (const star of ['丙', '丁', '戊']) {
+      assert.ok(idx.includes(star), `omitted star ${star} must still be listed by name`)
+    }
+    assert.ok(idx.includes('recall_capsule'))
+    cleanup()
+  })
+
+  it('renderCapsuleIndexBlock truncates on the stable sealedAt order', () => {
+    // 排序换了就等于换了「留哪 5 条」，会静默改变 lean 档的前缀字节。
+    writeCapsules(join(tmpDir, 'docs'), ['甲', '乙', '丙'])
+    assert.equal(renderCapsuleIndexBlock(tmpDir, 2), renderCapsuleIndexBlock(tmpDir, 2))
+    cleanup()
+  })
+
+  it('renderCapsuleIndexBlock ignores a limit that is not binding', () => {
+    writeCapsules(join(tmpDir, 'docs'), ['甲', '乙'])
+
+    const full = renderCapsuleIndexBlock(tmpDir)!
+    assert.equal(renderCapsuleIndexBlock(tmpDir, 2), full, 'limit == count must not add a tail line')
+    assert.equal(renderCapsuleIndexBlock(tmpDir, 9), full)
+    assert.equal(renderCapsuleIndexBlock(tmpDir, 0), full, 'limit 0 means unset, not "hide everything"')
+    cleanup()
+  })
+
+  it('renderCapsuleIndexBlock skips truncation when it would not save bytes', () => {
+    // 短 gist 时「其余 N 位（…）」尾行比省掉的行更长。没有这道闸，
+    // lean 档在小仓库下会比 standard 还胖 —— 瘦身反成增重。
+    writeCapsules(join(tmpDir, 'docs'), ['甲', '乙', '丙'], 2)
+
+    const full = renderCapsuleIndexBlock(tmpDir)!
+    assert.equal(renderCapsuleIndexBlock(tmpDir, 1), full)
+    cleanup()
+  })
+
+  it('renderResidentCapsuleBlock forwards the limit', () => {
+    writeCapsules(join(tmpDir, 'docs'), ['甲', '乙', '丙'])
+    assert.equal(renderResidentCapsuleBlock(tmpDir, 2), renderCapsuleIndexBlock(tmpDir, 2))
+    cleanup()
+  })
+
+  it('recall stays whole-catalog under a truncated index', () => {
+    // 档位只影响索引显示，不影响 store —— 被略去的星必须照样能取到全文。
+    writeCapsules(join(tmpDir, 'docs'), ['甲', '乙', '丙', '丁', '戊'])
+    renderCapsuleIndexBlock(tmpDir, 2)
+
+    assert.equal(listCapsuleStars(tmpDir).length, 5)
+    assert.ok(getCapsuleByStar(tmpDir, '戊'), 'omitted star must still resolve via recall_capsule')
+    cleanup()
+  })
+
   // C1（天梁最大化）：十域交付主力的胶囊真实存在且可被发现/提取。
   // 2026-07-21 增补 L7（测试即证据）/L8（不变量修复）。
   it('repo docs/ ships a 天梁 capsule with L1-L8 principles (C1)', () => {

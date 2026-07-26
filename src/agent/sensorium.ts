@@ -1,6 +1,5 @@
 import type { ReasoningEffort } from './auto-reasoning.js'
 import type { PressureResult } from '../context/pressure-monitor.js'
-import type { EvidenceState } from './evidence.js'
 import type { DoomLoopLevel, ToolStormLevel } from './trace-store.js'
 
 // ─── Pheromone reference (minimal type for SensoriumInput) ──────────
@@ -188,11 +187,6 @@ function computePressure(
   )
 }
 
-function computeConfidence(evidence: SensoriumInput['evidenceState']): number {
-  if (evidence.filesModified <= 0) return 1.0
-  return clamp(evidence.verifiedCount / evidence.filesModified)
-}
-
 /**
  * v3：验证覆盖率 — 即旧 computeConfidence 的语义归位。
  * 独立于果断度，驱动 pressure.verificationDebt。
@@ -244,12 +238,10 @@ function computeFreshness(
 
   // Dimension weights: pheromone is long-term memory, git/Zeitgeber is medium-term, fs is real-time
   let result = pheromoneAvg
-  let weight = 1.0
 
   if (gitChangeRate !== undefined && gitChangeRate >= 0) {
     // Git Zeitgeber: 70% pheromone + 30% git (inverse — high change = low freshness)
     result = 0.7 * result + 0.3 * (1 - gitChangeRate)
-    weight = 1.0
   }
 
   if (fsEventRate !== undefined && fsEventRate >= 0) {
@@ -432,10 +424,15 @@ export function extractAttentionMetrics(
 }
 
 export function computeStrategy(s: Sensorium): StrategyProfile {
+  // W4 三态消费（2026-07-25 advisory-ecology-repair）：momentum 的 no-data
+  // 回退值是 0（predictions 窗口空），不是实测停滞——判低效 / 判卡住都不得
+  // 拿它当证据。缺省 'measured' 兼容旧构造点。
+  const momentumMeasured = (s.quality?.momentum ?? 'measured') !== 'no-data'
+
   let reasoningEffort: ReasoningEffort
   if (s.complexity > 0.7) {
     reasoningEffort = 'high'
-  } else if (s.momentum > 0.8) {
+  } else if (momentumMeasured && s.momentum > 0.8) {
     reasoningEffort = 'low'
   } else {
     reasoningEffort = 'medium'
@@ -459,7 +456,9 @@ export function computeStrategy(s: Sensorium): StrategyProfile {
   // is smooth throughout. Baseline 0.5; pressure adds up to +0.15, low momentum
   // adds up to +0.25 — they compose additively.
   const pressureBoost = s.pressure > 0.7 ? (s.pressure - 0.7) * 0.5 : 0
-  const momentumDrag = s.momentum < 0.3 ? (0.3 - s.momentum) * (0.25 / 0.3) : 0
+  // W4：no-data 的 momentum=0 不是"卡住"，不加 commit 拖拽（此前空窗口
+  // 每次贡献满额 +0.25，是文档初版漏掉的真实行为消费点）
+  const momentumDrag = momentumMeasured && s.momentum < 0.3 ? (0.3 - s.momentum) * (0.25 / 0.3) : 0
   const commitThreshold = clamp(0.5 + pressureBoost + momentumDrag)
 
   return {

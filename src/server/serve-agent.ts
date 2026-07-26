@@ -218,10 +218,18 @@ const sessionStoresById = new Map<string, { stores: SessionStores; cwd: string }
 
 /** Late-bound goal handles for the session-manager's goal methods. Returns
  *  undefined when no stores have been built for this session yet (idle /
- *  rehydrated session whose agent hasn't been created). */
+ *  rehydrated session whose agent hasn't been created).
+ *
+ *  注：`allProviders` 必须从 `config.provider.providers` 填入，否则
+ *  `maybeAutoTitle` / `extractCriteria` 的 `!handles.allProviders` 守卫会恒
+ *  早退——桌面 sidecar 路径的会话标题自动生成曾因此从未生效（详见
+ *  commit `9835c856`）。TUI 路径在 `main.ts:366` 正确设置了此字段。 */
 export function resolveGoalHandles(
   sessionId: string,
-  config: { workers?: { profiles?: { cheap?: { provider: string; model: string } } } } | undefined,
+  config: {
+    workers?: { profiles?: { cheap?: { provider: string; model: string } } }
+    provider?: { providers?: Record<string, unknown> }
+  } | undefined,
 ): import('./session-manager.js').GoalHandles | undefined {
   const entry = sessionStoresById.get(sessionId)
   if (!entry) return undefined
@@ -229,6 +237,7 @@ export function resolveGoalHandles(
     goalTrackerRef: entry.stores.refs.goalTrackerRef,
     sessionDir: getSessionDir(entry.cwd),
     ...(config?.workers?.profiles?.cheap ? { cheapProfile: config.workers.profiles.cheap } : {}),
+    ...(config?.provider?.providers ? { allProviders: config.provider.providers } : {}),
   }
 }
 
@@ -431,6 +440,10 @@ function assembleAgentLoop(
       () => agent.updateTools(),
     )
   }
+
+  // Phase 2: 注册 coordinator 引用到 session-manager，让桌面 per-worker steer/kill 路由可达。
+  // 闭包每次实时读 stores.refs.coordinator——switchModel 会替换 coordinator，闭包必须跟到新实例。
+  shared?.sessions?.setCoordinatorRef(sessionId, () => stores.refs.coordinator ?? undefined)
 
   return agent
 }
@@ -655,6 +668,7 @@ export function buildManagedAgent(
     shutdown: () => {
       try { void agent.cancelIdleCompaction() } catch { /* best-effort */ }
       try { stores.refs.coordinator?.shutdown() } catch { /* best-effort */ }
+      shared?.sessions?.clearCoordinatorRef(sessionId)
     },
     // I1: 桌面端议事会入口，直接评审 artifact 中的 council-plan-json。
     conveneCouncil: (input) => conveneCouncilOnCoordinator(agent, stores.refs.coordinator, stores.refs, input),
@@ -873,10 +887,12 @@ async function delegateWorkerOnCoordinator(
         tokenCount: a.tokenCount,
         eventKind: a.eventKind,
         eventDetail: a.eventDetail,
+        contract: a.contract,
       })
     }),
   }
   if (input.authority) request.authority = input.authority
+  if (input.resume) request.resumeWorkOrderId = input.resume
   const run = await coordinator.delegate(request, opts.signal)
   const result = run.results[0]
   const status: DelegateActivityUpdate['status'] = result?.status ?? (run.status === 'skipped' ? 'blocked' : 'passed')
@@ -892,6 +908,13 @@ async function delegateWorkerOnCoordinator(
     model: run.selectedModel ?? result?.model,
     provider: result?.provider,
     usage: result?.usage,
+    // 终态证据摘要（与 delegate_task 的 emitTerminal 对齐）。
+    findingsCount: result?.findings && result.findings.length > 0 ? result.findings.length : undefined,
+    topFinding: result?.findings?.[0]?.claim,
+    verificationBrief: result?.verification
+      ? { status: result.verification.status, passed: result.verification.passed, failed: result.verification.failed }
+      : undefined,
+    evidenceStatus: result?.evidenceStatus,
   })
 }
 

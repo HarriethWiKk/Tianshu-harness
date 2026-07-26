@@ -31,6 +31,7 @@ export type EvidenceAction =
   | 'integration_environment'
   | 'baseline_diff'
   | 'ask_user'
+  | 'user_acceptance'
 
 export type ObligationState = 'open' | 'attempted' | 'satisfied' | 'blocked' | 'superseded'
 
@@ -42,6 +43,14 @@ export type ObligationFamily =
   | 'external_claim'
   | 'environment'
   | 'delivery'
+  /**
+   * 用户级行为验收（2026-07-25）。与 delivery 正交：delivery 问「验没验过」，
+   * acceptance 问「验在哪个层级」。**刻意不进 `applyVerificationEvent` 的
+   * `awaitsVerification` 集合，也不进 `applyProbeEvent` 的家族过滤**——跑再多
+   * 单测也关不掉它，只能由 agent 声明的可观察验收面被显式核销。
+   * 这条排除是整个机制的支点，改动前务必读 applyVerificationEvent 的注释。
+   */
+  | 'acceptance'
 
 export type ObligationRisk = 'low' | 'medium' | 'high'
 
@@ -98,6 +107,27 @@ const FIRST_ACTION: Record<ObligationFamily, EvidenceAction> = {
   external_claim: 'read_source',
   environment: 'integration_environment',
   delivery: 'targeted_verification',
+  acceptance: 'user_acceptance',
+}
+
+/** 动作 → 面向模型的中文措辞。续轮提醒直接把枚举名塞进中文句子会读成噪声，
+ *  措辞集中在这里，新增动作时一并补。 */
+const ACTION_COPY: Record<EvidenceAction, string> = {
+  read_source: '读源码确认',
+  cross_check: '换一个独立工具交叉验证',
+  micro_probe: '写最小探针验证',
+  red_reproduction: '先写一个失败的测试复现目标缺陷（RED）',
+  targeted_verification: '跑针对该改动的验证',
+  integration_environment: '在集成环境里验证',
+  baseline_diff: '与基线对照定位',
+  ask_user: '向用户澄清',
+  user_acceptance:
+    '声明并执行用户级验收——用 todo 的 acceptance 字段写「用户做什么动作 → 看到什么可观察结果」，'
+    + '执行后把该项回写为 met 并附 evidence；确实执行不了就标 blocked 并写明障碍',
+}
+
+export function describeAction(action: EvidenceAction): string {
+  return ACTION_COPY[action]
 }
 
 /** 失败升级阶梯：同一义务连续无新证据或同类失败时的下一动作。
@@ -110,6 +140,8 @@ const ESCALATION: Record<ObligationFamily, Partial<Record<EvidenceAction, Eviden
   external_claim: { read_source: 'micro_probe', micro_probe: 'targeted_verification' },
   environment: {},
   delivery: {},
+  // 反复做不成验收 → 升级为请用户来收，而不是原地重复同一句催促。
+  acceptance: { user_acceptance: 'ask_user' },
 }
 
 export function firstActionFor(family: ObligationFamily): EvidenceAction {
@@ -287,6 +319,9 @@ export function applyVerificationEvent(store: ObligationStore, meta: Verificatio
   let next = store
   for (const ob of store.obligations) {
     if (ob.state === 'satisfied' || ob.state === 'superseded') continue
+    // ⚠️ `acceptance` 刻意不在此集合内，不是遗漏。它问的是「验证跑在哪个层级」，
+    // 而这里的谓词是「跑没跑过」——把它加进来等于让任意一条 passed 单测关掉
+    // 用户级验收义务，正是本机制要修的假绿。核销走 onAcceptance → tracker.satisfy。
     const awaitsVerification = ob.family === 'bugfix' || ob.family === 'delivery'
       || ob.family === 'regression' || ob.family === 'behavior'
     if (!awaitsVerification) continue
@@ -414,8 +449,20 @@ export interface FinalEvaluation {
   nextAction?: { obligationId: string; action: EvidenceAction; claim: string }
 }
 
+/**
+ * `evaluateFinalCandidate` 挑 `nextAction` 时的家族优先级。
+ *
+ * **acceptance 必须排在 delivery 之前**，理由不是"先验收后跑测试"的执行顺序
+ * （这里排的不是执行顺序，delivery 被任意 passed 验证自动关闭，与排位无关），
+ * 而是续轮席位的分配：`evaluateFinal` 只看 `unresolved[0]`，而 `#continuedOnce`
+ * 是按义务 ID 记的 latch。排第一的那条若一直不结，第二次收尾时它仍是 `[0]`、
+ * 已在 latch 里 → 直接降 honest_blocked 返回，**排在后面的义务永远拿不到
+ * nextAction 席位**。delivery 本就能被任意测试自动满足，acceptance 是设计上
+ * 关不掉的那条——唯一那次续轮的话语权必须归 acceptance。
+ */
 const FAMILY_ORDER: Record<ObligationFamily, number> = {
-  bugfix: 0, regression: 1, delivery: 2, external_claim: 3, behavior: 4, existence: 5, environment: 6,
+  bugfix: 0, regression: 1, acceptance: 2, delivery: 3,
+  external_claim: 4, behavior: 5, existence: 6, environment: 7,
 }
 
 /**
@@ -445,6 +492,39 @@ export function evaluateFinalCandidate(store: ObligationStore): FinalEvaluation 
     return { verdict: 'honest_blocked', unresolved: [], blockedDisclosures }
   }
   return { verdict: 'allow', unresolved: [], blockedDisclosures: [] }
+}
+
+// ─── 用户级验收核销 ──────────────────────────────────────────────
+
+/**
+ * acceptance 义务的核销判定（纯函数，供 AgentLoop.captureAcceptance 使用）。
+ *
+ * - `declared`：仍有待执行项。只留痕，义务保持未决——声明不等于执行。
+ * - `missing_evidence`：标了 met 却没写做了什么。记 attempt 逼出实据，不放行。
+ * - `blocked`：有受阻项且无待执行项 → honest_blocked，交付时强制披露。
+ * - `met`：全部达标且都有据 → 关闭义务。
+ */
+export type AcceptanceOutcome =
+  | { kind: 'declared' }
+  | { kind: 'missing_evidence' }
+  | { kind: 'blocked'; reason: string }
+  | { kind: 'met'; evidenceRef: string }
+
+export function decideAcceptanceOutcome(
+  items: readonly import('../tools/types.js').AcceptanceItemInput[],
+): AcceptanceOutcome | null {
+  if (items.length === 0) return null
+  if (items.some(i => i.status === 'pending')) return { kind: 'declared' }
+  if (items.some(i => i.status === 'met' && !i.evidence?.trim())) return { kind: 'missing_evidence' }
+
+  const blocked = items.filter(i => i.status === 'blocked')
+  if (blocked.length > 0) {
+    return {
+      kind: 'blocked',
+      reason: `用户级验收受阻：${blocked.map(b => b.evidence?.trim() || b.criterion).join('；')}`,
+    }
+  }
+  return { kind: 'met', evidenceRef: `acceptance:${items.map(i => i.evidence!.trim()).join('；')}` }
 }
 
 // ─── 缓存稳定投影 ────────────────────────────────────────────────

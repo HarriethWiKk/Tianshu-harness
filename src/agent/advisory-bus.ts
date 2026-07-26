@@ -119,6 +119,9 @@ export type AdvisoryCategory =
   | 'typecheck'
   | 'todo'
   | 'background'
+  /** Monitor 工具的事件流（monitor-hook 投递）——独立类别，不与 background
+   *  争 MAX_PER_CATEGORY 预算（background-jobs hook 每轮也占 1 条）。 */
+  | 'monitor'
   /** 星域路由（CCR）与胶囊召回 — 独立类别，不与 discipline 争 MAX_PER_CATEGORY
    *  预算（2026-07-04 触发面修复：discipline 赛道扩容后 CCR 0.55 常被挤出）。 */
   | 'star_domain'
@@ -148,7 +151,24 @@ const SR_CARRY_LIMIT = 2
  *  "已足够"不成立，同轮双发会同时催"继续交叉验证"和"停止读取"。 */
 const MUTEX_PAIRS: ReadonlyArray<{ winner: string; loser: string }> = [
   { winner: 'lossy-observation', loser: 'readonly-spiral' },
+  // W3 穿透让位（2026-07-25 advisory-ecology-repair）：验证债在场时表扬让位。
+  // 「你有债」和「干得好」同屏是语义冲突——714c5d9b 里 self-verify 被忽略、
+  // 同轮表扬照发，验证债类缺陷（contract 死接线）从提醒眼皮底下逃逸。
+  // 匹配是精确 key 等值，不支持通配——CCR 验证债 key 增多时逐条补录。
+  { winner: 'self-verify', loser: 'virtue-encouragement' },
+  { winner: 'self-verify-scope-mismatch', loser: 'virtue-encouragement' },
+  { winner: 'ccr-天权-P3', loser: 'virtue-encouragement' },
+  { winner: 'ccr-天权-P7', loser: 'virtue-encouragement' },
 ]
+
+/** W2 结算限流（2026-07-25 advisory-ecology-repair）：key 级送达冷却。
+ *  注册表中的 key 距上次实际送达不足 N 轮时，本轮参赛条目直接吞掉并计入
+ *  dropped 遥测。动机：virtue-settlement-hook 每次美德结算提交一次表扬
+ *  （实测 9-88 次/会话），表扬的信息量在节奏确认而非重复计数。
+ *  门禁放 bus 层而非 hook 层——送达历史在 bus 手边，且天然覆盖未来任何调用方。 */
+export const KEY_COOLDOWN_TURNS: ReadonlyMap<string, number> = new Map([
+  ['virtue-encouragement', 5],
+])
 
 // ─── F-fix（session 803d897d）：纪律抗习惯化重锚 ─────────────────────
 // execute 阶段 field habituation（alpha=0.35）让 activeDomain 纪律约 4 轮后
@@ -204,31 +224,18 @@ export function virtueEncouragementEntry(): AdvisoryEntry {
   return {
     key: 'virtue-encouragement',
     priority: 0.4,
-    category: 'discipline',
+    // W2 表扬治理（2026-07-25）：正向激励归 'encouragement'——进 flow 抑制白名单，
+    // 产出流中自动推迟。此前挂 'discipline' 绕过阶段抑制，高产会话被自己的表扬刷屏
+    // （实测 9-88 次结算/会话，见 docs/design/2026-07-25-advisory-ecology-repair.md C-C）。
+    category: 'encouragement',
     content: variant,
     ttl: 1,
   }
 }
 
-export function testPassEncouragementEntry(testCount: number): AdvisoryEntry {
-  return {
-    key: 'test-pass-encouragement',
-    priority: 0.35,
-    category: 'discipline',
-    content: `【天府】${testCount} 个测试全部通过。代码质量守护有效。`,
-    ttl: 1,
-  }
-}
-
-export function vigorRecoveryEntry(): AdvisoryEntry {
-  return {
-    key: 'vigor-recovery',
-    priority: 0.35,
-    category: 'discipline',
-    content: '【天枢】执行能量恢复。你从低效状态走出来了，保持当前的行动节奏。',
-    ttl: 1,
-  }
-}
+// 死代码清理（2026-07-25 W2）：testPassEncouragementEntry / vigorRecoveryEntry 已删除。
+// 两函数自引入起零调用方——定义至今无人接线说明该正向反馈点从未被需要过。
+// 若日后要在测试通过 / vigor 恢复处发声，按彼时语境重写（category 用 'encouragement'）。
 
 /**
  * 投递账本快照 — 自上次 drain 以来的投递/渲染/丢弃计数。
@@ -383,6 +390,10 @@ export class AdvisoryBus {
   private srPendingDelivery = new Map<string, AdvisoryEntry>()
   /** W2：key → requeue 携带次数（跨轮延迟送达追踪，超 SR_CARRY_LIMIT 则 dropped）。 */
   private srCarryCount = new Map<string, number>()
+  /** W2 结算限流：KEY_COOLDOWN_TURNS 注册 key → 上次实际送达的轮号。 */
+  private lastDeliveredTurnByKey = new Map<string, number>()
+  /** 最近一次 render 的轮号——SR 确认回调（confirmSrDelivered）没有 turn 上下文时用它记账。 */
+  private lastRenderTurn = 0
   /** Wave 1 账本：SR 提交数与被 SessionContext cap 丢弃数。 */
   private ledgerSrSubmitted = 0
   private ledgerSrDropped = 0
@@ -518,6 +529,14 @@ export class AdvisoryBus {
     this.srCarryCount.delete(key)
     this.ledgerRendered++
     this.delivered.push({ key: entry.key, category: entry.category, tier: entry.tier, expect: entry.expect })
+    this.recordDeliveredTurn([entry.key], this.lastRenderTurn)
+  }
+
+  /** W2 结算限流：记录注册 key 的实际送达轮号（非注册 key 零开销跳过）。 */
+  private recordDeliveredTurn(keys: Iterable<string>, turn: number): void {
+    for (const key of keys) {
+      if (KEY_COOLDOWN_TURNS.has(key)) this.lastDeliveredTurnByKey.set(key, turn)
+    }
   }
 
   /** Wave 1：调用方确认 SR 被 SessionContext cap 拦截丢弃。不进入 delivered 桶。 */
@@ -703,9 +722,36 @@ export class AdvisoryBus {
     let all = [...this.alive, ...this.entries, ...promoted, ...carried.map(c => c.entry)]
     const deferralsByKey = new Map(carried.map(c => [c.entry.key, c.deferrals]))
 
+    // ── W2 key 级送达冷却：注册 key 距上次实际送达不足 N 轮 → 吞掉计 dropped ──
+    // 放在一切竞争逻辑之前——冷却中的条目不该占 MUTEX/预算/挂起任何一席。
+    this.lastRenderTurn = turn
+    {
+      const cooled: AdvisoryEntry[] = []
+      const swallowed: string[] = []
+      for (const e of all) {
+        const cooldown = KEY_COOLDOWN_TURNS.get(e.key)
+        const last = cooldown !== undefined ? this.lastDeliveredTurnByKey.get(e.key) : undefined
+        if (cooldown !== undefined && last !== undefined && turn - last < cooldown) {
+          swallowed.push(e.key)
+        } else {
+          cooled.push(e)
+        }
+      }
+      if (swallowed.length > 0) {
+        this.recordDropped(swallowed)
+        all = cooled
+      }
+    }
+
     // ── A4 互斥对：语义冲突信号同场时 loser 让位（跨通道，在 SR 分流前生效）──
+    // 复盘修复（2026-07-25）：winner 判定并入 pendingWatch——带 observe 的
+    // winner（如 self-verify）在挂起观察窗内不进竞争池 `all`，只扫 `all`
+    // 会让 loser（表扬）在债观察窗内照常送达，「有债仍表扬」的主路径没挡住。
+    // 挂起 ≠ 不在场：事实已被 hook 指认，只是送达被延迟确认。
+    const pendingWinnerKeys = new Set(this.pendingWatch.map(p => p.entry.key))
     for (const pair of MUTEX_PAIRS) {
-      if (all.some(e => e.key === pair.winner) && all.some(e => e.key === pair.loser)) {
+      const winnerPresent = all.some(e => e.key === pair.winner) || pendingWinnerKeys.has(pair.winner)
+      if (winnerPresent && all.some(e => e.key === pair.loser)) {
         this.recordDropped(all.filter(e => e.key === pair.loser).map(e => e.key))
         all = all.filter(e => e.key !== pair.loser)
       }
@@ -929,6 +975,7 @@ export class AdvisoryBus {
         this.statusSink(statusEntries)
         this.ledgerRendered += statusEntries.length
         this.delivered.push(...statusEntries.map(e => ({ key: e.key, category: e.category, tier: e.tier, expect: e.expect })))
+        this.recordDeliveredTurn(statusEntries.map(e => e.key), turn)
       }
     }
 
@@ -1040,6 +1087,8 @@ export class AdvisoryBus {
       tier: e.tier,
       expect: e.expect,
     })))
+    // W2 冷却记账只算真实送达（holdout 扣留条目模型没看到，不占冷却窗）
+    this.recordDeliveredTurn(sorted.map(e => e.key), turn)
     // holdout 反事实组:扣留但照常核销（shadow 桶,自发完成率基线）
     this.delivered.push(...heldOut.map(e => ({
       key: e.key,

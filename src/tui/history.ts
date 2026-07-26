@@ -44,10 +44,15 @@ export async function appendHistoryAsync(entry: string): Promise<void> {
 
 /** 模糊搜索历史记录，返回匹配项及得分 */
 export function searchHistory(query: string, limit = 20): string[] {
-  if (!query) return loadHistory().slice(0, limit)
+  return scoreHistoryEntries(loadHistory(), query, limit)
+}
+
+/** 纯函数：对给定历史条目按 query 评分排序（前缀 +10、词命中 +5）。
+ *  从 searchHistory 抽出便于单测（磁盘 loadHistory 不进测试）。 */
+export function scoreHistoryEntries(entries: readonly string[], query: string, limit = 20): string[] {
+  if (!query) return entries.slice(0, limit)
   const lower = query.toLowerCase()
-  const history = loadHistory()
-  const scored = history
+  return entries
     .filter(e => e.toLowerCase().includes(lower))
     .map(e => {
       let score = 0
@@ -60,5 +65,5 @@ export function searchHistory(query: string, limit = 20): string[] {
     })
     .sort((a, b) => b.score - a.score)
     .slice(0, limit)
-  return scored.map(s => s.entry)
+    .map(s => s.entry)
 }

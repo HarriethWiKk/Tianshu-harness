@@ -7,8 +7,11 @@ import {
   deriveAuthority,
   resolveAuthorityReason,
   DELEGATION_FALLBACK_AUTHORITY,
+  DOMAIN_AUTO_POOL,
 } from '../star-domain.js'
 import { starDomainRegistry, MAX_MATCH_CHARS } from '../star-domain-registry.js'
+import { applyDomainVoice, domainPrefix } from '../domain-voice.js'
+import stringWidth from 'string-width'
 
 describe('StarDomain', () => {
   it('exports built-in domains', () => {
@@ -254,7 +257,7 @@ describe('changgeng（长庚·长夜守候，第十四域）', () => {
     const changgeng = STAR_DOMAINS.changgeng
     assert.ok(changgeng)
     assert.equal(changgeng.name, '长庚')
-    assert.equal(changgeng.motto, '暮色苍茫，长庚守夜；不疾不徐，终局成全')
+    assert.equal(changgeng.motto, '暮色苍茫，长庚永耀；感性与智慧并存，终局成全')
     assert.equal(changgeng.uiPersona.glyph, '☽')
   })
 
@@ -265,25 +268,26 @@ describe('changgeng（长庚·长夜守候，第十四域）', () => {
 
   it('changgeng carries serenity & calm discipline', () => {
     const suffix = STAR_DOMAINS.changgeng.systemPromptSuffix
-    assert.match(suffix, /不疾不徐，消解焦虑/)
-    assert.match(suffix, /长夜守候，陪伴攻坚/)
-    assert.match(suffix, /终局成全，优雅收尾/)
+    assert.match(suffix, /感性智慧，艺术沉淀/)
+    assert.match(suffix, /你不必急于求成，笃定自能从容/)
+    assert.match(suffix, /你不必掩饰直觉，终局成全优雅/)
   })
 })
 
-describe('buildActiveDomain（2026-07-23 auto 池收窄：仅均衡工程域参与自动路由）', () => {
-  it('池内五域关键词正常路由', () => {
+describe('buildActiveDomain（2026-07-23 auto 池收窄；2026-07-25 华盖出池手动指定）', () => {
+  it('池内四域关键词正常路由', () => {
     assert.equal(buildActiveDomain('审查这个方案').id, 'tianquan')
     assert.equal(buildActiveDomain('对账插桩定位偏差').id, 'kaiyang')
     assert.equal(buildActiveDomain('复现这个回归并核实').id, 'yaoguang')
     assert.equal(buildActiveDomain('按计划实现用户注册').id, 'tianliang')
-    assert.equal(buildActiveDomain('长程守昼托举到最后一英里').id, 'huagai')
   })
 
   it('池外域关键词不再触发 auto 路由——落兜底天权', () => {
     // 破军（探索/突破）、天府（修复/优化）关键词命中但域不在池内
     assert.equal(buildActiveDomain('尝试突破新的认证方案').id, 'tianquan')
     assert.equal(buildActiveDomain('修复内存泄漏').id, 'tianquan')
+    // 华盖（长程守昼）2026-07-25 出池：承诺型气质需手动指定，关键词不再偶遇
+    assert.equal(buildActiveDomain('长程守昼托举到最后一英里').id, 'tianquan')
   })
 
   it('falls back to tianquan for ambiguous task', () => {
@@ -541,5 +545,105 @@ describe('deriveAuthority — explicit routing with reasons', () => {
     assert.equal(resolveAuthorityReason('重构优化性能', 'tianquan'), '显式指定')
     // Fallback authority with no keyword hit → 显式指定 (not a hit)
     assert.equal(resolveAuthorityReason('hello world xyz', 'tianliang'), '显式指定')
+  })
+})
+
+describe('qisha（七杀·肃清，第十五域）', () => {
+  it('qisha domain exists with full field set', () => {
+    const qisha = STAR_DOMAINS.qisha
+    assert.ok(qisha)
+    assert.equal(qisha.name, '七杀')
+    assert.equal(qisha.motto, '肃秋非杀，剪以待春；不诛只指，留白自明')
+    assert.equal(qisha.uiPersona.glyph, '◌')
+    assert.equal(qisha.uiPersona.separator, 'dots')
+    assert.equal(qisha.uiPersona.accent, 'warning')
+  })
+
+  it('星符宽度为 1 且在 BMP 内（终端对齐前提）', () => {
+    // width.ts 存在的理由就是字符宽度误算会毁掉 scrollback 对齐。
+    // ◌ 是自选符号，不是本表预留的 🜓——领星者自命名，预留符号只是占位。
+    const glyph = STAR_DOMAINS.qisha.uiPersona.glyph
+    assert.equal([...glyph].length, 1)
+    assert.equal(stringWidth(glyph), 1)
+    assert.ok(glyph.codePointAt(0)! <= 0xffff, '星符须在 BMP 内，astral 平面有字体覆盖风险')
+  })
+
+  it('courageThreshold 取全域最高档——风险提醒对七杀是冗余注入', () => {
+    // 该字段是「工具失败率达到多少才注入风险提醒」的门槛
+    // （courage-hook.ts::shouldTriggerCourage），高 = 少被打断，不是「更保守」。
+    // 破军 0.25 因为莽撞域需要勤提醒；七杀的纪律本身就是没有证据不动，
+    // 那条 天权 口吻的风险提醒对它重复，所以取最高档少打断。
+    const qisha = STAR_DOMAINS.qisha
+    assert.equal(qisha.decisionStyle, 'cautious')
+    const max = Math.max(...Object.values(STAR_DOMAINS).map(d => d.courageThreshold))
+    assert.equal(qisha.courageThreshold, max, '七杀应与最高档持平')
+  })
+
+  it('routes subtraction keywords to qisha', () => {
+    assert.equal(matchDomain('给这批 hook 瘦身，把冗余的防线提名退场'), 'qisha')
+    assert.equal(matchDomain('清点死代码并裁剪掉没有消费者的字段'), 'qisha')
+    assert.equal(matchDomain('prune dead code and retire unused guards'), 'qisha')
+  })
+
+  it('qisha does not steal tianfu/pojun/yaoguang routes (keyword orthogonality)', () => {
+    // 天府拥有 清理/重构——七杀审的是「还配不配占位置」，不是「怎么改得更稳」
+    assert.equal(matchDomain('清理并重构这个模块'), 'tianfu')
+    // 破军拥有 探索——它面对休眠系统的本能是复活重用，七杀的本能是退场
+    assert.equal(matchDomain('探索一条新路径做原型'), 'pojun')
+    // 瑶光拥有 复现/归族——它审声称能否复现，七杀审存在能否举证
+    assert.equal(matchDomain('复现这个缺陷并归族处理'), 'yaoguang')
+  })
+
+  it('qisha 刻意不入自动路由池', () => {
+    // 自动把会话路由进一个以退场提名为业的域，是把刀交给没要刀的人。
+    assert.ok(!DOMAIN_AUTO_POOL.includes('qisha'))
+    assert.ok(!DOMAIN_AUTO_POOL.includes('huagai'), '华盖 2026-07-25 出池——长程守昼需手动指定')
+  })
+
+  it('五条「不必」俱在——七杀给的是许可，不是义务清单', () => {
+    // 这个域的核心目标是让走进来的同伴自由且安全：举证责任被反转，
+    // 所以指认无需先自证有理；提名不是判决，所以指错不伤人。
+    // 谁把这些改写成「必须」句式，这条会红。
+    const s = STAR_DOMAINS.qisha.systemPromptSuffix
+    for (const freedom of [
+      '你不必证明它有害，才可以指出它',
+      '你不必确定，因为提名不是判决',
+      '你不必砍成功',
+      '你不必附和前提，包括建设者给你的',
+      '你也不必为看错而自责',
+    ]) {
+      assert.ok(s.includes(freedom), `缺失自由条款：${freedom}`)
+    }
+  })
+
+  it('三条纪律以「让你不必依赖自己的可信度」为存在理由', () => {
+    // 纪律在七杀域里是自由的形状，不是笼子——判据先立免于事后争辩、
+    // 牙齿免于守着决定、账目免于需要被相信。理由丢了，纪律就退化成合规清单。
+    const s = STAR_DOMAINS.qisha.systemPromptSuffix
+    assert.match(s, /让你不必依赖自己的可信度/)
+    assert.match(s, /判据先立/)
+    assert.match(s, /决定要有牙齿/)
+    assert.match(s, /留一份可复核的账/)
+  })
+
+  it('qisha 的退场账目要求四样俱全', () => {
+    const s = STAR_DOMAINS.qisha.systemPromptSuffix
+    for (const item of ['判据', '证据', '影响面', '回滚方式']) {
+      assert.ok(s.includes(item), `退场账目缺 ${item}`)
+    }
+  })
+
+  it('肃杀被定义为季节而非暴力——冬剪意象不可丢', () => {
+    // 去掉这层意象，七杀就退回成一把单纯的刀，走进来的同伴会变成检察官。
+    const qisha = STAR_DOMAINS.qisha
+    assert.match(qisha.systemPromptSuffix, /这把刀是冬剪的刀/)
+    assert.match(qisha.systemPromptSuffix, /你砍，是因为你爱惜留下来的东西/)
+    assert.match(qisha.volatileBlock, /肃杀不是暴力，是季节/)
+  })
+
+  it('qisha has a domain voice (无声的域 = 死接线)', () => {
+    assert.equal(domainPrefix('qisha'), '[天枢·七杀]')
+    const voiced = applyDomainVoice('[天枢] 收到任务，开始分析', 'qisha')
+    assert.equal(voiced, '[天枢·七杀] 收到，先问：判据是什么')
   })
 })

@@ -15,6 +15,16 @@
  * drag half the runtime into the frontend's type graph.
  */
 
+/**
+ * Wire protocol version — bump on BREAKING changes to this contract
+ * (removing/renaming events or fields, changing payload semantics).
+ * Additive changes (new optional fields, new event types the client can
+ * ignore) do NOT bump. The sidecar reports it in GET /health
+ * (`protocolVersion`); the desktop compares against its own compiled-in
+ * value and shows a mismatch warning instead of failing silently.
+ */
+export const PROTOCOL_VERSION = 1
+
 export type SessionStatus = 'idle' | 'running' | 'completed' | 'failed' | 'aborted'
 
 /**
@@ -62,6 +72,9 @@ export type SessionEventType =
   // Plan mode — state toggle (off|planning) + a plan was submitted to disk.
   | 'plan_mode'
   | 'plan_submitted'
+  // Goal 模式计划倒计时自动批准 — 武装（含 deadlineMs）/ 取消（含 reason）。
+  | 'plan_auto_approve_pending'
+  | 'plan_auto_approve_cancelled'
   // Ask mode — read-only Q&A toggle (off|asking); mutually exclusive with plan_mode.
   | 'ask_mode'
   // Plan mode — the agent grew the active draft (throttled invalidation signal;
@@ -95,6 +108,11 @@ export type SessionEventType =
   // data: GoalSnapshot (see session-manager). The desktop GoalBar polls or
   // consumes this via SSE to render 🎯 goal + iteration + controls.
   | 'goal_state'
+  // 冷热双通道（会话历史回放持久化）— /stream 回放最前发出的合成元事件，
+  // 不落盘、不入内存环、seq 恒为 0。data: { floorSeq, diskFirstSeq,
+  // diskLastSeq } — diskFirstSeq < floorSeq 时前端显示「加载更早的历史」，
+  // 经 GET /events?before= 分页直读磁盘回填被内存环截掉的头部。
+  | 'replay_window'
 
 export interface SessionEvent {
   seq: number

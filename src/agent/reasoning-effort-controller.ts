@@ -1,6 +1,6 @@
 import { type ReasoningEffort } from './auto-reasoning.js'
 import { type PredictionAccumulator, getErrorRate } from './prediction-error.js'
-import { buildEffortContext, type EffortShadowRecord } from './p3-reward.js'
+import { buildEffortContext, computeTurnDepth, type EffortShadowRecord } from './p3-reward.js'
 import { resolveEffortDelta } from './effort-delta.js'
 import { type P3Integration } from './p3-integration.js'
 
@@ -102,7 +102,7 @@ export class ReasoningEffortController {
       const ctx = buildEffortContext({
         taskComplexity: this.deps.hasTaskContract() ? 0.5 : 0.3,
         errorRate: overrides?.errorRate ?? getErrorRate(this.deps.getPredictionAccumulator()),
-        turnDepth: this.deps.getTurnCount() / Math.max(this.deps.getMaxTurns() ?? 50, 1),
+        turnDepth: computeTurnDepth(this.deps.getTurnCount(), this.deps.getMaxTurns()),
         fileCount: this.deps.getFilesModifiedCount(),
         isRepeat: overrides?.isRepeat ?? false,
         timeOfDay: new Date().getHours() / 24,
@@ -133,7 +133,7 @@ export class ReasoningEffortController {
       const ctx = buildEffortContext({
         taskComplexity: this.deps.hasTaskContract() ? 0.5 : 0.3,
         errorRate: getErrorRate(this.deps.getPredictionAccumulator()),
-        turnDepth: this.deps.getTurnCount() / Math.max(this.deps.getMaxTurns() ?? 50, 1),
+        turnDepth: computeTurnDepth(this.deps.getTurnCount(), this.deps.getMaxTurns()),
         fileCount: this.deps.getFilesModifiedCount(),
         isRepeat: false,
         timeOfDay: new Date().getHours() / 24,

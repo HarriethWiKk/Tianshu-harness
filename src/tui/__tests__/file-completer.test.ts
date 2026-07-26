@@ -41,13 +41,18 @@ describe('extractAtToken', () => {
 })
 
 describe('applyCompletion', () => {
-  it('replaces the @-token and appends a trailing space', () => {
+  it('产出规范形 @file:（mention-parser 可解析——断链修复）', () => {
     // 输入 'open @src/ag' 光标在 10（'@src/' 末尾）——applyCompletion 把
-    // @-token 整体替换为 completion + 空格，光标后的 'ag' 保留在尾部。
+    // @-token 整体替换为规范 mention + 空格，光标后的 'ag' 保留在尾部。
     const out = applyCompletion('open @src/ag', 10, 'src/agent.ts')
-    assert.equal(out.text, 'open @src/agent.ts ag')
-    // 19 = '@' (5) + 1 + 'src/agent.ts'.length (12) + 1 (trailing space)
-    assert.equal(out.cursor, 19)
+    assert.equal(out.text, 'open @file:src/agent.ts ag')
+    // 24 = 'open ' (5) + '@file:src/agent.ts '.length (19)
+    assert.equal(out.cursor, 24)
+  })
+
+  it('含空格路径用引用形', () => {
+    const out = applyCompletion('open @Pro', 9, 'Program Files/a.ts')
+    assert.equal(out.text, 'open @file:"Program Files/a.ts" ')
   })
 })
 

@@ -175,4 +175,25 @@ describe('formatMarkdown', () => {
     assert.ok(codeLine)
     assert.ok(/\x1B\[/.test(codeLine!), 'has ANSI color on keyword')
   })
+
+  it('显式标记与高亮 Git 提交标签行 (⎇ commit hash + files + diff)', () => {
+    const lines = formatMarkdown({ text: '95454cd0 — 5 files, +70/-4。', columns: 80 }, theme)
+    assert.ok(lines.some(l => stripAnsi(l).includes('⎇ 95454cd0')))
+    assert.ok(lines.some(l => stripAnsi(l).includes('+70')))
+  })
+
+  it('显式标识与高亮代码行首圈号序号 (①, ②)', () => {
+    const lines = formatMarkdown({ text: '```bash\n①git push origin main\n②npm publish\n```', columns: 80 }, theme)
+    const line1 = lines.find(l => stripAnsi(l).includes('git push'))
+    assert.ok(line1)
+    assert.ok(line1.includes('\x1B['), '圈号序号带有 ANSI 醒目色彩')
+  })
+
+  it('醒目标记主控回复末尾提问 (⚡ 是否执行？)', () => {
+    const text = '本地已就绪。需要你确认：\n\n是否执行？'
+    const lines = formatMarkdown({ text, columns: 80 }, theme)
+    const lastLine = lines[lines.length - 1]
+    assert.ok(lastLine)
+    assert.ok(stripAnsi(lastLine).includes('⚡ 是否执行？'))
+  })
 })

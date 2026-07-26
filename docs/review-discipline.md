@@ -70,8 +70,12 @@
 | 层级 | 开关 | 作用域 | 手动 `/review` |
 |------|------|--------|---------------|
 | 硬关闭 | `RIVET_REVIEW_DISCIPLINE=0` | 进程级（CI/headless） | 经 deliver_task 的一并关闭 |
-| 持久 | `review.skipAuto: true`（config；桌面端 Settings → Routing checkbox） | 全局、跨会话（新会话生效） | **可用** |
+| 持久 | `review.skipAuto`（config；桌面端 Settings → Routing checkbox） | 全局、跨会话（新会话生效） | **可用** |
 | 会话 | `/review off` · `/review on` · `/review status`（TUI） | 当前会话，即时生效 | **可用** |
+
+> **默认行为**：`review.skipAuto` 开箱默认 `true`（即「自动审查默认关」）——审查靠用户手动 `/review [max]` 或外部会话触发。想恢复自动审查：config 设 `skipAuto: false`，或会话内 `/review on`（仅当前会话）。
+>
+> **桌面端用户**：Settings → Routing 的 `skipAuto` 复选框（持久配置，新会话生效）与 Plus 菜单 → ⚖ 审查 → Off（会话级覆盖，立即生效但会话结束失效）是两个不同层级的开关——详见 [桌面端用户指南 · 审查门](./desktop-guide.md#审查门自动审查与手动触发)。
 
 核心原则：**一切"关闭"只抑制系统自动审查（auto / defer / final / goal-achieved L3）；显式 `review_level`（手动 `/review`，用户明确意图）永远放行**。off 模式下主控的测试/验证/提交环节完全不受影响——只是不再自动 spawn 审查 worker，用户可手动 `/review [max]` 或交给外部会话审，省掉无效 token 消耗。
 

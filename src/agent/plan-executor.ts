@@ -35,6 +35,8 @@ import type { ImpactResult } from '../repo/meridian-impact.js'
 import { runChangedFilesTypecheckMemo, typecheckGateEnabled, type TypecheckRunner } from './typecheck-gate.js'
 import { getWaveResults, setWaveResults } from './wave-results-store.js'
 import { evaluateWaveGate, formatWaveGate, getWaveGate, isWaveGateEnabled, setWaveGate } from './wave-gate.js'
+import { evaluateSkillGate, extractRequiredSkills, formatSkillGateBlock, getInvokedSkills, isSkillGateEnabled } from './skill-gate.js'
+import { skillRegistry } from '../skills/skill-loader.js'
 import { clearCheckpoint, deriveTeamGroupId, loadCheckpoint, saveCheckpoint, type WaveCheckpoint } from './wave-checkpoint.js'
 
 /** Narrow surface for meridian structural impact analysis, so tests can mock it
@@ -77,6 +79,9 @@ export interface PlanExecutorOptions {
   tasks?: TeamTask[]
   /** Markdown plan (team_orchestrate standard path). */
   planMarkdown?: string
+  /** 计划点名的流程 skill（技能门禁用）。缺省时从 planMarkdown 提取；
+   *  plan_task 走 tasks 路径无 markdown，读到计划文件时自行提取传入。 */
+  requiredSkills?: string[]
   fromWave: number
   maxParallel?: number
   sessionId?: string
@@ -215,6 +220,24 @@ export function buildWaveCheckpoint(
  */
 export async function executePlan(opts: PlanExecutorOptions, deps: PlanExecutorDeps): Promise<PlanExecutorRun> {
   let telemetryEvent: TeamWaveTelemetry | undefined
+
+  // ── 技能门禁（入口侧，仅首波）：计划点名的 skill 可加载但未加载 → 硬拦 ──
+  // 长庚域事故（2026-07-25）：计划写明「使用 executing-plans」，执行方以纪律
+  // 重叠为由跳过加载。点名 skill 是计划专属流程契约，机械拦截而非劝告。
+  // 续波（fromWave>0）不再查——skill 正文已在首波前进入消息历史。
+  // 点名但运行时不可加载的 skill 不拦（计划可能写于别的技能环境）。
+  if (isSkillGateEnabled() && opts.fromWave === 0) {
+    const required = opts.requiredSkills ?? (opts.planMarkdown ? extractRequiredSkills(opts.planMarkdown) : [])
+    if (required.length > 0) {
+      const verdict = evaluateSkillGate(required, {
+        availableNames: new Set(skillRegistry.list().map(s => s.name)),
+        invokedNames: getInvokedSkills(opts.sessionId),
+      })
+      if (verdict.missing.length > 0) {
+        throw new Error(formatSkillGateBlock(verdict.missing))
+      }
+    }
+  }
 
   // ── 波间硬门禁（入口侧）：上一波门禁未通过 → 禁止 dispatch 本波 ──
   // 自愈：主控可能已直接修复代码（而非重跑波），拦截前先复评一次；

@@ -23,17 +23,23 @@ const BING_UA =
 
 /**
  * Parse Bing (cn.bing.com) organic results. Structure verified against live
- * responses (Jul 2026):
- *   <li class="b_algo" ...>
- *     <div class="b_tpcn"><a class="tilk" href="URL">…favicon…</a></div>   ← skip
- *     <h2 class=""><a href="URL">TITLE with <strong>…</strong> highlights</a></h2>
- *     <div class="b_caption"><p class="b_lineclamp2">SNIPPET</p></div>
- *   </li>
+ * responses:
+ *   - Legacy (Jul 2026 and earlier):
+ *     <li class="b_algo" ...>
+ *       <div class="b_tpcn"><a class="tilk" href="URL">…favicon…</a></div>   ← skip
+ *       <h2 class=""><a href="URL">TITLE with <strong>…</strong> highlights</a></h2>
+ *       <div class="b_caption"><p class="b_lineclamp2">SNIPPET</p></div>
+ *     </li>
+ *   - Current (post-2026-07 revamp): the `<h2>` wrapper was dropped. The title
+ *     link is now a bare `<a>` directly inside `b_algo`, preceded by inline
+ *     `<link rel="stylesheet">` tags and an optional `tilk` favicon link.
  *
- * The title link is the first `<a>` inside `<h2>` — anchoring on `<h2>` skips
- * the favicon `tilk` link cleanly. URLs on cn.bing.com are direct (no redirect
- * wrapper); the `/ck/a?...&u=a1…` base64url form only appears on international
- * Bing, decoded by `decodeCkAUrl` for safety.
+ * Parser strategy: prefer the `<h2>` anchor (legacy structure) since it cleanly
+ * skips the favicon link; when no `<h2>` is present, fall back to scanning the
+ * block for the first `<a>` whose href is an external http(s) URL — this skips
+ * `tilk` favicon links (internal/same-origin) and Bing's own nav links.
+ * URLs on cn.bing.com are direct (no redirect wrapper); the `/ck/a?...&u=a1…`
+ * base64url form only appears on international Bing, decoded by `decodeCkAUrl`.
  */
 export function parseBingResults(html: string, maxCount: number): SearchResult[] {
   const results: SearchResult[] = []
@@ -43,15 +49,11 @@ export function parseBingResults(html: string, maxCount: number): SearchResult[]
   for (let i = 1; i < blocks.length && results.length < maxCount; i++) {
     const block = blocks[i]!
 
-    // Anchor on `<h2…>` to land on the title link, skipping the b_tpcn/tilk
-    // favicon link that precedes it. Bing emits `<h2 class="">` or `<h2>`.
-    const h2 = block.match(/<h2[^>]*>([\s\S]*?)<\/h2>/i)
-    if (!h2) continue
-    const linkMatch = h2[1]!.match(/<a[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/i)
+    const linkMatch = extractTitleLink(block)
     if (!linkMatch) continue
-    const rawUrl = decodeHtmlEntities(linkMatch[1]!)
+    const rawUrl = decodeHtmlEntities(linkMatch.url)
     const url = decodeCkAUrl(rawUrl)
-    const title = decodeHtmlEntities(stripHtml(linkMatch[2]!)).replace(/\s+/g, ' ').trim()
+    const title = decodeHtmlEntities(stripHtml(linkMatch.title)).replace(/\s+/g, ' ').trim()
     if (!title || !url || !/^https?:\/\//i.test(url)) continue
 
     // `b_lineclamp\d` covers b_lineclamp2 (default) and b_lineclamp4 (longer).
@@ -63,6 +65,55 @@ export function parseBingResults(html: string, maxCount: number): SearchResult[]
     results.push({ title, url, snippet })
   }
   return results
+}
+
+/**
+ * Extract the (url, title-html) of the title link from a `b_algo` block.
+ *
+ * Strategy:
+ *   1. Legacy: anchor on `<h2>` and take the first `<a>` inside it. This skips
+ *      the `tilk` favicon link that precedes `<h2>`.
+ *   2. Current (post-revamp, no `<h2>`): scan all `<a href="...">` in the block
+ *      and return the first whose href is an external http(s) URL. Skips:
+ *        - `tilk` favicon links (typically same-origin Bing URLs)
+ *        - Bing nav/pagination (`bing.com`, `microsoft.com`, `go.microsoft`)
+ *        - non-http anchors (mailto, javascript, in-page `#`)
+ *      We truncate the scan window to the first 4 KB of the block so a long
+ *      result list can't drag a distant unrelated link into the title slot.
+ */
+function extractTitleLink(block: string): { url: string; title: string } | undefined {
+  // 1. Legacy <h2> anchor.
+  const h2 = block.match(/<h2[^>]*>([\s\S]*?)<\/h2>/i)
+  if (h2) {
+    const m = h2[1]!.match(/<a[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/i)
+    if (m) return { url: m[1]!, title: m[2]! }
+  }
+  // 2. Fallback: first external http(s) <a> in the block head.
+  const head = block.slice(0, 4096)
+  const anchorRe = /<a[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi
+  let m: RegExpExecArray | null
+  while ((m = anchorRe.exec(head)) !== null) {
+    const href = m[1]!
+    if (!/^https?:\/\//i.test(href)) continue
+    if (isBingInternalUrl(href)) continue
+    return { url: href, title: m[2]! }
+  }
+  return undefined
+}
+
+/** Whether a URL points at Bing/Microsoft infrastructure (favicon, nav, etc.). */
+function isBingInternalUrl(url: string): boolean {
+  try {
+    const host = new URL(url).hostname.toLowerCase()
+    return (
+      host.endsWith('.bing.com') ||
+      host.endsWith('.microsoft.com') ||
+      host === 'go.microsoft.com' ||
+      host === 'r.bing.com'
+    )
+  } catch {
+    return false
+  }
 }
 
 function stripHtml(text: string): string {

@@ -212,3 +212,50 @@ describe('TurnOrchestrator.judgeGoalCompletion', () => {
     assert.equal(entry.overall, 'rejected')
   })
 })
+
+describe('GoalContinuationController 待批计划闸门（2026-07-24）', () => {
+  function makeGateController(tracker: GoalTracker, pending: boolean, probe?: { n: number }): GoalContinuationController {
+    return new GoalContinuationController({
+      getGoalTracker: () => tracker,
+      hasPendingPlanApproval: async () => { if (probe) probe.n += 1; return pending },
+      getStreamedText: () => '正在读取文件',
+      getEstimatedTokens: () => 0,
+      getSessionId: () => undefined,
+      getCwd: () => '/tmp',
+      appendSystemReminder: () => {},
+      appendSystemReminderAndReport: () => true,
+      resetSrCount: () => {},
+      completeTurn: async () => {},
+      writeTelemetry: () => {},
+      flushMeridianTurn: () => {},
+    })
+  }
+
+  const params = {
+    streamedText: '正在读取文件',
+    estimatedTokens: 0,
+    isAborted: false,
+    turn: 1,
+    callbacks: {} as never,
+    signal: new AbortController().signal,
+  }
+
+  it('有待批计划时 finalize 不续跑——goal 保持 active、不烧 iteration', async () => {
+    const tracker = makeTracker()
+    const probe = { n: 0 }
+    const ctrl = makeGateController(tracker, true, probe)
+    const result = await ctrl.handleGoalCheck(params)
+    assert.equal(result.kind, 'finalize')
+    assert.equal(tracker.isActive(), true, 'goal 不得 deactivate')
+    assert.equal(tracker.getIteration(), 0, '不得 advanceIteration')
+    assert.equal(probe.n, 1)
+  })
+
+  it('无待批计划时正常续跑（探针 false → 走原 continue 路径）', async () => {
+    const tracker = makeTracker()
+    const ctrl = makeGateController(tracker, false)
+    const result = await ctrl.handleGoalCheck(params)
+    assert.equal(result.kind, 'continue')
+    assert.equal(tracker.getIteration(), 1)
+  })
+})

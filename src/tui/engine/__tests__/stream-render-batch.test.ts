@@ -48,6 +48,15 @@ function makeApp() {
 
 const microtask = () => Promise.resolve().then(() => {})
 
+/** 轮询等待条件成立（16ms 节流尾沿/事件循环拥塞下比单次 microtask 等待稳健）。 */
+async function waitFor(cond: () => boolean, timeoutMs = 500): Promise<void> {
+  const start = Date.now()
+  while (!cond()) {
+    if (Date.now() - start > timeoutMs) throw new Error('waitFor timeout')
+    await new Promise(r => setTimeout(r, 5))
+  }
+}
+
 test('thinking delta 流经 WriteBatcher：同步批次合并为 1 次渲染', async () => {
   const { app, out } = makeApp()
   out.chunks = []
@@ -58,16 +67,13 @@ test('thinking delta 流经 WriteBatcher：同步批次合并为 1 次渲染', a
   // 修复前：此处已有 10 次 renderLive 的写入；修复后：写入被推迟到 microtask
   assert.equal(out.chunks.length, 0, `同步阶段不应渲染（batched），实际写了 ${out.chunks.length} 次`)
 
-  await microtask()
-  const afterFlush = out.chunks.length
-  assert.ok(afterFlush >= 1, 'microtask flush 后应渲染 1 次')
+  await waitFor(() => out.chunks.length >= 1)
 
-  // 再发一批，确认仍是「每 microtask 1 次」而非「每 token 1 次」
+  // 再发一批，确认仍是「每帧窗口 1 次」而非「每 token 1 次」
   out.chunks = []
   for (let i = 0; i < 10; i++) app.callbacks.onThinkingDelta(`x${i} `)
   assert.equal(out.chunks.length, 0, '第二批同步阶段同样不渲染')
-  await microtask()
-  assert.ok(out.chunks.length >= 1, '第二批 flush 后渲染')
+  await waitFor(() => out.chunks.length >= 1)
 
   // 累积的 thinking 文本完整保留（节流不丢内容）
   assert.ok((app as unknown as { state: { thinkingText: string } }).state.thinkingText.includes('tok9'), 'thinking 文本累积完整')
@@ -83,8 +89,7 @@ test('tool-result streaming chunk 经 WriteBatcher 合并', async () => {
   for (let i = 0; i < 8; i++) app.callbacks.onToolResult('t1', 'bash', `line${i}\n`, undefined)
   assert.equal(renders, 0, 'streaming chunk 同步阶段不渲染')
 
-  await microtask()
-  assert.equal(renders, 1, 'flush 后只渲染 1 次')
+  await waitFor(() => renders === 1)
 })
 
 test('critical phase flush invalidates a queued streaming render', async () => {
@@ -116,8 +121,7 @@ test('stable stream commit renders once while an unstable tail remains scheduled
 
   app.callbacks.onTextDelta('unfinished live tail')
   assert.equal(renders, 1, 'tail render stays deferred')
-  await microtask()
-  assert.equal(renders, 2, 'tail without stable boundary still redraws')
+  await waitFor(() => renders === 2) // commit 的 flushNow 使尾渲染走 16ms 尾沿（2026-07-24 P2）
 })
 
 test('app without a perf monitor emits no shutdown summary', () => {

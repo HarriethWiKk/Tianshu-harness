@@ -461,6 +461,31 @@ describe('computeStrategy', () => {
     // Boundary: exactly at old threshold
     assert.equal(computeStrategy(makeSensorium({ confidence: 0.29, momentum: 0.19 })).shouldEscalate, false)
   })
+
+  // ─── W4 momentum no-data 三态消费（2026-07-25 advisory-ecology-repair）──
+
+  it('W4: no-data momentum 不加 commit 拖拽——空窗口回退 0 不是实测停滞', () => {
+    const noData = makeSensorium({ momentum: 0, pressure: 0.3, quality: { confidence: 'measured', momentum: 'no-data', stability: 'measured', decisiveness: 'measured' } })
+    const measured = makeSensorium({ momentum: 0, pressure: 0.3, quality: { confidence: 'measured', momentum: 'measured', stability: 'measured', decisiveness: 'measured' } })
+    assert.equal(computeStrategy(noData).commitThreshold, 0.5, 'no-data → 无拖拽，基线 0.5')
+    assert.ok(
+      computeStrategy(measured).commitThreshold > computeStrategy(noData).commitThreshold,
+      '实测停滞（momentum=0 measured）才抬高 commit 门槛',
+    )
+  })
+
+  it('W4: no-data momentum 不判低效——即使数值巧合越过 0.8 阈值', () => {
+    // 防御未来上游改动：若 no-data 回退值从 0 改成别的，守卫兜住语义
+    const noData = makeSensorium({ momentum: 0.9, complexity: 0.5, quality: { confidence: 'measured', momentum: 'no-data', stability: 'measured', decisiveness: 'measured' } })
+    assert.equal(computeStrategy(noData).reasoningEffort, 'medium', 'no-data 不得作为降 effort 证据')
+    const measured = makeSensorium({ momentum: 0.9, complexity: 0.5, quality: { confidence: 'measured', momentum: 'measured', stability: 'measured', decisiveness: 'measured' } })
+    assert.equal(computeStrategy(measured).reasoningEffort, 'low', '实测高动量照常降档')
+  })
+
+  it('W4: quality 缺省语义 = measured（兼容旧构造点，行为不变）', () => {
+    const legacy = makeSensorium({ momentum: 0.9, complexity: 0.5 })
+    assert.equal(computeStrategy(legacy).reasoningEffort, 'low')
+  })
 })
 
 // ─── v3 decisiveness + verificationCoverage ────────────────────────

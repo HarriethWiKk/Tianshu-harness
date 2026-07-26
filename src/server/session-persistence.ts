@@ -2,13 +2,17 @@
  * File-backed durable store for desktop sessions (N1).
  *
  * Layout (one dir per session):
- *   <baseDir>/<id>/index.json   — latest SessionRecord snapshot
- *   <baseDir>/<id>/events.jsonl — append-only event log (one JSON per line)
+ *   <baseDir>/<id>/index.json         — latest SessionRecord snapshot
+ *   <baseDir>/<id>/events.jsonl       — append-only event log (one JSON per line)
+ *   <baseDir>/<id>/events.index.jsonl — sparse seq→byte-offset index (cold-path
+ *                                       pagination; missing/corrupt → rebuilt)
  *
  * Robustness contract (asserted by tests):
  *  - A corrupt/partial trailing line in events.jsonl is dropped, never throws.
  *  - A missing/corrupt index.json is reconstructed from the event tail.
  *  - seq never regresses: events are sorted and the max seq wins.
+ *  - The sparse index is advisory only: any validation failure falls back to a
+ *    full-log scan that rewrites the index (self-healing, one-time cost).
  */
 import {
   appendFileSync,
@@ -21,7 +25,7 @@ import {
   statSync,
   writeFileSync,
 } from 'node:fs'
-import { readFile } from 'node:fs/promises'
+import { open, readFile } from 'node:fs/promises'
 import { setImmediate as yieldToLoop } from 'node:timers/promises'
 import { join } from 'node:path'
 import { cpuPool } from '../workers/cpu-pool.js'
@@ -44,10 +48,18 @@ export class FileSessionPersistence implements SessionPersistenceAdapter {
    *  loss later resurfaces as "session interrupted, tool result lost"). The
    *  flush is one batched write() (not fsync); the threat model is process
    *  death, where page-cache contents survive. */
-  private eventBuffers = new Map<string, string[]>()
+  private eventBuffers = new Map<string, BufferedLine[]>()
   private flushTimer: ReturnType<typeof setTimeout> | null = null
   private static readonly FLUSH_INTERVAL_MS = 100
   private static readonly FLUSH_MAX_LINES = 50
+  /** 稀疏索引间距：每 ≥N 个事件在 events.index.jsonl 记一条 {seq, offset}。
+   *  进程重启会丢失"距上一条目多少事件"的计数（归零重数），只会拉大间距——
+   *  读路径唯一依赖的不变量是「相邻条目间 ≥ N 个事件」，间距变大不破坏正确性。 */
+  private static readonly INDEX_INTERVAL = 500
+  /** 单条区间读的 parse 走 cpuPool 的阈值（与 loadEventsAsync 同源策略）。 */
+  private static readonly INLINE_PARSE_MAX_BYTES = 256 * 1024
+  /** Per-session sparse-index write tracker（进程内状态；重启后 lazily 重建）。 */
+  private indexTracks = new Map<string, IndexTrack>()
   /** Hard cap per event JSON line — guard against runaway payloads (plan_draft
    *  content, large tool results) silently bloating events.jsonl. Exceeding
    *  events are replaced with a truncated stub that preserves seq/ts/type for
@@ -103,7 +115,7 @@ export class FileSessionPersistence implements SessionPersistenceAdapter {
       buf = []
       this.eventBuffers.set(sessionId, buf)
     }
-    buf.push(line)
+    buf.push({ line, seq: event.seq })
     if (
       FileSessionPersistence.CRITICAL_TYPES.has(event.type) ||
       buf.length >= FileSessionPersistence.FLUSH_MAX_LINES
@@ -122,13 +134,58 @@ export class FileSessionPersistence implements SessionPersistenceAdapter {
     const buf = this.eventBuffers.get(sessionId)
     if (!buf || buf.length === 0) return
     this.eventBuffers.set(sessionId, [])
+    let d: string
     try {
-      const d = this.ensureDir(sessionId)
-      appendFileSync(join(d, 'events.jsonl'), buf.join(''), 'utf8')
+      d = this.ensureDir(sessionId)
+      appendFileSync(join(d, 'events.jsonl'), buf.map((b) => b.line).join(''), 'utf8')
     } catch {
       // Re-queue on failure — better to retry than lose events.
       const existing = this.eventBuffers.get(sessionId) ?? []
       this.eventBuffers.set(sessionId, [...buf, ...existing])
+      return
+    }
+    // 稀疏索引推进（best-effort，绝不影响事件落盘的成功路径）。
+    try {
+      this.advanceSparseIndex(sessionId, d, buf)
+    } catch {
+      // 索引是纯加速层——写失败下次读走全量重建。
+      this.indexTracks.delete(sessionId)
+    }
+  }
+
+  /**
+   * 事件批成功落盘后推进稀疏索引：按写入字节数累计偏移，每 ≥INDEX_INTERVAL
+   * 个事件追加一条 {seq, offset} 到 events.index.jsonl。offset 指向该事件行
+   * 在 events.jsonl 中的起始字节。
+   */
+  private advanceSparseIndex(sessionId: string, dir: string, batch: BufferedLine[]): void {
+    let track = this.indexTracks.get(sessionId)
+    if (!track) {
+      // 惰性初始化：stat 在 append 之后 → 减去本批字节得到批前偏移。
+      let fileBytes = 0
+      try { fileBytes = statSync(join(dir, 'events.jsonl')).size } catch { fileBytes = 0 }
+      const batchBytes = batch.reduce((n, b) => n + Buffer.byteLength(b.line, 'utf8'), 0)
+      const preBytes = Math.max(0, fileBytes - batchBytes)
+      // 全新日志（批前为空）→ 首个事件立即记条目（offset 0，锚定磁盘最早 seq）。
+      // 已有日志（无论索引是否存在）→ 从 0 重数，只保证间距 ≥ INTERVAL；
+      // 头部无覆盖的旧日志由读路径整本重建自愈。
+      track = {
+        bytes: preBytes,
+        sinceEntry: preBytes === 0 ? FileSessionPersistence.INDEX_INTERVAL : 0,
+      }
+      this.indexTracks.set(sessionId, track)
+    }
+    const entryLines: string[] = []
+    for (const b of batch) {
+      track.sinceEntry++
+      if (track.sinceEntry > FileSessionPersistence.INDEX_INTERVAL) {
+        entryLines.push(JSON.stringify({ seq: b.seq, offset: track.bytes }))
+        track.sinceEntry = 1
+      }
+      track.bytes += Buffer.byteLength(b.line, 'utf8')
+    }
+    if (entryLines.length > 0) {
+      appendFileSync(join(dir, 'events.index.jsonl'), entryLines.join('\n') + '\n', 'utf8')
     }
   }
 
@@ -247,6 +304,126 @@ export class FileSessionPersistence implements SessionPersistenceAdapter {
   }
 
   /**
+   * 稀疏索引区间读（冷通道分页，Phase 2）：返回 seq < before 的尾部窗口，
+   * 至少 minCount 条（或到日志开头）。只读取覆盖窗口的字节区间、只 parse
+   * 该区间——大日志分页不再整本进内存。
+   *
+   * 索引缺失/损坏/校验不过（区间首行 seq 与索引条目不符）→ 整本扫描重建
+   * 索引并从全量切片（自愈，一次性成本；旧日志首次分页也走这条路补齐头部
+   * 条目）。events.jsonl 是 append-only（rewind 也只追加标记事件），索引
+   * 无需处理重写失效，只防外部损坏与崩溃截尾。
+   */
+  async loadEventsBefore(id: string, before: number, minCount: number): Promise<{
+    events: SessionEvent[]
+    /** true = 窗口起点即日志开头（无更早内容可扩）。 */
+    atLogStart: boolean
+    /** 磁盘日志最早 seq（空日志为 0）。 */
+    firstSeq: number
+  }> {
+    this.flushSession(id)
+    const dir = this.dir(id)
+    const entries = readIndexEntries(join(dir, 'events.index.jsonl'))
+    // 无可用索引 / 头部无覆盖（旧日志中途才开始记条目）→ 整本重建。
+    if (!entries || entries.length === 0 || entries[0]!.offset !== 0) {
+      return this.rebuildAndSlice(id, before, minCount)
+    }
+    // 定位窗口：endIdx = 首个 seq ≥ before 的条目（其 offset 为读取上界；
+    // 该条目之后的事件 seq 单调 ≥ before，不可能落入窗口）。
+    let endIdx = -1
+    for (let i = 0; i < entries.length; i++) {
+      if (entries[i]!.seq >= before) { endIdx = i; break }
+    }
+    const lastBelow = endIdx === -1 ? entries.length - 1 : endIdx - 1
+    if (lastBelow < 0) {
+      // before ≤ 磁盘最早 seq → 无更早页。
+      return { events: [], atLogStart: true, firstSeq: entries[0]!.seq }
+    }
+    // 相邻条目间 ≥ INDEX_INTERVAL 个事件 → 回看 ceil(minCount/INTERVAL) 个
+    // 条目即保证窗口内 seq < before 的事件 ≥ minCount（除非顶到日志开头）。
+    const lookback = Math.ceil(Math.max(1, minCount) / FileSessionPersistence.INDEX_INTERVAL)
+    const startIdx = Math.max(0, lastBelow - lookback)
+    const startOffset = entries[startIdx]!.offset
+    const endOffset = endIdx === -1 ? undefined : entries[endIdx]!.offset
+    const text = await readByteRange(join(dir, 'events.jsonl'), startOffset, endOffset)
+    if (text === null) return { events: [], atLogStart: true, firstSeq: 0 }
+    const parsed = await this.parseRegion(text)
+    // 校验：区间首个事件必须就是索引条目锚定的那个 seq——否则索引与文件
+    // 已漂移（外部改写/崩溃截尾后的偏移错位），整本重建。
+    if (parsed.length === 0 || parsed[0]!.seq !== entries[startIdx]!.seq) {
+      return this.rebuildAndSlice(id, before, minCount)
+    }
+    return {
+      events: parsed.filter((e) => e.seq < before),
+      atLogStart: startIdx === 0,
+      firstSeq: entries[0]!.seq,
+    }
+  }
+
+  /** 区间文本 parse：小区间内联，大区间走 cpuPool（与 loadEventsAsync 同策略）。 */
+  private async parseRegion(text: string): Promise<SessionEvent[]> {
+    if (!text) return []
+    if (text.length < FileSessionPersistence.INLINE_PARSE_MAX_BYTES) {
+      return parseEventsJsonlRaw(text) as SessionEvent[]
+    }
+    try {
+      return (await cpuPool.run('parseEventsJsonlRaw', [text])) as SessionEvent[]
+    } catch {
+      return chunkedParseEvents(text)
+    }
+  }
+
+  /**
+   * 索引不可用时的自愈路径：整本读取 + 逐行扫描重建 events.index.jsonl
+   * （tmp+rename 原子替换），并直接从全量结果切片返回。重建后写指针同步
+   * 到文件末尾，后续 append 无缝续写条目。
+   */
+  private async rebuildAndSlice(id: string, before: number, minCount: number): Promise<{
+    events: SessionEvent[]
+    atLogStart: boolean
+    firstSeq: number
+  }> {
+    const dir = this.dir(id)
+    const file = join(dir, 'events.jsonl')
+    let text: string
+    try {
+      text = await readFile(file, 'utf8')
+    } catch {
+      return { events: [], atLogStart: true, firstSeq: 0 }
+    }
+    const { events, entryLines, validCount } = await scanLogWithOffsets(text)
+    // 写回重建的索引（best-effort）+ 同步进程内写指针。
+    try {
+      const idx = join(dir, 'events.index.jsonl')
+      if (entryLines.length > 0) {
+        const tmp = idx + '.tmp'
+        writeFileSync(tmp, entryLines.join('\n') + '\n', 'utf8')
+        renameSync(tmp, idx)
+      } else {
+        rmSync(idx, { force: true })
+      }
+      this.indexTracks.set(id, {
+        bytes: Buffer.byteLength(text, 'utf8'),
+        // 上一条目落在 valid 行序号 floor((validCount-1)/N)*N（0 起）——
+        // 之后已写入 validCount-1-那个序号 个事件。
+        sinceEntry: validCount === 0
+          ? FileSessionPersistence.INDEX_INTERVAL
+          : validCount - Math.floor((validCount - 1) / FileSessionPersistence.INDEX_INTERVAL)
+            * FileSessionPersistence.INDEX_INTERVAL,
+      })
+    } catch {
+      this.indexTracks.delete(id)
+    }
+    const head = events.filter((e) => e.seq < before)
+    const keep = Math.max(1, minCount)
+    const start = Math.max(0, head.length - keep)
+    return {
+      events: head.slice(start),
+      atLogStart: start === 0,
+      firstSeq: events[0]?.seq ?? 0,
+    }
+  }
+
+  /**
    * On-disk byte size of every session, keyed by session id. Stat-based only
    * (file metadata, never reads contents) so surfacing storage usage in the UI
    * costs a handful of stat() calls — not a re-read of the (potentially huge)
@@ -275,6 +452,7 @@ export class FileSessionPersistence implements SessionPersistenceAdapter {
   deleteSession(id: string): void {
     this.flushSession(id)
     this.eventBuffers.delete(id)
+    this.indexTracks.delete(id)
     try { rmSync(this.dir(id), { recursive: true, force: true }) } catch { /* best-effort */ }
   }
 
@@ -356,6 +534,123 @@ export class FileSessionPersistence implements SessionPersistenceAdapter {
 
 function sanitize(id: string): string {
   return id.replace(/[^A-Za-z0-9._-]/g, '_')
+}
+
+/** 事件写缓冲行：flush 时既要行文本（落盘）也要 seq（稀疏索引条目）。 */
+interface BufferedLine {
+  line: string
+  seq: number
+}
+
+/** 进程内稀疏索引写指针：events.jsonl 当前字节长 + 距上一条目的事件数。 */
+interface IndexTrack {
+  bytes: number
+  sinceEntry: number
+}
+
+interface IndexEntry {
+  seq: number
+  offset: number
+}
+
+/**
+ * 读取并校验稀疏索引文件。任何结构异常（非法行、seq/offset 非严格递增）
+ * 都返回 null 触发整本重建——索引是纯加速层，宁可重建不可误导。
+ */
+function readIndexEntries(file: string): IndexEntry[] | null {
+  let text: string
+  try {
+    text = readFileSync(file, 'utf8')
+  } catch {
+    return null
+  }
+  const entries: IndexEntry[] = []
+  for (const raw of text.split('\n')) {
+    const trimmed = raw.trim()
+    if (!trimmed) continue
+    try {
+      const e = JSON.parse(trimmed) as IndexEntry
+      if (typeof e.seq !== 'number' || typeof e.offset !== 'number') return null
+      const prev = entries[entries.length - 1]
+      if (prev && (e.seq <= prev.seq || e.offset <= prev.offset)) return null
+      entries.push({ seq: e.seq, offset: e.offset })
+    } catch {
+      // 尾部截断行（崩溃窗口）可容忍——只有出现在中间才算结构损坏。
+      // 无法区分位置时保守处理：忽略并继续；递增校验兜底真正的错位。
+    }
+  }
+  return entries
+}
+
+/** 读取文件的 [start, end) 字节区间（end 省略 = 到 EOF）。失败返回 null。 */
+async function readByteRange(file: string, start: number, end?: number): Promise<string | null> {
+  let fh: Awaited<ReturnType<typeof open>>
+  try {
+    fh = await open(file, 'r')
+  } catch {
+    return null
+  }
+  try {
+    const size = (await fh.stat()).size
+    const stop = end === undefined ? size : Math.min(end, size)
+    const len = stop - start
+    if (len <= 0) return ''
+    const buf = Buffer.allocUnsafe(len)
+    await fh.read(buf, 0, len, start)
+    return buf.toString('utf8')
+  } catch {
+    return null
+  } finally {
+    await fh.close().catch(() => {})
+  }
+}
+
+/**
+ * 整本扫描：逐行 parse（分批 yield，防大日志饿死事件循环），同时按字节偏移
+ * 每 INDEX_INTERVAL 个有效行生成一条索引条目（有效行序号 0, N, 2N, …）。
+ * 损坏行跳过（与 parseEventsJsonlRaw 同语义），偏移按原始字节推进。
+ */
+async function scanLogWithOffsets(text: string): Promise<{
+  events: SessionEvent[]
+  entryLines: string[]
+  validCount: number
+}> {
+  const INTERVAL = 500
+  const BATCH = 2000
+  const lines = text.split('\n')
+  const events: SessionEvent[] = []
+  const entryLines: string[] = []
+  let offset = 0
+  let validCount = 0
+  for (let i = 0; i < lines.length; i += BATCH) {
+    if (i > 0) await yieldToLoop()
+    const end = Math.min(i + BATCH, lines.length)
+    for (let j = i; j < end; j++) {
+      const raw = lines[j]!
+      const lineBytes = Buffer.byteLength(raw, 'utf8') + (j < lines.length - 1 ? 1 : 0)
+      const trimmed = raw.trim()
+      if (trimmed) {
+        try {
+          const parsed = JSON.parse(trimmed) as SessionEvent
+          if (parsed && typeof parsed.seq === 'number' && typeof parsed.type === 'string') {
+            if (validCount % INTERVAL === 0) {
+              // 序号 0 的条目 offset 强制 0：即使日志首行损坏（崩溃残留），
+              // 从文件头读到的首个有效事件仍是该 seq——校验成立，且
+              // 「offset 0 = 头部有覆盖」的判定不会因损坏前缀反复触发重建。
+              entryLines.push(JSON.stringify({ seq: parsed.seq, offset: validCount === 0 ? 0 : offset }))
+            }
+            validCount++
+            events.push(parsed)
+          }
+        } catch {
+          // corrupt/partial line — drop it, keep the rest
+        }
+      }
+      offset += lineBytes
+    }
+  }
+  events.sort((a, b) => a.seq - b.seq)
+  return { events, entryLines, validCount }
 }
 
 /**

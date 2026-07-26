@@ -10,7 +10,8 @@
  */
 
 import { EnvHttpProxyAgent, setGlobalDispatcher } from 'undici'
-import { join } from 'path'
+import { join, resolve } from 'path'
+import { homedir } from 'os'
 import { randomUUID, createHash } from 'crypto'
 import { existsSync, mkdirSync, writeFileSync, readFileSync, readdirSync, statSync, rmSync } from 'fs'
 import { spawn } from 'child_process'
@@ -29,6 +30,7 @@ import { AgentLoop } from './agent/loop.js'
 import { createAgentConfig, createMainAgentConfigInput } from './agent/create-agent-config.js'
 import { SessionContext } from './agent/context.js'
 import { SessionPersist, evictOldSessions, getSessionDir } from './agent/session-persist.js'
+import { migrateSessionFiles } from './agent/session-cd.js'
 import { decideStartupSession, RESUME_FRESHNESS_MS } from './agent/session-recovery.js'
 import { runResumePreflightOai } from './context/resume-preflight.js'
 import { createWriteEvidenceProbe } from './context/write-evidence-probe.js'
@@ -712,6 +714,9 @@ export function createAgentRuntime(deps: {
   sharedProviderHealth?: ProviderHealthTracker
   /** I4: optional callback to surface user hook results to the desktop event stream. */
   emitHookResult?: import('./agent/loop-types.js').AgentConfig['emitHookResult']
+  /** /cd: previous PromptEngine whose frozen snapshots the new engine inherits
+   *  (keeps the historical prefix byte-stable across the cwd switch). */
+  inheritFrozenFrom?: import('./prompt/engine.js').PromptEngine
 }): { agent: AgentLoop } {
   const {
     provider, apiKey, auth, config, sessionId, cwd,
@@ -742,6 +747,7 @@ export function createAgentRuntime(deps: {
     toolDefinitions: toolRegistry.getDefinitions(),
     sessionMemoryBlock: persist.buildMemoryBlock(),
     auth,
+    inheritFrozenFrom: deps.inheritFrozenFrom,
   }))
 
   // Model capability cards
@@ -1346,25 +1352,25 @@ export interface SwitchModelResult {
   contextWindow?: number
 }
 
-/**
- * 跨 provider 查找并切换模型 —— 重建 AgentLoop（与 React main.tsx 的 useMemo 重建同构，
- * 不存在仅热换 client 的轻量路径）。成功时**原地更新** ctx 的 agent/provider/apiKey/auth，
- * 使所有持有 ctx 引用的闭包（onSubmit/onAbort）自动用上新 agent。
- *
- * session / persist / toolRegistry / refs / fileHistory 等全部复用，前缀缓存与历史不受影响。
- */
-export function switchAgentRuntime(ctx: BootstrapContext, modelId: string): SwitchModelResult {
-  // 切换前记录当前模型 id，供 JSONL 审计事件的 from 字段。
-  let fromModel: string | undefined
-  try { fromModel = ctx.agent.config.promptEngine.getModel() } catch { /* idle/未初始化 */ }
+/** 跨 provider 解析模型 + 凭证（switchAgentRuntime 与 resume 原模型恢复共用）。
+ *  模型不在任何 provider → null；找到但 API key 缺失 → { error }（oauth 免 key）；
+ *  命中且凭证就绪 → 完整解析（provider/apiKey/auth 已按目标 provider 摆正）。 */
+export interface ResolvedModelTarget {
+  provider: ProviderConfig
+  providerName: string
+  apiKey: string
+  auth: AuthProvider | undefined
+  modelId: string
+  alias?: string
+  contextWindow?: number
+}
+export function resolveProviderForModel(ctx: BootstrapContext, modelId: string): ResolvedModelTarget | { error: string } | null {
   for (const [provName, prov] of Object.entries(ctx.config.provider.providers)) {
     const found = prov.models.find(m => m.id === modelId || m.alias === modelId)
     if (!found) continue
-
     let provider = ctx.provider
     let apiKey = ctx.apiKey
     let auth = ctx.auth
-
     if (prov.auth?.type === 'oauth') {
       if (provName !== ctx.provider.name) {
         provider = prov
@@ -1376,7 +1382,7 @@ export function switchAgentRuntime(ctx: BootstrapContext, modelId: string): Swit
         try { return resolveApiKey(prov) } catch { return undefined }
       })()
       if (!provKey) {
-        return { ok: false, error: `API key not set for ${provName}. Set ${prov.apiKeyEnv ?? 'apiKey'} in config or environment.` }
+        return { error: `API key not set for ${provName}. Set ${prov.apiKeyEnv ?? 'apiKey'} in config or environment.` }
       }
       if (provName !== ctx.provider.name || provKey !== apiKey) {
         provider = prov
@@ -1384,13 +1390,35 @@ export function switchAgentRuntime(ctx: BootstrapContext, modelId: string): Swit
         auth = undefined
       }
     }
+    return { provider, providerName: provName, apiKey, auth, modelId: found.id, alias: found.alias, contextWindow: found.contextWindow }
+  }
+  return null
+}
 
-    // Wave K (P0 同源修复): createAgentRuntime 内部会 new DelegationCoordinator
+/**
+ * 跨 provider 查找并切换模型 —— 重建 AgentLoop（与 React main.tsx 的 useMemo 重建同构，
+ * 不存在仅热换 client 的轻量路径）。成功时**原地更新** ctx 的 agent/provider/apiKey/auth，
+ * 使所有持有 ctx 引用的闭包（onSubmit/onAbort）自动用上新 agent。
+ *
+ * session / persist / toolRegistry / refs / fileHistory 等全部复用，前缀缓存与历史不受影响。
+ */
+export function switchAgentRuntime(ctx: BootstrapContext, modelId: string): SwitchModelResult {
+  // 切换前记录当前模型 id，供 JSONL 审计事件的 from 字段。
+  let fromModel: string | undefined
+  try { fromModel = ctx.agent.config.promptEngine.getModel() } catch { /* idle/未初始化 */ }
+  const resolved = resolveProviderForModel(ctx, modelId)
+  if (!resolved) return { ok: false, error: `Model "${modelId}" not found in any provider.` }
+  if ('error' in resolved) return { ok: false, error: resolved.error }
+  const { provider, apiKey, auth, providerName: provName } = resolved
+
+  // Wave K (P0 同源修复): createAgentRuntime 内部会 new DelegationCoordinator
     // 写入 refs.coordinator，旧 coordinator 被覆盖但其 stallSweep 定时器与在途
     // worker AbortController 仍在持有句柄。TUI 单 session 进程 + switch 频率低，
     // 影响有限——但与 sidecar 同源 (serve.ts 已修)，一并对齐避免长会话切换密集
     // 场景累积泄漏。
     const oldCoordinator = ctx.refs.coordinator
+    // 旧 agent 的 fs.watch 句柄随丢弃释放（三条 switch 路径统一纪律）。
+    try { ctx.agent.stopFsWatcher() } catch { /* best-effort */ }
 
     const { agent } = createAgentRuntime({
       provider,
@@ -1405,7 +1433,7 @@ export function switchAgentRuntime(ctx: BootstrapContext, modelId: string): Swit
       fileHistory: ctx.fileHistory,
       refs: ctx.refs,
       domainKnowledgeStore: ctx.domainKnowledgeStore,
-      modelId: found.id,
+      modelId: resolved.modelId,
       session: ctx.session,
     })
 
@@ -1428,13 +1456,11 @@ export function switchAgentRuntime(ctx: BootstrapContext, modelId: string): Swit
     // 持久化切换：metadata.model/provider 反映当前模型（会话恢复/列表显示用），
     // 并在 JSONL 落一条审计事件（每次切换可溯源）。best-effort，不阻塞切换。
     try {
-      ctx.persist.updateMetadata({ model: found.id, provider: provName })
-      ctx.persist.appendModelSwitch({ from: fromModel, to: found.id, provider: provName })
+      ctx.persist.updateMetadata({ model: resolved.modelId, provider: provName })
+      ctx.persist.appendModelSwitch({ from: fromModel, to: resolved.modelId, provider: provName })
     } catch { /* persistence is best-effort — never block a model switch */ }
 
-    return { ok: true, modelName: found.alias ?? found.id, contextWindow: found.contextWindow }
-  }
-  return { ok: false, error: `Model "${modelId}" not found in any provider.` }
+    return { ok: true, modelName: resolved.alias ?? resolved.modelId, contextWindow: resolved.contextWindow }
 }
 
 export interface SwitchSessionResult {
@@ -1474,15 +1500,44 @@ export function switchAgentSession(ctx: BootstrapContext, targetId: string): Swi
     return { ok: false, error: '该会话属于其他工作目录,拒绝载入。' }
   }
 
+  // 缓存亲和（2026-07-25，对齐桌面 resumeRun 硬契约）：resume 切回目标会话记录的
+  // 原模型——旧语义「仅换身份、保留当前模型」（da015480 起）会把整段历史塞进
+  // 错误前缀全量重建（~10x 成本），事后再切回又烧一次。meta 无 model 记录（旧
+  // 会话）退回保留当前模型；原模型不可用走 agent.resumeFallbackModel 兜底（落
+  // 审计），无兜底 fail-closed——宁可拒绝续跑也不静默换前缀。重建前判定，失败零成本。
+  const originalModel = meta?.model
+  let resumeTarget: ResolvedModelTarget | null = null
+  let resumeFallbackUsed = false
+  if (originalModel) {
+    const hit = resolveProviderForModel(ctx, originalModel)
+    if (hit && !('error' in hit)) {
+      resumeTarget = hit
+    } else {
+      const fallbackId = ctx.config.agent?.resumeFallbackModel
+      const fb = fallbackId ? resolveProviderForModel(ctx, fallbackId) : null
+      if (fb && !('error' in fb)) {
+        resumeTarget = fb
+        resumeFallbackUsed = true
+      } else {
+        return {
+          ok: false,
+          error: `原模型 ${originalModel} 当前不可用，且未配置续跑兜底模型（agent.resumeFallbackModel）——请开新会话继续`,
+        }
+      }
+    }
+  }
+
   const rawMsgs = targetPersist.loadOai()
   const preflight = runResumePreflightOai(rawMsgs, { writeProbe: createWriteEvidenceProbe(ctx.cwd) })
 
-  // 仅换会话身份,保留当前模型。
+  // 目标会话无 model 记录（旧会话）时保留当前模型。
   let currentModelId: string | undefined
   try { currentModelId = ctx.agent.config.promptEngine.getModel() } catch { /* idle/未初始化 */ }
 
   // flush 旧会话的 volatile store(信息素),避免切换丢数据。
   try { ctx.agent.stigmergyStore.flushSync() } catch { /* best-effort */ }
+  // 旧 agent 的 fs.watch 句柄随丢弃释放（三条 switch 路径统一纪律）。
+  try { ctx.agent.stopFsWatcher() } catch { /* best-effort */ }
 
   const oldId = ctx.sessionId
   // Wave K (P0 同源修复): 与 switchAgentRuntime 同源——createAgentRuntime 会
@@ -1492,9 +1547,9 @@ export function switchAgentSession(ctx: BootstrapContext, targetId: string): Swi
 
   // 整体重建 AgentLoop —— 构造函数内部按 targetId 重建子系统并重挂持久化监听。
   const { agent } = createAgentRuntime({
-    provider: ctx.provider,
-    apiKey: ctx.apiKey,
-    auth: ctx.auth,
+    provider: resumeTarget?.provider ?? ctx.provider,
+    apiKey: resumeTarget?.apiKey ?? ctx.apiKey,
+    auth: resumeTarget ? resumeTarget.auth : ctx.auth,
     config: ctx.config,
     sessionId: targetId,
     cwd: ctx.cwd,
@@ -1504,7 +1559,7 @@ export function switchAgentSession(ctx: BootstrapContext, targetId: string): Swi
     fileHistory: ctx.fileHistory,
     refs: ctx.refs,
     domainKnowledgeStore: ctx.domainKnowledgeStore,
-    modelId: currentModelId,
+    modelId: resumeTarget?.modelId ?? currentModelId,
     session: ctx.session,
   })
 
@@ -1519,6 +1574,41 @@ export function switchAgentSession(ctx: BootstrapContext, targetId: string): Swi
   ctx.refs.getSessionVitals = () => agent.getSessionVitals()
   ctx.refs.getProblemAttackStore = () => agent.problemAttack
   ctx.refs.getAttackEvidenceVerifier = () => makeAttackEvidenceVerifier(agent)
+  // resume 换到原模型的 provider 时，后续切换/重建的基线凭证同步摆正
+  //（同 switchAgentRuntime 的原地更新纪律）。
+  if (resumeTarget) {
+    ctx.provider = resumeTarget.provider
+    ctx.apiKey = resumeTarget.apiKey
+    ctx.auth = resumeTarget.auth
+  }
+  // 兜底模型续跑：meta + JSONL 审计，对齐桌面 resume-fallback 语义。
+  if (resumeFallbackUsed && resumeTarget) {
+    try {
+      targetPersist.updateMetadata({ model: resumeTarget.modelId, provider: resumeTarget.providerName })
+      targetPersist.appendModelSwitch({ from: originalModel, to: resumeTarget.modelId, provider: resumeTarget.providerName })
+    } catch { /* best-effort */ }
+  }
+
+  // 星域恢复（2026-07-25）：resume 恢复原域，不重新路由——重路由落点与旧域
+  // 不同 = 前缀再碎一次。meta.domain 由 setSessionDomain/bindSessionDomain 变更
+  // 即写（shutdown 另有兜底）；无记录按配置默认钉定（defaultDomain 非 auto 时），
+  // auto 保持未钉定维持重路由语义。恢复失败不阻断会话切换。
+  try {
+    const configuredDefault = ctx.config.agent?.defaultDomain
+    const defaultPinned = configuredDefault && configuredDefault !== 'auto'
+      ? starDomainRegistry.get(configuredDefault)
+      : undefined
+    const restoredDomain = (meta?.domain ? starDomainRegistry.get(meta.domain) : undefined) ?? defaultPinned
+    if (restoredDomain) {
+      agent.setSessionDomain({
+        id: restoredDomain.id as import('./agent/star-domain.js').StarDomainId,
+        name: restoredDomain.name,
+        volatileBlock: restoredDomain.volatileBlock,
+        motto: restoredDomain.motto,
+        courageThreshold: restoredDomain.courageThreshold,
+      })
+    }
+  } catch { /* domain restore best-effort */ }
 
   // 同一身份判等防御：装配实际替换 coordinator 才关旧的。
   if (oldCoordinator && oldCoordinator !== ctx.refs.coordinator) {
@@ -1565,6 +1655,157 @@ export function restorePlanModeFromMeta(
   agent.enterPlanMode({ planFilePath: rel })
   return rel
 }
+
+// ── /cd：会话中途切换工作目录（保前缀缓存）──────────────────────
+
+export interface SwitchCwdResult {
+  ok: boolean
+  error?: string
+  from?: string
+  to?: string
+  /** 迁移到新 slug 目录的会话文件（相对名）。 */
+  movedFiles?: string[]
+}
+
+/**
+ * 运行时工作目录切换（TUI /cd）。与 switchAgentSession 同构——经
+ * createAgentRuntime 整体重建 AgentLoop，让 ~12 个构造期绑定 cwd 的子系统
+ * （工具执行/路径校验/hooks/persist/stigmergy/artifact/telemetry…）一次性
+ * 指向新目录，杜绝原地变异漏改。
+ *
+ * 缓存语义（与 /resume 的本质区别）：新 PromptEngine 经 inheritFrozenFrom
+ * 继承旧引擎的 frozen 快照 + T7 水位——历史 user 消息字节不变，前缀只在新
+ * user 边界断尾（同 /domain 切换代价），不是 /resume 的 byte-0 全 miss。
+ * 新边界的 volatile 块按新 cwd 重采（AGENTS.md/verify/project-memory 等），
+ * 对模型是诚实的。
+ *
+ * 会话归属：会话文件迁移到新 slug 目录（move 语义），meta.cwd/pointer/
+ * registry 同步——新项目的 /resume 与 --continue 从此看到本会话。
+ */
+export async function switchAgentCwd(ctx: BootstrapContext, target: string): Promise<SwitchCwdResult> {
+  // 1. 解析目标路径（~ 展开 + 相对当前 cwd）并校验。
+  const expanded = target.startsWith('~') ? target.replace(/^~(?=$|[\\/])/, homedir()) : target
+  const newCwd = resolve(ctx.cwd, expanded)
+  if (newCwd === ctx.cwd) {
+    return { ok: false, error: '已经在该目录中。' }
+  }
+  if (!existsSync(newCwd) || !statSync(newCwd).isDirectory()) {
+    return { ok: false, error: `目录不存在：${newCwd}` }
+  }
+  // 2. worker 存活守卫——worker 会话/artifact 绑定旧 cwd，切换会留孤儿。
+  if (ctx.refs.coordinator?.hasRunningWork()) {
+    return { ok: false, error: '仍有运行中的 worker，请先等待完成或用 /tasks 停止后再切换目录。' }
+  }
+  // 2b. plan mode 守卫——计划文件在旧项目 .rivet/plans/ 下（activePlanFilePath
+  //     是相对路径），切目录后新旧项目都找不对它。先 close/approve 再切换。
+  if (ctx.agent.getPlanModeState() !== 'off') {
+    return { ok: false, error: 'Plan Mode 进行中（计划文件属于当前项目）。请先 /plan-close 关闭或完成审批后再切换目录。' }
+  }
+
+  const oldCwd = ctx.cwd
+  const sessionId = ctx.sessionId
+
+  // 3. flush 旧会话信息素（写入旧路径后再迁移，次序不可换）+ drain 排队中的
+  //    异步持久化写（否则迁移后队列落盘会在旧路径重建出悬空 jsonl）。
+  try { ctx.agent.stigmergyStore.flushSync() } catch { /* best-effort */ }
+  try { await ctx.agent.drainPersistWrites() } catch { /* best-effort */ }
+
+  // 4. 迁移会话文件到新 slug 目录（失败则拒绝切换——半迁移比不切换更糟）。
+  let movedFiles: string[] = []
+  try {
+    movedFiles = migrateSessionFiles(sessionId, oldCwd, newCwd).moved
+  } catch (err) {
+    return { ok: false, error: `会话文件迁移失败: ${(err as Error).message}` }
+  }
+
+  // 5. 新 cwd 的 persist + 整体重建（新 volatile 快照、新工具/hooks cwd），
+  //    frozen 快照继承保历史前缀。模型保持不变。
+  let currentModelId: string | undefined
+  try { currentModelId = ctx.agent.config.promptEngine.getModel() } catch { /* idle/未初始化 */ }
+  const oldEngine = ctx.agent.config.promptEngine
+  const oldCoordinator = ctx.refs.coordinator
+  const newPersist = new SessionPersist(sessionId, newCwd)
+
+  const { agent } = createAgentRuntime({
+    provider: ctx.provider,
+    apiKey: ctx.apiKey,
+    auth: ctx.auth,
+    config: ctx.config,
+    sessionId,
+    cwd: newCwd,
+    toolRegistry: ctx.toolRegistry,
+    persist: newPersist,
+    claimStore: ctx.claimStore,
+    fileHistory: ctx.fileHistory,
+    refs: ctx.refs,
+    domainKnowledgeStore: ctx.domainKnowledgeStore,
+    modelId: currentModelId,
+    session: ctx.session,
+    inheritFrozenFrom: oldEngine,
+  })
+
+  // 6. 原地更新 ctx —— 持有 ctx 引用的闭包（onSubmit/handlerCtx）即时一致。
+  const oldAgent = ctx.agent
+  const oldLspManager = ctx.refs.lspManager
+  ctx.agent = agent
+  ctx.persist = newPersist
+  ctx.cwd = newCwd
+  ctx.refs.promptEngine = agent.config.promptEngine
+  ctx.refs.getTaskContract = () => agent.getTaskContract()
+  ctx.refs.getImpactedTests = () => [...agent.getEvidenceState().impactedTests]
+  ctx.refs.getSessionVitals = () => agent.getSessionVitals()
+  ctx.refs.getProblemAttackStore = () => agent.problemAttack
+  ctx.refs.getAttackEvidenceVerifier = () => makeAttackEvidenceVerifier(agent)
+
+  if (oldCoordinator && oldCoordinator !== ctx.refs.coordinator) {
+    try { oldCoordinator.shutdown() } catch { /* best-effort */ }
+  }
+  // 旧 agent 的 fs.watch 句柄随丢弃释放（/model、/resume 同款统一纪律）。
+  try { oldAgent.stopFsWatcher() } catch { /* best-effort */ }
+
+  // 7. 会话归属账本：meta.cwd（跨 cwd resume 守卫读它）+ pointer + registry。
+  try { newPersist.updateMetadata({ cwd: newCwd }) } catch { /* best-effort */ }
+  try { writeFileSync(lastSessionPointerFile(newCwd), sessionId) } catch { /* ignore */ }
+  try {
+    // 旧 pointer 若仍指向本会话则清除——旧项目 --continue 不应再找回它。
+    const oldPointer = lastSessionPointerFile(oldCwd)
+    if (existsSync(oldPointer) && readFileSync(oldPointer, 'utf-8').trim() === sessionId) {
+      rmSync(oldPointer, { force: true })
+    }
+  } catch { /* ignore */ }
+  try {
+    ctx.refs.sessionRegistry?.unregister(sessionId)
+    ctx.refs.sessionRegistry?.register(sessionId, newCwd)
+  } catch { /* registry best-effort */ }
+
+  // 8. LSP 按新 cwd 异步重建（复用启动路径的 re-attach + updateTools 模式），
+  //    旧 manager 的语言服务器进程即时释放；Meridian/domain knowledge 换新。
+  //    MCP 不动（进程级，配置来自启动 cwd——见设计文档「明确不做」）。
+  initializeLsp(newCwd, ctx.toolRegistry).then(lsp => {
+    ctx.refs.lspManager = lsp
+    agent.updateTools()
+  }).catch(() => {})
+  if (oldLspManager) {
+    try { oldLspManager.dispose() } catch { /* best-effort */ }
+  }
+  try {
+    ctx.meridianIndexer = new MeridianIndexer(newCwd)
+    ctx.refs.meridianIndexer = ctx.meridianIndexer
+  } catch { /* 索引器重建失败不阻断切换（repo 工具降级为空图） */ }
+  try {
+    ctx.domainKnowledgeStore = new DomainKnowledgeStore(join(newCwd, '.rivet', 'knowledge'))
+  } catch { /* best-effort */ }
+
+  // 9. 语义漂移护栏：提醒模型历史里的路径属于旧目录（functional 通道，
+  //    不占 discipline 额度、不被限流吞掉）。
+  ctx.session.appendSystemReminder(
+    `工作目录已从 ${oldCwd} 切换到 ${newCwd}。此前上下文中的文件路径、工具结果与 claim 均属于旧目录；后续操作请基于新目录。`,
+    'functional',
+  )
+
+  return { ok: true, from: oldCwd, to: newCwd, movedFiles }
+}
+
 
 // ── Aggregate Bootstrap ────────────────────────────────────────
 

@@ -338,6 +338,8 @@ export interface ToolPipelineDeps {
   onLeaveMark?: (mark: import('../tools/types.js').LeaveMarkInput) => void
   /** U6/C1: capture goal decomposition from plan_steps into the loop's PlanExecutionTrace. */
   onPlanSteps?: (steps: import('../tools/types.js').PlanStepInput[]) => void
+  /** 用户级验收面的声明与核销（todo 的 acceptance 字段 → loop）。 */
+  onAcceptance?: (items: import('../tools/types.js').AcceptanceItemInput[]) => void
   /** Write a constellation milestone when plan_close succeeds with apply=true. */
   onPlanClosed?: (input: import('../tools/types.js').PlanClosedInput) => void
   /** Notify the UI that a plan was submitted for approval so it can prompt the user. */
@@ -369,6 +371,8 @@ export interface ToolPipelineDeps {
   artifactStore?: import('../artifact/store.js').ArtifactStore
   /** Session-scoped background job registry — forwarded to bash / job tools. */
   jobs?: import('../tools/job-store.js').JobRegistry
+  /** Session-scoped monitor registry — forwarded to the monitor tool. */
+  monitors?: import('./monitor-registry.js').MonitorRegistry
   /** Immune system hook for recording repair success (failed→passed transitions) */
   immuneHook?: ImmuneHook
   /** Optional cache advisor for adaptive artifact thresholds */
@@ -740,6 +744,7 @@ export async function executeToolUse(
       : undefined,
     onLeaveMark: deps.onLeaveMark,
     onPlanSteps: deps.onPlanSteps,
+    onAcceptance: deps.onAcceptance,
     onPlanClosed: deps.onPlanClosed,
     onPlanSubmitted: deps.onPlanSubmitted,
     onAskUserQuestion: deps.onAskUserQuestion,
@@ -754,9 +759,11 @@ export async function executeToolUse(
     baselineHead: deps.ownershipLedger?.getBaselineHead(),
     artifactStore: deps.artifactStore,
     jobs: deps.jobs,
+    monitors: deps.monitors,
     prewarmCache: deps.prewarm,
     contextWindow: deps.config.contextWindow,
     providerProfile: deps.config.providerProfile,
+    readCapOverride: deps.config.readCapOverride,
     sessionTurnCount: deps.sessionTurnCount,
     sessionId: deps.config.sessionId,
     reviewDepth: deps.config.reviewDepth,

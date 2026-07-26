@@ -14,6 +14,8 @@ function mockRes(): ServerResponse & { chunks: string[]; ended: boolean; writabl
   const emitter = new EventEmitter()
   return Object.assign(emitter, {
     writeHead(_status: number, _headers?: Record<string, string>) {},
+    // b6ea4e94：SseStream 构造时 flushHeaders() 立即推送响应头（治骨架屏卡 6s）
+    flushHeaders() {},
     write(data: string) { chunks.push(data) },
     end() {
       ;(this as any).ended = true

@@ -32,16 +32,11 @@ export interface BrowserToolOptions {
   enabled?: boolean
 }
 
-/**
- * 导航结果 URL 前缀——desktop browser-mirror / walkthrough-recorder 靠此前缀
- * 提取当前页。改文案必须与消费方同步（用常量共享，禁止两边各自手抄）。
- */
-export const BROWSER_NAVIGATED_PREFIX = '已导航至'
-
-/**
- * 截图结果 URL 前缀——同上。尾随 ` → artifact <id>` 为结构标记，不译。
- */
-export const BROWSER_SCREENSHOT_OF_PREFIX = '截图于'
+// 导航/截图结果前缀已抽至 output-markers.ts（零依赖叶子，桌面端共享）；
+// 此处 re-export 保持内核调用方不变。
+export { BROWSER_NAVIGATED_PREFIX, BROWSER_SCREENSHOT_OF_PREFIX } from './output-markers.js'
+import { BROWSER_NAVIGATED_PREFIX, BROWSER_SCREENSHOT_OF_PREFIX } from './output-markers.js'
+import { PLAYWRIGHT_INSTALL_HINT } from './net/playwright-driver.js'
 
 /** Default allowlist: comma-separated hosts in RIVET_BROWSER_ALLOWLIST. */
 function envAllowlist(): string[] {
@@ -59,13 +54,13 @@ export function isHostAllowed(host: string, allowlist: string[]): boolean {
 
 async function playwrightDriver(): Promise<BrowserDriver> {
   // Dynamic specifier via a variable so tsc doesn't try to resolve the optional
-  // 'playwright' types at build time.
-  const specifier = 'playwright'
+  // 'playwright-core' types at build time.
+  const specifier = 'playwright-core'
   let mod: { chromium: { launch: (o: { headless: boolean }) => Promise<unknown> } }
   try {
     mod = (await import(specifier)) as never
   } catch {
-    throw new Error('未安装 Playwright。请运行 `npm i -D playwright && npx playwright install chromium`。')
+    throw new Error(`未安装 playwright-core。${PLAYWRIGHT_INSTALL_HINT}`)
   }
   const browser = (await mod.chromium.launch({ headless: true })) as {
     newPage: () => Promise<never>

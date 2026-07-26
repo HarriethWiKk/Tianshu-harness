@@ -50,6 +50,9 @@ const PILLAR_OF_AUTHORITY: Record<string, CouncilPillar> = {
   huagai: 'constraint',
   tianfu: 'constraint',
   tianliang: 'constraint',
+  // 七杀只减不加，是最纯粹的约束算子——同席「又给又砍」的禁令对它天然成立。
+  // 不进默认席位，仅在用户显式配置 qisha 席时按约束柱参与柱级检测。
+  qisha: 'constraint',
   // 平衡柱：合成裁决（唯一）
   yaoguang: 'balance',
 }

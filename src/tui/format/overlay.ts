@@ -20,6 +20,7 @@ import { formatTokenCount } from './spinner-status.js'
 import { formatAuthorityLabel } from './profile-labels.js'
 import type { TranscriptMessage } from '../scrollback-transcript.js'
 import type { ConnectView } from '../connect-flow.js'
+import type { InitView } from '../init-flow.js'
 import {
   frameTop as formatBorder,
   frameBottom as formatBottomBorder,
@@ -427,7 +428,9 @@ export function renderChronicle(data: ChronicleData, width: number, height: numb
     lines.push(padLine('', width, theme))
   }
 
-  lines.push(formatFooter(compactHints([['↑↓', '选择'], ['Enter', '恢复会话'], ['Esc', '关闭']]), width, theme, 'subtle'))
+  // footer 不再展示 Enter=恢复会话（2026-07-25）：恢复功能保留但不主动
+  // 展示——降低顺手回连带来的碎缓存风险。
+  lines.push(formatFooter(compactHints([['↑↓', '选择'], ['Esc', '关闭']]), width, theme, 'subtle'))
   lines.push(formatBottomBorder(width, theme, 'subtle'))
 
   return lines
@@ -446,6 +449,9 @@ export interface TasksWorkerRow {
   status: TasksWorkerStatus
   /** 最新活动行或终态摘要。 */
   activity?: string
+  /** 契约目标（`contract.objective`）——渲染为主行下的缩进子行。
+   *  与 activity 不同：activity 是「此刻在干什么」，objective 是「派他去干什么」。 */
+  objective?: string
   elapsedMs: number
   /** 累计工具调用次数（计数列；0 时省略）。 */
   toolUseCount?: number
@@ -715,6 +721,14 @@ export function renderTasks(
   const multiGroup = data.groups.length > 1
   const inner = width - 2
 
+  // objective 子行的纵向预算。body 在下方是 `slice(0, maxEntries)` 硬截断、
+  // 没有滚动——子行让每个 worker 占两行，屏幕矮时会把列表底部的 worker 整个
+  // 挤出可视区。宁可不显示 objective，也不能让 worker 消失，所以先按最坏情况
+  // （每个 worker 都有 objective）算总需求，装不下就整体降级回单行。
+  const workerTotal = data.groups.reduce((n, g) => n + g.workers.length, 0)
+  const totalRowsNeeded = data.groups.length + workerTotal * 2 + Math.max(0, data.groups.length - 1)
+  const showObjective = totalRowsNeeded <= maxEntries
+
   data.groups.forEach((g, gi) => {
     // 组头：进度条填充段用语义色（全过→success，有失败→warning，其余→primary）
     const barColor = g.total > 0 && g.done === g.total ? theme.success
@@ -758,6 +772,13 @@ export function renderTasks(
       const stats = color(statsPlain, theme.muted)
       const labelColored = w.status === 'running' ? label : color(label, theme.muted)
       body.push(`  ${unreadMark}${glyphColored} ${labelColored}  ${activity}  ${stats}`)
+
+      // objective 子行：缩进到 label 列下方。追加在主行**之后**，selectable
+      // 记录的 bodyIndex 仍指向主行，光标的 slice(3) 前缀替换不受影响。
+      if (showObjective && w.objective) {
+        const objText = w.objective.replace(/\s+/g, ' ').trim()
+        if (objText) body.push(`     ${color(fitDisplay(objText, Math.max(0, inner - 6)), theme.dim)}`)
+      }
     }
     // 组间空行（最后一组后不加）
     if (gi < data.groups.length - 1) body.push('')
@@ -1196,6 +1217,87 @@ export function renderConnect(data: ConnectOverlayData, width: number, height: n
   const footer = view.kind === 'choice'
     ? compactHints([['↑↓', '选择'], ['Enter', '确认'], ['Esc', '取消']])
     : compactHints([['Enter', '提交'], ['Esc', '取消']])
+  lines.push(formatFooter(footer, width, theme, 'subtle'))
+  lines.push(formatBottomBorder(width, theme, 'subtle'))
+  return lines
+}
+
+// ── Init Wizard (/init 交互式项目初始化) ──────────────────────
+// Single stateful overlay driven by InitFlow: multi-choice steps with checkbox
+// toggles (scope / details) and a confirm step listing files to be written.
+
+export interface InitOverlayData {
+  view: InitView
+  /** Validation error for the current step (shown in red). */
+  error?: string
+  /** Selected option index for multi-choice steps. */
+  selectedIndex: number
+}
+
+export function renderInitFlow(data: InitOverlayData, width: number, height: number, theme: RivetTheme): string[] {
+  const { view } = data
+  const lines: string[] = []
+  lines.push(formatBorder(width, theme, 'subtle'))
+  const titleBar = view.stepLabel ? `${view.title}   ${view.stepLabel}` : view.title
+  lines.push(formatTitleLeft(titleBar, width, theme))
+  lines.push(frameDivider(width, theme))
+
+  const innerWidth = width - 6
+  const contentRows = Math.max(1, height - 5)
+  let rowsUsed = 0
+  const push = (s: string): void => { lines.push(padLine(s, width, theme)); rowsUsed++ }
+
+  if (view.subtitle && rowsUsed < contentRows) {
+    for (const d of wrapToWidth(view.subtitle, innerWidth, 1)) {
+      if (rowsUsed >= contentRows) break
+      push(` ${color(d, theme.muted)}`)
+    }
+    if (rowsUsed < contentRows) push('')
+  }
+
+  if (view.kind === 'multi-choice') {
+    const options = view.options ?? []
+    for (let i = 0; i < options.length; i++) {
+      if (rowsUsed >= contentRows) break
+      const opt = options[i]!
+      const selected = i === data.selectedIndex
+      const cursor = selected ? color(CURSOR, theme.primary, { bold: true }) : ' '
+      const box = opt.checked ? color('☑', theme.success) : color('☐', theme.muted)
+      const star = opt.recommended ? color(' ★', theme.warning ?? theme.primary, { bold: true }) : ''
+      const labelColor = selected ? theme.primary : theme.secondary
+      const label = selected ? color(opt.label, labelColor, { bold: true }) : color(opt.label, labelColor)
+      push(` ${cursor} ${box} ${label}${star}`)
+      if (opt.description && rowsUsed < contentRows) {
+        for (const d of wrapToWidth(opt.description, innerWidth, 2)) {
+          if (rowsUsed >= contentRows) break
+          push(`     ${color(d, theme.muted)}`)
+        }
+      }
+    }
+  } else {
+    // confirm step: the file list about to be written.
+    for (const line of view.lines ?? []) {
+      if (rowsUsed >= contentRows) break
+      for (const d of wrapToWidth(line, innerWidth, 1)) {
+        if (rowsUsed >= contentRows) break
+        push(` ${color(d, theme.secondary)}`)
+      }
+    }
+  }
+
+  if (data.error && rowsUsed < contentRows) {
+    push('')
+    for (const d of wrapToWidth(data.error, innerWidth, 1)) {
+      if (rowsUsed >= contentRows) break
+      push(` ${color(d, theme.error ?? theme.primary)}`)
+    }
+  }
+
+  while (rowsUsed < contentRows) push('')
+
+  const footer = view.kind === 'multi-choice'
+    ? compactHints([['↑↓', '移动'], ['空格', '勾选'], ['Enter', '继续'], ['Esc', '取消']])
+    : compactHints([['Enter', '执行'], ['Esc', '取消']])
   lines.push(formatFooter(footer, width, theme, 'subtle'))
   lines.push(formatBottomBorder(width, theme, 'subtle'))
   return lines

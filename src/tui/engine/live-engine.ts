@@ -139,25 +139,23 @@ export class LiveEngine {
   /** 最近一次探针响应的光标行（恢复路径的爬升上限——绝不爬出视口顶）。 */
   private cprReportRow = 1
 
-  // ── 硬件光标驻停（2026-07-23 IME 锚定）─────────────────────────────
+  // ── 硬件光标驻停（2026-07-23 IME 锚定；2026-07-24 默认重开）─────────
   // 帧末把（默认隐藏的）硬件光标搬到输入框软件光标 █ 的坐标——终端 IME 候选窗
   // 锚定硬件光标，自绘 █ 它不可见。kimi-code pi-tui 同款机制（tui.ts
   // positionHardwareCursor），适配本引擎 cursor-resident 协议：
   // - parkedRowsUp：驻停点距区域末行的 display rows（无 caret 帧 = 0）。帧首
   //   爬升量必须减去它（光标不在末行尾而在 caret 行）。
   // - parkedCol：驻停放列（0-based cell）；null = 驻停末行尾（历史协议）。
-  // - RIVET_TUI_HARDWARE_CURSOR=1：驻停后 SHOW_CURSOR（个别终端光标可见才
-  //   跟踪 IME；默认隐藏保持单指针视觉，与 pi-tui 默认一致）。
+  // - 默认驻停但保持隐藏（单指针视觉）；RIVET_TUI_HARDWARE_CURSOR=1 仅控制
+  //   可见性（个别终端光标可见才跟踪 IME）。
+  // - CPR 防误判：响应按 probeParked（发针时 rowsUp）折算区域末行；若响应
+  //   到达时 rowsUp 已漂移（slash 面板开合等合法几何变化）→ 丢弃本次判定
+  //   （2026-07-24 重复行根修——dc572683 曾整体关闭 parking 兜底，此为正修）。
   private parkedRowsUp = 0
   private parkedCol: number | null = null
   /** 发 CPR 探针那一刻的驻停记账——响应按它折算区域末行，防 caret 移动误判污染。 */
   private probeParked: { rowsUp: number; col: number | null } | null = null
   private readonly hardwareCursorVisible = process.env.RIVET_TUI_HARDWARE_CURSOR === '1'
-
-  /** 有效的驻停行数：硬件光标不可见时不驻停，恢复 pre-IME 的帧末光标位置（末行尾）。 */
-  private effectiveParkedRowsUp(): number {
-    return this.hardwareCursorVisible ? this.parkedRowsUp : 0
-  }
 
   /** 探针最小间隔：渲染每帧都可能触发，防探针风暴。 */
   private static readonly CPR_PROBE_MIN_INTERVAL_MS = 1000
@@ -232,10 +230,15 @@ export class LiveEngine {
     // 不判污染也不更新基线，避免退出后用跨 alt screen 的基线误判。
     if (this.probeSuppressed) return
     this.cprReportRow = row
+    const probe = this.probeParked
+    // rowsUp 漂移丢弃（2026-07-24 重复行根修）：发针后几何合法变化（slash
+    // 面板开合/输入框增行）使 caret 之下行数改变，响应无法可靠折算区域末行
+    // ——既不判污染也不动基线（误判断曾触发恢复性全量重铺 = 输入框重复行）。
+    // rowsUp 稳定时按 FIFO 语义用发针时记账折算，判定与基线照常。
+    if (probe && probe.rowsUp !== this.parkedRowsUp) return
     // caret 驻停期间响应的是 caret 坐标：折算回区域末行再与基线比对
     //（发探针时的 parkedRowsUp 记账）；列比对只在驻停末行尾时进行——
     // caret 驻停下列随打字合法变化，比列会误报。
-    const probe = this.probeParked
     const regionEndRow = row + (probe?.rowsUp ?? 0)
     const compareCol = probe?.col == null
     // 区域未在屏上（clear/commit 途中）时只更新基线，不判污染。
@@ -376,7 +379,7 @@ export class LiveEngine {
       const newDisplayRows = this.countDisplayRows(bounded)
       let body: string
       if (this.hasRendered && this.lastDisplayRows > 0) {
-        const climb = Math.min(Math.max(0, this.lastDisplayRows - 1 - this.effectiveParkedRowsUp()), Math.max(0, this.cprReportRow - 1))
+        const climb = Math.min(Math.max(0, this.lastDisplayRows - 1 - this.parkedRowsUp), Math.max(0, this.cprReportRow - 1))
         body = (climb > 0 ? cursorUp(climb) : '') + '\r' + ANSI.ERASE_SCREEN_END + this.buildAppend(bounded)
       } else {
         body = this.buildAppend(bounded)
@@ -407,7 +410,7 @@ export class LiveEngine {
       // 行未变但 caret 移动（纯光标键）：不重绘文字，只把硬件光标搬到新坐标
       // （kimi-code pi-tui 同款——无变化帧也归位光标，几字节零闪烁）。
       // caret 消失（parking=null）的转移走常规路径收敛，不在此处理。
-      if (this.hardwareCursorVisible && parking) this.reparkIfChanged(parking)
+      if (parking) this.reparkIfChanged(parking)
       return
     }
 
@@ -450,7 +453,7 @@ export class LiveEngine {
 
     // 帧首爬升以驻停点为起点：硬件光标模式 caret 驻停时光标不在末行尾
     // （差 parkedRowsUp 行）；软件光标模式下光标始终在末行尾，parkedRowsUp=0。
-    const climbRows = prevDisplayRows - this.effectiveParkedRowsUp()
+    const climbRows = prevDisplayRows - this.parkedRowsUp
     const body = canDiff
       ? this.buildDiff(bounded, climbRows)
       : this.buildFullRewrite(bounded, climbRows)
@@ -473,16 +476,16 @@ export class LiveEngine {
     return { rowsUp, col: bounded[idx]!.caretCol! }
   }
 
-  /** 帧末驻停序列：末行尾 → caret 坐标；硬件光标不可见时不移动光标（恢复 pre-IME 稳态）。 */
+  /** 帧末驻停序列：末行尾 → caret 坐标（默认驻停但保持隐藏；env 仅控制可见性）。 */
   private buildParkSeq(parking: { rowsUp: number; col: number } | null): string {
-    // 软件光标（█ 字面渲染）不需要移动硬件光标；帧末保持 HIDE_CURSOR 即可。
-    if (!this.hardwareCursorVisible) return ANSI.HIDE_CURSOR
     let seq = ''
     if (parking) {
       if (parking.rowsUp > 0) seq += cursorUp(parking.rowsUp)
       seq += cursorToCol(parking.col + 1)
     }
-    seq += parking ? ANSI.SHOW_CURSOR : ANSI.HIDE_CURSOR
+    // 默认隐藏（定位不可见，单指针视觉）；RIVET_TUI_HARDWARE_CURSOR=1 时可见化——
+    // 个别终端光标可见才跟踪 IME。无 caret 帧显式 HIDE（防 stray 指针）。
+    if (this.hardwareCursorVisible) seq += parking ? ANSI.SHOW_CURSOR : ANSI.HIDE_CURSOR
     return seq
   }
 
@@ -623,7 +626,7 @@ export class LiveEngine {
   clear(): void {
     this.reconcileWidth()
     if (this.lastDisplayRows === 0) return
-    this.stdout.write(ANSI.HIDE_CURSOR + this.moveToTop(this.lastDisplayRows - this.effectiveParkedRowsUp()) + '\r' + ANSI.ERASE_SCREEN_END)
+    this.stdout.write(ANSI.HIDE_CURSOR + this.moveToTop(this.lastDisplayRows - this.parkedRowsUp) + '\r' + ANSI.ERASE_SCREEN_END)
     this.lastDisplayRows = 0
     this.lineCache = []
     this.setParked(null)

@@ -185,6 +185,21 @@ export function loadConfig(options?: {
     base = deepMerge(base, options.sessionOverlay)
   }
 
+  // Backfill missing provider names from the providers map key.
+  // Older config files or partial overrides may omit `name`; the schema
+  // requires it. Auto-populate so user configs stay forward-compatible.
+  const rawProvider = (base as Record<string, unknown>).provider as Record<string, unknown> | undefined
+  if (rawProvider) {
+    const providerMap = rawProvider.providers as Record<string, unknown> | undefined
+    if (providerMap && typeof providerMap === 'object') {
+      for (const [key, entry] of Object.entries(providerMap)) {
+        if (entry && typeof entry === 'object' && !(entry as Record<string, unknown>).name) {
+          (entry as Record<string, unknown>).name = key
+        }
+      }
+    }
+  }
+
   return configSchema.parse(base)
 }
 
@@ -582,9 +597,9 @@ export function setToolPresetConfig(input: { preset?: unknown }): ToolPresetConf
 // --- Default star domain (new-session initial domain + Auto keyword routing) ---
 
 export interface DefaultDomainConfigSnapshot {
-  /** 'auto' 或星域 id（tianshu / kaiyang / …）。 */
+  /** 'auto' 或星域 id（qiming / tianshu / kaiyang / …），默认 qiming。 */
   defaultDomain: string
-  /** Auto 是否按首条消息关键词匹配换域（未命中回退天枢）。 */
+  /** Auto 是否按首条消息关键词匹配换域（未命中回退天权）。 */
   domainKeywordRouting: boolean
 }
 
@@ -592,7 +607,7 @@ export interface DefaultDomainConfigSnapshot {
 export function getDefaultDomainConfig(): DefaultDomainConfigSnapshot {
   const cfg = loadConfig()
   return {
-    defaultDomain: cfg.agent.defaultDomain ?? 'auto',
+    defaultDomain: cfg.agent.defaultDomain ?? 'qiming',
     domainKeywordRouting: cfg.agent.domainKeywordRouting !== false,
   }
 }
@@ -621,7 +636,7 @@ export function setDefaultDomainConfig(input: { defaultDomain?: unknown; domainK
   }
   saveConfig(cfg)
   return {
-    defaultDomain: cfg.agent.defaultDomain ?? 'auto',
+    defaultDomain: cfg.agent.defaultDomain ?? 'qiming',
     domainKeywordRouting: cfg.agent.domainKeywordRouting !== false,
   }
 }

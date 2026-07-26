@@ -10,6 +10,7 @@ import { createReadOnlyWorkOrder } from '../work-order.js'
 import {
   runWorkerSession,
   detectApprovalDeadlock,
+  buildMaxTurnsExhaustedResult,
   HEADLESS_DENY_MARKER,
   type WorkerTranscript,
 } from '../worker-session.js'
@@ -239,6 +240,87 @@ describe('runWorkerSession', () => {
     assert.equal(run.result.status, 'passed', 'json-mode repair should recover to passed')
     assert.ok(sawResponseFormat, 'repair request must carry response_format: json_object')
     assert.equal(repairCallCount, 1, 'exactly one json-mode repair call')
+  })
+})
+
+describe('buildMaxTurnsExhaustedResult (2026-07-24 假 summary 事故)', () => {
+  // classifyInfraFailure (review-coordinator-deps.ts) 的 budget 分流正则——
+  // blocked summary 必须命中它，否则 review-router 会当瞬时故障重试（同预算必死）。
+  const BUDGET_CLASSIFIER_RE = /max.?turns|exhausted without a final turn/i
+
+  function makeOrder(id: string) {
+    return createReadOnlyWorkOrder({
+      id,
+      parentTurnId: 'turn_1',
+      kind: 'review',
+      profile: 'reviewer',
+      objective: 'Review the wiring of the plan approval chain.',
+      scope: {},
+    })
+  }
+
+  function exploringTranscript(toolCalls: number): WorkerTranscript {
+    return {
+      text: '',
+      thinking: '',
+      toolUses: Array.from({ length: toolCalls }, (_, i) => (i % 2 === 0 ? 'read_file' : 'grep')),
+      toolResults: [],
+      errors: [],
+      repairAttempts: 0,
+    }
+  }
+
+  it('终轮已产出合法报告 → 返回 null（soft-landing 成功，走正常路径）', () => {
+    const result = buildMaxTurnsExhaustedResult(makeOrder('wo_mt1'), exploringTranscript(8), validPacket('wo_mt1'), 12)
+    assert.equal(result, null)
+  })
+
+  it('纯探索散文 → 结构化 budget blocked，绝不进修复梯', () => {
+    const prose = '我需要检查提交的差异。先看 session-manager.ts 的 onToolResult……'
+    const result = buildMaxTurnsExhaustedResult(makeOrder('wo_mt2'), exploringTranscript(21), prose, 12)
+    assert.ok(result, 'expected a structured result')
+    assert.equal(result!.status, 'blocked')
+    assert.equal(result!.failureReason, 'max_turns')
+    assert.match(result!.summary, /max-turns: exhausted without a final turn/)
+    assert.match(result!.summary, /21 tool calls/)
+    assert.match(result!.summary, BUDGET_CLASSIFIER_RE)
+    // 半成品散文只作为 artifact 留痕，不进 summary（防"缺上下文"假象上桌）
+    const note = result!.artifacts.find(a => a.title === 'Max-turns worker partial output')
+    assert.ok(note, 'partial output preserved as artifact')
+    assert.match(note!.content, /session-manager/)
+  })
+
+  it('空输出 → blocked 且不附 partial artifact', () => {
+    const result = buildMaxTurnsExhaustedResult(makeOrder('wo_mt3'), exploringTranscript(3), '   ', 12)
+    assert.ok(result)
+    assert.equal(result!.status, 'blocked')
+    assert.equal(result!.failureReason, 'max_turns')
+    assert.equal(result!.artifacts.some(a => a.title === 'Max-turns worker partial output'), false)
+  })
+
+  it('半成品报告可字段级抢救 → findings 保留 + max_turns 标注（不丢工作成果）', () => {
+    // 一个 finding 的 "claim": 键名丢失 → 整体 JSON.parse 失败，但其余 finding 可独立抢救
+    const malformed = `{
+      "workOrderId": "wo_mt4",
+      "status": "passed",
+      "summary": "wiring 审查中间产物",
+      "findings": [
+        { "claim": "plan_submitted 事件断链", "evidence": "src/server/session-manager.ts:2101", "confidence": "high" },
+        { 缺键名的坏对象" }
+      ],
+      "artifacts": [],
+      "changedFiles": [],
+      "risks": [],
+      "nextActions": []
+    }`
+    const result = buildMaxTurnsExhaustedResult(makeOrder('wo_mt4'), exploringTranscript(15), malformed, 12)
+    assert.ok(result)
+    assert.equal(result!.failureReason, 'max_turns')
+    assert.ok(result!.findings.length >= 1, 'salvaged findings preserved')
+    assert.ok(
+      result!.risks.some(r => BUDGET_CLASSIFIER_RE.test(r)),
+      'budget marker present in risks for classifyInfraFailure routing',
+    )
   })
 })
 

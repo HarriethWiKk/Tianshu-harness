@@ -3,6 +3,7 @@ import type { CockpitSnapshot, Panel } from '../cockpit/types.js'
 import type { RewindData, RewindFile, RewindMode } from '../format/rewind.js'
 import type { HistorySearchData } from '../format/history-search.js'
 import type { ConnectCommit } from '../connect-flow.js'
+import type { InitCommit } from '../init-flow.js'
 
 export interface OverlayNavState {
   pagerPage: number
@@ -27,6 +28,7 @@ export interface OverlayNavState {
   choicePanelIndex: number
   planPickerIndex: number
   connectIndex: number
+  initIndex: number
   query: string
 }
 
@@ -54,7 +56,7 @@ export interface OverlayDataProviders {
  * TuiApp; this class only manages nav state / data providers / exec callbacks.
  */
 export class OverlayController {
-  private overlayNav: OverlayNavState = { pagerPage: 0, pagerMode: 'page', pagerSearchQuery: '', pagerSearchCurrent: 0, pagerSelectedMessage: 0, pagerVerbose: false, paletteIndex: 0, rewindIndex: 0, rewindPhase: 'list', rewindActionIndex: 0, historySearchIndex: 0, chronicleIndex: 0, tasksIndex: 0, tasksFilter: 'running', domainPickerIndex: 0, modelPickerIndex: 0, themePickerIndex: 0, choicePanelIndex: 0, planPickerIndex: 0, connectIndex: 0, query: '' }
+  private overlayNav: OverlayNavState = { pagerPage: 0, pagerMode: 'page', pagerSearchQuery: '', pagerSearchCurrent: 0, pagerSelectedMessage: 0, pagerVerbose: false, paletteIndex: 0, rewindIndex: 0, rewindPhase: 'list', rewindActionIndex: 0, historySearchIndex: 0, chronicleIndex: 0, tasksIndex: 0, tasksFilter: 'running', domainPickerIndex: 0, modelPickerIndex: 0, themePickerIndex: 0, choicePanelIndex: 0, planPickerIndex: 0, connectIndex: 0, initIndex: 0, query: '' }
   private overlayData?: OverlayDataProviders
   private paletteExec?: (index: number) => void
   private rewindExec?: (messageIndex: number, mode: RewindMode) => void
@@ -68,13 +70,14 @@ export class OverlayController {
   private choicePanelExec?: (id: string) => void
   private planPickerExec?: (slug: string) => void
   private connectExec?: (commit: ConnectCommit, summary: string) => void
+  private initExec?: (commit: InitCommit, summary: string) => void
   private cockpitPanel: Panel = 'summary'
 
   // ── nav state ──
   /** Direct mutable access to nav state object */
   nav(): OverlayNavState { return this.overlayNav }
   resetNav(): void {
-    this.overlayNav = { pagerPage: 0, pagerMode: 'page' as const, pagerSearchQuery: '', pagerSearchCurrent: 0, pagerSelectedMessage: 0, pagerVerbose: false, paletteIndex: 0, rewindIndex: 0, rewindPhase: 'list' as const, rewindActionIndex: 0, historySearchIndex: 0, chronicleIndex: 0, tasksIndex: 0, tasksFilter: 'running' as const, domainPickerIndex: 0, modelPickerIndex: 0, themePickerIndex: 0, choicePanelIndex: 0, planPickerIndex: 0, connectIndex: 0, query: '' }
+    this.overlayNav = { pagerPage: 0, pagerMode: 'page' as const, pagerSearchQuery: '', pagerSearchCurrent: 0, pagerSelectedMessage: 0, pagerVerbose: false, paletteIndex: 0, rewindIndex: 0, rewindPhase: 'list' as const, rewindActionIndex: 0, historySearchIndex: 0, chronicleIndex: 0, tasksIndex: 0, tasksFilter: 'running' as const, domainPickerIndex: 0, modelPickerIndex: 0, themePickerIndex: 0, choicePanelIndex: 0, planPickerIndex: 0, connectIndex: 0, initIndex: 0, query: '' }
   }
 
   get pagerPage(): number { return this.overlayNav.pagerPage }
@@ -152,6 +155,8 @@ export class OverlayController {
   setPlanPickerExec(fn: ((slug: string) => void) | undefined): void { this.planPickerExec = fn }
   getConnectExec(): ((commit: ConnectCommit, summary: string) => void) | undefined { return this.connectExec }
   setConnectExec(fn: ((commit: ConnectCommit, summary: string) => void) | undefined): void { this.connectExec = fn }
+  getInitExec(): ((commit: InitCommit, summary: string) => void) | undefined { return this.initExec }
+  setInitExec(fn: ((commit: InitCommit, summary: string) => void) | undefined): void { this.initExec = fn }
 
   // ── cockpit panel ──
   getCockpitPanel(): Panel { return this.cockpitPanel }

@@ -51,13 +51,12 @@ function legacyMessageToOaiMessages(message: Message): OaiMessage[] {
   return [assistant]
 }
 import type { SessionMetadata } from '../context/types.js'
-import type { LedgerSessionMemoryState, ResumePreflightReport, SessionMemoryEntry, SessionMemoryState } from '../context/types.js'
-import { runResumePreflight } from '../context/resume-preflight.js'
+import type { LedgerSessionMemoryState, SessionMemoryEntry, SessionMemoryState } from '../context/types.js'
 import { appendSessionMemory, buildSessionMemoryBlock, loadSessionMemory } from '../context/session-memory.js'
 import { ContextClaimStore } from '../context/claim-store.js'
 import type { ContextClaim } from '../context/claims.js'
 import { assertValidSessionId } from '../validation.js'
-import { appendChecksum, verifyAndExtract, verifyLines } from './checksum.js'
+import { appendChecksum, verifyLines } from './checksum.js'
 
 /** Re-export for backward compatibility — tests still import projectSlug from here. */
 export { projectSlug } from '../config/paths.js'
@@ -419,7 +418,7 @@ export class SessionPersist {
     const content = readFileSync(this.filePath, 'utf-8')
     const lines = content.trim().split('\n').filter(Boolean)
     
-    const { validLines, invalidCount, legacyCount } = verifyLines(lines)
+    const { validLines, invalidCount } = verifyLines(lines)
     
     // 记录校验失败（可选：写入日志或返回统计）
     if (invalidCount > 0) {

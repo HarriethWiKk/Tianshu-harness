@@ -17,6 +17,11 @@ describe('extractPlanPath', () => {
     assert.equal(path, 'docs/superpowers/plans/my-plan.md')
   })
 
+  it('finds .rivet/plans path (approved-plan kickoff route)', () => {
+    const path = extractPlanPath('开始执行已批准方案「X」(.rivet/plans/my-approved-plan.md)。')
+    assert.equal(path, '.rivet/plans/my-approved-plan.md')
+  })
+
   it('finds path in files array when objective has none', () => {
     const path = extractPlanPath('实现缓存预热', ['.rivet/knowledge/bar.md', 'src/foo.ts'])
     assert.equal(path, '.rivet/knowledge/bar.md')

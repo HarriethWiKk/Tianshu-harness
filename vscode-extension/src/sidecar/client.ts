@@ -62,8 +62,23 @@ export class SidecarClient {
     return this.request('POST', `/sessions/${encodeURIComponent(id)}/prompt`, { prompt, images })
   }
 
-  steer(id: string, text: string): Promise<{ queued: boolean }> {
-    return this.request('POST', `/sessions/${encodeURIComponent(id)}/steer`, { text })
+  /**
+   * T3 — 运行中插话。409（提交瞬间 run 恰好收束）返回 'idle' 而不抛错，
+   * 由调用方回退 /prompt 开新 turn——与桌面端 steerSession 同一约定，输入不丢。
+   */
+  async steer(id: string, text: string): Promise<'queued' | 'idle'> {
+    const res = await fetch(`${this.baseUrl}/sessions/${encodeURIComponent(id)}/steer`, {
+      method: 'POST',
+      headers: this.headers(),
+      body: JSON.stringify({ text }),
+    })
+    if (res.status === 409) return 'idle'
+    if (!res.ok) {
+      let detail = ''
+      try { detail = ((await res.json()) as { error?: string }).error ?? '' } catch { /* non-json */ }
+      throw new Error(`POST /sessions/${encodeURIComponent(id)}/steer → ${res.status}${detail ? `: ${detail}` : ''}`)
+    }
+    return 'queued'
   }
 
   abort(id: string): Promise<{ aborted: boolean }> {
@@ -170,6 +185,16 @@ export class SidecarClient {
       `/sessions/${encodeURIComponent(id)}/plans/${encodeURIComponent(slug)}/reject`,
       comment ? { comment } : {},
     )
+  }
+
+  /** Plan 编辑 — 仅 submitted 状态可改（server 侧 409 闸门），保存后调用方重拉 readPlan。 */
+  editPlan(id: string, slug: string, content: string): Promise<{ ok: boolean }> {
+    return this.request('PUT', `/sessions/${encodeURIComponent(id)}/plans/${encodeURIComponent(slug)}`, { content })
+  }
+
+  /** 手动进出 plan mode（state 驱动走 plan_mode SSE 事件回流，客户端不做本地臆测）。 */
+  setPlanMode(id: string, state: 'planning' | 'off'): Promise<unknown> {
+    return this.request('POST', `/sessions/${encodeURIComponent(id)}/plan-mode`, { state })
   }
 
   /** E4 — register / heartbeat client landing capabilities. */

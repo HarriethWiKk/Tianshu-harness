@@ -258,13 +258,13 @@ describe('/config/default-domain', () => {
     rmSync(home, { recursive: true, force: true })
   })
 
-  it('GET returns the defaults (auto + keyword routing on) with the domain list', async () => {
+  it('GET returns the defaults (qiming pinned + keyword routing on) with the domain list', async () => {
     writeConfig(home, {})
     const router = createRouter(buildConfigRoutes(TOKEN))
     const res = await router('GET', '/config/default-domain', {}, AUTH)
     assert.equal(res.status, 200)
     const body = res.body as { defaultDomain: string; domainKeywordRouting: boolean; domains: { id: string; name: string }[] }
-    assert.equal(body.defaultDomain, 'auto')
+    assert.equal(body.defaultDomain, 'qiming')
     assert.equal(body.domainKeywordRouting, true)
     assert.ok(body.domains.some(d => d.id === 'tianshu'), 'domain list includes tianshu')
     assert.ok(body.domains.some(d => d.id === 'kaiyang'), 'domain list includes kaiyang')

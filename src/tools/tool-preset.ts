@@ -11,9 +11,9 @@ import { defaultRivetHome } from '../config/paths.js'
  *   交付/plan/web_search/web_fetch。去掉编排（council/team）、browser 系、
  *   attack_case、semantic_search 等重而冷门的工具。
  * - **frontend（31）**：minimal + browser_debug（UI 渲染验证闭环）。
- * - **full（44）**：全集，含 attack_case/council/team/semantic_search/repo_graph/
+ * - **full（45）**：全集，含 attack_case/council/team/semantic_search/repo_graph/
  *   undo/recall_general/record_general_finding/ast_edit/related_tests/
- *   inspect_project/import_resource/leave_mark/browser_debug。
+ *   inspect_project/import_resource/leave_mark/browser_debug/monitor。
  *
  * 解析优先级：`RIVET_TOOL_PRESET` env > 项目 `.rivet-config.json` tools.preset
  * > 用户 `~/.rivet/config.json` tools.preset > 'minimal'。
@@ -97,6 +97,11 @@ const MINIMAL_EXCLUDES: ReadonlySet<string> = new Set([
   'file_info',
   'session_vitals',
   'update_goal',
+  // monitor 事件订阅（full 档专属——引导模型改干等为订阅的进阶能力）
+  'monitor',
+  // 整站爬取/发现（重 + 非常用；RIVET_WEB_CRAWL/RIVET_WEB_MAP=1 可单独强制开启）
+  'web_crawl',
+  'web_map',
 ])
 
 /** 判断某工具在给定档位下是否注册。 */

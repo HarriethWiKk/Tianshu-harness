@@ -1,55 +1,70 @@
 import type { Tool, ToolCallParams } from '../types.js'
-import { fetchCauseDetail } from '../../api/error-classifier.js'
-import { httpFetchGuarded, type HttpFetchDeps, type HttpFetchOptions } from '../net/http-fetch.js'
 import { SSRFError } from '../net/ssrf.js'
-import { decodeBody, extractMainContent, htmlToMarkdown } from './extract.js'
-import { fetchViaJina, isJinaQualityHeuristic } from './jina-fetch.js'
+import type { HttpFetchOptions } from '../net/http-fetch.js'
+import { MIN_SUBSTANTIAL_LENGTH } from './extract.js'
+import { fetchViaPlaywright, type RenderFetchResult } from './render-fetch.js'
+import { parseRenderActions, type RenderAction } from './render-actions.js'
+import { formatCacheAge } from './fetch-cache.js'
+import { fetchMarkdown, type FetchCoreDeps } from './fetch-core.js'
 
-export interface FetchDeps extends HttpFetchDeps {}
+export interface FetchDeps extends FetchCoreDeps {}
 export interface WebFetchOptions extends HttpFetchOptions {
   extractMainContent?: boolean
+  /** 本地 Playwright 渲染 SPA 降级层（默认关；需 chromium 可用，桌面端内置）。 */
+  enablePlaywright?: boolean
+  /** 渲染超时（默认 30s，独立于请求超时）。 */
+  renderTimeoutMs?: number
+  /** 渲染后额外等待（默认 0，SPA 水合用）。 */
+  renderWaitMs?: number
+  /** 缓存读取有效期（默认 2 天；0 = 禁读仍写）。 */
+  cacheMaxAgeMs?: number
 }
 
-const DEFAULT_TIMEOUT_MS = 15_000
-const DEFAULT_MAX_BYTES = 10_485_760
-const DEFAULT_MAX_REDIRECTS = 5
-const DEFAULT_USER_AGENT = 'Tianshu/1.0 (terminal coding agent)'
-const DEFAULT_EXTRACT_MAIN = true
-
-const BINARY_CONTENT_TYPE_PREFIXES = [
-  'image/',
-  'application/pdf',
-  'application/octet-stream',
-  'video/',
-  'audio/',
-  'font/',
-]
-
-/** HTTP 状态码会留在文案里并命中 classifyFailure 的 api_error 正则——结构字段先行。 */
-function httpApiErrorKind(status: number): 'api_error' | undefined {
-  if (status === 429 || status === 500 || status === 502 || status === 503) return 'api_error'
-  return undefined
+/** actions 直达渲染路径的输出组装：动作摘要进 via，execute_js 返回与失败警告附尾部。 */
+function formatRenderedOutput(rawUrl: string, rendered: RenderFetchResult): string {
+  const results = rendered.actionResults ?? []
+  const failedIdx = results.findIndex((r) => !r.ok)
+  const note = results.length > 0
+    ? `，${results.length} 个动作${failedIdx >= 0 ? `，第 ${failedIdx + 1} 步失败` : ''}`
+    : ''
+  let out = `URL：${rawUrl}\n状态：本地渲染\n内容长度：${rendered.markdown.length}（经 Playwright 渲染${note}）\n\n${rendered.markdown}`
+  const jsResults = results.filter((r) => r.type === 'execute_js' && r.ok && r.detail)
+  if (jsResults.length > 0) {
+    out += `\n\n---\nexecute_js 返回：\n${jsResults.map((r, i) => `[${i + 1}] ${r.detail}`).join('\n')}`
+  }
+  if (failedIdx >= 0) {
+    const failed = results[failedIdx]!
+    out += `\n\n⚠ 动作第 ${failedIdx + 1} 步（${failed.type}）失败：${failed.detail}——以上为先前已渲染的页面内容`
+  }
+  return out
 }
 
-// No explicit `fetch` here: leaving it undefined lets httpFetchGuarded use the
-// real (undici) global fetch AND engage connection pinning against DNS
-// rebinding. `lookup` also defaults inside httpFetchGuarded to node:dns.
 const defaultDeps: FetchDeps = {}
 
 export function createWebFetchTool(deps: FetchDeps = defaultDeps, opts: WebFetchOptions = {}): Tool {
-  const options = {
-    timeoutMs: opts.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-    maxResponseBytes: opts.maxResponseBytes ?? DEFAULT_MAX_BYTES,
-    maxRedirects: opts.maxRedirects ?? DEFAULT_MAX_REDIRECTS,
-    userAgent: opts.userAgent ?? DEFAULT_USER_AGENT,
-  }
-  const extractMainContentEnabled = opts.extractMainContent ?? DEFAULT_EXTRACT_MAIN
+  const extractMainContentEnabled = opts.extractMainContent ?? true
+
+  // actions 直达渲染用的闭包（带动作参数）；常规降级链由 fetch-core 内核驱动。
+  const renderFetchWithActions =
+    deps.renderFetch ??
+    (opts.enablePlaywright
+      ? (url: string, actions?: RenderAction[]) =>
+          fetchViaPlaywright(url, {
+            timeoutMs: opts.renderTimeoutMs,
+            waitMs: opts.renderWaitMs,
+            actions,
+            lookup: deps.lookup,
+            extractMainContent: extractMainContentEnabled,
+          })
+      : undefined)
 
   return {
     definition: {
       name: 'web_fetch',
       description: `抓取 URL 内容并以文本返回。适合阅读文档、API 参考或 issue 页面。
 		返回转换为纯文本的页面内容（已剥离 HTML 标签）。内容截断至约 50K 字符。
+		本地提取质量差时自动用本地浏览器渲染（SPA 页面）或 Jina Reader 兜底；重复抓取走缓存。
+		可选 actions：在渲染页面中按序交互（点击/输入/滚动/等待/执行 JS），用于登录墙、无限滚动、Tab 内容——需启用 Playwright。
 		因发起网络请求，需要用户审批。`,
       input_schema: {
         type: 'object',
@@ -57,6 +72,24 @@ export function createWebFetchTool(deps: FetchDeps = defaultDeps, opts: WebFetch
           url: {
             type: 'string',
             description: '要抓取的 URL',
+          },
+          actions: {
+            type: 'array',
+            description: '渲染后按序执行的交互动作（≤50 步，wait 总时长 ≤60s）。仅 Playwright 渲染可用时生效。',
+            items: {
+              type: 'object',
+              properties: {
+                type: { type: 'string', enum: ['wait', 'click', 'write', 'press', 'scroll', 'execute_js'] },
+                ms: { type: 'number', description: 'wait：等待毫秒数' },
+                selector: { type: 'string', description: '目标元素 CSS 选择器（wait/click/write/press/scroll）' },
+                all: { type: 'boolean', description: 'click：点击所有匹配元素（默认 false 只点第一个）' },
+                text: { type: 'string', description: 'write：要填入的文本' },
+                key: { type: 'string', description: 'press：按键名（如 Enter/Tab/Escape）' },
+                direction: { type: 'string', enum: ['down', 'up', 'top', 'bottom'], description: 'scroll：滚动方向（默认 down）' },
+                script: { type: 'string', description: 'execute_js：在页面上下文执行的 JS 表达式，返回值随结果返回' },
+              },
+              required: ['type'],
+            },
           },
         },
         required: ['url'],
@@ -66,68 +99,52 @@ export function createWebFetchTool(deps: FetchDeps = defaultDeps, opts: WebFetch
     async execute(params: ToolCallParams) {
       const rawUrl = params.input.url as string
 
-      let url: URL
-      try {
-        url = new URL(rawUrl)
-      } catch {
-        return { content: `无效 URL：${rawUrl}`, isError: true }
-      }
-
-      if (url.protocol !== 'http:' && url.protocol !== 'https:') {
-        return { content: `不支持的协议：${url.protocol}。仅允许 http 和 https。`, isError: true }
-      }
-
-      try {
-        const { status, contentType, bytes } = await httpFetchGuarded(rawUrl, deps, options)
-
-        if (status >= 400) {
-          const errorKind = httpApiErrorKind(status)
-          return {
-            content: `HTTP ${status}：${rawUrl}`,
-            isError: true,
-            ...(errorKind ? { errorKind } : {}),
-          }
+      // actions 校验（≤50 步、wait 总长 ≤60s）——任何一步非法整体拒绝，不启动渲染
+      let actions: RenderAction[] | undefined
+      if (params.input.actions !== undefined) {
+        const parsed = parseRenderActions(params.input.actions)
+        if ('error' in parsed) {
+          return { content: `actions 校验失败：${parsed.error}`, isError: true }
         }
+        actions = parsed.actions
+      }
 
-        const contentTypeLower = contentType.toLowerCase()
-        if (BINARY_CONTENT_TYPE_PREFIXES.some(prefix => contentTypeLower.includes(prefix))) {
+      // 动作序列只能跑在渲染路径——跳过直连/turndown 层，直达渲染；禁读禁写缓存
+      if (actions !== undefined) {
+        if (!renderFetchWithActions) {
           return {
-            content: `二进制内容（${contentType}）不会以文本返回。请使用 import_resource 下载此 URL。`,
+            content: `actions 需要启用 Playwright 渲染（config fetch.enablePlaywright，或桌面端内置 chromium）。`,
             isError: true,
           }
         }
-
-        const body = decodeBody(bytes, contentType)
-
-        let content: string
-        let via: string = ''
-        if (contentTypeLower.includes('text/html')) {
-          const html = extractMainContentEnabled ? extractMainContent(body) : body
-          content = await htmlToMarkdown(html)
-          // Quality heuristic: if local extraction looks bad (short, JS-only page),
-          // fall back to Jina Reader which server-renders + strips noise.
-          if (isJinaQualityHeuristic(content)) {
-            const jinaResult = await fetchViaJina(rawUrl, deps, options)
-            if (jinaResult) {
-              content = jinaResult.markdown
-              via = '（经 Jina Reader）'
-            }
+        try {
+          const rendered = await renderFetchWithActions(rawUrl, actions)
+          if (!rendered || rendered.markdown.trim().length < MIN_SUBSTANTIAL_LENGTH) {
+            return { content: `渲染失败或动作后内容过薄：${rawUrl}`, isError: true }
           }
-        } else {
-          content = body
+          return { content: formatRenderedOutput(rawUrl, rendered) }
+        } catch (err) {
+          if (err instanceof SSRFError) {
+            return { content: err.message, isError: true }
+          }
+          const message = err instanceof Error ? err.message : String(err)
+          return { content: `渲染失败 ${rawUrl}：${message}`, isError: true }
         }
-
-        return { content: `URL：${rawUrl}\n状态：${status}\n内容长度：${bytes.length}${via}\n\n${content}` }
-      } catch (err) {
-        if (err instanceof SSRFError) {
-          return { content: err.message, isError: true }
-        }
-        const message = err instanceof Error ? err.message : String(err)
-        const detail = fetchCauseDetail(err)
-        const full = detail ? `${message}: ${detail}` : message
-        // 外部错误文本可能仍含 timeout/ECONNRESET 等英文模式——中文前缀+变量，可不打标。
-        return { content: `抓取失败 ${rawUrl}：${full}`, isError: true }
       }
+
+      // 常规路径：共享内核（缓存 → 直连 → 渲染 → Jina）
+      const outcome = await fetchMarkdown(rawUrl, deps, { ...opts, cwd: params.cwd })
+      if (!outcome.ok) {
+        return {
+          content: outcome.error,
+          isError: true,
+          ...(outcome.errorKind ? { errorKind: outcome.errorKind } : {}),
+        }
+      }
+      const header = outcome.fromCache
+        ? `URL：${rawUrl}\n状态：${outcome.status}（缓存，${formatCacheAge(outcome.fetchedAt!)}前抓取${outcome.via}）\n内容长度：${outcome.markdown.length}`
+        : `URL：${rawUrl}\n状态：${outcome.status}\n内容长度：${outcome.rawBytes}${outcome.via}`
+      return { content: `${header}\n\n${outcome.markdown}` }
     },
 
     requiresApproval: () => true,

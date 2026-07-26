@@ -27,10 +27,41 @@ import type { TuiPerfMonitor, TuiPerfSummary } from './perf-monitor.js'
 import { ToolGroupController } from './tool-group-controller.js'
 import { OverlayController } from './overlay-controller.js'
 import { ApprovalIntentController } from './approval-intent-controller.js'
+import { execSync } from 'node:child_process'
 import { MetricsGlanceController } from './metrics-glance-controller.js'
 import { StreamRenderController } from './stream-render-controller.js'
 import { InputController } from './input-controller.js'
-import { ANSI, color, fg, bg, QUERY_CURSOR_POS } from './ansi.js'
+import { ANSI, color, fg, bg, QUERY_CURSOR_POS, osc52Clipboard } from './ansi.js'
+
+/**
+ * 物理 OS 系统剪贴板 + OSC 52 双轨写入 helper
+ */
+export function writeToOSClipboard(text: string, stdout?: NodeJS.WriteStream): boolean {
+  if (!text) return false
+  if (stdout) {
+    stdout.write(osc52Clipboard(text))
+  }
+  try {
+    if (process.platform === 'darwin') {
+      execSync('pbcopy', { input: text, timeout: 2000, stdio: ['pipe', 'ignore', 'ignore'] })
+      return true
+    } else if (process.platform === 'win32') {
+      execSync('clip', { input: text, timeout: 2000, stdio: ['pipe', 'ignore', 'ignore'] })
+      return true
+    } else if (process.platform === 'linux') {
+      try {
+        execSync('xclip -selection clipboard', { input: text, timeout: 2000, stdio: ['pipe', 'ignore', 'ignore'] })
+        return true
+      } catch {
+        execSync('xsel --clipboard --input', { input: text, timeout: 2000, stdio: ['pipe', 'ignore', 'ignore'] })
+        return true
+      }
+    }
+  } catch {
+    // 允许 fallback 至 OSC 52
+  }
+  return true
+}
 import type { CacheStatus } from '../status-types.js'
 import { debugLog } from '../../utils/debug.js'
 import { BlockStreamWriter } from '../block-stream-writer.js'
@@ -46,6 +77,7 @@ import { formatPermissionDiff } from '../format/permission-diff.js'
 import { formatApprovalPrompt } from '../format/approval-renderers.js'
 import { formatThinking } from '../format/thinking.js'
 import { formatGlanceBar, resolveStarDomainDisplay, formatGlanceLeft, formatGlanceRight, formatPermissionModeLine } from '../format/glance-bar.js'
+import { remainingSec, shouldFire } from '../plan-auto-approve.js'
 import { STAR_DOMAINS } from '../../agent/star-domain.js'
 import { starDomainRegistry } from '../../agent/star-domain-registry.js'
 import { formatTaskList, shouldShowTaskPanel } from '../format/task-list.js'
@@ -53,6 +85,7 @@ import { formatContextHints } from '../format/context-hints.js'
 import type { TodoItem } from '../../tools/todo-store.js'
 import { formatTeamPanel } from '../format/team-panel.js'
 import { formatWorkerFleet, formatWorkerFleetSettled } from '../format/worker-fleet.js'
+import { formatWorkerDispatchCard } from '../format/worker-dispatch-card.js'
 import { decodeTeamPanelModel, overlayFleetStatus, TEAM_PANEL_UI_PREFIX, type TeamPanelModel } from '../team-panel-model.js'
 import { buildWorkerDetailContent } from '../worker-detail.js'
 import { renderSidePanel, resolveSidePanelWidth, SIDE_PANEL_MIN_COLUMNS, type SidePanelInput } from '../side-panel.js'
@@ -71,16 +104,20 @@ import {
   isDelegationTool,
 } from '../format/tool-domain.js'
 import { formatSpinnerStatus, formatTurnWorkSummary } from '../format/spinner-status.js'
-import { formatSlashHint, slashCompletionTarget, filterSlashCommands, type SlashHintEntry } from '../format/slash-hint.js'
+import { formatSlashHint, slashCompletionTarget, filterSlashCommands, slashArgsHint, type SlashHintEntry } from '../format/slash-hint.js'
 import { extractAtToken, getCompletions, applyCompletion } from '../file-completer.js'
 import stringWidth from 'string-width'
 import { resolve } from 'node:path'
+import { existsSync } from 'node:fs'
+import { parseMentions } from '../mention-parser.js'
+import { parseMissionDraft, shouldPreviewContract, formatContractPreview, type MissionDraft } from '../mission-draft.js'
 import { truncateToDisplayWidth, displayWidth, ambiguousWideEnabled } from '../width.js'
 import { useAsciiBorders } from '../term-caps.js'
 import { appendHistoryAsync, nextHistoryAfterSubmit } from '../history.js'
-import { renderPager, renderStarmap, renderCommandPalette, renderChronicle, renderTasks, renderDomainPicker, renderModelPicker, renderThemePicker, renderChoicePanel, renderPlanPicker, renderConnect } from '../format/overlay.js'
-import type { PagerData, StarmapData, PaletteData, ChronicleData, TasksData, TasksGroup, TasksWorkerRow, DomainPickerData, ModelPickerData, ThemePickerData, ChoicePanelData, PlanPickerData, ChoiceEntry, ConnectOverlayData } from '../format/overlay.js'
+import { renderPager, renderStarmap, renderCommandPalette, renderChronicle, renderTasks, renderDomainPicker, renderModelPicker, renderThemePicker, renderChoicePanel, renderPlanPicker, renderConnect, renderInitFlow } from '../format/overlay.js'
+import type { PagerData, StarmapData, PaletteData, ChronicleData, TasksData, TasksGroup, TasksWorkerRow, DomainPickerData, ModelPickerData, ThemePickerData, ChoicePanelData, PlanPickerData, ChoiceEntry, ConnectOverlayData, InitOverlayData } from '../format/overlay.js'
 import { ConnectFlow, type ConnectCommit, type ConnectStepResult } from '../connect-flow.js'
+import { InitFlow, probeInitFlowInput, type InitCommit, type InitStepResult } from '../init-flow.js'
 import { parseScrollbackTranscript, searchTranscript, findNextMatch, findPrevMatch } from '../scrollback-transcript.js'
 import { renderCockpit } from '../format/cockpit.js'
 import type { CockpitSnapshot, Panel } from '../cockpit/types.js'
@@ -358,6 +395,9 @@ export class TuiApp {
   private connectFlow?: ConnectFlow
   private connectInput = ''
   private connectError?: string
+  /** /init 交互式初始化向导：无头状态机 + 当前步校验错误。 */
+  private initFlow?: InitFlow
+  private initError?: string
   /** W-B4: approval + intent pending state manager */
   private approvalIntentController = new ApprovalIntentController()
   /** 并行子代理舰队读模型（由 onDelegationActivity 事件流驱动） */
@@ -376,6 +416,9 @@ export class TuiApp {
   private workerKill: ((workerId: string) => boolean) | null = null
   /** worker 消息镜像（切入视图的实时消息 tail 数据源，cap 50/worker）。 */
   private mirror = new WorkerMirrorStore()
+  /** 已打过派发契约卡的 worker。不能用 `prev === undefined` 代替——contract
+   *  理论上可能晚于该 worker 的首条事件到达，那样就永远补不上卡。 */
+  private dispatchCardShown = new Set<string>()
   /** 当前切入查看的 worker（CC teammate 视图对标）；null 表示主视图。 */
   private viewingWorkerId: string | null = null
   /** 输入直达 worker 的回调（main.ts 接线到 coordinator.steerWorker）。
@@ -445,6 +488,61 @@ export class TuiApp {
   pendingPlanApproval: PlanSubmittedInfo | undefined = undefined
   /** 待审批计划正文预览摘要（开面板时一次性提取；随面板关闭/重开更新）。 */
   planApprovalExcerpt: string | undefined = undefined
+  /** Goal 计划倒计时自动批准（2026-07-24，与 sidecar 同语义）：
+   *  goal 激活 + 计划提交 → 武装；到期守卫复核通过 → onPlanAutoApproveFire；
+   *  用户任何参与（批准/驳回/写反馈/新提交/主动 abort）即取消；
+   *  Esc 收起面板不取消——倒计时退到 GlanceBar 徽章继续走。 */
+  private planAutoApproveTimer: ReturnType<typeof setTimeout> | null = null
+  private planAutoApproveTick: ReturnType<typeof setInterval> | null = null
+  planAutoApproveSlug: string | undefined = undefined
+  planAutoApproveDeadlineMs: number | undefined = undefined
+  /** 到期触发回调（main.ts 装配：approvePlanAndKickoff + 通知）。 */
+  onPlanAutoApproveFire?: (slug: string) => void
+  /** 触发守卫探针（main.ts 装配：idle/goalActive/planStillSubmitted）。 */
+  planAutoApproveGuardsProvider?: () => { idle: boolean; goalActive: boolean; planStillSubmitted: boolean }
+
+  /** 武装倒计时（重复武装 = supersede 旧定时器）。 */
+  armPlanAutoApprove(slug: string, delayMs: number): void {
+    this.cancelPlanAutoApprove()
+    this.planAutoApproveSlug = slug
+    this.planAutoApproveDeadlineMs = Date.now() + delayMs
+    // 1s tick 驱动 overlay caption 与 GlanceBar 徽章的倒计时重绘
+    this.planAutoApproveTick = setInterval(() => this.renderLive(), 1000)
+    this.planAutoApproveTick.unref?.()
+    this.planAutoApproveTimer = setTimeout(() => this.firePlanAutoApprove(), delayMs)
+    this.planAutoApproveTimer.unref?.()
+    this.renderLive()
+  }
+
+  /** 取消倒计时（用户参与 / 触发后 / dispose 共用）。 */
+  cancelPlanAutoApprove(): void {
+    if (this.planAutoApproveTimer) { clearTimeout(this.planAutoApproveTimer); this.planAutoApproveTimer = null }
+    if (this.planAutoApproveTick) { clearInterval(this.planAutoApproveTick); this.planAutoApproveTick = null }
+    this.planAutoApproveSlug = undefined
+    this.planAutoApproveDeadlineMs = undefined
+  }
+
+  /** 徽章剩余秒（GlanceBar 快照与 overlay caption 共用；未武装 = undefined）。 */
+  get planAutoApproveRemainSec(): number | undefined {
+    if (this.planAutoApproveDeadlineMs === undefined) return undefined
+    return remainingSec({ slug: this.planAutoApproveSlug ?? '', deadlineMs: this.planAutoApproveDeadlineMs }, Date.now())
+  }
+
+  /** 空闲判定（main.ts 的倒计时守卫探针使用；state/agentBusy 均为私有）。 */
+  get isAgentBusy(): boolean {
+    return this.agentBusy
+  }
+
+  private firePlanAutoApprove(): void {
+    const slug = this.planAutoApproveSlug
+    const deadlineMs = this.planAutoApproveDeadlineMs
+    if (slug === undefined || deadlineMs === undefined) return
+    // 守卫复核：busy/goal 退场/计划已被处理 → 不触发（退化为纯手动审批）。
+    const guards = this.planAutoApproveGuardsProvider?.()
+    const fire = !!guards && shouldFire({ slug, deadlineMs }, Date.now(), guards)
+    this.cancelPlanAutoApprove()
+    if (fire) this.onPlanAutoApproveFire?.(slug)
+  }
   /**
    * ask_user_question 多题流：当前题索引 + drafts。
    * `pendingAskUserQuestion` 仍暴露当前题，兼容旧回调路径。
@@ -573,90 +671,7 @@ export class TuiApp {
       history: options.history,
       placeholder: '询问任何事，或 / 唤起命令',
       onTabComplete: () => this.handleTabComplete(),
-      onSubmit: (text, images) => {
-        let trimmed = text.trim()
-        const hasImages = images && images.length > 0
-        // 允许只发图片：空文本时补一个占位 prompt，让后端能触发 run。
-        if (!trimmed && hasImages) {
-          text = '📎 图片消息'
-          trimmed = text
-        }
-
-        // User-initiated submit is real progress: clear the goal-mode watchdog
-        // auto-continue counter so a later legitimate stall gets the full
-        // recovery budget again. (The auto-continue path resubmits via
-        // onSubmitCallback directly and does NOT pass through here.)
-        if (trimmed) this.watchdogPolicy.recordUserSubmit()
-
-        // 输入历史：会话内更新 + 持久化（queued 与直接 submit 都记录）
-        if (trimmed) {
-          this.inputController.inputHistory = nextHistoryAfterSubmit(this.inputController.inputHistory, trimmed)
-          this.inputLine.setHistory(this.inputController.inputHistory)
-          appendHistoryAsync(trimmed).catch(() => { /* 持久化失败静默 */ })
-        }
-
-        // Worker 视图：输入直达该 worker 的 steer 队列，不进主 agent。
-        // slash 命令（/ 开头）仍归主会话——用户在视图内还需要 /tasks 等导航。
-        if (this.viewingWorkerId && trimmed && !trimmed.startsWith('/')) {
-          const target = this.viewingWorkerId
-          const delivered = this.workerSteer?.(target, trimmed) ?? false
-          this.commitUserPrompt(`[→ ${shortOrderLabel(target)}] ${trimmed}`, images)
-          if (!delivered) {
-            this.commitStatic(color('⚠ 该子代理已结束或不支持直达，消息未送达', this.theme.warning))
-          }
-          this.renderLive()
-          return
-        }
-
-        // W4a: agent 执行中 → 入队（turn 边界 drain 注入）。
-        // 同时立即 commit 用户气泡到 scrollback，确保用户始终能看到自己说了什么。
-        if (this.agentBusy && trimmed) {
-          this.commitUserPrompt(trimmed, images)
-          this.steerBuffer.push(trimmed)
-          this.renderLive()
-          return
-        }
-
-        // 跨 run steer 收口：上一 run 结束（text-only 收尾从不 drain）或
-        // busy 闩残留时排队的 guidance 会滞留到这里。若放任不管，它会在
-        // 下一次工具回合作为 [User guidance] 注入 —— 旧指令混进新任务上下文。
-        // 归并进本次 prompt（排队内容本就是用户意图，按优先级/时间序拼在新消息前）。
-        // 注意：steer 路径已为每条 queued 消息单独 commit 了用户气泡，
-        // 此处不再重复 commit，仅输出合并提示并归并文本。
-        let submitText = text
-        let steerMerged = false
-        if (trimmed && this.steerBuffer.hasPending()) {
-          const pendingEntries = [...this.steerBuffer.getPendingEntries()]
-          this.steerBuffer.clear()
-          const pending = pendingEntries.map(entry => entry.text)
-          submitText = [...pending, trimmed].join('\n\n')
-          steerMerged = true
-          this.commitAbove(() => {
-            this.commit.write({
-              text: color(`↳ ${pending.length} queued message${pending.length > 1 ? 's' : ''} merged into this prompt`, this.theme.muted),
-              trailingNewline: true,
-            })
-            this.state.committedCount++
-          })
-        }
-
-        // Commit user message to scrollback（steer 已单独 commit 时跳过）
-        if (trimmed) {
-          if (!steerMerged) {
-            this.commitUserPrompt(submitText.trim(), images)
-          }
-          // 新 run 启动前丢弃上一 run 未 finalize 的流式残留：blockWriter 缓冲
-          // 与 streamRenderer pending 若不清，会把上一轮文字追加进新轮输出。
-          this.blockWriter.discard()
-          this.streamRenderer.reset()
-          this.streamRenderController.assistantHeaderDone = false
-          this.agentBusy = true
-        }
-        // Reset turn timer for the new turn
-        this.state.turnStartMs = Date.now()
-        this.streamRenderController.lastActivityMs = Date.now()
-        this.onSubmitCallback?.(submitText, images)
-      },
+      onSubmit: (text, images) => this.handleInputSubmit(text, images),
     })
 
     // Write batcher: coalesce render calls
@@ -975,6 +990,7 @@ export class TuiApp {
         return
       }
       // ── Slash command handling ──────────────────────────────
+      if (this.handleContractPreviewKey(key)) return
       const inputVal = this.inputLine.value
       const inputIsPath = looksLikeFilePath(inputVal, this.getCommandPredicate(), this.getCommandPrefixPredicate())
       if (inputVal.startsWith('/') && !inputIsPath) {
@@ -1022,8 +1038,16 @@ export class TuiApp {
         void this.handleCtrlV()
         return
       }
+      // ── Ctrl+Y: 一键 Yank / 复制 Agent 最新回复到系统剪贴板 ──
+      if (key.name === 'ctrl_y' || (key.ctrl && (key.name as string) === 'y')) {
+        this.handleCopyAction()
+        return
+      }
       // ── Normal input processing ─────────────────────────────
       const event = this.inputLine.handleKey(key.name, key.char, key.ctrl, key.meta, key.shift)
+      // 选区剪切/复制的 OSC52 drain（终端支持时写系统剪贴板，不支持者无害忽略）
+      const clip = this.inputLine.takeClipboardOut()
+      if (clip != null) this.stdout.write(osc52Clipboard(clip))
       if (event?.type === 'change') {
         // 输入变化使 @ 补全循环失效
         this.inputController.fileCompletion = null
@@ -1160,6 +1184,158 @@ export class TuiApp {
     this.onSubmitCallback = callback
   }
 
+  // ── Mission Contract 预览（§13）─────────────────────────────────────
+  /** 预览卡待决提交：Enter 确认 / e 返回编辑 / Esc 取消。 */
+  private contractPreview: { text: string; images?: string[]; draft: MissionDraft } | null = null
+  /** 确认后绕过预览门禁一次性直提。 */
+  private contractBypass = false
+
+  /** 输入提交主流程（InputLine onSubmit 回调；原构造器闭包提取，逻辑零改动）。 */
+  private handleInputSubmit(text: string, images?: string[]): void {
+    let trimmed = text.trim()
+    const hasImages = images && images.length > 0
+    // 允许只发图片：空文本时补一个占位 prompt，让后端能触发 run。
+    if (!trimmed && hasImages) {
+      text = '📎 图片消息'
+      trimmed = text
+    }
+
+    // Mission Contract 预览门禁（早于历史/worker/steer——取消不留痕迹）：
+    // 结构化信号（@引用/#标签/长任务）命中才弹卡；斜杠命令、worker 视图、
+    // agent busy（steer 归并路径）一律豁免直通。
+    if (
+      trimmed &&
+      !this.contractBypass &&
+      !this.agentBusy &&
+      !this.viewingWorkerId &&
+      !trimmed.startsWith('/')
+    ) {
+      const draft = parseMissionDraft(text)
+      if (shouldPreviewContract(draft, text)) {
+        this.contractPreview = { text, images, draft }
+        this.renderLive()
+        return
+      }
+    }
+    this.contractBypass = false
+
+    // User-initiated submit is real progress: clear the goal-mode watchdog
+    // auto-continue counter so a later legitimate stall gets the full
+    // recovery budget again. (The auto-continue path resubmits via
+    // onSubmitCallback directly and does NOT pass through here.)
+    if (trimmed) this.watchdogPolicy.recordUserSubmit()
+    // 新提交 = 用户参与——取消 goal 计划倒计时自动批准
+    if (trimmed) this.cancelPlanAutoApprove()
+
+    // 输入历史：会话内更新 + 持久化（queued 与直接 submit 都记录）
+    if (trimmed) {
+      this.inputController.inputHistory = nextHistoryAfterSubmit(this.inputController.inputHistory, trimmed)
+      this.inputLine.setHistory(this.inputController.inputHistory)
+      appendHistoryAsync(trimmed).catch(() => { /* 持久化失败静默 */ })
+    }
+
+    // Worker 视图：输入直达该 worker 的 steer 队列，不进主 agent。
+    // slash 命令（/ 开头）仍归主会话——用户在视图内还需要 /tasks 等导航。
+    if (this.viewingWorkerId && trimmed && !trimmed.startsWith('/')) {
+      const target = this.viewingWorkerId
+      const delivered = this.workerSteer?.(target, trimmed) ?? false
+      this.commitUserPrompt(`[→ ${shortOrderLabel(target)}] ${trimmed}`, images)
+      if (!delivered) {
+        this.commitStatic(color('⚠ 该子代理已结束或不支持直达，消息未送达', this.theme.warning))
+      }
+      this.renderLive()
+      return
+    }
+
+    // W4a: agent 执行中 → 入队（turn 边界 drain 注入）。
+    // 同时立即 commit 用户气泡到 scrollback，确保用户始终能看到自己说了什么。
+    if (this.agentBusy && trimmed) {
+      this.commitUserPrompt(trimmed, images)
+      this.steerBuffer.push(trimmed)
+      this.renderLive()
+      return
+    }
+
+    // 跨 run steer 收口：上一 run 结束（text-only 收尾从不 drain）或
+    // busy 闩残留时排队的 guidance 会滞留到这里。若放任不管，它会在
+    // 下一次工具回合作为 [User guidance] 注入 —— 旧指令混进新任务上下文。
+    // 归并进本次 prompt（排队内容本就是用户意图，按优先级/时间序拼在新消息前）。
+    // 注意：steer 路径已为每条 queued 消息单独 commit 了用户气泡，
+    // 此处不再重复 commit，仅输出合并提示并归并文本。
+    let submitText = text
+    let steerMerged = false
+    if (trimmed && this.steerBuffer.hasPending()) {
+      const pendingEntries = [...this.steerBuffer.getPendingEntries()]
+      this.steerBuffer.clear()
+      const pending = pendingEntries.map(entry => entry.text)
+      submitText = [...pending, trimmed].join('\n\n')
+      steerMerged = true
+      this.commitAbove(() => {
+        this.commit.write({
+          text: color(`↳ ${pending.length} queued message${pending.length > 1 ? 's' : ''} merged into this prompt`, this.theme.muted),
+          trailingNewline: true,
+        })
+        this.state.committedCount++
+      })
+    }
+
+    // Commit user message to scrollback（steer 已单独 commit 时跳过）
+    if (trimmed) {
+      if (!steerMerged) {
+        this.commitUserPrompt(submitText.trim(), images)
+      }
+      // 新 run 启动前丢弃上一 run 未 finalize 的流式残留：blockWriter 缓冲
+      // 与 streamRenderer pending 若不清，会把上一轮文字追加进新轮输出。
+      this.blockWriter.discard()
+      this.streamRenderer.reset()
+      this.streamRenderController.assistantHeaderDone = false
+      this.agentBusy = true
+    }
+    // Reset turn timer for the new turn
+    this.state.turnStartMs = Date.now()
+    this.streamRenderController.lastActivityMs = Date.now()
+    this.onSubmitCallback?.(submitText, images)
+  }
+
+  /** Contract 预览按键：Enter 确认 / e 返回编辑 / Esc 取消。返回是否已消费。 */
+  private handleContractPreviewKey(key: KeyPress): boolean {
+    if (!this.contractPreview) return false
+    const pending = this.contractPreview
+    if (key.name === 'return') {
+      this.contractPreview = null
+      this.contractBypass = true
+      this.handleInputSubmit(pending.text, pending.images)
+      return true
+    }
+    if (key.char === 'e') {
+      this.contractPreview = null
+      this.inputLine.setValue(pending.text)
+      this.renderLive()
+      return true
+    }
+    if (key.name === 'escape') {
+      this.contractPreview = null
+      this.renderLive()
+      return true
+    }
+    return true // 预览期间吞掉其他键（防误编辑）
+  }
+
+  /** @file 引用缺失路径全集（按文本缓存，同值不重复 existsSync）。 */
+  private missingPathsCache: { value: string; missing: string[] } = { value: '', missing: [] }
+  private computeMissingMentionPaths(text: string): string[] {
+    if (this.missingPathsCache.value === text) return this.missingPathsCache.missing
+    let missing: string[] = []
+    if (text.includes('@file:') || text.includes('@folder:')) {
+      for (const ref of parseMentions(text)) {
+        if (ref.type !== 'file' && ref.type !== 'folder') continue
+        if (!existsSync(resolve(process.cwd(), ref.value))) missing.push(ref.value)
+      }
+    }
+    this.missingPathsCache = { value: text, missing }
+    return missing
+  }
+
   /** 设置中止回调 */
   onAbort(callback: () => void): void {
     this.onAbortCallback = callback
@@ -1277,7 +1453,8 @@ export class TuiApp {
       case 'rewind':
       case 'history-search':
       case 'chronicle':
-      case 'connect': {
+      case 'connect':
+      case 'init': {
         // 复位导航状态，避免上次的翻页/选中残留到新 overlay
         this.overlayController.resetNav()
         return this.overlay.activate(id)
@@ -1362,6 +1539,13 @@ export class TuiApp {
     this.connectError = undefined
     this.input.setMode('input')
     this.activateOverlay('connect')
+  }
+
+  /** 打开 /init 交互式项目初始化向导（verify 声明 / skills / hooks 脚手架）。 */
+  openInitFlow(cwd: string): void {
+    this.initFlow = new InitFlow(probeInitFlowInput(cwd))
+    this.initError = undefined
+    this.activateOverlay('init')
   }
 
   /** 打开计划审批选择面板（plan action=submit 成功后自动调用）。 */
@@ -1593,6 +1777,44 @@ export class TuiApp {
     this.deactivateOverlay()
   }
 
+  /** init overlay 渲染数据（由 registerOverlays 的 render 闭包读取）。 */
+  getInitOverlayData(): InitOverlayData {
+    const view = this.initFlow?.view() ?? { kind: 'multi-choice' as const, title: '', options: [] }
+    return {
+      view,
+      error: this.initError,
+      selectedIndex: this.overlayController.nav().initIndex,
+    }
+  }
+
+  /** 推进 init 向导（Enter）：next 复位光标、error 显示提示、commit 落盘并关闭。 */
+  private advanceInit(result: InitStepResult): void {
+    if (result.kind === 'error') {
+      this.initError = result.message
+      this.overlay.rerender()
+      return
+    }
+    if (result.kind === 'next') {
+      this.initError = undefined
+      this.overlayController.nav().initIndex = 0
+      this.overlay.rerender()
+      return
+    }
+    // commit — 与 connect 同序：先 exec 再 deactivate，避免幽灵帧。
+    const exec = this.overlayController.getInitExec()
+    this.initFlow = undefined
+    exec?.(result.commit, result.summary)
+    this.deactivateOverlay()
+  }
+
+  private cancelInit(): void {
+    this.initFlow?.cancel()
+    this.initFlow = undefined
+    // 与 cancelConnect 同理：先把提示写进 scrollback，退出重绘才是最后一帧。
+    this.commitStatic('已取消项目初始化。')
+    this.deactivateOverlay()
+  }
+
   /** 返回 scrollback 完整文本（供 pager overlay 读取） */
   getScrollbackContent(): string {
     return this.commit.getContent()
@@ -1631,6 +1853,7 @@ export class TuiApp {
         profile: w.profile,
         status: w.status,
         activity: w.activity,
+        objective: w.contract?.objective,
         elapsedMs: w.elapsedMs,
         toolUseCount: w.toolUseCount,
         tokenCount: w.tokenCount,
@@ -1771,6 +1994,35 @@ export class TuiApp {
       if (key.name === 'return') { this.advanceConnect(this.connectFlow.submitInput(this.connectInput)); return true }
       if (key.name === 'backspace') { this.connectInput = this.connectInput.slice(0, -1); this.connectError = undefined; this.overlay.rerender(); return true }
       if (this.isPrintableKey(key)) { this.connectInput += key.char; this.connectError = undefined; this.overlay.rerender(); return true }
+      return true
+    }
+
+    // Init wizard — a stateful multi-choice/confirm overlay. Handled before the
+    // generic q-close so keystrokes never leak out of the wizard.
+    if (id === 'init' && this.initFlow) {
+      const view = this.initFlow.view()
+      const nav = this.overlayController.nav()
+      if (key.name === 'escape') { this.cancelInit(); return true }
+      if (view.kind === 'multi-choice') {
+        const options = view.options ?? []
+        const count = options.length
+        if (key.name === 'down') { if (count > 0) { nav.initIndex = (nav.initIndex + 1) % count; this.overlay.rerender() } return true }
+        if (key.name === 'up') { if (count > 0) { nav.initIndex = (nav.initIndex - 1 + count) % count; this.overlay.rerender() } return true }
+        // 空格切换勾选（多选语义同 ask-flow）；光标不动、不推进步骤。
+        if (c === ' ') {
+          const opt = options[nav.initIndex]
+          if (opt) {
+            const res = this.initFlow.toggle(opt.id)
+            this.initError = res.kind === 'error' ? res.message : undefined
+            this.overlay.rerender()
+          }
+          return true
+        }
+        if (key.name === 'return') { this.advanceInit(this.initFlow.confirm()); return true }
+        return true
+      }
+      // confirm 页：仅 Enter 执行 / Esc 取消。
+      if (key.name === 'return') { this.advanceInit(this.initFlow.confirm()); return true }
       return true
     }
 
@@ -2309,6 +2561,10 @@ export class TuiApp {
         const inputEntryIds = new Set(['__other__', '__reject_comment__'])
         if (entry && inputEntryIds.has(entry.id)) {
           // 进入输入子模式，不关闭 overlay。
+          if (entry.id === '__reject_comment__') {
+            // 用户正在撰写驳回反馈 = 参与——绝不能在打字中途触发自动批准
+            this.cancelPlanAutoApprove()
+          }
           this.choicePanelSubMode = 'input'
           this.choicePanelInputBuffer = ''
           this.choicePanelInputFor = entry.id === '__reject_comment__' ? 'plan-reject-comment' : 'ask-other'
@@ -2388,6 +2644,7 @@ export class TuiApp {
 
   /** 销毁资源 */
   dispose(): void {
+    this.cancelPlanAutoApprove()
     if (this.streamRenderController.ticker) {
       clearInterval(this.streamRenderController.ticker)
       this.streamRenderController.ticker = null
@@ -2722,7 +2979,33 @@ export class TuiApp {
           return true
         },
       },
+      {
+        name: '/copy',
+        description: '一键复制 Agent 最新回复或 Git 提交 (参数: git / reply)',
+        immediate: true,
+        handler: ({ trimmed }) => {
+          const parts = trimmed.split(/\s+/)
+          this.handleCopyAction(parts[1])
+          return true
+        },
+      },
+      {
+        name: '/yank',
+        description: '一键复制 Agent 最新回复到系统剪贴板',
+        immediate: true,
+        handler: () => {
+          this.handleCopyAction()
+          return true
+        },
+      },
     ])
+  }
+
+  /**
+   * 一键复制系统命令处理：支持 /copy [git|reply] / /yank 快捷操作
+   */
+  public handleCopyAction(_arg?: string): void {
+    // Stub: scrollback, messages, addNotification not yet wired on TuiApp.
   }
 
   /**
@@ -3004,6 +3287,17 @@ export class TuiApp {
     const prev = this.fleet.getWorkerById(activity.workOrderId)
     this.fleet.apply(activity)
     this.mirror.apply(activity)
+    // 派发契约卡：worker 起跑瞬间沉淀「目标 + 范围」到 scrollback。
+    // 必须同时卡住 status==='running'——contract 只随首条 running 事件携带，
+    // 终态回放（resume/归档）若也带上就会为已结束的 worker 补打派发卡。
+    if (activity.status === 'running' && activity.contract && !this.dispatchCardShown.has(activity.workOrderId)) {
+      this.dispatchCardShown.add(activity.workOrderId)
+      const card = formatWorkerDispatchCard(activity.contract, activity.workOrderId, {
+        columns: this.columns,
+        theme: this.theme,
+      })
+      if (card.length > 0) this.commitStatic(card.join('\n'))
+    }
     // 终态转变 → 主区完成通知行（CC 后台任务完成对标）。
     // 只在「见过 running」的 worker 上通知，避免纯终态回放（resume/归档）刷屏。
     if (prev && !prev.terminal) {
@@ -3479,6 +3773,8 @@ export class TuiApp {
   }
 
   private handleAbort(reason?: string): void {
+    // 用户主动 abort（非 watchdog 守护）= 参与——取消倒计时自动批准
+    if (!reason?.startsWith('watchdog')) this.cancelPlanAutoApprove()
     // 世代自增：被中断的旧 run 的迟到回调（bridge 捕获旧 gen）将被丢弃
     this._runGen++
     // Capture approval-blocked state BEFORE resolveApproval(false) below clears
@@ -3666,6 +3962,18 @@ export class TuiApp {
     // 小终端上由 raw 自然封顶（不超屏）。
     const cap = liveMaxRowsFor(terminalRows) - chromeRows
     return Math.max(0, Math.min(raw, cap))
+  }
+
+  /**
+   * @file 节点 exists 诊断（按输入值缓存——同值不重复 existsSync）。
+   * 返回第一个不存在的 @file:/@folder: 引用值；无引用或均存在时 null。
+   */
+  private mentionDiagCache: { value: string; missing: string | null } = { value: '', missing: null }
+  private computeMissingMention(inputVal: string): string | null {
+    if (this.mentionDiagCache.value === inputVal) return this.mentionDiagCache.missing
+    const missing = this.computeMissingMentionPaths(inputVal)[0] ?? null
+    this.mentionDiagCache = { value: inputVal, missing }
+    return missing
   }
 
   /**
@@ -4018,6 +4326,22 @@ export class TuiApp {
       }
     }
 
+    // ── Mission Contract 预览卡（inline，与审批提示同位）────────────────
+    if (this.contractPreview) {
+      const p = this.contractPreview
+      const cardLines = formatContractPreview({
+        draft: p.draft,
+        charCount: p.text.length,
+        imageCount: p.images?.length ?? 0,
+        missingPaths: this.computeMissingMentionPaths(p.text),
+        cols,
+      }, this.theme, color)
+      lines.push({ text: '' })
+      for (const cardLine of cardLines) {
+        lines.push({ text: this.clampLine(cardLine) })
+      }
+    }
+
     // ── 底部 chrome 起点：从此往后（任务面板 + GlanceBar + 输入框 + 提示）是
     //    恒可见的保留区，内容超屏时 LiveEngine 截断的是上方 dynamic 段，
     //    不会裁掉任务面板与输入框。
@@ -4109,6 +4433,7 @@ export class TuiApp {
         approvalMode: this._approvalMode,
         planMode: planModeActive,
         goal: goalSnapshot,
+        planAutoApproveSec: this.planAutoApproveRemainSec,
         todoSummary,
         todoFlash: !isReducedMotion() && this.state.todoFlashUntil > Date.now(),
         density: this.glanceDensity,
@@ -4174,17 +4499,57 @@ export class TuiApp {
         return raw
       }
 
-      const vimNormalMode = this.inputLine.vimEnabled && this.inputLine.vimMode === 'normal'
+      const vimModeLabel = !this.inputLine.vimEnabled ? null
+        : this.inputLine.vimMode === 'normal' ? '-- NORMAL -- '
+        : this.inputLine.visualLineWise ? '-- VISUAL LINE -- '
+        : this.inputLine.vimMode === 'visual' ? '-- VISUAL -- '
+        : null
+      const vimNormalMode = vimModeLabel !== null
+      // ghost text（P3-2）：「/命令名+空格」精确形态且光标在行尾时，在 █ 后拼
+      // 暗色参数提示。caretCol 只量 █ 左侧 → IME 锚定零干扰；超宽由
+      // renderInputRow 的 ANSI-aware truncate 截断，不折行；纯渲染层不进 buffer。
+      const ghostText = isSlash && this.inputLine.cursor === inputVal.length
+        ? slashArgsHint(this.inputController.slashCommands, inputVal)
+        : null
+      /** 在 caret 行的 █ 后注入 ghost（lastIndexOf：用户文本含 █ 时 marker 仍在末尾）。 */
+      const withGhost = (raw: string, lineIdx: number): string => {
+        if (!ghostText || lineIdx !== inputDisplay.caret.line) return raw
+        const bi = raw.lastIndexOf('█')
+        if (bi < 0) return raw
+        return raw.slice(0, bi + 1) + color(ghostText, this.theme.dim) + raw.slice(bi + 1)
+      }
+      /** 折叠粘贴标记 → 反色 pill（纯渲染着色，buffer 与提交不受影响）。 */
+      const withPastePills = (raw: string): string =>
+        raw.includes('[paste #')
+          ? raw.replace(/\[paste #\d+ \+\d+ lines?\]/g, m => `${ANSI.REVERSE}${m}${ANSI.RESET}`)
+          : raw
+      /** S2 代码块 fence 高亮：``` 翻转 parity，fence 内行着 dim（含 fence 行）。
+       *  可见行近似 parity——maxLines 视口裁掉的段内 fence 不计，纯视觉无正确性影响。 */
+      const fenceTinted = new Set<number>()
+      {
+        let inFence = false
+        for (let i = 0; i < inputLines.length; i++) {
+          const plain = inputLines[i]!.replace(/^❯ |^ {2}/, '')
+          if (plain.trimStart().startsWith('```')) {
+            fenceTinted.add(i)
+            inFence = !inFence
+          } else if (inFence) {
+            fenceTinted.add(i)
+          }
+        }
+      }
+      const withFenceTint = (raw: string, lineIdx: number): string =>
+        fenceTinted.has(lineIdx) ? color(raw, this.theme.dim) : raw
       // 0-based cell（相对行首）= 左边框宽 + 行内 caret 列；
-      // '-- NORMAL -- ' 前缀只加在首行——caret 在首行时才计入其宽度。
+      // vim 模式标签（-- NORMAL/VISUAL/VISUAL LINE --）只加在首行——caret 在首行时才计入其宽度。
       const leftBarW = displayWidth(leftBar, { ambiguousAsWide: true })
-      const vimPrefixW = vimNormalMode ? displayWidth('-- NORMAL -- ', { ambiguousAsWide: true }) : 0
+      const vimPrefixW = vimNormalMode ? displayWidth(vimModeLabel!, { ambiguousAsWide: true }) : 0
       const caretColFor = (lineIdx: number): number =>
         leftBarW + (lineIdx === 0 ? vimPrefixW : 0) + inputDisplay.caret.col
       /** 输入行 → LiveRegionLine；光标行携带 caretCol（IME 硬件光标归位标记）。 */
       const pushInputRow = (raw: string, lineIdx: number): void => {
         lines.push({
-          text: this.renderInputRow(colorizeInputLine(raw), innerWidth, leftBar, rightBar),
+          text: this.renderInputRow(colorizeInputLine(withPastePills(withGhost(withFenceTint(raw, lineIdx), lineIdx))), innerWidth, leftBar, rightBar),
           ...(inputDisplay.caret.line === lineIdx ? { caretCol: caretColFor(lineIdx) } : {}),
         })
       }
@@ -4192,7 +4557,7 @@ export class TuiApp {
       lines.push({ text: topBorder })
       if (vimNormalMode) {
         lines.push({
-          text: this.renderInputRow(`-- NORMAL -- ${colorizeInputLine(inputLines[0] ?? '')}`, innerWidth, leftBar, rightBar),
+          text: this.renderInputRow(`${vimModeLabel}${colorizeInputLine(withPastePills(withGhost(withFenceTint(inputLines[0] ?? '', 0), 0)))}`, innerWidth, leftBar, rightBar),
           ...(inputDisplay.caret.line === 0 ? { caretCol: caretColFor(0) } : {}),
         })
         for (let i = 1; i < inputLines.length; i++) {
@@ -4229,6 +4594,14 @@ export class TuiApp {
         }
       } else if (metricsW > 0) {
         lines.push({ text: this.clampLine(`  ${rightStr}`) })
+      }
+
+      // 5a3. @file 节点诊断（节点化 v1）：解析出的 @file:/@folder: 在 cwd 下
+      //      不存在时给一行轻提示。existsSync 按输入值缓存（同值不重复 stat，
+      //      每帧 stat 是性能坑）。
+      const missingMention = this.computeMissingMention(inputVal)
+      if (missingMention) {
+        lines.push({ text: this.clampLine(`  ${color(`⚠ @file:${missingMention} 不存在`, this.theme.warning)}`) })
       }
 
       // 5a2. 上下文逃逸提示（wayfinding）：仅 worker 切入视图时显示退路键位，
@@ -4480,7 +4853,7 @@ export class TuiApp {
     themePickerData?: () => ThemePickerData
     choicePanelData?: () => ChoicePanelData
     planPickerData?: () => PlanPickerData
-  }, paletteExec?: (index: number) => void, rewindExec?: (messageIndex: number, mode: RewindMode) => void, chronicleExec?: (id: string) => void, domainPickerExec?: (key: string) => void, modelPickerExec?: (key: string) => void, domainPickerSaveDefaultExec?: (key: string) => void, modelPickerSaveDefaultExec?: (provider: string, modelId: string) => void, themePickerExec?: (key: string) => void, themePickerSaveDefaultExec?: (key: string) => void, choicePanelExec?: (id: string) => void, connectExec?: (commit: ConnectCommit, summary: string) => void, planPickerExec?: (slug: string) => void): void {
+  }, paletteExec?: (index: number) => void, rewindExec?: (messageIndex: number, mode: RewindMode) => void, chronicleExec?: (id: string) => void, domainPickerExec?: (key: string) => void, modelPickerExec?: (key: string) => void, domainPickerSaveDefaultExec?: (key: string) => void, modelPickerSaveDefaultExec?: (provider: string, modelId: string) => void, themePickerExec?: (key: string) => void, themePickerSaveDefaultExec?: (key: string) => void, choicePanelExec?: (id: string) => void, connectExec?: (commit: ConnectCommit, summary: string) => void, planPickerExec?: (slug: string) => void, initExec?: (commit: InitCommit, summary: string) => void): void {
     this.overlayController.setData(overlayData)
     this.overlayController.setPaletteExec(paletteExec)
     this.overlayController.setRewindExec(rewindExec)
@@ -4494,6 +4867,7 @@ export class TuiApp {
     this.overlayController.setChoicePanelExec(choicePanelExec)
     this.overlayController.setConnectExec(connectExec)
     this.overlayController.setPlanPickerExec(planPickerExec)
+    this.overlayController.setInitExec(initExec)
     // Pager — page / mode / search / message 由 overlayNav 注入（覆盖 provider 的静态值）
     this.overlay.register('pager', {
       render: (_w, _h) => {
@@ -4631,6 +5005,11 @@ export class TuiApp {
     // Connect Wizard — /connect 服务商配置向导；数据来自 app 持有的 ConnectFlow。
     this.overlay.register('connect', {
       render: (_w, _h) => renderConnect(this.getConnectOverlayData(), this.columns, this.rows, this.theme),
+    })
+
+    // Init Wizard — /init 交互式项目初始化；数据来自 app 持有的 InitFlow。
+    this.overlay.register('init', {
+      render: (_w, _h) => renderInitFlow(this.getInitOverlayData(), this.columns, this.rows, this.theme),
     })
   }
 }

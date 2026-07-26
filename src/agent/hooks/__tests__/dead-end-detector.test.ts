@@ -47,11 +47,14 @@ function harness() {
 }
 
 describe('dead-end-detector 缺口 A', () => {
-  it('同文件 2 次 edit→verify-fail 循环触发 advisory + stigmergy 沉积', async () => {
+  it('同文件 3 次 edit→verify-fail 循环触发 advisory + stigmergy 沉积', async () => {
     const { submitted, deposits, hook } = harness()
     await hook.run(makeCtx(), edit('src/a.ts'))
     await hook.run(makeCtx(), verifyFail())
     assert.equal(submitted.length, 0) // 1 循环不触发
+    await hook.run(makeCtx(), edit('src/a.ts'))
+    await hook.run(makeCtx(), verifyFail())
+    assert.equal(submitted.length, 0) // 2 循环不触发(TDD 余地)
     await hook.run(makeCtx(), edit('src/a.ts'))
     await hook.run(makeCtx(), verifyFail())
     assert.equal(submitted.length, 1)
@@ -65,6 +68,8 @@ describe('dead-end-detector 缺口 A', () => {
 
   it('advisory 出生即带 tool_appears expect 谓词(因果账本)', async () => {
     const { submitted, hook } = harness()
+    await hook.run(makeCtx(), edit('src/a.ts'))
+    await hook.run(makeCtx(), verifyFail())
     await hook.run(makeCtx(), edit('src/a.ts'))
     await hook.run(makeCtx(), verifyFail())
     await hook.run(makeCtx(), edit('src/a.ts'))
@@ -137,6 +142,9 @@ describe('dead-end-detector 缺口 A', () => {
     await hook.run(makeCtx(), bashVerifyFail('npm test'))
     await hook.run(makeCtx(), edit('src/a.ts'))
     await hook.run(makeCtx(), bashVerifyFail('npx tsx --test src/x.test.ts'))
+    assert.equal(submitted.length, 0) // 2 循环不触发(阈值=3)
+    await hook.run(makeCtx(), edit('src/a.ts'))
+    await hook.run(makeCtx(), bashVerifyFail('npm test'))
     assert.equal(submitted.length, 1)
   })
 
@@ -182,7 +190,10 @@ describe('dead-end-detector 缺口 A', () => {
     // 第二次循环 — 相同错误
     await hook.run(makeCtx(), edit('src/a.ts'))
     await hook.run(makeCtx(), verifyFail('assertion', sameError))
-    // 指纹相同 → 触发盲改 advisory
+    assert.equal(submitted.length, 0) // 2 循环不触发(阈值=3)
+    // 第三次循环 — 指纹不变,触发盲改
+    await hook.run(makeCtx(), edit('src/a.ts'))
+    await hook.run(makeCtx(), verifyFail('assertion', sameError))
     assert.equal(submitted.length, 1)
     assert.match(submitted[0]!.content, /盲改/)
   })
@@ -194,13 +205,17 @@ describe('dead-end-detector 缺口 A', () => {
     await hook.run(makeCtx(), verifyFail()) // 无 resultContent
     await hook.run(makeCtx(), edit('src/a.ts'))
     await hook.run(makeCtx(), verifyFail()) // 无 resultContent
-    // 仍然触发（旧行为不变）
+    assert.equal(submitted.length, 0) // 2 循环不触发(阈值=3)
+    await hook.run(makeCtx(), edit('src/a.ts'))
+    await hook.run(makeCtx(), verifyFail())
     assert.equal(submitted.length, 1)
   })
 
   it('verify pass 清除已沉积的 dead-end 信息素', async () => {
     const { submitted, deposits, hook } = harness()
-    // 先触发一次死路沉积
+    // 先触发一次死路沉积(阈值=3)
+    await hook.run(makeCtx(), edit('src/a.ts'))
+    await hook.run(makeCtx(), verifyFail())
     await hook.run(makeCtx(), edit('src/a.ts'))
     await hook.run(makeCtx(), verifyFail())
     await hook.run(makeCtx(), edit('src/a.ts'))
@@ -218,7 +233,10 @@ describe('dead-end-detector 缺口 A', () => {
 
   it('verify pass 清除多个文件的 dead-end 信息素', async () => {
     const { deposits, hook } = harness()
-    // 两个文件各有死路
+    // 两个文件各有死路(阈值=3)
+    await hook.run(makeCtx(), edit('src/a.ts'))
+    await hook.run(makeCtx(), edit('src/b.ts'))
+    await hook.run(makeCtx(), verifyFail())
     await hook.run(makeCtx(), edit('src/a.ts'))
     await hook.run(makeCtx(), edit('src/b.ts'))
     await hook.run(makeCtx(), verifyFail())
@@ -237,5 +255,31 @@ describe('dead-end-detector 缺口 A', () => {
     const bCleared = deposits.filter(d => d.path === 'src/b.ts' && d.signal === 'dead-end').at(-1)
     assert.equal(aCleared!.strength, 0)
     assert.equal(bCleared!.strength, 0)
+  })
+
+  it('TDD 豁免:run_tests 下测试文件 RED 不计入死路', async () => {
+    const { submitted, deposits, hook } = harness()
+    const testFile = 'src/foo.test.ts'
+    // TDD: 改测试→跑测试→爆红→改测试→再跑→再红…这是正常 TDD 节奏
+    await hook.run(makeCtx(), edit(testFile))
+    await hook.run(makeCtx(), verifyFail())
+    await hook.run(makeCtx(), edit(testFile))
+    await hook.run(makeCtx(), verifyFail())
+    await hook.run(makeCtx(), edit(testFile))
+    await hook.run(makeCtx(), verifyFail())
+    // TDD 豁免——测试文件 RED 不触发死路
+    assert.equal(submitted.length, 0)
+    assert.equal(hook.getCycleCount(testFile), 0)
+
+    // 但源代码文件仍然正常追踪
+    await hook.run(makeCtx(), edit('src/lib.ts'))
+    await hook.run(makeCtx(), verifyFail())
+    await hook.run(makeCtx(), edit('src/lib.ts'))
+    await hook.run(makeCtx(), verifyFail())
+    await hook.run(makeCtx(), edit('src/lib.ts'))
+    await hook.run(makeCtx(), verifyFail())
+    assert.equal(submitted.length, 1)
+    assert.match(submitted[0]!.content, /src\/lib\.ts/)
+    assert.equal(deposits.length, 1)
   })
 })

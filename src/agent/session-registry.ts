@@ -136,7 +136,10 @@ export class SessionRegistry {
       if ((err as { code?: string })?.code === 'ESQLITE_BUNDLE_BROKEN') throw err
       // Distinguish "library missing" from "schema execution failed"
       if (err instanceof Error && err.message?.includes('better-sqlite3')) {
-        console.warn(`⚠ better-sqlite3 not available. Session registry disabled — running in memory-only mode. Reason: ${(err as Error).message}`)
+        const hint = process.platform === 'win32'
+          ? 'Run: npm install -g windows-build-tools (as admin), then: npm rebuild better-sqlite3 -g tianshu-tui'
+          : 'Run: npm rebuild better-sqlite3 -g tianshu-tui'
+        console.warn(`⚠ better-sqlite3 not available. Session history & cross-session memory will NOT persist (in-memory only, lost on exit). Reason: ${(err as Error).message}\n  Fix: ${hint}`)
       } else {
         console.error('Session registry schema failed:', err)
       }

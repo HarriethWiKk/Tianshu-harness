@@ -388,6 +388,53 @@ function formatInlineToAnsi(segments: Segment[], theme: RivetTheme): string {
   return segments.map(seg => formatSegment(seg, theme)).join('')
 }
 
+// ── Git & Code & Prompt Helpers ───────────────────────────────
+
+/**
+ * 1. 尝试检测并格式化 Git Commit 提交标签行
+ * 示例: "95454cd0  — 5 files, +70/-4。"
+ */
+export function tryFormatGitCommitLine(line: string, theme: RivetTheme): string | null {
+  const trimmed = line.trim()
+  const gitLineRe = /^(?:commit\s+)?([0-9a-f]{7,40})\s+(—|-|:)\s+(.*)$/i
+  const match = gitLineRe.exec(trimmed)
+  if (!match) return null
+
+  const [, hash, sep, rest] = match as unknown as [string, string, string, string]
+  if (!/\b\d+\s+files?|\+\d+|\-\d+|insertions?|deletions?/i.test(rest)) return null
+
+  const hashPart = color(`⎇ ${hash}`, theme.secondary, { bold: true, underline: true })
+  const sepPart = color(` ${sep} `, theme.dim)
+
+  const formattedRest = rest
+    .replace(/\+(\d+)/g, color('+$1', theme.success, { bold: true }))
+    .replace(/\-(\d+)/g, color('-$1', theme.error, { bold: true }))
+    .replace(/(\d+)(\s+files?)/g, color('$1$2', theme.assistantColor))
+
+  return `${hashPart}${sepPart}${formattedRest}`
+}
+
+/**
+ * 2. 高亮行首的代码序号（如 ①-⑩ / ❶-❿ / 1. 2. 等）
+ */
+export function highlightCodeLineNumber(renderedLine: string, theme: RivetTheme): string {
+  const circleNumRe = /^(\s*)([①②③④⑤⑥⑦⑧⑨⑩❶❷❸❹❺❻❼❽❾❿])(\s*.*)$/
+  const circleMatch = circleNumRe.exec(renderedLine)
+  if (circleMatch) {
+    const [, indent, num, rest] = circleMatch as unknown as [string, string, string, string]
+    return `${indent}${color(num, theme.warning, { bold: true })}${rest}`
+  }
+
+  const digitNumRe = /^(\s*)(\d+[\.\)])(\s+.*)$/
+  const digitMatch = digitNumRe.exec(renderedLine)
+  if (digitMatch) {
+    const [, indent, num, rest] = digitMatch as unknown as [string, string, string, string]
+    return `${indent}${color(num, theme.warning, { bold: true })}${rest}`
+  }
+
+  return renderedLine
+}
+
 function formatCodeBlock(language: string | undefined, content: string, columns: number, theme: RivetTheme): string[] {
   const lines = content.split('\n')
   const langConfig = language ? keywordsForLang(language) : null
@@ -400,15 +447,26 @@ function formatCodeBlock(language: string | undefined, content: string, columns:
 
   const result: string[] = []
 
-  // 轻量语言标签（不含竖线/边框，不会污染选区复制）：
-  // 仅用一行 dim 的「╴ ts ╴」标识语言，代码行裸输出便于整体选中。
+  // 醒目 Code 标题行（带 💻 ‹/› 标识与主题二次亮色）
   const label = language || 'code'
-  result.push(color(`╴ ${label} ╴`, theme.muted))
+  let labelDisplay = label
+  if (label === 'code' || label === '- code -' || label === 'bash') {
+    labelDisplay = `‹/› ${label.replace(/^-?\s*code\s*-?$/i, 'CODE')}`
+  } else {
+    labelDisplay = `‹/› ${label.toUpperCase()}`
+  }
+  result.push(color(`╴ ${labelDisplay} ╴`, theme.secondary, { bold: true }))
 
-  // 代码行直接渲染：不加左侧 │ 竖线，用户可干净选中整段复制。
+  // 代码行直接渲染
   for (const line of visible) {
+    const gitFormatted = tryFormatGitCommitLine(line, theme)
+    if (gitFormatted) {
+      result.push(gitFormatted)
+      continue
+    }
     const segs = highlightLine(line, keywords, caseInsensitive, theme)
-    result.push(formatInlineToAnsi(segs, theme))
+    const ansiLine = formatInlineToAnsi(segs, theme)
+    result.push(highlightCodeLineNumber(ansiLine, theme))
   }
 
   if (truncated) {
@@ -429,8 +487,6 @@ function formatBlock(block: Block, columns: number, theme: RivetTheme): string[]
       const glyph = glyphs[level - 1] ?? ''
       const headerColor = colors[level - 1]
       const text = glyph ? `${glyph} ${block.content}` : block.content
-      // h2/h3 无 accent 色：用 assistantColor（跟随主题明暗，亮色主题下是深灰近黑，
-      // 此前硬编码 #e6edf3 亮灰在白底上不可读）。
       result.push(headerColor ? color(text, headerColor, { bold: true }) : color(text, theme.assistantColor, { bold: true }))
       break
     }
@@ -438,10 +494,8 @@ function formatBlock(block: Block, columns: number, theme: RivetTheme): string[]
       result.push(...formatCodeBlock(block.language, block.content, columns, theme))
       break
     case 'math': {
-      // Display math: render to stacked Unicode lines via latexToBlock.
       const mathLines = latexToBlock(block.content)
       if (mathLines.length === 0) {
-        // Fallback: no stacking structure, render inline.
         result.push(color(latexToUnicode(block.content), theme.assistantColor))
       } else {
         for (const ml of mathLines) {
@@ -453,13 +507,12 @@ function formatBlock(block: Block, columns: number, theme: RivetTheme): string[]
     case 'list': {
       const items = block.items ?? block.content.split('\n')
       for (const item of items) {
-        result.push(`${color('◇', theme.secondary)} ${formatInlineToAnsi(parseInline(item), theme)}`)
+        const itemAnsi = formatInlineToAnsi(parseInline(item), theme)
+        result.push(`${color('◇', theme.secondary)} ${highlightCodeLineNumber(itemAnsi, theme)}`)
       }
       break
     }
     case 'blockquote':
-      // 左边条 secondary + 引文斜体 muted（对齐 CC 的暗色可读性改版：
-      // 纯 dim 引文在暗背景下几乎不可见，斜体+彩色边条保留层次又可读）。
       result.push(`${color('▎', theme.secondary)} ${color(block.content, theme.muted, { italic: true })}`)
       break
     case 'hr':
@@ -470,16 +523,24 @@ function formatBlock(block: Block, columns: number, theme: RivetTheme): string[]
       const dataLines = tableLines.filter(l => !/^\|?[\s-:|]+\|?$/.test(l.trim()))
       for (let i = 0; i < dataLines.length; i++) {
         const line = dataLines[i]!
-        // 表头是结构强调，走 secondary（primary 保留给交互焦点——颜色层级规范）。
         result.push(i === 0 ? color(line, theme.secondary, { bold: true }) : line)
       }
       break
     }
     case 'paragraph':
-    default:
-      // Convert inline math ($...$, \(...\)) to Unicode before inline formatting.
-      result.push(color(formatInlineToAnsi(parseInline(renderMathInText(block.content)), theme), theme.assistantColor))
+    default: {
+      const lines = block.content.split('\n')
+      for (const line of lines) {
+        const gitFormattedLine = tryFormatGitCommitLine(line, theme)
+        if (gitFormattedLine) {
+          result.push(gitFormattedLine)
+        } else {
+          const formatted = color(formatInlineToAnsi(parseInline(renderMathInText(line)), theme), theme.assistantColor)
+          result.push(highlightCodeLineNumber(formatted, theme))
+        }
+      }
       break
+    }
   }
 
   return result
@@ -527,15 +588,36 @@ export function formatMarkdown(input: FormatMarkdownInput, theme: RivetTheme): s
   // 纯文本快速路径
   if (!hasMarkdown(input.text)) {
     for (const line of input.text.split('\n')) {
-      result.push(line)
+      const gitFormatted = tryFormatGitCommitLine(line, theme)
+      if (gitFormatted) {
+        result.push(gitFormatted)
+      } else {
+        result.push(highlightCodeLineNumber(line, theme))
+      }
     }
-    return result
+  } else {
+    // 完整 Markdown 解析
+    const blocks = parseBlocks(input.text)
+    for (const block of blocks) {
+      result.push(...formatBlock(block, input.columns, theme))
+    }
   }
 
-  // 完整 Markdown 解析
-  const blocks = parseBlocks(input.text)
-  for (const block of blocks) {
-    result.push(...formatBlock(block, input.columns, theme))
+  // 末尾句检查：若最后一句话包含提问探询（如 "是否执行？"），进行醒目 Alert 高亮
+  for (let i = result.length - 1; i >= 0; i--) {
+    const lineStr = result[i]
+    if (!lineStr) continue
+    const plainLine = lineStr.replace(/\u001b\[[0-9;]*m/g, '').trim()
+    if (!plainLine) continue
+
+    if (/[？\?]\s*$/.test(plainLine) || /^(是否|请问|需要|确认|要不要).*[\?？]?$/.test(plainLine)) {
+      if (!plainLine.includes('⚡')) {
+        result[i] = color(`⚡ ${plainLine}`, theme.warning, { bold: true })
+      } else {
+        result[i] = color(plainLine, theme.warning, { bold: true })
+      }
+    }
+    break
   }
 
   return result

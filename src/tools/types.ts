@@ -4,6 +4,7 @@ import type { PrewarmCache } from '../agent/prewarm.js'
 import type { ReadRefStats } from './read-file.js'
 import type { ProviderProfile } from '../api/provider-profile.js'
 import type { FailureClass } from '../agent/failure-classifier.js'
+import type { ContractProjection } from '../agent/contract-projection.js'
 
 /**
  * T4 — structured per-worker delegation update for the desktop subagent panel
@@ -61,6 +62,16 @@ export interface DelegationActivity {
   artifactId?: string
   /** Files this worker changed (for diff review entry hints). */
   changedFiles?: string[]
+  /** 用户契约投影——只随首条 running 事件携带（同 objective 先例）。 */
+  contract?: ContractProjection
+  /** 终态 findings 计数（不进完整数组，保持 SSE 轻量）。 */
+  findingsCount?: number
+  /** 终态第一条 finding claim（空/无则缺省）。 */
+  topFinding?: string
+  /** 终态 verification 摘要。 */
+  verificationBrief?: { status: string; passed: number; failed: number }
+  /** 终态 evidenceStatus。 */
+  evidenceStatus?: string
 }
 
 /**
@@ -114,6 +125,18 @@ export interface PlanStepInput {
 }
 
 /**
+ * 用户级验收项（2026-07-25 交付前行为验收闸门）。经 `onAcceptance` 从 todo 工具
+ * 流向 loop：声明写进 `TaskContract.successCriteria`，状态回写核销 acceptance 义务。
+ */
+export interface AcceptanceItemInput {
+  /** 用户做什么动作 → 看到什么可观察结果。拒绝内部属性/信号级表述。 */
+  criterion: string
+  status: 'pending' | 'met' | 'blocked'
+  /** met：实际执行了什么观察到了什么；blocked：为何执行不了。 */
+  evidence?: string
+}
+
+/**
  * VSW: a resolved snapshot plan attached to a verification tool call. Built by
  * the session-scoped verification-snapshot-manager from the §6 policy decision.
  */
@@ -152,6 +175,10 @@ export interface ToolCallParams {
    *  by the plan_steps tool during planning. The loop maps these into the active
    *  PlanExecutionTrace. Absent in non-task / worker contexts → tool is a no-op. */
   onPlanSteps?: (steps: PlanStepInput[]) => void
+  /** 用户级验收面的声明与核销（todo 工具的 acceptance 字段）。loop 侧写入
+   *  TaskContract.successCriteria 并 satisfy/block acceptance 义务。
+   *  worker/非任务上下文缺省 → 工具侧 no-op。 */
+  onAcceptance?: (items: AcceptanceItemInput[]) => void
   /** T4: structured per-worker delegation updates (subagent panel). Optional —
    *  set by the tool pipeline; absent in non-server contexts (no-op). */
   onWorkerActivity?: (activity: DelegationActivity) => void
@@ -163,6 +190,9 @@ export interface ToolCallParams {
    *  the `job` tool (list/logs/await/kill). Absent in TUI/non-server contexts →
    *  bash degrades to foreground execution. */
   jobs?: import('./job-store.js').JobRegistry
+  /** Session-scoped monitor registry — enables the `monitor` tool (subscribe /
+   *  list / unsubscribe). Absent → monitor degrades to a hint to use job(await). */
+  monitors?: import('../agent/monitor-registry.js').MonitorRegistry
   /** Prewarm cache for speculative file reads — injected so read_file can hit
    *  warmed entries (mtime-verified) instead of a cold fs read. Per-session. */
   prewarmCache?: PrewarmCache
@@ -194,6 +224,12 @@ export interface ToolCallParams {
   contextWindow?: number
   /** P0-2: Provider profile — read caps relax for cache-preserving providers. */
   providerProfile?: Pick<ProviderProfile, 'cacheType' | 'persistent'>
+  /** Per-agent read-cap override — wins over the contextWindow-derived cap.
+   *  Workers run with compaction disabled AND the 1M-window request-side
+   *  pruning skipped, so a single uncapped full-file read stays in history and
+   *  is re-sent every turn until the turn budget dies (2026-07-24 诊断).
+   *  Injected via AgentConfig.readCapOverride; absent → computed cap as before. */
+  readCapOverride?: import('./model-read-cap.js').ModelReadCap
   /** Current session turn count — enables progressive timeout strategies. */
   sessionTurnCount?: number
   /** Session identifier — used to isolate per-session state (read history,

@@ -1,4 +1,5 @@
 import type { WorkerActivityEvent } from '../agent/coordinator.js'
+import type { ContractProjection } from '../agent/contract-projection.js'
 import type { DelegationActivity } from './types.js'
 
 /** Shorten a work order id to a human label: "wo_team:T1" → "T1". */
@@ -37,6 +38,9 @@ export interface DelegationActivityMapperOpts {
   /** Resolve the worker objective by workOrderId. Objective is attached only
    *  on the first running event per worker to keep the SSE stream small. */
   objectiveOf?: (workOrderId: string) => string | undefined
+  /** Resolve the contract projection by workOrderId. Like objective, only
+   *  attached on the first running event per worker. */
+  contractOf?: (workOrderId: string) => ContractProjection | undefined
 }
 
 /**
@@ -56,6 +60,11 @@ export function createDelegationActivityMapper(
 ): (event: WorkerActivityEvent) => void {
   const counters = new Map<string, { toolUseCount: number; tokenCount: number }>()
   const objectiveSent = new Set<string>()
+  // contract 与 objective 分开记账。objective 的「没查到就下条再试」是有意的
+  // （objectiveOf 查表可能首条事件时还没就绪），但那道守卫此前连 contract 一起
+  // 管着——objective 恰好为空时，contract 会跟着每条事件重发，下游按「首条才带」
+  // 的约定去重就会漏。
+  const contractSent = new Set<string>()
 
   return (event: WorkerActivityEvent) => {
     let c = counters.get(event.workOrderId)
@@ -70,10 +79,16 @@ export function createDelegationActivityMapper(
     }
     const line = activityProgressLine(event)
     let objective: string | undefined
+    let contract: ContractProjection | undefined
     if (!objectiveSent.has(event.workOrderId)) {
       // Prefer coordinator-attached objective; fall back to tool-side lookup.
       objective = event.objective ?? opts?.objectiveOf?.(event.workOrderId)
       if (objective) objectiveSent.add(event.workOrderId)
+    }
+    if (!contractSent.has(event.workOrderId)) {
+      // Contract: coordinator 随事件携带（首选）；contractOf 为工具侧兜底。
+      contract = event.contract ?? opts?.contractOf?.(event.workOrderId)
+      if (contract) contractSent.add(event.workOrderId)
     }
     onWorkerActivity({
       workOrderId: event.workOrderId,
@@ -88,6 +103,7 @@ export function createDelegationActivityMapper(
       tokenCount: c.tokenCount > 0 ? c.tokenCount : undefined,
       eventKind: event.kind,
       eventDetail: event.detail,
+      ...(contract ? { contract } : {}),
     })
   }
 }

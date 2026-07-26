@@ -1,5 +1,5 @@
 import type { Message, ContentBlock } from '../api/types.js'
-import type { OaiMessage, OaiToolMessage, OaiAssistantMessage } from '../api/oai-types.js'
+import type { OaiMessage, OaiToolMessage } from '../api/oai-types.js'
 import { groupIntoRounds, computeInvariantStatus, groupIntoRoundsOai } from './rounds.js'
 import type { ResumePreflightReport } from './types.js'
 import {
@@ -182,8 +182,6 @@ export function detectOrphanToolResultsOai(messages: OaiMessage[]): string[] {
   }
   return orphanResultIds
 }
-
-const SYNTHETIC_TOOL_RESULT_CONTENT = syntheticResultContent()
 
 /**
  * True when every assistant `tool_calls` message is IMMEDIATELY followed by a

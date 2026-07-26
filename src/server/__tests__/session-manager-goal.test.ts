@@ -20,6 +20,7 @@ import type { GoalSnapshot } from '../session-manager.js'
 import type { Artifact } from '../../artifact/types.js'
 import type { AgentCallbacks } from '../../agent/loop-types.js'
 import type { OaiMessage } from '../../api/oai-types.js'
+import type { PlanDocument } from '../../plan/plan-store.js'
 
 /** Minimal fake agent that remembers the tracker it was handed (for the
  *  double-track assertion: cancelGoal must clear BOTH refs AND agent field). */
@@ -230,5 +231,118 @@ describe('RuntimeSessionManager goal mode', () => {
     const evs = manager.getEvents(s.id)
     const goalEvs = evs!.events.filter((e) => e.type === 'goal_state')
     assert.equal(goalEvs.length, 1, 'still only 1 goal_state (baseline not re-emitted)')
+  })
+})
+
+describe('Goal 计划倒计时自动批准（2026-07-24）', () => {
+  let sessionDir: string
+
+  beforeEach(() => {
+    sessionDir = mkdtempSync(join(tmpdir(), 'rivet-goal-plan-auto-'))
+  })
+  afterEach(() => {
+    rmSync(sessionDir, { recursive: true, force: true })
+  })
+
+  type CapturingAgent = GoalFakeAgent & { callbacks?: AgentCallbacks }
+
+  function makePlanManager(opts: { delayMs: number; plans: PlanDocument[] }) {
+    const goalTrackerRef: { current: GoalTracker | null } = { current: null }
+    const agents: CapturingAgent[] = []
+    const manager = new RuntimeSessionManager({
+      createAgent: () => {
+        const a = new GoalFakeAgent() as CapturingAgent
+        a.run = (_p, cb) => { a.callbacks = cb; return Promise.resolve() }
+        agents.push(a)
+        return a
+      },
+      defaultCwd: '/tmp',
+      resolveGoalHandles: () => ({ goalTrackerRef, sessionDir } as GoalHandles),
+      goalPlanAutoApproveMs: opts.delayMs,
+      listPlans: async () => opts.plans,
+    })
+    return { manager, agents }
+  }
+
+  function submittedPlan(slug = 'p-1'): PlanDocument {
+    return {
+      slug,
+      title: 'Plan One',
+      status: 'submitted',
+      content: '# P1',
+      path: `.rivet/plans/${slug}.md`,
+      createdAt: new Date(),
+    }
+  }
+
+  async function submitPlanViaTool(cb: AgentCallbacks): Promise<void> {
+    cb.onToolUse('t1', 'plan', { action: 'submit' })
+    cb.onToolResult('t1', 'plan', 'ok', false)
+    await new Promise((r) => setTimeout(r, 20))
+  }
+
+  test('goal 激活时计划提交武装倒计时；非 submit action 不武装', async () => {
+    const { manager, agents } = makePlanManager({ delayMs: 5000, plans: [submittedPlan()] })
+    const s = manager.createSession({})
+    void manager.run(s.id, 'go')
+    await manager.setGoal(s.id, { goal: 'x', maxIterations: 10, contextWindow: 1000 })
+
+    const cb = agents[0]!.callbacks!
+    await submitPlanViaTool(cb)
+
+    const pending = manager.getEvents(s.id)!.events.filter((e) => e.type === 'plan_auto_approve_pending')
+    assert.equal(pending.length, 1, 'goal 激活 + submit → 武装一次')
+    assert.equal(pending[0]!.data.slug, 'p-1')
+    assert.equal(typeof pending[0]!.data.deadlineMs, 'number')
+
+    // 未登记 toolId 的 plan 结果（非 submit action）不得触发第二次武装
+    cb.onToolResult('t2', 'plan', 'ok', false)
+    await new Promise((r) => setTimeout(r, 20))
+    assert.equal(manager.getEvents(s.id)!.events.filter((e) => e.type === 'plan_auto_approve_pending').length, 1)
+  })
+
+  test('非 goal 会话不武装（纯手动审批语义不变）', async () => {
+    const { manager, agents } = makePlanManager({ delayMs: 5000, plans: [submittedPlan()] })
+    const s = manager.createSession({})
+    void manager.run(s.id, 'go')
+
+    await submitPlanViaTool(agents[0]!.callbacks!)
+    const pending = manager.getEvents(s.id)!.events.filter((e) => e.type === 'plan_auto_approve_pending')
+    assert.equal(pending.length, 0)
+  })
+
+  test('到期触发 approvePlan（同 slug）', async () => {
+    const { manager, agents } = makePlanManager({ delayMs: 40, plans: [submittedPlan()] })
+    const s = manager.createSession({})
+    void manager.run(s.id, 'go')
+    await manager.setGoal(s.id, { goal: 'x', maxIterations: 10, contextWindow: 1000 })
+
+    const calls: Array<[string, string]> = []
+    ;(manager as unknown as { approvePlan: (id: string, slug: string) => Promise<{ ok: boolean }> }).approvePlan =
+      async (id, slug) => { calls.push([id, slug]); return { ok: true } }
+
+    await submitPlanViaTool(agents[0]!.callbacks!)
+    await new Promise((r) => setTimeout(r, 150))
+    assert.deepEqual(calls, [[s.id, 'p-1']])
+  })
+
+  test('显式取消后到期不触发（cancelled 事件带 reason）', async () => {
+    const { manager, agents } = makePlanManager({ delayMs: 40, plans: [submittedPlan()] })
+    const s = manager.createSession({})
+    void manager.run(s.id, 'go')
+    await manager.setGoal(s.id, { goal: 'x', maxIterations: 10, contextWindow: 1000 })
+
+    const calls: Array<[string, string]> = []
+    ;(manager as unknown as { approvePlan: (id: string, slug: string) => Promise<{ ok: boolean }> }).approvePlan =
+      async (id, slug) => { calls.push([id, slug]); return { ok: true } }
+
+    await submitPlanViaTool(agents[0]!.callbacks!)
+    assert.equal(manager.cancelPlanAutoApproveForUser(s.id), true)
+    await new Promise((r) => setTimeout(r, 150))
+
+    assert.deepEqual(calls, [], '取消后定时器不得触发')
+    const cancelled = manager.getEvents(s.id)!.events.filter((e) => e.type === 'plan_auto_approve_cancelled')
+    assert.equal(cancelled.length, 1)
+    assert.equal(cancelled[0]!.data.reason, 'user')
   })
 })

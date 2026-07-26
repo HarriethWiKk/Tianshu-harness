@@ -29,8 +29,10 @@ function makeLedger(overrides: Partial<CognitiveLedgerInput> = {}): CognitiveLed
     evidence: {
       filesModified: new Set(),
       filesTouched: new Map(),
+      // 706aef36：mirror 的 verification_coverage 语义化改造读 verifications 数组
+      verifications: [],
       deliveryStatus: 'unverified',
-      getState: () => ({ filesModified: new Set(), filesTouched: new Map(), deliveryStatus: 'unverified' }),
+      getState: () => ({ filesModified: new Set(), filesTouched: new Map(), verifications: [], deliveryStatus: 'unverified' }),
       recordModification: () => {},
       recordTest: () => {},
       merge: () => {},
@@ -174,7 +176,7 @@ describe('cognitive mirror — 认知镜面', () => {
     const sensorium = makeSensorium({ confidence: 1.0 })
     const ledger = makeLedger({
       sensorium,
-      evidence: { filesModified: new Set(['src/x.ts']) } as any,
+      evidence: { filesModified: new Set(['src/x.ts']), verifications: [] } as any,
     })
     const mirror = buildCognitiveMirror(ledger)
 

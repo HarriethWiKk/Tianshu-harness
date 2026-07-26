@@ -91,6 +91,24 @@ describe('advanceContractStatus', () => {
     assert.equal(planning.updatedAtTurn, 2)
   })
 
+  it('复工降级：ready_to_deliver 遇执行证据退回 executing，其余相位不回退', () => {
+    const contract = extractTaskContract('implement src/foo.ts feature')
+    const delivered = advanceContractStatus(contract, 'ready_to_deliver', 5)
+    assert.equal(delivered.status, 'ready_to_deliver')
+    // 新一轮编辑 → executing 证据 → 复工
+    const resumed = advanceContractStatus(delivered, 'executing', 6)
+    assert.equal(resumed.status, 'executing')
+    assert.equal(resumed.updatedAtTurn, 6)
+    // 交付后读文档/规划不重开任务
+    const afterExplore = advanceContractStatus(delivered, 'exploring', 6)
+    assert.equal(afterExplore.status, 'ready_to_deliver')
+    const afterPlan = advanceContractStatus(delivered, 'planning', 6)
+    assert.equal(afterPlan.status, 'ready_to_deliver')
+    // 复工后可再次正常走到交付
+    const redelivered = advanceContractStatus(resumed, 'ready_to_deliver', 8)
+    assert.equal(redelivered.status, 'ready_to_deliver')
+  })
+
   it('allows forward progress and blocked recovery', () => {
     const contract = extractTaskContract('implement src/foo.ts feature')
     const blocked = advanceContractStatus(contract, 'blocked', 2)

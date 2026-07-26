@@ -33,6 +33,21 @@ function formatTokens(usage?: { input_tokens?: number; output_tokens?: number; c
   return parts.join(' · ') || '-'
 }
 
+/** 诚实标签：根据 failureReason / evidenceStatus 返回人类可读的警告文本。 */
+function honestyLabel(failureReason?: string, evidenceStatus?: string): string | null {
+  switch (failureReason) {
+    case 'max_turns': return '预算耗尽 · 摘要可能不完整'
+    case 'json_parse': return '结果解析失败 · 已从碎片恢复'
+    case 'worker_crash': return 'Worker 异常终止'
+    case 'timeout': return 'Worker 超时'
+    case 'caller_aborted': return '已被取消'
+    case 'worker_blocked': return 'Worker 被阻断'
+    default: break
+  }
+  if (evidenceStatus === 'failed') return '验收证据验证失败'
+  return null
+}
+
 function formatOaiMessages(messages: OaiMessage[]): string {
   const lines: string[] = []
   for (const msg of messages) {
@@ -108,6 +123,20 @@ export function buildWorkerDetailContent(
   }
   lines.push(statusLineParts.join(' · '))
 
+  // ── 契约摘要（首条 running 事件携带） ──
+  if (liveView?.contract) {
+    const c = liveView.contract
+    lines.push('')
+    lines.push('── Contract ──')
+    lines.push(`objective: ${truncate(c.objective)}`)
+    lines.push(`profile: ${c.profile} · tools: ${c.allowedToolsDigest}`)
+    if (c.authority) lines.push(`authority: ${formatAuthorityLabel(c.authority, c.authorityReason)}`)
+    lines.push(`budget: ${c.budget.maxTurns} turns · ${Math.floor(c.budget.timeoutMs / 1000)}s timeout`)
+    if (c.scope.files?.length) {
+      lines.push(`scope: ${c.scope.files.slice(0, 5).join(', ')}${c.scope.files.length > 5 ? ` +${c.scope.files.length - 5}` : ''}`)
+    }
+  }
+
   // ── 活动日志 ──
   if (liveView?.activityLog && liveView.activityLog.length > 0) {
     lines.push('')
@@ -126,7 +155,31 @@ export function buildWorkerDetailContent(
     if (result.model) lines.push(`model: ${result.model}`)
     if (result.provider) lines.push(`provider: ${result.provider}`)
     if (result.usage) lines.push(`usage: ${formatTokens(result.usage)}`)
+    // 诚实标签（failureReason 驱动）
+    const honesty = honestyLabel(result.failureReason, result.evidenceStatus)
+    if (honesty) lines.push(`⚠ ${honesty}`)
     lines.push(`summary: ${truncate(result.summary)}`)
+    if (result.findings && result.findings.length > 0) {
+      lines.push(`findings: ${result.findings.length}`)
+      for (const f of result.findings.slice(0, 5)) {
+        const conf = f.confidence ? ` [${f.confidence}]` : ''
+        lines.push(`  ·${conf} ${truncate(f.claim, 120)}`)
+      }
+      if (result.findings.length > 5) {
+        lines.push(`  … +${result.findings.length - 5} more`)
+      }
+    }
+    if (result.verification) {
+      const v = result.verification
+      const statusGlyph = v.status === 'passed' ? '✅' : v.status === 'failed' ? '❌' : '⚠'
+      lines.push(`verification: ${statusGlyph} ${v.passed}/${v.passed + v.failed} passed · ${v.command}`)
+    }
+    if (result.nextActions && result.nextActions.length > 0) {
+      lines.push('next actions:')
+      for (const a of result.nextActions.slice(0, 5)) {
+        lines.push(`  · ${truncate(a, 120)}`)
+      }
+    }
     if (result.changedFiles && result.changedFiles.length > 0) {
       lines.push('changed files:')
       for (const f of result.changedFiles.slice(0, 20)) {

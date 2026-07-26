@@ -1,7 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import type { CapabilityTask } from '../model/capability.js'
-import type { Usage } from '../api/types.js'
 import type { VerificationMetadata } from '../tools/types.js'
 import { profileRegistry } from './profile-registry.js'
 import { starDomainRegistry } from './star-domain-registry.js'
@@ -178,6 +177,8 @@ export type WorkerArtifact = z.infer<typeof workerArtifactSchema>
  *  Enables the primary agent to choose the right recovery strategy:
  *  - json_parse / schema_mismatch → retry with clearer format instructions
  *  - timeout / circuit_open → do NOT retry immediately, wait or skip
+ *  - max_turns → deterministic budget exhaustion; same-budget retry is dead,
+ *    re-dispatch with a bigger budget or narrower scope
  *  - worker_crash → retry may help (infra flake)
  *  - claim_conflict → resolve the conflict first
  *  - caller_aborted → the primary cancelled this, don't retry same request
@@ -187,6 +188,7 @@ export type WorkerFailureReason =
   | 'circuit_open'
   | 'claim_conflict'
   | 'timeout'
+  | 'max_turns'
   | 'json_parse'
   | 'schema_mismatch'
   | 'worker_crash'
@@ -211,7 +213,7 @@ export const workerResultSchema = z.object({
   nextActions: z.array(z.string()),
   evidenceStatus: z.enum(['verified', 'failed', 'blocked', 'unverified', 'skipped']).default('unverified'),
   /** Why the worker failed — enables recovery-strategy differentiation. */
-  failureReason: z.enum(['caller_aborted', 'circuit_open', 'claim_conflict', 'timeout', 'json_parse', 'schema_mismatch', 'worker_crash', 'worker_blocked', 'unknown']).optional(),
+  failureReason: z.enum(['caller_aborted', 'circuit_open', 'claim_conflict', 'timeout', 'max_turns', 'json_parse', 'schema_mismatch', 'worker_crash', 'worker_blocked', 'unknown']).optional(),
   /** Runtime metadata: actual model used by the worker. */
   model: z.string().optional(),
   /** Runtime metadata: provider used by the worker. */
@@ -425,13 +427,6 @@ export function mapWorkOrderKindToCapabilityTask(kind: WorkOrderKind): Capabilit
       return 'risky_refactor'
   }
 }
-
-function extractFencedJsonCandidates(text: string): string[] {
-  return [...text.matchAll(/```(?:json)?\s*([\s\S]*?)```/g)]
-    .map(match => match[1]?.trim())
-    .filter((candidate): candidate is string => Boolean(candidate?.startsWith('{') && candidate.endsWith('}')))
-}
-
 function extractBalancedJsonCandidates(text: string): string[] {
   const candidates: string[] = []
   for (let start = text.indexOf('{'); start !== -1; start = text.indexOf('{', start + 1)) {

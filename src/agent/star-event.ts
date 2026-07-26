@@ -64,6 +64,9 @@ export interface StarPhaseContext {
   isWriting: boolean
   isRunningTests: boolean
   isFinalTurn: boolean
+  /** YOLO（无上限轮次）下的归航证据门：交付验证通过时为真（2026-07-25）。
+   *  有界会话恒为 false/缺省——归航仍只认最终轮。 */
+  readyByEvidence?: boolean
   shouldEscalate: boolean
   /** True if complexity > 0.5 was ever reached this session.
    *  Enables contracting phase (plan was decomposed, now settled). */
@@ -92,7 +95,7 @@ export interface StarEvent {
  * Priority order (first match wins):
  * 1. Encore: shouldEscalate + turn>1 + confidence<0.3 → 二次请星
  * 2. Testing: isRunningTests → 试锋
- * 3. Delivering: momentum>0.8 + isFinalTurn → 归航
+ * 3. Delivering: momentum>0.8 + (isFinalTurn | readyByEvidence) → 归航
  * 4. Implementing: confidence>0.6 + isWriting → 铸形
  * 5. Decomposing: complexity>0.5 → 排阵
  * 6. Contracting: wasHighComplexity + confidence>0.7 + complexity<0.4 + !writing + !testing → 立约
@@ -113,8 +116,13 @@ export function mapSensoriumToPhase(
     return 'kaiyang-testing'
   }
 
-  // 3. Delivering: high momentum on final turn
-  if (s.momentum > 0.8 && ctx.isFinalTurn) {
+  // 3. Delivering: high momentum on final turn (or YOLO evidence gate)
+  // W4（2026-07-25）：momentum 需实测才可信——no-data 回退 0 本就不会命中
+  // >0.8，显式守卫钉死意图（防未来阈值调整误引入 no-data 误判）。
+  // 复盘修复（2026-07-25）：YOLO 无最终轮，readyByEvidence（交付验证通过）
+  // 作为归航的替代证据门，否则 delivering / ready_to_deliver 结构性不可达。
+  if ((s.quality?.momentum ?? 'measured') !== 'no-data' && s.momentum > 0.8
+      && (ctx.isFinalTurn || ctx.readyByEvidence === true)) {
     return 'yaoguang-delivering'
   }
 
@@ -209,7 +217,7 @@ export function getThetaPhase(state: ThetaState): ThetaPhase {
  * Returns true if it's time for a cross-file consistency check AND
  * the phase is in retrieval mode (momentum-safe).
  */
-export function tickTheta(state: ThetaState, currentTurn: number): boolean {
+export function tickTheta(state: ThetaState, _currentTurn: number): boolean {
   const next = state.toolCallCount + 1
   const due = next - state.lastThetaAt >= state.interval
   if (!due) return false

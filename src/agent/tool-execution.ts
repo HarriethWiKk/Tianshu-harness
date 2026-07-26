@@ -12,6 +12,7 @@ import type { RepairHintTracker } from './repair-hint.js'
 import type { RepairPipeline } from './repair-pipeline.js'
 import type { ImportGraph } from './import-graph.js'
 import type { PredictionAccumulator } from './prediction-error.js'
+import { computeTurnDepth } from './p3-reward.js'
 import type { VigorState } from './vigor.js'
 import type { RuntimeHookSnapshot, RuntimeHookPipeline } from './runtime-hooks.js'
 import type { ContextInjectionController } from './context-injection.js'
@@ -85,6 +86,8 @@ export interface ToolExecutionDeps {
   artifactStore?: import('../artifact/store.js').ArtifactStore
   /** Late-bound background job registry getter (server replaces it post-construction). */
   getJobs?: () => import('../tools/job-store.js').JobRegistry | undefined
+  /** Late-bound monitor registry getter (monitor tool + monitor-hook share it). */
+  getMonitors?: () => import('./monitor-registry.js').MonitorRegistry | undefined
   /** Session state manager for cross-turn awareness */
   sessionStateManager?: import('./session-state.js').SessionStateManager
   /** Cache advisor for adaptive thresholds */
@@ -110,6 +113,8 @@ export interface ToolExecutionDeps {
   onLeaveMark?: (mark: import('../tools/types.js').LeaveMarkInput) => void
   /** U6/C1: capture goal decomposition (plan_steps) for the loop's PlanExecutionTrace. */
   onPlanSteps?: (steps: import('../tools/types.js').PlanStepInput[]) => void
+  /** 用户级验收面的声明与核销（todo 的 acceptance 字段 → loop）。 */
+  onAcceptance?: (items: import('../tools/types.js').AcceptanceItemInput[]) => void
   /** Write a constellation milestone when plan_close succeeds with apply=true. */
   onPlanClosed?: (input: import('../tools/types.js').PlanClosedInput) => void
   /** Notify the UI that a plan was submitted for approval so it can prompt the user. */
@@ -195,7 +200,7 @@ export class ToolExecutionController {
       const ctx = [
         Math.min(1, errorRate * 2),                  // taskComplexity proxy
         errorRate,                                     // errorRate
-        Math.min(1, this.deps.getSessionTurnCount() / 50), // turnDepth
+        computeTurnDepth(this.deps.getSessionTurnCount()), // turnDepth（此层拿不到 maxTurns → 无上限口径）
         0,                                             // fileCount (not accessible at this level)
         0,                                             // isRepeat (not accessible)
         new Date().getHours() / 24,                    // timeOfDay
@@ -252,6 +257,7 @@ export class ToolExecutionController {
         this.deps.recordToolHistory(name, input_, isError, content, errorClass),
       onLeaveMark: this.deps.onLeaveMark,
       onPlanSteps: this.deps.onPlanSteps,
+      onAcceptance: this.deps.onAcceptance,
       onPlanClosed: this.deps.onPlanClosed,
       onPlanSubmitted: this.deps.onPlanSubmitted,
       onAskUserQuestion: this.deps.onAskUserQuestion,
@@ -272,6 +278,7 @@ export class ToolExecutionController {
       turnBudget: this.deps.getTurnBudget(),
       artifactStore: this.deps.artifactStore,
       jobs: this.deps.getJobs?.(),
+      monitors: this.deps.getMonitors?.(),
       cacheAdvisor: this.deps.cacheAdvisor,
       taskLedger: this.deps.config.taskLedger,
       ownershipLedger: this.deps.config.ownershipLedger,

@@ -801,7 +801,9 @@ test('POST /model switches model on an idle session; 409 on unknown', async () =
 
 test('GET /domains + POST /domain round-trips a selection', async () => {
   const { router } = setupPlus()
-  const s = await router('POST', '/sessions', {}, AUTH)
+  // 显式 domain —— 空 body 时起始星域由 ~/.rivet 全局配置 defaultDomain 决定
+  // （同 a976167f 对 model 的处理），在本机真实配置下不可预测，需锚定起点。
+  const s = await router('POST', '/sessions', { domain: 'auto' }, AUTH)
   const id = (s.body as { id: string }).id
   const before = await router('GET', `/sessions/${id}/domains`, {}, AUTH)
   const entries = (before.body as { entries: Array<{ key: string; current: boolean }> }).entries

@@ -1,5 +1,4 @@
 import type { Message } from '../api/types.js'
-import type { OaiMessage } from '../api/oai-types.js'
 import type { OaiRound } from './rounds.js'
 
 // ─── Health & Budget ──────────────────────────────────────────

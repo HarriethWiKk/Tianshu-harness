@@ -143,9 +143,9 @@ describe('renderChronicle', () => {
     assert.ok(firstLine && !stripAnsi(firstLine).includes('>'), '未选中行无游标')
   })
 
-  it('footer 引导 Enter → resume（G5 诚实文案）', () => {
+  it('footer 不展示恢复提示（2026-07-25 降可见性：功能保留，文案退场）', () => {
     const data: ChronicleData = { entries: [{ index: 1, time: 'a', summary: 's', current: false, id: 'x' }] }
     const lines = renderChronicle(data, 80, 20, theme)
-    assert.ok(lines.some(l => stripAnsi(l).includes('恢复')), 'footer 含恢复会话提示')
+    assert.ok(!lines.some(l => stripAnsi(l).includes('恢复')), 'footer 不含恢复会话提示')
   })
 })

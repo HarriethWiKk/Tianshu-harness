@@ -75,6 +75,8 @@ function clamp(value: number, min = 0, max = 1): number {
  * @param structuralEpistemic Track 1（经络图×自由能）：来自 Physarum/Meridian
  *   图结构的探索信息增益估计（0=熟路, 1=边疆）。提供时与 confidence 不确定性
  *   混合，使 epistemic 项从泛化信号变为结构化导航；缺省时保持原公式。
+ * @param inProductionFlow 主控是否处于产出流（isInProductionFlow）。true 时
+ *   解除 wuwei 的抑执行折扣——详见下方 seasonFactor 注释。
  */
 export function computeEFE(
   acc: PredictionAccumulator,
@@ -82,6 +84,7 @@ export function computeEFE(
   vigor: VigorState | null,
   sensorium?: Sensorium | null,
   structuralEpistemic?: number | null,
+  inProductionFlow?: boolean,
 ): EFEComponents {
   const confidence = sensorium?.confidence ?? 0.5
   const freshness = sensorium?.freshness ?? 0.5
@@ -108,7 +111,13 @@ export function computeEFE(
   // ── Pragmatic Value: 目标推进预期 ──
   // 高 confidence + 高 vigor → 高 pragmatic（可以执行）
   // wuwei 季节 → 无为而治，抑制执行
-  const seasonFactor = season === 'wuwei' ? 0.3
+  //
+  // 但「无为」说的是成熟稳态不需要额外干预，不是产出中要收手。实测 wuwei
+  // 覆盖 73.9% 的帧、产出流帧的 92.8% 落在 wuwei 内（2026-07-25 离线探针），
+  // 折扣正好压在「编辑+验证推进中」的那批帧上——与 stability 高恰恰因为在
+  // 稳定产出这一事实相悖。产出流中让位到无折扣基线（不是换个新系数）。
+  const wuweiDamped = season === 'wuwei' && !inProductionFlow
+  const seasonFactor = wuweiDamped ? 0.3
     : season === 'genesis' ? 0.5
     : 1.0
   const pragmaticValue = clamp(confidence * vigorEnergy * seasonFactor)

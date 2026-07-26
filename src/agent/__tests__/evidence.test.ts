@@ -77,6 +77,42 @@ describe('EvidenceTracker delivery status', () => {
     assert.equal(tracker.getState().deliveryStatus, 'failed')
   })
 
+  // ── deliveryReady：YOLO 证据门判据（2026-07-25）──
+  // 与 deliveryStatus 全窗口口径刻意不同：红→绿即就绪（failed 不粘滞），
+  // 绿后首次代码编辑即失效（verified 不反向粘滞）。
+
+  it('deliveryReady: 先红后绿 → 就绪（failed 不粘滞）', () => {
+    const tracker = new EvidenceTracker()
+    tracker.trackFileModified('src/a.ts')
+    tracker.trackVerification({ command: 'npm test', status: 'failed', scope: 'full', exitCode: 1, passed: 0, failed: 1, skipped: 0, durationMs: 100 })
+    assert.equal(tracker.deliveryReady(), false)
+    tracker.trackVerification({ command: 'npm test', status: 'passed', scope: 'full', exitCode: 0, passed: 5, failed: 0, skipped: 0, durationMs: 100 })
+    assert.equal(tracker.deliveryReady(), true, '最近一条验证 passed 即就绪——窗口内历史 failed 不挡')
+    assert.equal(tracker.getState().deliveryStatus, 'failed', '对照：deliveryStatus 保持粘滞语义不变')
+  })
+
+  it('deliveryReady: 绿后编辑代码 → 失效；再验证通过 → 恢复（verified 不反向粘滞）', () => {
+    const tracker = new EvidenceTracker()
+    tracker.trackFileModified('src/a.ts')
+    tracker.trackVerification({ command: 'npm test', status: 'passed', scope: 'full', exitCode: 0, passed: 5, failed: 0, skipped: 0, durationMs: 100 })
+    assert.equal(tracker.deliveryReady(), true)
+    tracker.trackFileModified('src/b.ts')
+    assert.equal(tracker.deliveryReady(), false, '绿后动过代码就不再就绪')
+    assert.equal(tracker.getState().deliveryStatus, 'verified', '对照：deliveryStatus 此时仍是 verified（反向粘滞）')
+    tracker.trackVerification({ command: 'npm test', status: 'passed', scope: 'full', exitCode: 0, passed: 6, failed: 0, skipped: 0, durationMs: 100 })
+    assert.equal(tracker.deliveryReady(), true)
+  })
+
+  it('deliveryReady: 绿后编辑非代码文件不失效；无验证 / 最近一条 blocked → 不就绪', () => {
+    const tracker = new EvidenceTracker()
+    assert.equal(tracker.deliveryReady(), false, '无验证不就绪')
+    tracker.trackVerification({ command: 'npm test', status: 'passed', scope: 'full', exitCode: 0, passed: 5, failed: 0, skipped: 0, durationMs: 100 })
+    tracker.trackFileModified('docs/notes.md')
+    assert.equal(tracker.deliveryReady(), true, '文档编辑不计入 TDD 计数，不掐门')
+    tracker.trackVerification({ command: 'npm test', status: 'blocked', scope: 'full', exitCode: 0, passed: 0, failed: 0, skipped: 0, durationMs: 0 })
+    assert.equal(tracker.deliveryReady(), false, '最近一条 blocked 不就绪')
+  })
+
   it('reset clears delivery status', () => {
     const tracker = new EvidenceTracker()
     tracker.trackFileModified('src/a.ts')

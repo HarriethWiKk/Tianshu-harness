@@ -23,8 +23,10 @@ test('WriteBatcher 同 tick 多次 schedule 只 flush 一次', async () => {
   await Promise.resolve()
   assert.equal(flushes, 1, '合并为一次')
   wb.schedule()
-  await Promise.resolve()
-  assert.equal(flushes, 2, '下一 tick 再 flush 一次')
+  // 16ms 节流窗口内走尾沿（2026-07-24 P2）；轮询等待比定长 sleep 耐负载
+  const start = Date.now()
+  while (flushes < 2 && Date.now() - start < 500) await new Promise(r => setTimeout(r, 5))
+  assert.equal(flushes, 2, '尾沿 flush 不丢')
 })
 
 const tick = (ms = 10) => new Promise(r => setTimeout(r, ms))

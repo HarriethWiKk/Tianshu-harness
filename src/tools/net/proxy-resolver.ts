@@ -23,27 +23,67 @@ function envCaseInsensitive(key: string): string | undefined {
 
 /** Read Windows system proxy from registry (HKCU Internet Settings).
  *  Returns undefined on non-Windows or when no proxy is configured.
- *  Format: "host:port" or "http=host:port;https=host:port". */
+ *  Normalized to a full URL (http://host:port) for ProxyAgent compatibility. */
 function readWindowsSystemProxy(): string | undefined {
   if (process.platform !== 'win32') return undefined
   try {
-    const stdout = execSync(
-      'reg query "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings" /v ProxyServer 2>nul',
-      { encoding: 'utf8', timeout: 3000, windowsHide: true },
-    )
-    // Output: "    ProxyServer    REG_SZ    host:port"
-    const match = stdout.match(/REG_SZ\s+(.+)/)
-    if (match?.[1]) return match[1].trim()
-    // Also check ProxyEnable
+    // 先查 ProxyEnable —— 代理已禁用（0x0 或不存在）直接返回 undefined。
+    // 必须在 ProxyServer 之前：注册表里 ProxyServer 键即使代理禁用也常残留
+    // （Windows 关代理时只翻 ProxyEnable，不清 ProxyServer），先读 ProxyServer
+    // 会让禁用代理的用户被强制走残留的代理地址。
     const enable = execSync(
       'reg query "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings" /v ProxyEnable 2>nul',
       { encoding: 'utf8', timeout: 3000, windowsHide: true },
     )
     if (!/0x1/.test(enable)) return undefined
+
+    // 代理已启用 —— 读 ProxyServer 拿地址
+    const stdout = execSync(
+      'reg query "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings" /v ProxyServer 2>nul',
+      { encoding: 'utf8', timeout: 3000, windowsHide: true },
+    )
+    return parseWindowsProxyOutput(enable, stdout)
   } catch {
     // reg query fails when the key doesn't exist — no proxy configured
   }
   return undefined
+}
+
+/**
+ * 从 reg query 的 ProxyEnable / ProxyServer 两段输出解析代理 URL。
+ * 抽成纯函数便于单测——避免 mock child_process（Node 24 内置模块属性
+ * 不可配置，mock.method 会抛 Cannot redefine property）。
+ *
+ * ProxyEnable 输出形如 "    ProxyEnable    REG_DWORD    0x1"，
+ * ProxyServer 输出形如 "    ProxyServer    REG_SZ    host:port"。
+ */
+export function parseWindowsProxyOutput(enableStdout: string, serverStdout: string): string | undefined {
+  // 代理未启用（0x0 或非 0x1）—— 即使 ProxyServer 残留也不返回
+  if (!/0x1/.test(enableStdout)) return undefined
+  const match = serverStdout.match(/REG_SZ\s+(.+)/)
+  if (match?.[1]) return normalizeProxyUrl(match[1].trim())
+  return undefined
+}
+
+/** Ensure a proxy URL has a protocol prefix. Windows registry stores proxy as
+ *  "host:port" (no scheme), but undici ProxyAgent requires "http://host:port".
+ *  Also handles the "http=host;https=host" multi-protocol format——优先取 https，
+ *  因为绝大多数出站流量（API 调用、更新检查）走 https，http 代理端口常不监听 TLS。 */
+function normalizeProxyUrl(raw: string): string | undefined {
+  // Format: "http=host:port;https=host:port" — 两轮扫描，优先 https
+  if (raw.includes('=')) {
+    const parts = raw.split(';')
+    for (const want of ['https', 'http']) {
+      for (const part of parts) {
+        const m = part.match(/^(https?)=(.+)/i)
+        if (m && m[1]!.toLowerCase() === want) return normalizeProxyUrl(m[2]!.trim())
+      }
+    }
+    return undefined
+  }
+  // Bare "host:port" → add http:// prefix
+  if (/^https?:\/\//i.test(raw)) return raw
+  return `http://${raw}`
 }
 
 /**

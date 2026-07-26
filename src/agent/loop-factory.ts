@@ -6,6 +6,7 @@ import type { RuntimeHookSnapshot } from './runtime-hooks.js'
 import { createRuntimeHookContext, RuntimeHookPipeline } from './runtime-hooks.js'
 import { createDefaultRuntimeHooks } from './create-runtime-hooks.js'
 import { createUserHooksBridge, runOnErrorHooks } from './hooks/user-hooks-bridge.js'
+import { recordSkillInvoked } from './skill-gate.js'
 import { normalizeAntiAnchoringConfig } from './anti-anchoring-config.js'
 import { mapQueriedPheromones } from './pheromone-map.js'
 import { setGeneralLedgerTelemetrySink } from './general-ledger.js'
@@ -26,6 +27,7 @@ import { PlanTraceCoordinator } from './plan-trace-coordinator.js'
 import { CompactBoundaryCoordinator, DEFAULT_QUALITY_COMPACT_THRESHOLDS } from './compact-boundary-coordinator.js'
 import { TurnOrchestrator, type TurnStateBag } from './turn-orchestrator.js'
 import { GoalContinuationController } from './goal-continuation.js'
+import { listPlans } from '../plan/plan-store.js'
 import { PostTurnDecisionController } from './post-turn-decision.js'
 import { ReasoningEffortController } from './reasoning-effort-controller.js'
 import { buildGatedInfluenceAuditEvent, persistGatedInfluenceAudit } from './gated-influence-audit.js'
@@ -342,6 +344,7 @@ export function createToolExecutionController(self: AgentLoop): ToolExecutionCon
       recordToolHistory: (name, input, isError, content, errorClass) => self.recordToolHistory(name, input, isError, content, errorClass),
       onLeaveMark: mark => self.captureLeaveMark(mark),
       onPlanSteps: steps => self.capturePlanSteps(steps),
+      onAcceptance: items => self.captureAcceptance(items),
       onPlanClosed: input => self.handlePlanClosed(input),
       onPlanSubmitted: info => self.onPlanApprovalRequested?.(info),
       onAskUserQuestion: info => self.onAskUserQuestionRequested?.(info),
@@ -355,19 +358,28 @@ export function createToolExecutionController(self: AgentLoop): ToolExecutionCon
       },
       exitPlanMode: () => { if (self.getPlanModeState() === 'planning') self.exitPlanMode() },
       getVerificationEvidence: () => self.evidence.getVerificationSummary(),
-      onSkillInvoked: name => self.config.promptEngine.markSkillInvoked(name),
+      // 技能门禁（2026-07-25）：同步记入会话级 store，executePlan 入口据此
+      // 判定计划点名的 skill 是否已加载。
+      onSkillInvoked: name => {
+        self.config.promptEngine.markSkillInvoked(name)
+        recordSkillInvoked(name, self.config.sessionId)
+      },
       onSkillCompleted: name => self.config.promptEngine.markSkillCompleted(name),
       buildRuntimeSnapshot: extra => self.buildRuntimeSnapshot(extra),
       submitControlSignal: signal => { self.controlPlane.submit(signal) },
       requestThetaCheck: reason => { self.requestThetaCheck(reason) },
-      getAutoReasoning: () => self.config.autoReasoning ?? false,
+      // 复盘修复（2026-07-25）：tip 档位调整是 autoReasoning 的一部分——用户
+      // /effort 显式选档后（override 为真）不得再被 bandit 调整改档。
+      getAutoReasoning: () => (self.config.autoReasoning ?? false) && !self.userReasoningOverride,
       getReasoningEffort: () => self.config.reasoningEffort,
-      setClientReasoningEffort: effort => { self.setReasoningEffort(effort) },
+      // autoReasoning 档位调整是程序化来源——不得置 userReasoningOverride（W1 分流）
+      setClientReasoningEffort: effort => { self.setReasoningEffort(effort, 'programmatic') },
       getSensorium: () => self.sensorium,
       getReliabilityDecision: () => self.latestReliabilityDecision,
       getTurnBudget: () => self.turnBudget,
       artifactStore: self.artifactStore,
       getJobs: () => self.jobs,
+      getMonitors: () => self.monitors,
       sessionStateManager: self.sessionStateManager,
       cacheAdvisor: self.cacheAdvisor,
       p3: self.p3,
@@ -475,6 +487,7 @@ export function createRuntimeHooksPipeline(self: AgentLoop): RuntimeHookPipeline
     stigmergyDeposit: deposit => self.stigmergyStore.deposit(deposit),
     stigmergyQuery: () => self.stigmergyStore.query(),
     getEvidenceState: () => self.evidence.getState(),
+    getVerificationDebt: () => self.evidence.hasVerificationDebt(),
     obligations: self.obligations,
     // A4（信号互扰治理）：收束类 hook 的续轮活跃判定半边（另一半是 high 义务）。
     getGoalActive: () => self.isGoalActive(),
@@ -750,6 +763,7 @@ export function createRuntimeHooksPipeline(self: AgentLoop): RuntimeHookPipeline
     userHooksBridge: userBridgeDeps,
     advisoryBus: self.advisoryBus,
     getJobs: () => self.jobs,
+    getMonitors: () => self.monitors,
     sycophancyTrap: self.sycophancyTrap,
     getEstimatedTokens: () => self.session.getEstimatedTokens(),
     getContextWindow: () => self.config.contextWindow ?? 128_000,
@@ -1130,6 +1144,16 @@ export function createTurnOrchestrator(self: AgentLoop): TurnOrchestrator {
     // === Sub-controllers ===
     goalContinuation: new GoalContinuationController({
       getGoalTracker: () => self.getGoalTracker(),
+      hasPendingPlanApproval: async () => {
+        // 待批计划闸门（2026-07-24）：最新计划为 submitted 即停 goal 续跑。
+        // 读盘失败 fail-open——宁可空转不可假死。
+        try {
+          const plans = await listPlans(self.cwd)
+          return plans[0]?.status === 'submitted'
+        } catch {
+          return false
+        }
+      },
       getGoalJudgeDeps: () => {
         if (self.config.goalJudge?.enabled === false) return undefined
         const coordinator = self.config.coordinatorRef?.()

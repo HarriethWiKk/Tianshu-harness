@@ -10,6 +10,9 @@ export interface StarPhaseContextInput {
   recentTools: string[]
   shouldEscalate: boolean
   hasEnteredHighComplexity: boolean
+  /** 交付证据门（evidence.deliveryStatus === 'verified'）——YOLO 无最终轮，
+   *  归航改由交付证据抬升（2026-07-25 复盘修复）。 */
+  deliveryVerified?: boolean
 }
 
 export interface ThetaTelemetrySnapshot {
@@ -89,7 +92,15 @@ export function buildStarPhaseContext(input: StarPhaseContextInput): StarPhaseCo
     turn: input.turn,
     isWriting: input.recentTools.some(t => t === 'write_file' || t === 'edit_file'),
     isRunningTests: input.recentTools.some(t => t === 'run_tests'),
-    isFinalTurn: input.turn >= input.maxTurns - 1,
+    // maxTurns<=0 是 YOLO 的「无上限」哨兵（turn-orchestrator 解释为
+    // MAX_SAFE_INTEGER）——无上限就没有最终轮，否则 turn >= -1 恒真，
+    // momentum>0.8 的帧会全数落进「瑶光归航」，把无限轮次的会话一路当成收尾。
+    isFinalTurn: input.maxTurns > 0 && input.turn >= input.maxTurns - 1,
+    // YOLO 证据门归航（2026-07-25 复盘修复）：isFinalTurn 恒假让 delivering
+    // 相位（及下游 phaseClass:'deliver' → 合同 ready_to_deliver）在 YOLO 下
+    // 结构性不可达。用交付证据（验证通过）替代轮次边界；有界会话不走此门，
+    // 语义保持「最终轮才归航」不变。
+    readyByEvidence: input.maxTurns <= 0 && (input.deliveryVerified ?? false),
     shouldEscalate: input.shouldEscalate,
     hasEnteredHighComplexity: input.hasEnteredHighComplexity,
   }

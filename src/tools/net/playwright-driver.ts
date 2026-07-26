@@ -1,0 +1,101 @@
+/**
+ * playwright-driver — playwright-core 共享加载与 headless chromium 启动。
+ *
+ * 浏览器依赖统一为 playwright-core（不含浏览器下载逻辑）；chromium 可执行
+ * 文件完全交给 playwright-core 内建 registry 解析：
+ *   1. PLAYWRIGHT_BROWSERS_PATH env（桌面端 sidecar 指向打包资源目录）
+ *   2. 默认缓存目录（CLI：`npx playwright install chromium` 的落地处）
+ * 浏览器缺失时抛带国内镜像安装提示的友好错误。
+ *
+ * 本模块只定义最小结构化接口（Pw*），调用方按需收窄——与
+ * browser-debug/driver.ts 的 `as never` 动态加载同风格，避免构建期
+ * 解析 playwright-core 的类型。
+ */
+
+export const PLAYWRIGHT_INSTALL_HINT =
+  'chromium 未安装。安装：npx playwright install chromium' +
+  '（国内网络：PLAYWRIGHT_DOWNLOAD_HOST=https://registry.npmmirror.com/-/binary/playwright npx playwright install chromium）'
+
+/**
+ * 动态 specifier（变量形式），避免 tsc/tsup 构建期静态解析。
+ * 返回 unknown——各调用方（render-pool / browser / browser-debug）按自己的
+ * Pw* 接口收窄，互不耦合。
+ */
+export async function loadPlaywrightCore(): Promise<unknown> {
+  const specifier = 'playwright-core'
+  try {
+    return await import(specifier)
+  } catch {
+    throw new Error(`未安装 playwright-core。请运行 npm i playwright-core。${PLAYWRIGHT_INSTALL_HINT}`)
+  }
+}
+
+/** 启动错误是否由浏览器可执行文件缺失引起（此时才附安装提示）。 */
+export function isBrowserMissingError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err)
+  return msg.includes('Executable') && msg.includes("doesn't exist")
+}
+
+export interface PwRoute {
+  abort(errorCode?: string): Promise<void>
+  continue(): Promise<void>
+}
+export interface PwRequest {
+  url(): string
+}
+export type PwRouteHandler = (route: PwRoute, request: PwRequest) => Promise<void>
+export interface PwPage {
+  goto(url: string, opts: Record<string, unknown>): Promise<unknown>
+  url(): string
+  content(): Promise<string>
+  route(url: string, handler: PwRouteHandler): Promise<void>
+  close(): Promise<void>
+  /** 以下为 actions 体系（B2）扩展——与真实 playwright Page 签名对齐。 */
+  click(selector: string, opts?: Record<string, unknown>): Promise<void>
+  fill(selector: string, text: string, opts?: Record<string, unknown>): Promise<void>
+  press(selector: string, key: string, opts?: Record<string, unknown>): Promise<void>
+  keyboard?: { press(key: string): Promise<void> }
+  evaluate(script: string): Promise<unknown>
+  waitForSelector(selector: string, opts?: Record<string, unknown>): Promise<unknown>
+}
+export interface PwContext {
+  newPage(): Promise<PwPage>
+  close(): Promise<void>
+}
+export interface PwBrowser {
+  newPage(): Promise<PwPage>
+  newContext(opts: Record<string, unknown>): Promise<PwContext>
+  close(): Promise<void>
+  on(event: string, handler: (arg: never) => void): void
+  isConnected?(): boolean
+}
+export interface PwChromium {
+  launch(opts: Record<string, unknown>): Promise<PwBrowser>
+}
+
+export interface LaunchHeadlessOptions {
+  proxy?: { server: string; bypass?: string }
+  timeoutMs?: number
+}
+
+/**
+ * 启动 headless chromium（无显式 executablePath——registry 结合
+ * PLAYWRIGHT_BROWSERS_PATH 自动定位，桌面端打包浏览器因此零配置生效）。
+ * 浏览器缺失时抛带安装提示的友好错误；其余启动错误原样上抛。
+ */
+export async function launchHeadlessChromium(opts: LaunchHeadlessOptions = {}): Promise<PwBrowser> {
+  const mod = (await loadPlaywrightCore()) as { chromium: PwChromium }
+  try {
+    return await mod.chromium.launch({
+      headless: true,
+      ...(opts.timeoutMs ? { timeout: opts.timeoutMs } : {}),
+      ...(opts.proxy ? { proxy: opts.proxy } : {}),
+    })
+  } catch (err) {
+    if (isBrowserMissingError(err)) {
+      const msg = err instanceof Error ? err.message : String(err)
+      throw new Error(`${PLAYWRIGHT_INSTALL_HINT}\n（原始错误：${msg.split('\n')[0]}）`)
+    }
+    throw err
+  }
+}

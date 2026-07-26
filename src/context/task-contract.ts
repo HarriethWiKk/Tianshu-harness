@@ -258,6 +258,15 @@ export function advanceContractStatus(contract: TaskContract, nextStatus: Contra
   if (nextStatus === 'blocked') return { ...contract, status: 'blocked', updatedAtTurn: turn }
   if (contract.status === 'blocked') return { ...contract, status: nextStatus, updatedAtTurn: turn }
 
+  // 复工降级（2026-07-25）：交付态不是终态闩。YOLO 证据门让 delivering 可在
+  // 会话中途达成——其后若又出现执行证据（新一轮编辑），必须退回 executing，
+  // 否则合同块在剩余任务期间持续向模型宣告 status="ready_to_deliver"，
+  // 是每轮复读的误导信号。仅放行这一条降级弧：explore/plan 类相位不回退
+  // （交付后读文档/收尾不该重开任务），单调性对其余状态照旧。
+  if (contract.status === 'ready_to_deliver' && nextStatus === 'executing') {
+    return { ...contract, status: 'executing', updatedAtTurn: turn }
+  }
+
   const currentRank = STATUS_RANK[contract.status]
   const nextRank = STATUS_RANK[nextStatus]
   if (nextRank < currentRank) return contract

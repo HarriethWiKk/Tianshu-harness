@@ -3,6 +3,7 @@
  */
 
 import { shouldCaptureResponseBody, truncateResponseBody } from './log-capture.js'
+import { PLAYWRIGHT_INSTALL_HINT } from '../net/playwright-driver.js'
 
 export interface DriverEvents {
   onConsole(level: string, text: string): void
@@ -132,13 +133,11 @@ interface PwChromium {
 }
 
 async function loadPlaywright(): Promise<{ chromium: PwChromium }> {
-  const specifier = 'playwright'
+  const specifier = 'playwright-core'
   try {
     return (await import(specifier)) as never
   } catch {
-    throw new Error(
-      'Playwright is not installed. Run `npm i -D playwright && npx playwright install chromium`.',
-    )
+    throw new Error(`Playwright chromium unavailable. ${PLAYWRIGHT_INSTALL_HINT}`)
   }
 }
 

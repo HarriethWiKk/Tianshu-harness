@@ -34,8 +34,13 @@ export interface DeadEndDetectorDeps {
   obligations?: Pick<import('../obligation-tracker.js').ObligationTracker, 'upsert'>
 }
 
-/** 触发阈值:同文件 edit→verify-fail 循环次数 */
-const CYCLE_THRESHOLD = 2
+/** 触发阈值:同文件 edit→verify-fail 循环次数。
+ *  2026-07-28 从 2 调到 3：TDD 的 RED→edit→RED 正常节奏被 2
+ *  次阈值误判为死路——写实现还不绿是完全正常的。3 次给足调试余地。 */
+const CYCLE_THRESHOLD = 3
+
+/** 测试文件匹配:这些文件的 RED 是 TDD 预期行为,不计入死路。 */
+const TEST_FILE_RE = /\.test\.|\.spec\.|__tests__|_test\.|test_/
 
 /** 诊断类工具 — expect 谓词与触发内容共用(采纳 = 转向这些工具) */
 const DIAGNOSIS_TOOLS = ['read_file', 'grep', 'glob', 'semantic_search', 'lsp_goto_definition', 'lsp_find_references']
@@ -128,10 +133,16 @@ export function createDeadEndDetectorHook(
       if (isNonSemanticFailure(tool)) return
 
       // ── 验证失败:所有 pending 文件各记一次循环 ────────────────
+      // TDD 豁免:run_tests 下测试文件 RED 是预期行为,不计入死路。
+      // 写测试→爆红→写实现→绿,这个循环不是盲改,不需要死路信号介入。
+      const isRunTests = tool.name === 'run_tests'
       const fingerprint = extractFailureFingerprint(tool.resultContent)
       for (const [file, s] of files) {
         if (!s.editPending) continue
         s.editPending = false
+
+        // 测试文件 + run_tests → 跳过死路计数（TDD 正常 RED）
+        if (isRunTests && TEST_FILE_RE.test(file)) continue
 
         // 失败指纹对比：如果指纹变了 → 新问题，不是盲改，重置计数
         if (fingerprint && s.lastFailureFingerprint && fingerprint !== s.lastFailureFingerprint) {

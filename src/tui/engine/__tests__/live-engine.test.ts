@@ -559,22 +559,14 @@ test('嵌入 \\n 的行参与 reservedTail 预算时 chrome 仍完整保留', ()
   assert.equal(term.cursorRow, 5, '帧恒 ≤ maxRows=6 display rows（光标停在第 6 行内）')
 })
 
-// ── IME 硬件光标锚定（caretCol parking，2026-07-23）────────────────
+// ── IME 硬件光标锚定（caretCol parking，2026-07-23；2026-07-24 默认重开）────
 // 终端 IME 候选窗锚定【硬件光标】而非自绘 █：帧末把硬件光标搬到 caretCol
-// 标记的坐标，组词串才会出现在输入框内。默认保持隐藏（单指针视觉）。
-// 需 RIVET_TUI_HARDWARE_CURSOR=1 才激活 parking 序列（cursorUp + G 驻停），
-// 否则走 pre-IME 路径（帧末光标留在末行尾，零额外序列）。
+// 标记的坐标，组词串才会出现在输入框内。默认驻停但保持隐藏（单指针视觉）；
+// RIVET_TUI_HARDWARE_CURSOR=1 仅控制可见性。
+// 2026-07-24 重复行根修：CPR 响应在 rowsUp 漂移（slash 面板开合等合法几何
+// 变化）时丢弃判定——dc572683 曾用 env 闸门整体关闭 parking 兜底，此为正修。
 
-function withHardwareCursor(fn: () => void): void {
-  const prev = process.env.RIVET_TUI_HARDWARE_CURSOR
-  process.env.RIVET_TUI_HARDWARE_CURSOR = '1'
-  try { fn() } finally {
-    if (prev === undefined) delete process.env.RIVET_TUI_HARDWARE_CURSOR
-    else process.env.RIVET_TUI_HARDWARE_CURSOR = prev
-  }
-}
-
-test('IME: caret 帧末硬件光标驻停到 caret 行/列（cursorUp + G 序列）', () => withHardwareCursor(() => {
+test('IME: caret 帧末硬件光标驻停到 caret 行/列（cursorUp + G 序列）', () => {
   const term = new MockTerminal(80, 24)
   const engine = new LiveEngine({ stdout: asStdout(term), reservedRows: 0, maxRows: 20 })
 
@@ -585,10 +577,11 @@ test('IME: caret 帧末硬件光标驻停到 caret 行/列（cursorUp + G 序列
   assert.ok(frame.includes('\x1B[6G'), '帧末应定位第 6 列（caretCol 5 + 1）')
   assert.equal(term.cursorRow, 1, '光标驻停 caret 行（区域第 2 行）')
   assert.equal(term.cursorCol, 5, '光标驻停 caret 列')
-  assert.ok(frame.includes('\x1B[?25h'), '硬件光标模式下帧末 SHOW_CURSOR')
-}))
+  assert.ok(frame.includes('\x1B[?25l'), '默认保持隐藏（定位但不可见）')
+  assert.ok(!frame.includes('\x1B[?25h'), '默认不显示硬件光标')
+})
 
-test('IME: caret 驻停后下一帧 diff 爬升扣 parkedRowsUp（回顶不错位、无滚屏）', () => withHardwareCursor(() => {
+test('IME: caret 驻停后下一帧 diff 爬升扣 parkedRowsUp（回顶不错位、无滚屏）', () => {
   const term = new MockTerminal(80, 24)
   const engine = new LiveEngine({ stdout: asStdout(term), reservedRows: 0, maxRows: 20 })
 
@@ -602,9 +595,9 @@ test('IME: caret 驻停后下一帧 diff 爬升扣 parkedRowsUp（回顶不错�
   assert.equal(term.cursorRow, 1, '帧末仍驻停 caret 行')
   assert.equal(term.cursorCol, 5)
   assert.equal(term.scrollCount, 0, '全程无滚屏')
-}))
+})
 
-test('IME: 行未变仅 caret 移动 → 只发重定位序列（零文字重绘）', () => withHardwareCursor(() => {
+test('IME: 行未变仅 caret 移动 → 只发重定位序列（零文字重绘）', () => {
   const term = new MockTerminal(80, 24)
   const engine = new LiveEngine({ stdout: asStdout(term), reservedRows: 0, maxRows: 20 })
 
@@ -617,9 +610,9 @@ test('IME: 行未变仅 caret 移动 → 只发重定位序列（零文字重绘
   assert.ok(frame.includes('\x1B[10G'), '重定位到新列（9+1）')
   assert.equal(term.cursorRow, 1, 'caret 行不变（rowsUp 相同无垂直移动）')
   assert.equal(term.cursorCol, 9)
-}))
+})
 
-test('IME: 行与 caret 均未变 → H2 短路零写入', () => withHardwareCursor(() => {
+test('IME: 行与 caret 均未变 → H2 短路零写入', () => {
   const term = new MockTerminal(80, 24)
   const engine = new LiveEngine({ stdout: asStdout(term), reservedRows: 0, maxRows: 20 })
 
@@ -628,7 +621,7 @@ test('IME: 行与 caret 均未变 → H2 短路零写入', () => withHardwareCur
   term.flush()
   engine.render([{ text: 'L0' }, { text: 'IN', caretCol: 5 }, { text: 'L2' }])
   assert.equal(term.flush(), '', '完全无变化应零写入')
-}))
+})
 
 test('IME: CPR 响应按驻停记账折算区域末行——caret 移动/列变化不误判污染', () => {
   let polluted = 0
@@ -693,4 +686,50 @@ test('IME: clear() 从 caret 驻停点爬升（不错位）并复位驻停记账
   // 驻停复位后首帧 append 不再携带爬升偏差
   engine.render(lines('X'))
   assert.equal(term.scrollCount, 0, 'clear/render 全程无滚屏')
+})
+
+test('IME: rowsUp 漂移的 CPR 响应丢弃判定（slash 面板开合不误判污染 = 重复行根修）', () => {
+  let polluted = 0
+  const term = new MockTerminal(80, 24)
+  const engine = new LiveEngine({
+    stdout: asStdout(term), reservedRows: 0, maxRows: 20,
+    onProbeRequest: () => {}, onPolluted: () => { polluted++ },
+  })
+
+  // 帧1：caret 之下 2 行（rowsUp=2）；帧末探针记账 probeParked(rowsUp=2)
+  engine.render([{ text: 'L0' }, { text: 'IN', caretCol: 5 }, { text: 'L2' }, { text: 'L3' }])
+  engine.noteCpr(10, 6) // rowsUp 稳定：建基线 regionEndRow = 10+2 = 12
+  assert.equal(polluted, 0)
+
+  // slash 面板打开：caret 之下多出 3 行（rowsUp 2→5）；探针节流未重发，
+  // probeParked 仍是旧值 2 → 与当前 5 漂移
+  engine.render([
+    { text: 'L0' }, { text: 'IN', caretCol: 5 }, { text: 'L2' },
+    { text: '/help — hint' }, { text: '/compact — hint' }, { text: 'footer' }, { text: 'L3' },
+  ])
+  // 响应 row=7 在新几何下其实一致（7+5=12=基线），但按旧记账会算成 7+2=9 ≠ 12
+  // → 无漂移丢弃时将误判污染并触发恢复重铺（输入框重复行的成因）
+  engine.noteCpr(7, 6)
+  assert.equal(polluted, 0, 'rowsUp 漂移期响应必须丢弃（不误判污染 → 不触发恢复重铺 = 无重复行）')
+
+  // 面板关闭（rowsUp 回到 2）：几何与发针时一致，映射恢复有效——
+  // 一致响应（10+2=12=基线）照常判定不报污染
+  engine.render([{ text: 'L0' }, { text: 'IN', caretCol: 5 }, { text: 'L2' }, { text: 'L3' }])
+  engine.noteCpr(10, 6)
+  assert.equal(polluted, 0, '几何回到发针时状态后判定恢复有效')
+})
+
+test('IME: rowsUp 稳定时外来写入仍判污染（漂移丢弃不削弱检测）', () => {
+  let polluted = 0
+  const term = new MockTerminal(80, 24)
+  const engine = new LiveEngine({
+    stdout: asStdout(term), reservedRows: 0, maxRows: 20,
+    onProbeRequest: () => {}, onPolluted: () => { polluted++ },
+  })
+
+  engine.render([{ text: 'L0' }, { text: 'IN', caretCol: 5 }, { text: 'L2' }, { text: 'L3' }])
+  engine.noteCpr(10, 6) // 建基线 12
+  // rowsUp 无漂移（不再渲染），外来写入把 caret 行推低 3 行：9+2=11 ≠ 12
+  engine.noteCpr(9, 6)
+  assert.equal(polluted, 1, '几何未漂移时外来写入仍应判污染')
 })

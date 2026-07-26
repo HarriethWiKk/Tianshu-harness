@@ -190,6 +190,28 @@ describe('computeEFE', () => {
     assert.ok(normal.pragmaticValue > wuwei.pragmaticValue)
   })
 
+  // 2026-07-25：wuwei 覆盖 73.9% 的帧，其中产出流帧被同时判为「推进中」和
+  // 「抑执行 ×0.3」。无为的本意是「成熟会话别打扰」，不是「产出中别干活」。
+  it('产出流中的 wuwei 不再压低 pragmatic', () => {
+    const v = { tonic: 0.8, phasic: 0.2, curiosity: 0.3, vigor: 0.85, variability: 0.1, history: [] }
+    const s = { momentum: 0.7, pressure: 0.2, confidence: 0.8, complexity: 0.3, freshness: 0.5, stability: 0.8 }
+    const idle = computeEFE(baseAcc, 'wuwei', v, s)
+    const flowing = computeEFE(baseAcc, 'wuwei', v, s, undefined, true)
+    assert.ok(flowing.pragmaticValue > idle.pragmaticValue,
+      `flow ${flowing.pragmaticValue} should exceed idle wuwei ${idle.pragmaticValue}`)
+    // 让位到无惩罚基线，而不是换一个新的折扣系数
+    assert.equal(flowing.pragmaticValue, computeEFE(baseAcc, 'return', v, s).pragmaticValue)
+  })
+
+  it('产出流不改动 genesis 的探索折扣（只解除 wuwei 的抑执行）', () => {
+    const v = { tonic: 0.8, phasic: 0.2, curiosity: 0.3, vigor: 0.85, variability: 0.1, history: [] }
+    const s = { momentum: 0.7, pressure: 0.2, confidence: 0.8, complexity: 0.3, freshness: 0.5, stability: 0.8 }
+    assert.equal(
+      computeEFE(baseAcc, 'genesis', v, s, undefined, true).pragmaticValue,
+      computeEFE(baseAcc, 'genesis', v, s).pragmaticValue,
+    )
+  })
+
   it('high vigor drives high precision', () => {
     const high = computeEFE(baseAcc, 'genesis', {
       tonic: 0.9, phasic: 0.3, curiosity: 0.3, vigor: 0.95, variability: 0.05, history: [],

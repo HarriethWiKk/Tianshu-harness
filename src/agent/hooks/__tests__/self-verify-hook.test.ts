@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { createSelfVerifyHook, detectScopeMismatch, moduleOf } from '../self-verify-hook.js'
+import { createSelfVerifyHook, detectScopeMismatch, moduleOf, escalatedPriority, DEBT_ESCALATION_STEPS } from '../self-verify-hook.js'
 import type { AdvisoryEntry } from '../../advisory-bus.js'
 import type { RuntimeHookContext } from '../../runtime-hooks.js'
 import type { VerificationMetadata } from '../../../tools/types.js'
@@ -271,5 +271,80 @@ describe('SelfVerifyHook — scope mismatch advisory (W5)', () => {
     })
     hook.run(makeCtx([{ tool: 'run_tests', status: 'success', target: 'src' }]))
     assert.equal(submitted.length, 0)
+  })
+})
+
+describe('W3 债龄阶梯（2026-07-25 advisory-ecology-repair）', () => {
+  const READ_ONLY = [
+    { tool: 'read_file', status: 'success' as const, target: 'src/a.ts' },
+    { tool: 'grep', status: 'success' as const, target: 'src/' },
+  ]
+
+  it('escalatedPriority：<10 轮基线，≥10 轮 0.7，≥20 轮 0.79 封顶', () => {
+    assert.equal(escalatedPriority(0.58, 0), 0.58)
+    assert.equal(escalatedPriority(0.58, 9), 0.58)
+    assert.equal(escalatedPriority(0.58, 10), 0.7)
+    assert.equal(escalatedPriority(0.58, 19), 0.7)
+    assert.equal(escalatedPriority(0.58, 20), 0.79)
+    assert.equal(escalatedPriority(0.58, 100), 0.79, '封顶不再上浮')
+    assert.equal(escalatedPriority(0.9, 20), 0.9, '基线更高时不降级')
+  })
+
+  it('封顶必须低于 efficacy fail-open 豁免线 0.8——陈债涨价但不豁免问责', () => {
+    // advisory-bus 的负反馈环对 priority ≥ 0.8 fail-open；阶梯若越线，
+    // 陈债提醒将永久逃逸「送达多次零采纳 → 冷却/静默」，重现 714c5d9b。
+    for (const step of DEBT_ESCALATION_STEPS) {
+      assert.ok(step.priority < 0.8, `阶梯档 ${step.priority} 必须 < 0.8`)
+    }
+  })
+
+  it('债连续在场 → 计数陈化 → 提交 priority 上浮；债消失 → 清零回基线', () => {
+    const submitted: AdvisoryEntry[] = []
+    let debt = true
+    const hook = createSelfVerifyHook({
+      advisoryBus: { submit(e: AdvisoryEntry) { submitted.push(e) } },
+      getVerificationDebt: () => debt,
+    })
+
+    // 债在场跑 10 轮（每轮 postTurn 计数一次）
+    for (let i = 0; i < 10; i++) hook.run(makeCtx(READ_ONLY))
+    const atTen = submitted.filter(e => e.key === 'self-verify').at(-1)!
+    assert.equal(atTen.priority, 0.7, '债龄 ≥10 轮 → priority 上浮到 0.7')
+
+    // 继续陈化到 20 轮
+    for (let i = 0; i < 10; i++) hook.run(makeCtx(READ_ONLY))
+    const atTwenty = submitted.filter(e => e.key === 'self-verify').at(-1)!
+    assert.equal(atTwenty.priority, 0.79, '债龄 ≥20 轮 → priority 上浮到 0.79 封顶')
+
+    // 债清偿 → 计数清零，下次触发回基线
+    debt = false
+    hook.run(makeCtx(READ_ONLY))
+    debt = true
+    hook.run(makeCtx(READ_ONLY))
+    const afterReset = submitted.filter(e => e.key === 'self-verify').at(-1)!
+    assert.equal(afterReset.priority, 0.58, '债消失即清零——计的是这笔债的驻留，不是会话累计')
+  })
+
+  it('阶梯只调 priority 不额外发条目——发射时机仍由 hook 自身判据决定', () => {
+    const submitted: AdvisoryEntry[] = []
+    const hook = createSelfVerifyHook({
+      advisoryBus: { submit(e: AdvisoryEntry) { submitted.push(e) } },
+      getVerificationDebt: () => true,
+    })
+    // 债在场但每轮都有验证 → hook 判据不触发，债龄再高也零提交
+    for (let i = 0; i < 25; i++) {
+      hook.run(makeCtx([{ tool: 'run_tests', status: 'success', target: 'src' }]))
+    }
+    assert.equal(submitted.length, 0, '边沿纪律不破：债龄不制造新的发射时机')
+  })
+
+  it('无 getVerificationDebt dep → 阶梯禁用，priority 恒为基线', () => {
+    const submitted: AdvisoryEntry[] = []
+    const hook = createSelfVerifyHook({
+      advisoryBus: { submit(e: AdvisoryEntry) { submitted.push(e) } },
+    })
+    for (let i = 0; i < 25; i++) hook.run(makeCtx(READ_ONLY))
+    assert.ok(submitted.length > 0)
+    assert.ok(submitted.every(e => e.priority === 0.58), '缺省行为与旧版一致')
   })
 })

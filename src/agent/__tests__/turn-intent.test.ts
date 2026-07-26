@@ -90,19 +90,45 @@ describe('TurnIntentController', () => {
   it('caps notes at three until reset', () => {
     let calls = 0
     const controller = new TurnIntentController()
-    const input = makeInput(() => { calls++ })
+    // 每次改变 target 让 fingerprint 不重复——去重不挡不同信号
+    const mk = (target: string) => ({
+      ...makeInput(() => { calls++ }),
+      recentToolHistory: [{ tool: 'read_file', target, status: 'success' as const }],
+    })
 
-    controller.evaluate(input)
-    controller.evaluate(input)
-    controller.evaluate(input)
-    controller.evaluate(input)
+    controller.evaluate(mk('src/a.ts'))
+    controller.evaluate(mk('src/b.ts'))
+    controller.evaluate(mk('src/c.ts'))
+    controller.evaluate(mk('src/d.ts'))
 
     assert.equal(calls, 3)
     assert.equal(controller.getShownCount(), 3)
 
     controller.reset()
-    controller.evaluate(input)
+    controller.evaluate(mk('src/e.ts'))
     assert.equal(calls, 4)
     assert.equal(controller.getShownCount(), 1)
+  })
+
+  it('deduplicates adjacent turns with the same warnings', () => {
+    let calls = 0
+    const controller = new TurnIntentController()
+    const input = makeInput(() => { calls++ })
+
+    controller.evaluate(input) // first: fires
+    assert.equal(calls, 1)
+    assert.equal(controller.getShownCount(), 1)
+
+    controller.evaluate(input) // same fingerprint: suppressed
+    assert.equal(calls, 1)
+    assert.equal(controller.getShownCount(), 1)
+
+    // 不同 fingerprint（不同 target）: fires again
+    controller.evaluate({
+      ...makeInput(() => { calls++ }),
+      recentToolHistory: [{ tool: 'read_file', target: 'src/other.ts', status: 'success' as const }],
+    })
+    assert.equal(calls, 2)
+    assert.equal(controller.getShownCount(), 2)
   })
 })

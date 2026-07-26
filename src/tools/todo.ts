@@ -15,9 +15,19 @@ const todoItemSchema = z.object({
   status: z.enum(VALID_STATUSES),
 })
 
+const acceptanceItemSchema = z.object({
+  criterion: z.string().min(1),
+  status: z.enum(['pending', 'met', 'blocked']),
+  evidence: z.string().optional(),
+})
+
 const todoActionSchema = z.discriminatedUnion('action', [
   z.object({ action: z.literal('read') }),
-  z.object({ action: z.literal('write'), todos: z.array(todoItemSchema) }),
+  z.object({
+    action: z.literal('write'),
+    todos: z.array(todoItemSchema),
+    acceptance: z.array(acceptanceItemSchema).optional(),
+  }),
 ])
 
 // Process-wide default store backing the convenience `getTodos`/`setTodos`
@@ -109,7 +119,9 @@ TDD 纪律：
 状态规则：
 - 开工前把任务标为 in_progress；任何时刻恰好只有一个 in_progress。
 - 完成立即标 completed——不要攒批。
-- 重写清单时不要静默丢弃或重置已完成项。`,
+- 重写清单时不要静默丢弃或重置已完成项。
+
+验收面：代码任务首次 write 时用 acceptance 字段声明可观察的完成标志（形状与正反例见该字段说明）。`,
       input_schema: {
         type: 'object',
         properties: {
@@ -129,6 +141,22 @@ TDD 纪律：
                 status: { type: 'string', enum: [...VALID_STATUSES], description: '任务状态' },
               },
               required: ['id', 'content', 'status'],
+            },
+          },
+          acceptance: {
+            type: 'array',
+            description: '用户级验收面（可选，代码任务建议首次 write 就带；声明须早于验证）。'
+              + '正例「按 ESC 后弹窗 isVisible() 为 False」。'
+              + '反例一律拒绝：「信号连通」「函数逻辑正确」是内部属性；'
+              + '「所有测试通过」「跑 test_x.py 看到 3 passed」是信号级——单测覆盖的是函数分支，不是用户按键后的行为。',
+            items: {
+              type: 'object',
+              properties: {
+                criterion: { type: 'string', description: '用户做什么动作 → 看到什么可观察结果' },
+                status: { type: 'string', enum: ['pending', 'met', 'blocked'] },
+                evidence: { type: 'string', description: 'met：实际做了什么、观察到什么；blocked：为何执行不了' },
+              },
+              required: ['criterion', 'status'],
             },
           },
         },
@@ -167,6 +195,12 @@ TDD 纪律：
         params.onPlanSteps(data.todos.map(t => ({ id: t.id, content: t.content, status: t.status })))
       }
 
+      // 用户级验收面：声明与核销共用这一个字段。loop 侧写 successCriteria 并
+      // satisfy/block acceptance 义务——这是该义务唯一的核销入口。
+      if (params.onAcceptance && data.acceptance && data.acceptance.length > 0) {
+        params.onAcceptance(data.acceptance)
+      }
+
       const summary = TodoStore.formatSummary(data.todos)
       let content = summary
 
@@ -185,6 +219,16 @@ TDD 纪律：
         const warn = regressions.map(r => `  - ${r}`).join('\n')
         content = `⚠️ ${regressions.length} 项此前已完成的任务被重置或移除：\n${warn}\n\n`
             + `若非有意为之（例如长任务后凭记忆重建清单），请重新标为 completed。不要重做已完成的工作。\n\n${content}`
+      }
+
+      if (data.acceptance && data.acceptance.length > 0) {
+        const met = data.acceptance.filter(a => a.status === 'met').length
+        const blocked = data.acceptance.filter(a => a.status === 'blocked').length
+        const pending = data.acceptance.length - met - blocked
+        content += `\n\n验收面 ${met}/${data.acceptance.length} 达标`
+          + (pending > 0 ? `，${pending} 项待执行` : '')
+          + (blocked > 0 ? `，${blocked} 项受阻（交付时须披露）` : '')
+          + '。'
       }
 
       // P1-1: 续用回执——提醒模型继续用 todo 跟踪进度

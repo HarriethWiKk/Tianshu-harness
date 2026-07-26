@@ -197,7 +197,8 @@ export function checkPlanMode(
         'Plan Mode: only read-only scout profiles (code_scout/doc_scout) and test-only verifiers ' +
         '(adversarial_verifier — for 瑶光反证 reproduction) may be delegated; ' +
         'write/execute profiles (e.g. patcher) are blocked until the plan is approved. ' +
-        'Re-run delegation with one of those profiles, or /plan-approve first.',
+        'Re-run delegation with one of those profiles. Approving the plan exits plan mode ' +
+        'automatically; to abandon planning and write directly, call plan action=exit_mode.',
     }
   }
 
@@ -214,6 +215,9 @@ export function checkPlanMode(
       'Allowed tools: read, grep, glob, repo_map, inspect_project, web_search, web_fetch, ' +
       'ask_user_question, run_tests (瑶光反证 reproduction), ' +
       'delegate_task/delegate_batch (code_scout/doc_scout/adversarial_verifier + authority), todo, plan. ' +
-      'Use /plan-approve to exit plan mode and allow execution.',
+      // 前端无关指引（2026-07-25 桌面「退不出」修复）：原文 "Use /plan-approve" 在
+      // 桌面端是死路（无斜杠命令）。批准自动退出；放弃规划模型可自调 exit_mode。
+      'Plan mode exits automatically once the user approves the plan; to abandon planning ' +
+      'and write directly, call plan action=exit_mode (no user approval needed).',
   }
 }

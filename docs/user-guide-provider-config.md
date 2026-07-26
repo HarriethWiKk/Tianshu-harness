@@ -649,7 +649,7 @@ rivet config providers  # 应该只显示内置 Provider
         "verifier":             { "provider": "deepseek", "model": "deepseek-v4-flash" },
         "patcher":              { "provider": "deepseek", "model": "deepseek-v4-flash" }
       },
-      "skipAuto": false,
+      "skipAuto": true,
       "mechanicalFastPath": true
     }
   }
@@ -658,7 +658,7 @@ rivet config providers  # 应该只显示内置 Provider
 
 - **`profiles`**：按 worker profile 名指定 `{ provider, model }`，命中**所有携带该 profile 的子代理**（不止提交后审查——见下文「council / team 覆盖」）。提交后自动审查（`deliver_task` commit）实际用的是 **`reviewer`** 这个 profile，所以只想让提交审查走 Flash，配 `reviewer` 一项即可；要把对抗验证（L2）、补丁建议也一并下放就把 `adversarial_verifier` / `verifier` / `patcher` 也配上。
   - **键名不做注册表校验**：profile 名是自由字符串，写错（如把 `reviewer` 拼成 `reviewr`）**不会报错，也不会回退**——只是永远匹配不到任何 worker，等于**静默失效**。常用的有效 profile：`reviewer` / `adversarial_verifier` / `verifier` / `patcher` / `council_expert` / `code_scout` / `doc_scout`。配 `RIVET_DEBUG=1` 可在日志看 `[review-override] active` / `[worker-model] review-override` 确认是否真的命中。
-- **`skipAuto`**（默认 `false`）：设为 `true` 完全关闭 `deliver_task` 的提交后自动审查（等价于环境变量 `RIVET_REVIEW_DISCIPLINE=0`，但限本配置文件）。急救用，不想要审查时最直接。
+- **`skipAuto`**（默认 `true`）：关闭 `deliver_task` 的提交后自动审查（等价于环境变量 `RIVET_REVIEW_DISCIPLINE=0`，但限本配置文件）。**开箱默认即关闭**——审查靠用户手动 `/review [max]` 或外部会话；想恢复自动审查设为 `false`。
 - **`mechanicalFastPath`**（默认 `true`）：纯文档 / 纯重命名变更跳过审查 worker 和未验证 RED 闸门。
 
 ### `workers` —— 通用子代理能力路由

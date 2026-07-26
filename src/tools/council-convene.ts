@@ -249,6 +249,12 @@ export function createCouncilConveneTool(
               model: r.model,
               provider: r.provider,
               usage: r.usage,
+              findingsCount: r.findings.length > 0 ? r.findings.length : undefined,
+              topFinding: r.findings[0]?.claim,
+              verificationBrief: r.verification
+                ? { status: r.verification.status, passed: r.verification.passed, failed: r.verification.failed }
+                : undefined,
+              evidenceStatus: r.evidenceStatus,
             })
           }
         }

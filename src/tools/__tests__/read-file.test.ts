@@ -254,3 +254,65 @@ describe('READ_FILE_TOOL multi-read', () => {
   })
 })
 
+describe('readCapOverride (2026-07-24 worker max-turns 诊断)', () => {
+  let dir: string
+  // ~30KB 源文件:policy 判 full-with-hint(20-80KB),主控 120K cap 下全量返回,
+  // worker 紧 cap 下必须降级为 PARTIAL 骨架而非原样占满历史。
+  const bigSource = Array.from({ length: 800 }, (_, i) =>
+    `export function handler${i}(input: string): string {\n  return input + '${i}'\n}\n`,
+  ).join('')
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'rivet-readcap-'))
+    mkdirSync(join(dir, 'src'), { recursive: true })
+    writeFileSync(join(dir, 'src', 'big.ts'), bigSource, 'utf-8')
+  })
+
+  afterEach(() => {
+    if (existsSync(dir)) rmSync(dir, { recursive: true, force: true })
+  })
+
+  it('无 override 时 1M 窗口全量返回（主控行为不变）', async () => {
+    const { READ_FILE_TOOL } = await import('../read-file.js')
+    const result = await READ_FILE_TOOL.execute({
+      input: { file_path: 'src/big.ts' },
+      toolUseId: 'test',
+      cwd: dir,
+      contextWindow: 1_000_000,
+      sessionId: `readcap-a-${Date.now()}`,
+    })
+    assert.ok(!result.isError)
+    assert.match(result.content, /handler799/, 'full content retained on the primary path')
+  })
+
+  it('紧 override 下超 cap 全量读降级为 PARTIAL 骨架（不再原样占满 worker 历史）', async () => {
+    const { READ_FILE_TOOL } = await import('../read-file.js')
+    const result = await READ_FILE_TOOL.execute({
+      input: { file_path: 'src/big.ts' },
+      toolUseId: 'test',
+      cwd: dir,
+      contextWindow: 1_000_000,
+      sessionId: `readcap-b-${Date.now()}`,
+      readCapOverride: { maxChars: 4_000, headChars: 2_400, tailChars: 1_200 },
+    })
+    assert.ok(!result.isError)
+    assert.match(result.content, /── PARTIAL view of/, 'fold-then-partial skeleton served')
+    assert.ok(result.content.length < bigSource.length / 2, `content bounded (got ${result.content.length} of ${bigSource.length})`)
+  })
+
+  it('override 不影响显式 offset/limit 精读', async () => {
+    const { READ_FILE_TOOL } = await import('../read-file.js')
+    const result = await READ_FILE_TOOL.execute({
+      input: { file_path: 'src/big.ts', offset: 1, limit: 3 },
+      toolUseId: 'test',
+      cwd: dir,
+      contextWindow: 1_000_000,
+      sessionId: `readcap-c-${Date.now()}`,
+      readCapOverride: { maxChars: 4_000, headChars: 2_400, tailChars: 1_200 },
+    })
+    assert.ok(!result.isError)
+    assert.match(result.content, /handler0/)
+    assert.doesNotMatch(result.content, /── PARTIAL view of/)
+  })
+})
+

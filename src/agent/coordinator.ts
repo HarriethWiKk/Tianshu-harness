@@ -30,6 +30,7 @@ import {
   clampWorkerMaxTurns,
   deriveWorkerSessionId,
 } from './work-order.js'
+import { buildContractProjection, type ContractProjection } from './contract-projection.js'
 import { buildPrimaryWorkerPacket } from './worker-prompts.js'
 import { runWorkerSession, type WorkerActivityKind, type WorkerCheckpoint, type WorkerSessionConfig, type WorkerSessionRun } from './worker-session.js'
 import { saveWorkerSession, loadWorkerSession } from './worker-session-persist.js'
@@ -89,6 +90,8 @@ export interface WorkerActivityEvent {
   profile: string
   /** Worker task objective (from WorkOrder) — desktop panel / activity mapper. */
   objective?: string
+  /** 用户契约投影（白名单构造，随每条事件携带；mapper 只在首条转发）。 */
+  contract?: ContractProjection
   /** 星域 id（星名来源），由 coordinator 从 order.authority 透传。 */
   authority?: string
   /** Why this authority was chosen (from WorkOrder.authorityReason). */
@@ -696,6 +699,16 @@ export class DelegationCoordinator {
   /** 指定 order 当前是否在跑（TUI 判断直达通道可用性）。 */
   isWorkerRunning(workOrderId: string): boolean {
     return this.orderControllers.has(workOrderId)
+  }
+
+  /** 任意 worker（前台批次或后台 run）仍在跑时为 true —— /cd 借此拒绝
+   *  在 worker 存活期间切换 cwd（worker 会话绑定旧目录）。 */
+  hasRunningWork(): boolean {
+    if (this.orderControllers.size > 0) return true
+    for (const run of this.backgroundRuns.values()) {
+      if (run.status === 'running') return true
+    }
+    return false
   }
 
   // ── B2: background (async) work orders ──
@@ -1439,6 +1452,9 @@ export class DelegationCoordinator {
     // calling tool can stream live worker progress into the UI.
     const upstreamActivity = workerConfig.onActivity
     const requestUpstream = this.activityUpstream.get(order.id)
+    // 用户契约投影：每 order 构造一次（白名单纯函数），随事件引用携带；
+    // mapper 只在首条事件转发（同 objective 先例），SSE 无重复负载。
+    const contractProjection = requestUpstream ? buildContractProjection(order) : undefined
     workerConfig.onActivity = (kind, detail) => {
       this.liveness.tick(order.id)
       upstreamActivity?.(kind, detail)
@@ -1447,6 +1463,7 @@ export class DelegationCoordinator {
           workOrderId: order.id,
           profile: order.profile,
           objective: order.objective,
+          contract: contractProjection,
           authority: order.authority,
           authorityReason: order.authorityReason,
           kind,

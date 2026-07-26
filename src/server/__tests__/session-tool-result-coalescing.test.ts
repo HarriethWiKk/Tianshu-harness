@@ -371,7 +371,7 @@ describe('session tool_result stream coalescing', () => {
     callbacks.onTurnComplete({}, 99, true)
     callbacks.onError(new Error('late error'))
     callbacks.onPhaseChange?.('executing', { reason: 'late phase' })
-    callbacks.onToolResult('late-plan', 'plan_submit', 'late plan', false)
+    callbacks.onToolResult('late-plan', 'plan', 'late plan', false)
     callbacks.onToolResult('late-write', 'write_file', 'late write', false)
     await new Promise((resolve) => setTimeout(resolve, 60))
 
@@ -496,7 +496,8 @@ describe('session tool_result stream coalescing', () => {
     internals.readPlanDraft = () => draftReads.shift()!.promise
 
     oldPlanModeChange('planning')
-    oldCallbacks.onToolResult('old-submit', 'plan_submit', 'ok', false)
+    oldCallbacks.onToolUse('old-submit', 'plan', { action: 'submit' })
+    oldCallbacks.onToolResult('old-submit', 'plan', 'ok', false)
     oldCallbacks.onToolResult('old-write-1', 'write_file', 'ok', false)
     oldCallbacks.onToolResult('old-write-2', 'write_file', 'ok', false)
     assert.equal(scheduler.size, 1)
@@ -533,7 +534,8 @@ describe('session tool_result stream coalescing', () => {
 
     newPlanModeChange('off')
     newPlanModeChange('planning')
-    newCallbacks.onToolResult('new-submit', 'plan_submit', 'ok', false)
+    newCallbacks.onToolUse('new-submit', 'plan', { action: 'submit' })
+    newCallbacks.onToolResult('new-submit', 'plan', 'ok', false)
     newCallbacks.onToolResult('new-write', 'write_file', 'ok', false)
     newPlans.resolve([{
       slug: 'new-plan',
@@ -558,6 +560,46 @@ describe('session tool_result stream coalescing', () => {
       ['plan_submitted', 'new-plan'],
       ['plan_draft', '.rivet/plans/new-draft.md'],
     ])
+  })
+
+  // 2026-07-25 桌面「审批卡丢失」修复：多会话共享 cwd 时 plans[0] 可能是别会话
+  // 的更新计划。plan_submitted 必须发本次 submit 的确定 slug（onToolUse 登记的
+  // title 经 slugify 推导），而不是磁盘上最新的那个。
+  it('emits plan_submitted with the submitted slug, not plans[0]', async () => {
+    const { manager, agent, session } = setup()
+    const cb = agent.callbacks!
+    const plans = new Deferred<Array<{
+      slug: string
+      title: string
+      status: 'submitted'
+      content: string
+      path: string
+      createdAt: Date
+    }>>()
+    const internals = manager as unknown as {
+      loadPlans: () => Promise<Array<{
+        slug: string
+        title: string
+        status: 'submitted'
+        content: string
+        path: string
+        createdAt: Date
+      }>>
+    }
+    internals.loadPlans = () => plans.promise
+
+    cb.onToolUse('submit-1', 'plan', { action: 'submit', title: 'My Plan' })
+    cb.onToolResult('submit-1', 'plan', 'ok', false)
+    plans.resolve([
+      // 另一个会话的更新计划排在 plans[0]；本次提交的 my-plan 排在其后
+      { slug: 'other-sessions-plan', title: 'Other', status: 'submitted', content: '# O', path: '.rivet/plans/other.md', createdAt: new Date(2) },
+      { slug: 'my-plan', title: 'My Plan', status: 'submitted', content: '# M', path: '.rivet/plans/my-plan.md', createdAt: new Date(1) },
+    ])
+    await new Promise((resolve) => setImmediate(resolve))
+
+    const submitted = manager.getEvents(session.id, 0)!.events.filter((event) => event.type === 'plan_submitted')
+    assert.equal(submitted.length, 1)
+    assert.equal(submitted[0]!.data.slug, 'my-plan', '应发本次提交的确定 slug，而非 plans[0]')
   })
 
   it('keeps abort settlement busy and gates resubmit, model switch, rewind, and claims', async () => {

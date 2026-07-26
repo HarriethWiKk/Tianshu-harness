@@ -51,7 +51,7 @@ export interface InputLineDisplayOptions {
   maxWidth?: number
 }
 
-export type VimMode = 'normal' | 'insert'
+export type VimMode = 'normal' | 'insert' | 'visual'
 
 /** Grapheme 分段器（Node 22+）。用于按用户感知字符（CJK/emoji/ZWJ 簇）步进光标。
  * WSL/Alpine 中若 Node.js 运行时缺少 ICU 数据，Intl.Segmenter 会抛出。
@@ -65,7 +65,44 @@ try {
 
 const GRAPHEME_SEGMENTER = graphemeSegmenter
 
+// ── fish 式 undo 合并（2026-07-23 P1-1）──────────────────────────────
+// 连续 word 字符插入合并为一单元；空格/换行各自独立；删除/粘贴/历史导航/
+// 外部写入各自独立；kind 切换或光标跳变（移动/模式切换）时封口。
+type UndoKind = 'insert-word' | 'insert-space' | 'insert-other' | 'delete' | 'replace'
+
+interface UndoUnit {
+  value: string
+  cursor: number
+  kind: UndoKind
+}
+
+/** CJK 统一表意/扩展A/兼容/假名/谚文——与 \w 一起视为 word 字符。
+ *  不复用 prevWordStart 的 /\w/ 口径：它把整段中文当非词，连续中文输入
+ *  会被错分为一堆独立单元。 */
+const WORD_CHAR_RE = /^(?:\w|[一-鿿㐀-䶿豈-﫿぀-ヿ가-힯])$/
+
+function classifyInsert(ch: string): UndoKind {
+  if (/^\s$/.test(ch)) return 'insert-space'
+  if (WORD_CHAR_RE.test(ch)) return 'insert-word'
+  return 'insert-other'
+}
+
+const UNDO_STACK_MAX = 200
+/** 快照滞留总字符上限（≈2M UTF-16 code units）：200 单元 × 极端大 buffer
+ * （多次 100KB+ 粘贴）的滞留内存长尾防护——超限时逐出最旧单元。 */
+const UNDO_TOTAL_CHARS_MAX = 2_000_000
+
+// ── 长粘贴自动收纳（2026-07-24，对齐 pi-tui 与 Mission Composer §12）────────
+// 命中阈值的粘贴不原文进 buffer，而是插入原子标记串 `[paste #N +M lines]`，
+// 原文存 _pastes 旁路——输入框不被长计划/日志淹没，提交时展开还原。
+/** 触发折叠的阈值（行数 或 字符数）。 */
+const PASTE_FOLD_MIN_LINES = 10
+const PASTE_FOLD_MIN_CHARS = 1000
+/** 标记串形态（grapheme 原子化 / 提交展开 / 渲染着色共用）。 */
+const PASTE_MARKER_RE = /\[paste #(\d+) \+\d+ lines?\]/g
+
 import { ambiguousWideEnabled, displayWidth } from '../width.js'
+import { ANSI } from './ansi.js'
 
 /**
  * Grapheme 边界缓存：Intl.Segmenter 对整串分段是 O(n)，而 prevGrapheme/
@@ -116,21 +153,30 @@ function pushWrappedSegment(
   ambiguousAsWide: boolean,
   /** 输出参数：记录 █ 插入点左侧的 cell 数（不含前缀）。仅在插入时写入。 */
   caretCol?: { value: number },
+  /** segment 在 buffer 中的绝对起始偏移（选区高亮定位用）。 */
+  segAbsStart?: number,
+  /** 键盘选区（buffer 绝对偏移，start<end）：范围内字符反色渲染。 */
+  sel?: { start: number; end: number } | null,
 ): void {
   const chars = Array.from(segment)
   let current = ''
   let currentWidth = 0
   let currentHasCursor = false
   let offset = 0
+  let inSel = false
 
   const flush = (): void => {
-    out.push({ text: `${prefix}${current}`, cursor: currentHasCursor })
-    current = ''
+    // 选区跨越折行边界：本行末 RESET 封口，下一视觉行重新 REVERSE 起头。
+    out.push({ text: `${prefix}${current}${inSel ? ANSI.RESET : ''}`, cursor: currentHasCursor })
+    current = inSel ? ANSI.REVERSE : ''
     currentWidth = 0
     currentHasCursor = false
   }
 
   for (const ch of chars) {
+    const absOff = (segAbsStart ?? 0) + offset
+    if (sel && inSel && absOff === sel.end) { current += ANSI.RESET; inSel = false }
+    if (sel && !inSel && absOff === sel.start) { current += ANSI.REVERSE; inSel = true }
     if (cursorOffset !== null && offset === cursorOffset) {
       const markerWidth = inputDisplayWidth('█', ambiguousAsWide)
       if (currentWidth > 0 && currentWidth + markerWidth > maxContentWidth) flush()
@@ -148,6 +194,9 @@ function pushWrappedSegment(
   }
 
   if (cursorOffset !== null && cursorOffset === segment.length) {
+    const absOff = (segAbsStart ?? 0) + offset
+    if (sel && inSel && absOff === sel.end) { current += ANSI.RESET; inSel = false }
+    if (sel && !inSel && absOff === sel.start) { current += ANSI.REVERSE; inSel = true }
     const markerWidth = inputDisplayWidth('█', ambiguousAsWide)
     if (currentWidth > 0 && currentWidth + markerWidth > maxContentWidth) flush()
     if (caretCol) caretCol.value = currentWidth
@@ -156,10 +205,10 @@ function pushWrappedSegment(
     currentHasCursor = true
   }
 
-  if (current.length > 0 || currentHasCursor || segment.length === 0) flush()
+  if (currentWidth > 0 || currentHasCursor || segment.length === 0) flush()
 }
 
-function wrapInputLines(value: string, cursor: number, maxWidth: number): { lines: string[]; cursorLine: number; cursorCol: number } {
+function wrapInputLines(value: string, cursor: number, maxWidth: number, sel?: { start: number; end: number } | null): { lines: string[]; cursorLine: number; cursorCol: number } {
   const ambiguousAsWide = ambiguousWideEnabled()
   const visual: VisualLine[] = []
   const logicalLines = value.split('\n')
@@ -177,7 +226,7 @@ function wrapInputLines(value: string, cursor: number, maxWidth: number): { line
     const prefix = cursorInLine ? '❯ ' : '  '
     const beforeCount = visual.length
     const caretCol: { value: number } = { value: 0 }
-    pushWrappedSegment(visual, logicalLine, prefix, maxContentWidth, cursorInLine ? cursor - lineStart : null, ambiguousAsWide, caretCol)
+    pushWrappedSegment(visual, logicalLine, prefix, maxContentWidth, cursorInLine ? cursor - lineStart : null, ambiguousAsWide, caretCol, lineStart, sel)
     if (cursorInLine) {
       const found = visual.findIndex((line, idx) => idx >= beforeCount && line.cursor)
       cursorLine = found >= 0 ? found : beforeCount
@@ -209,6 +258,16 @@ function boundaryAfter(bounds: number[], cursor: number): number {
     else lo = mid + 1
   }
   return bounds[lo]! > cursor ? bounds[lo]! : -1
+}
+
+/** 剔除落在 `[paste #N …]` 标记内部的边界（端点保留）——标记成为原子编辑单位。 */
+function atomicPasteMarkerBounds(value: string, bounds: number[]): number[] {
+  const spans: Array<[number, number]> = []
+  for (const m of value.matchAll(new RegExp(PASTE_MARKER_RE.source, 'g'))) {
+    spans.push([m.index!, m.index! + m[0].length])
+  }
+  if (spans.length === 0) return bounds
+  return bounds.filter(b => !spans.some(([s, e]) => b > s && b < e))
 }
 
 /** 视窗裁剪：返回可见行 + 光标行在【返回数组内】的下标（硬件光标归位需要）。 */
@@ -266,6 +325,33 @@ export class InputLine {
   private onTabCompleteCallback?: () => boolean
   private onImagesChangeCallback?: (images: string[]) => void
 
+  /** undo 栈（改前快照）。submit 后清空——上一条输入的文本不得被下一条撤销复活。 */
+  private _undoStack: UndoUnit[] = []
+  /** 栈内快照滞留的总字符数（配合 UNDO_TOTAL_CHARS_MAX 防护内存长尾）。 */
+  private _undoChars = 0
+  /** redo 栈（undo 目标态快照）。任何新编辑（recordUndo）清空——redo 分支失效。 */
+  private _redoStack: UndoUnit[] = []
+  private _redoChars = 0
+  /** 当前未封口单元 kind（仅 insert-word 参与合并）。 */
+  private _undoOpen: UndoKind | null = null
+  /** 合并继续时光标应处的位置（插入点右缘）；不符即封口。 */
+  private _undoExpectCursor = -1
+  /** 翻历史前的在输草稿（P1-2 shell 式往返恢复）。 */
+  private _draft: string | null = null
+  /** 折叠粘贴原文旁路：标记序号 → 原文。提交时展开还原（expandPastes）。 */
+  private _pastes = new Map<number, string>()
+  private _pasteSeq = 0
+
+  // ── 键盘选区（S1）──
+  /** 选区锚点（shift+方向键设定）；null = 无选区。选区 = [min(anchor,cursor), max)。 */
+  private _selAnchor: number | null = null
+  /** vim visual linewise 标记（V 进入时为 true，v 进入/退出 visual 时复位）。 */
+  private _visualLineWise = false
+  /** 内部剪贴板（Alt+Y yank / vim p）；系统剪贴板经 OSC52（_clipboardOut → app drain）。 */
+  private _clipboard = ''
+  /** 待 app 写出 OSC52 的剪贴文本（takeClipboardOut 取走后清空）。 */
+  private _clipboardOut: string | null = null
+
   constructor(options: InputLineOptions = {}) {
     this._value = options.value ?? ''
     this._cursor = this._value.length
@@ -295,7 +381,11 @@ export class InputLine {
   setVimEnabled(enabled: boolean): void {
     this._vimEnabled = enabled
     this._vimMode = 'insert'
+    this._visualLineWise = false
   }
+
+  /** visual 模式是否为 linewise（V 进入；charwise v 为 false）。渲染 `-- VISUAL LINE --` 用。 */
+  get visualLineWise(): boolean { return this._vimMode === 'visual' && this._visualLineWise }
 
   /**
    * 多行渲染：返回输入框的显示行数组。
@@ -328,7 +418,7 @@ export class InputLine {
     const cursorCol = before.length - (before.lastIndexOf('\n') + 1)
 
     if (options.maxWidth !== undefined) {
-      const wrapped = wrapInputLines(this._value, this._cursor, options.maxWidth)
+      const wrapped = wrapInputLines(this._value, this._cursor, options.maxWidth, this.selectionRange)
       const view = viewportWithCaret(wrapped.lines, wrapped.cursorLine, options.maxLines)
       return { lines: view.lines, caret: { line: view.caretLine, col: wrapped.cursorCol } }
     }
@@ -347,8 +437,9 @@ export class InputLine {
     return { lines: view.lines, caret: { line: view.caretLine, col } }
   }
 
-  /** 设置值（外部更新用） */
+  /** 设置值（外部更新用）。覆盖式写入（粘贴/补全/审批填充等）记为独立 undo 单元。 */
   setValue(value: string, cursor?: number): void {
+    this.recordUndo('replace')
     this._value = value.slice(0, this._maxLength)
     this._cursor = cursor !== undefined ? Math.min(cursor, this._value.length) : this._value.length
     this.onChangeCallback?.(this._value, this._cursor)
@@ -359,14 +450,29 @@ export class InputLine {
     this.setValue(this._value + text, this._value.length + text.length)
   }
 
-  /** 在光标处插入文本（用于 bracketed paste），光标移动到插入内容之后。 */
+  /** 在光标处插入文本（用于 bracketed paste），光标移动到插入内容之后。
+   *  命中折叠阈值的长粘贴收纳为原子标记 `[paste #N +M lines]`（原文旁路存储）。 */
   insertText(text: string): void {
     if (!text) return
+    const lineCount = text.split('\n').length
+    if (lineCount > PASTE_FOLD_MIN_LINES || text.length > PASTE_FOLD_MIN_CHARS) {
+      const id = ++this._pasteSeq
+      this._pastes.set(id, text)
+      const marker = `[paste #${id} +${lineCount} lines]`
+      this.insertText(marker)
+      return
+    }
     const before = this._value.slice(0, this._cursor)
     const after = this._value.slice(this._cursor)
     const next = (before + text + after).slice(0, this._maxLength)
     const cursor = Math.min(before.length + text.length, next.length)
     this.setValue(next, cursor)
+  }
+
+  /** 提交前把折叠粘贴标记还原为原文（用户手输的同名标记无原文则原样保留）。 */
+  expandPastes(text: string): string {
+    if (this._pastes.size === 0) return text
+    return text.replace(PASTE_MARKER_RE, (m, id) => this._pastes.get(Number(id)) ?? m)
   }
 
   /** 添加图片附件（data URL）。 */
@@ -402,6 +508,88 @@ export class InputLine {
     this._history = history
   }
 
+  // ── 键盘选区（S1）───────────────────────────────────────────
+
+  /** 选区范围（start<end，buffer code-unit 偏移）；无选区或锚点=光标时 null。
+   *  vim visual linewise（V）时对齐整行：start=起始行行首，end=结束行行尾——
+   *  删除/复制/高亮自动行级化。 */
+  get selectionRange(): { start: number; end: number } | null {
+    if (this._selAnchor === null || this._selAnchor === this._cursor) return null
+    let start = Math.min(this._selAnchor, this._cursor)
+    let end = Math.max(this._selAnchor, this._cursor)
+    if (this._vimMode === 'visual' && this._visualLineWise) {
+      start = this._value.lastIndexOf('\n', Math.max(0, start - 1)) + 1
+      const nl = this._value.indexOf('\n', end)
+      // 含行尾换行（vim 行删除语义：删行后剩余行自然上提，不留空行）
+      end = nl === -1 ? this._value.length : nl + 1
+    }
+    return { start, end }
+  }
+
+  /** 取走待 OSC52 写出的剪贴文本（app 渲染循环 drain）。 */
+  takeClipboardOut(): string | null {
+    const t = this._clipboardOut
+    this._clipboardOut = null
+    return t
+  }
+
+  private collapseSelection(): void {
+    this._selAnchor = null
+  }
+
+  /** Shift+←/→/Home/End：锚定（首次）并移动光标扩展选区。 */
+  private extendSelection(name: string): InputLineEvent | null {
+    if (this._selAnchor === null) this._selAnchor = this._cursor
+    this.sealUndo()
+    switch (name) {
+      case 'left': this._cursor = this.prevGrapheme(); break
+      case 'right': this._cursor = this.nextGrapheme(); break
+      case 'home': this._cursor = 0; break
+      case 'end': this._cursor = this._value.length; break
+    }
+    return { type: 'change', value: this._value, cursor: this._cursor }
+  }
+
+  /** Backspace/Delete（有选区）：删除选区（独立 undo 单元）。 */
+  private deleteSelection(): InputLineEvent | null {
+    const r = this.selectionRange
+    if (!r) return null
+    this.recordUndo('delete')
+    this._value = this._value.slice(0, r.start) + this._value.slice(r.end)
+    this._cursor = r.start
+    this.collapseSelection()
+    this.onChangeCallback?.(this._value, this._cursor)
+    return { type: 'change', value: this._value, cursor: this._cursor }
+  }
+
+  /** Ctrl+K（有选区）：剪切选区 → 内部剪贴板 + OSC52 drain。 */
+  private cutSelection(): InputLineEvent | null {
+    const r = this.selectionRange
+    if (!r) return null
+    this._clipboard = this._value.slice(r.start, r.end)
+    this._clipboardOut = this._clipboard
+    return this.deleteSelection()
+  }
+
+  /** Alt+W：复制选区 → 内部剪贴板 + OSC52 drain（不删除，复制后折叠选区）。 */
+  private copySelection(): InputLineEvent | null {
+    const r = this.selectionRange
+    if (!r) return null
+    this._clipboard = this._value.slice(r.start, r.end)
+    this._clipboardOut = this._clipboard
+    this.collapseSelection()
+    return { type: 'change', value: this._value, cursor: this._cursor }
+  }
+
+  /** Alt+Y：yank 内部剪贴板（直插不走粘贴折叠；setValue 记 undo）。 */
+  private yankClipboard(): InputLineEvent | null {
+    if (!this._clipboard) return null
+    const before = this._value.slice(0, this._cursor)
+    const after = this._value.slice(this._cursor)
+    this.setValue(before + this._clipboard + after, before.length + this._clipboard.length)
+    return { type: 'change', value: this._value, cursor: this._cursor }
+  }
+
   // ── Key Dispatch ─────────────────────────────────────────────
 
   /**
@@ -416,6 +604,7 @@ export class InputLine {
     if (name === 'return') {
       // 多行输入：`\` + Enter 续行（去掉尾部反斜杠，插入换行）
       if (this._value.slice(0, this._cursor).endsWith('\\')) {
+        this.recordUndo('replace')
         const before = this._value.slice(0, this._cursor - 1)
         const after = this._value.slice(this._cursor)
         this._value = before + '\n' + after
@@ -424,7 +613,7 @@ export class InputLine {
         this.onChangeCallback?.(this._value, this._cursor)
         return { type: 'change', value: this._value, cursor: this._cursor }
       }
-      const submitted = this._value
+      const submitted = this.expandPastes(this._value)
       const submittedImages = [...this._images]
       this.clearAfterSubmit()
       this.onImagesChangeCallback?.([])
@@ -441,6 +630,23 @@ export class InputLine {
       this.onTabCompleteCallback?.()
       return { type: 'tab' }
     }
+
+    // ── Vim mode: visual（必须在 collapseSelection 之前——motion 扩展不折叠）──
+    if (this._vimEnabled && this._vimMode === 'visual') {
+      return this.handleVimVisual(name, char, ctrl)
+    }
+
+    // ── 键盘选区（S1）：shift+移动扩展；编辑/移动/导航折叠；剪切/复制/yank ──
+    if (shift && !ctrl && !meta && (name === 'left' || name === 'right' || name === 'home' || name === 'end')) {
+      return this.extendSelection(name)
+    }
+    if (meta && char === 'w') return this.copySelection()
+    if (meta && char === 'y') return this.yankClipboard()
+    if (ctrl && name === 'ctrl_k' && this.selectionRange) return this.cutSelection()
+    if (!ctrl && !meta && (name === 'backspace' || name === 'delete') && this.selectionRange) {
+      return this.deleteSelection()
+    }
+    this.collapseSelection()
 
     // ── Vim mode: normal ────────────────────────────────────────
     if (this._vimEnabled && this._vimMode === 'normal') {
@@ -462,8 +668,10 @@ export class InputLine {
     switch (name) {
       case 'escape':
         if (this._vimEnabled) {
+          this.sealUndo()
           this._vimMode = 'normal'
-          return null
+          // change 事件触发重绘——模式标签（-- NORMAL --）切换不能等下一帧
+          return { type: 'change', value: this._value, cursor: this._cursor }
         }
         break // not vim → fall through to ignore
 
@@ -493,6 +701,9 @@ export class InputLine {
         case 'ctrl_f': return this.moveRight()
         case 'ctrl_n': return this.historyNext()
         case 'ctrl_p': return this.historyPrev()
+        case 'ctrl_minus':
+        case 'ctrl_z': return this.undo()
+        case 'ctrl_y': return this.redo()
         default: break
       }
       return null
@@ -509,6 +720,69 @@ export class InputLine {
   // ── Editing Operations ───────────────────────────────────────
 
   /**
+   * 改值前记录 undo 单元（改前快照）。仅 insert-word 在光标连续时合并
+   * （不新增单元）；其余 kind 每次独立成元。kind 切换即自然封口。
+   */
+  private recordUndo(kind: UndoKind): void {
+    // 新编辑分支使 redo 失效（标准编辑器语义）——undo 本身不经此方法，不受影响。
+    this._redoStack = []
+    this._redoChars = 0
+    const canMerge = kind === 'insert-word'
+      && this._undoOpen === kind
+      && this._undoExpectCursor === this._cursor
+    if (!canMerge) {
+      this._undoStack.push({ value: this._value, cursor: this._cursor, kind })
+      this._undoChars += this._value.length
+      while (this._undoStack.length > UNDO_STACK_MAX || this._undoChars > UNDO_TOTAL_CHARS_MAX) {
+        const dropped = this._undoStack.shift()
+        if (!dropped) break
+        this._undoChars -= dropped.value.length
+      }
+    }
+    this._undoOpen = kind
+    this._undoExpectCursor = -1 // 由插入方在改值后按需重设
+  }
+
+  /** 纯光标移动/模式切换：封口袋前单元（不产生新单元）。 */
+  private sealUndo(): void {
+    this._undoOpen = null
+    this._undoExpectCursor = -1
+  }
+
+  /** fish 式撤销：弹出最近单元恢复 {value, cursor}。Ctrl+- / Ctrl+Z。 */
+  private undo(): InputLineEvent | null {
+    const unit = this._undoStack.pop()
+    this.sealUndo()
+    if (!unit) return null
+    this._undoChars -= unit.value.length
+    this._redoStack.push({ value: this._value, cursor: this._cursor, kind: unit.kind })
+    this._redoChars += this._value.length
+    while (this._redoStack.length > UNDO_STACK_MAX || this._redoChars > UNDO_TOTAL_CHARS_MAX) {
+      const dropped = this._redoStack.shift()
+      if (!dropped) break
+      this._redoChars -= dropped.value.length
+    }
+    this._value = unit.value
+    this._cursor = Math.min(unit.cursor, this._value.length)
+    this.onChangeCallback?.(this._value, this._cursor)
+    return { type: 'change', value: this._value, cursor: this._cursor }
+  }
+
+  /** 重做：恢复最近一次 undo 前的状态。Ctrl+Y。 */
+  private redo(): InputLineEvent | null {
+    const unit = this._redoStack.pop()
+    this.sealUndo()
+    if (!unit) return null
+    this._redoChars -= unit.value.length
+    this._undoStack.push({ value: this._value, cursor: this._cursor, kind: unit.kind })
+    this._undoChars += this._value.length
+    this._value = unit.value
+    this._cursor = Math.min(unit.cursor, this._value.length)
+    this.onChangeCallback?.(this._value, this._cursor)
+    return { type: 'change', value: this._value, cursor: this._cursor }
+  }
+
+  /**
    * 提交后重置缓冲：清空文本、归零光标、复位历史游标、清空图片附件。
    * 不触发 onChangeCallback —— submit 路径自己负责后续渲染，
    * 避免在 submit 回调里又触发一次 change 渲染造成竞态。
@@ -518,20 +792,46 @@ export class InputLine {
     this._cursor = 0
     this._historyIdx = -1
     this._images = []
+    this._undoStack = []
+    this._undoChars = 0
+    this._redoStack = []
+    this._redoChars = 0
+    this.sealUndo()
+    this._draft = null
+    this._pastes.clear()
+    this._selAnchor = null // 内部剪贴板随会话保留（常规剪贴板语义）
+    this._visualLineWise = false
   }
 
   private insertChar(ch: string): InputLineEvent | null {
     if (this._value.length >= this._maxLength) return null
+    const kind = classifyInsert(ch)
+    this.recordUndo(kind)
     const before = this._value.slice(0, this._cursor)
     const after = this._value.slice(this._cursor)
     this._value = before + ch + after
     this._cursor += ch.length
+    if (kind === 'insert-word') this._undoExpectCursor = this._cursor
     this.onChangeCallback?.(this._value, this._cursor)
     return { type: 'change', value: this._value, cursor: this._cursor }
   }
 
   private backspace(): InputLineEvent | null {
     if (this._cursor <= 0) return null
+    this.recordUndo('delete')
+    // @mention 节点原子删除：光标左侧紧邻完整 token 时整体删除（@file 节点化 v1）。
+    // 右侧字符必须是空白或行尾——否则光标其实在 token 中间（如 'fix @file:sr|c'），
+    // 左侧形似完整 token 是误判，走 grapheme 单删。
+    const left = this._value.slice(0, this._cursor)
+    const mentionTail = left.match(/@(?:file|folder|symbol|codebase):(?:"[^"]+"|[^\s]+)\s?$/)
+    const nextCh = this._value[this._cursor] ?? ''
+    if (mentionTail && (nextCh === '' || /\s/.test(nextCh))) {
+      const start = this._cursor - mentionTail[0].length
+      this._value = left.slice(0, start) + this._value.slice(this._cursor)
+      this._cursor = start
+      this.onChangeCallback?.(this._value, this._cursor)
+      return { type: 'change', value: this._value, cursor: this._cursor }
+    }
     // grapheme-aware：删除光标左侧一个完整用户字符（CJK/emoji 簇）
     const start = this.prevGrapheme()
     const before = this._value.slice(0, start)
@@ -544,6 +844,7 @@ export class InputLine {
 
   private deleteForward(): InputLineEvent | null {
     if (this._cursor >= this._value.length) return null
+    this.recordUndo('delete')
     // grapheme-aware：删除光标右侧一个完整用户字符
     const end = this.nextGrapheme()
     const before = this._value.slice(0, this._cursor)
@@ -555,6 +856,7 @@ export class InputLine {
 
   private deleteToStart(): InputLineEvent | null {
     if (this._cursor <= 0) return null
+    this.recordUndo('delete')
     this._value = this._value.slice(this._cursor)
     this._cursor = 0
     this.onChangeCallback?.(this._value, this._cursor)
@@ -563,6 +865,7 @@ export class InputLine {
 
   private deleteToEnd(): InputLineEvent | null {
     if (this._cursor >= this._value.length) return null
+    this.recordUndo('delete')
     this._value = this._value.slice(0, this._cursor)
     this.onChangeCallback?.(this._value, this._cursor)
     return { type: 'change', value: this._value, cursor: this._cursor }
@@ -570,6 +873,7 @@ export class InputLine {
 
   private deleteWordBack(): InputLineEvent | null {
     if (this._cursor <= 0) return null
+    this.recordUndo('delete')
     const start = this.prevWordStart()
     const before = this._value.slice(0, start)
     const after = this._value.slice(this._cursor)
@@ -581,6 +885,7 @@ export class InputLine {
 
   private deleteWordForward(): InputLineEvent | null {
     if (this._cursor >= this._value.length) return null
+    this.recordUndo('delete')
     const end = this.nextWordEnd()
     const before = this._value.slice(0, this._cursor)
     const after = this._value.slice(end)
@@ -593,12 +898,14 @@ export class InputLine {
 
   private moveLeft(): InputLineEvent | null {
     if (this._cursor <= 0) return null
+    this.sealUndo()
     this._cursor = this.prevGrapheme()
     return { type: 'change', value: this._value, cursor: this._cursor }
   }
 
   private moveRight(): InputLineEvent | null {
     if (this._cursor >= this._value.length) return null
+    this.sealUndo()
     this._cursor = this.nextGrapheme()
     return { type: 'change', value: this._value, cursor: this._cursor }
   }
@@ -616,22 +923,26 @@ export class InputLine {
     return b < 0 ? this._value.length : b
   }
 
-  /** 当前 value 的 grapheme 边界（按 value 缓存，纯光标移动命中缓存）。 */
+  /** 当前 value 的 grapheme 边界（按 value 缓存，纯光标移动命中缓存）。
+   *  折叠粘贴标记为原子单位：标记内部的边界被剔除，光标/删除整体越过。 */
   private graphemeBounds(): number[] {
     if (this._graphemeCache?.value === this._value) return this._graphemeCache.bounds
-    const bounds = graphemeBoundaries(this._value)
+    let bounds = graphemeBoundaries(this._value)
+    if (this._pastes.size > 0) bounds = atomicPasteMarkerBounds(this._value, bounds)
     this._graphemeCache = { value: this._value, bounds }
     return bounds
   }
 
   private moveHome(): InputLineEvent | null {
     if (this._cursor === 0) return null
+    this.sealUndo()
     this._cursor = 0
     return { type: 'change', value: this._value, cursor: this._cursor }
   }
 
   private moveEnd(): InputLineEvent | null {
     if (this._cursor === this._value.length) return null
+    this.sealUndo()
     this._cursor = this._value.length
     return { type: 'change', value: this._value, cursor: this._cursor }
   }
@@ -639,6 +950,7 @@ export class InputLine {
   private moveWordLeft(): InputLineEvent | null {
     const start = this.prevWordStart()
     if (start === this._cursor) return null
+    this.sealUndo()
     this._cursor = start
     return { type: 'change', value: this._value, cursor: this._cursor }
   }
@@ -646,6 +958,7 @@ export class InputLine {
   private moveWordRight(): InputLineEvent | null {
     const end = this.nextWordEnd()
     if (end === this._cursor || end >= this._value.length && this._cursor === this._value.length) return null
+    this.sealUndo()
     this._cursor = end
     return { type: 'change', value: this._value, cursor: this._cursor }
   }
@@ -673,6 +986,7 @@ export class InputLine {
     if (this._value.includes('\n')) {
       const { line, col } = this.getLineCol(this._cursor)
       if (line > 0) {
+        this.sealUndo()
         this._cursor = this.posFromLineCol(line - 1, col)
         return { type: 'change', value: this._value, cursor: this._cursor }
       }
@@ -686,6 +1000,7 @@ export class InputLine {
       const { line, col } = this.getLineCol(this._cursor)
       const lastLine = this._value.split('\n').length - 1
       if (line < lastLine) {
+        this.sealUndo()
         this._cursor = this.posFromLineCol(line + 1, col)
         return { type: 'change', value: this._value, cursor: this._cursor }
       }
@@ -697,9 +1012,14 @@ export class InputLine {
 
   private historyPrev(): InputLineEvent | null {
     if (this._history.length === 0) return null
-    if (this._historyIdx === -1) this._historyIdx = 0
+    this.recordUndo('replace')
+    if (this._historyIdx === -1) {
+      // P1-2：首次上翻暂存在输草稿，回到 historyNext(-1) 时恢复（shell 式往返）。
+      this._draft = this._value
+      this._historyIdx = 0
+    }
     else if (this._historyIdx < this._history.length - 1) this._historyIdx++
-    else return null
+    else { this.sealUndo(); return null }
     this._value = this._history[this._historyIdx] ?? ''
     this._cursor = this._value.length
     this.onChangeCallback?.(this._value, this._cursor)
@@ -707,10 +1027,17 @@ export class InputLine {
   }
 
   private historyNext(): InputLineEvent | null {
-    if (this._historyIdx <= 0) return null
-    this._historyIdx--
-    this._value = this._history[this._historyIdx] ?? ''
-    if (this._historyIdx === 0) this._historyIdx = -1
+    if (this._historyIdx < 0) return null
+    this.recordUndo('replace')
+    if (this._historyIdx === 0) {
+      // 越过最新一条 → 恢复在输草稿（无草稿即空串）
+      this._historyIdx = -1
+      this._value = this._draft ?? ''
+      this._draft = null
+    } else {
+      this._historyIdx--
+      this._value = this._history[this._historyIdx] ?? ''
+    }
     this._cursor = this._value.length
     this.onChangeCallback?.(this._value, this._cursor)
     return { type: 'change', value: this._value, cursor: this._cursor }
@@ -722,7 +1049,7 @@ export class InputLine {
     switch (name) {
       case 'escape': return null
       case 'return': {
-        const submitted = this._value
+        const submitted = this.expandPastes(this._value)
         const submittedImages = [...this._images]
         this.clearAfterSubmit()
         this.onImagesChangeCallback?.([])
@@ -737,21 +1064,133 @@ export class InputLine {
       case 'end': return this.moveEnd()
       case 'up': return this.historyPrev()
       case 'down': return this.historyNext()
+      case 'ctrl_minus':
+      case 'ctrl_z': return this.undo()
+      case 'ctrl_y': return this.redo()
       default:
         // i → insert, a → append, I → insert at start, A → append at end
-        if (_char === 'i') { this._vimMode = 'insert'; return null }
-        if (_char === 'a') { this._cursor = Math.min(this._cursor + 1, this._value.length); this._vimMode = 'insert'; return null }
-        if (_char === 'I') { this._cursor = 0; this._vimMode = 'insert'; return null }
-        if (_char === 'A') { this._cursor = this._value.length; this._vimMode = 'insert'; return null }
+        //（模式切换 = 封口袋前 undo 单元；a/I/A 附带光标移动同理；
+        //  change 事件触发重绘——模式标签切换不能等下一帧）
+        if (_char === 'i') { this.sealUndo(); this._vimMode = 'insert'; return { type: 'change', value: this._value, cursor: this._cursor } }
+        if (_char === 'a') { this.sealUndo(); this._cursor = Math.min(this._cursor + 1, this._value.length); this._vimMode = 'insert'; return { type: 'change', value: this._value, cursor: this._cursor } }
+        if (_char === 'I') { this.sealUndo(); this._cursor = 0; this._vimMode = 'insert'; return { type: 'change', value: this._value, cursor: this._cursor } }
+        if (_char === 'A') { this.sealUndo(); this._cursor = this._value.length; this._vimMode = 'insert'; return { type: 'change', value: this._value, cursor: this._cursor } }
         // x → delete char, D → delete to end
         if (_char === 'x') return this.deleteForward()
         if (_char === 'D') return this.deleteToEnd()
         // 0 → home, $ → end, ^ → first non-whitespace
         if (_char === '0') return this.moveHome()
         if (_char === '$') return this.moveEnd()
-        if (_char === '^') { this._cursor = this._value.search(/\S|$/); return { type: 'change', value: this._value, cursor: this._cursor } }
+        if (_char === '^') { this.sealUndo(); this._cursor = this._value.search(/\S|$/); return { type: 'change', value: this._value, cursor: this._cursor } }
         if (_char === 'w') return this.moveWordRightVim()
         if (_char === 'b') return this.moveWordLeft()
+        // v → visual charwise；V → visual linewise；p/P → 粘贴内部剪贴板
+        if (_char === 'v') { this.sealUndo(); this._selAnchor = this._cursor; this._visualLineWise = false; this._vimMode = 'visual'; return { type: 'change', value: this._value, cursor: this._cursor } }
+        if (_char === 'V') { this.sealUndo(); this._selAnchor = this._cursor; this._visualLineWise = true; this._vimMode = 'visual'; return { type: 'change', value: this._value, cursor: this._cursor } }
+        if (_char === 'p') return this.pasteClipboard(false)
+        if (_char === 'P') return this.pasteClipboard(true)
+        return null
+    }
+  }
+
+  // ── Vim Visual Mode ──────────────────────────────────────────
+
+  /** vim p/P：内部剪贴板插到光标后/前（charwise 直插，不走粘贴折叠）。 */
+  private pasteClipboard(before: boolean): InputLineEvent | null {
+    if (!this._clipboard) return null
+    const at = before ? this._cursor : Math.min(this._cursor + 1, this._value.length)
+    const head = this._value.slice(0, at)
+    const tail = this._value.slice(at)
+    this.setValue(head + this._clipboard + tail, head.length + this._clipboard.length)
+    return { type: 'change', value: this._value, cursor: this._cursor }
+  }
+
+  /** visual：motion 扩展选区（选区渲染/linewise 对齐由 selectionRange 驱动）。 */
+  private handleVimVisual(name: string, _char: string, _ctrl: boolean): InputLineEvent | null {
+    switch (name) {
+      case 'escape':
+        this.collapseSelection()
+        this._visualLineWise = false
+        this._vimMode = 'normal'
+        return { type: 'change', value: this._value, cursor: this._cursor }
+      case 'return': {
+        const submitted = this.expandPastes(this._value)
+        const submittedImages = [...this._images]
+        this.clearAfterSubmit()
+        this._visualLineWise = false
+        this._vimMode = 'normal'
+        this.onImagesChangeCallback?.([])
+        this.onSubmitCallback?.(submitted, submittedImages)
+        return { type: 'submit', value: submitted, images: submittedImages }
+      }
+      case 'left': this._cursor = this.prevGrapheme(); return { type: 'change', value: this._value, cursor: this._cursor }
+      case 'right': this._cursor = this.nextGrapheme(); return { type: 'change', value: this._value, cursor: this._cursor }
+      case 'home': this._cursor = 0; return { type: 'change', value: this._value, cursor: this._cursor }
+      case 'end': this._cursor = this._value.length; return { type: 'change', value: this._value, cursor: this._cursor }
+      case 'up':
+      case 'down': {
+        const { line, col } = this.getLineCol(this._cursor)
+        const lastLine = this._value.split('\n').length - 1
+        const next = name === 'up' ? Math.max(0, line - 1) : Math.min(lastLine, line + 1)
+        this._cursor = this.posFromLineCol(next, col)
+        return { type: 'change', value: this._value, cursor: this._cursor }
+      }
+      case 'backspace':
+      case 'delete': {
+        // vim：x/d 同义剪切（Backspace/Delete 同 d）——先取选区（linewise 对齐
+        // 依赖 visual 模式态）再复位模式，顺序不可换。
+        const ev = this.cutSelection()
+        this._vimMode = 'normal'
+        this._visualLineWise = false
+        return ev
+      }
+      case 'ctrl_minus':
+      case 'ctrl_z': return this.undo()
+      case 'ctrl_y': return this.redo()
+      default:
+        if (_char === 'h') { this._cursor = this.prevGrapheme(); return { type: 'change', value: this._value, cursor: this._cursor } }
+        if (_char === 'l') { this._cursor = this.nextGrapheme(); return { type: 'change', value: this._value, cursor: this._cursor } }
+        if (_char === '0') { this._cursor = 0; return { type: 'change', value: this._value, cursor: this._cursor } }
+        if (_char === '$') { this._cursor = this._value.length; return { type: 'change', value: this._value, cursor: this._cursor } }
+        if (_char === '^') { this._cursor = this._value.search(/\S|$/); return { type: 'change', value: this._value, cursor: this._cursor } }
+        if (_char === 'w') { const r = this.moveWordRightVim(); return r ?? { type: 'change', value: this._value, cursor: this._cursor } }
+        if (_char === 'b') { const r = this.moveWordLeft(); return r ?? { type: 'change', value: this._value, cursor: this._cursor } }
+        if (_char === 'j' || _char === 'k') return this.handleVimVisual(_char === 'j' ? 'down' : 'up', _char, _ctrl)
+        // o：交换锚点/光标（选区另一端编辑）
+        if (_char === 'o') {
+          if (this._selAnchor !== null) {
+            const tmp = this._selAnchor
+            this._selAnchor = this._cursor
+            this._cursor = tmp
+          }
+          return { type: 'change', value: this._value, cursor: this._cursor }
+        }
+        // d/x：剪切回 normal；c：剪切进 insert；y：复制回 normal；v：退出 visual
+        //（均先取选区再复位模式——linewise 对齐依赖 visual 模式态，顺序不可换）
+        if (_char === 'd' || _char === 'x') {
+          const ev = this.cutSelection()
+          this._vimMode = 'normal'
+          this._visualLineWise = false
+          return ev
+        }
+        if (_char === 'c') {
+          const ev = this.cutSelection()
+          this._vimMode = 'insert'
+          this._visualLineWise = false
+          return ev
+        }
+        if (_char === 'y') {
+          const ev = this.copySelection()
+          this._vimMode = 'normal'
+          this._visualLineWise = false
+          return ev
+        }
+        if (_char === 'v') {
+          this.collapseSelection()
+          this._visualLineWise = false
+          this._vimMode = 'normal'
+          return { type: 'change', value: this._value, cursor: this._cursor }
+        }
         return null
     }
   }
@@ -784,6 +1223,7 @@ export class InputLine {
     // Skip whitespace
     while (i < this._value.length && !/\w/.test(this._value[i] ?? '')) i++
     if (i === this._cursor) return null
+    this.sealUndo()
     this._cursor = i
     return { type: 'change', value: this._value, cursor: this._cursor }
   }

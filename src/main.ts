@@ -41,7 +41,7 @@ import { formatWelcome } from './tui/format/welcome.js'
 import { color } from './tui/engine/ansi.js'
 import type { RewindMode } from './tui/format/rewind.js'
 import { collectPostBoundaryEditIds } from './agent/file-history.js'
-import { loadHistory } from './tui/history.js'
+import { loadHistory, searchHistory } from './tui/history.js'
 import { parseScrollbackTranscript } from './tui/scrollback-transcript.js'
 import { buildWorkerDetailContent } from './tui/worker-detail.js'
 import { killAllSync } from './tools/process-tracker.js'
@@ -53,11 +53,11 @@ import { StatusLineRunner } from './tui/statusline.js'
 import { buildVerboseTranscript } from './tui/transcript-verbose.js'
 import { resolveAppPromptInput, registerTuiSlashCommands, approvePlanAndKickoff } from './tui/slash-commands.js'
 import { listPlansSync, rejectPlan } from './plan/plan-store.js'
+import { resolveAutoApproveMs, shouldArm } from './tui/plan-auto-approve.js'
 import type { PlanPickerEntry } from './tui/format/overlay.js'
 import { skillRegistry } from './skills/skill-loader.js'
 import { starDomainRegistry } from './agent/star-domain-registry.js'
 import { buildDomainPickerEntries, DOMAIN_SWITCH_CACHE_WARNING } from './agent/domain-picker-entries.js'
-import { isStarSoulEnabled } from './agent/star-soul-gate.js'
 import { SessionPersist, formatExitSummary } from './agent/session-persist.js'
 import { parseSessionCliArgs } from './agent/session-recovery.js'
 import { loadConstellation } from './constellation/store.js'
@@ -65,6 +65,7 @@ import { formatMilestoneLine } from './constellation/format.js'
 import { join } from 'path'
 import { execSync } from 'child_process'
 import { applyProjectTemplates, recordTemplatesDecision } from './bootstrap/project-templates.js'
+import { applyInitCommit, formatInitApplyReport } from './bootstrap/init-scaffold.js'
 import { checkForUpdate, formatUpdateBanner, detectInstallRoot, getCurrentVersion } from './tui/updater.js'
 import { detectEnv, formatGitMissingBanner } from './tools/env-check.js'
 import { computeUsageCost, findModelPricing } from './utils/pricing.js'
@@ -578,30 +579,38 @@ async function main() {
     // 工具执行期间直接推 overlay 可能与 turn 收尾渲染冲突，defer 到下一事件循环。
     // 预览摘要在开面板时一次性读取（避免渲染路径每帧读盘；修订重提同 slug 也能取到新内容）。
     setImmediate(() => tuiApp.openPlanApprovalPanel(info, planExcerptFor(info.slug)))
+    // Goal 模式倒计时自动批准（2026-07-24，与 sidecar 同语义同 env）：
+    // goal 激活 + 窗口开启才武装；非 goal 会话保持纯手动审批。
+    const delayMs = resolveAutoApproveMs()
+    if (shouldArm(ctx!.refs.goalTrackerRef.current?.isActive() === true, delayMs)) {
+      tuiApp.armPlanAutoApprove(info.slug, delayMs)
+    }
+  }
+  // 倒计时触发守卫：idle（非运行中）+ goal 仍激活 + 计划仍 submitted。
+  tuiApp.planAutoApproveGuardsProvider = () => ({
+    idle: !tuiApp.isAgentBusy,
+    goalActive: ctx!.refs.goalTrackerRef.current?.isActive() === true,
+    planStillSubmitted: listPlansSync(ctx!.agent.cwd).find(p => p.slug === tuiApp.planAutoApproveSlug)?.status === 'submitted',
+  })
+  // 倒计时到期 → 自动批准并执行（默认方案：Recommended 否则首个，与面板 approve 同逻辑）。
+  tuiApp.onPlanAutoApproveFire = (slug) => {
+    const plan = listPlansSync(ctx!.agent.cwd).find(p => p.slug === slug)
+    const option = plan?.options?.find(o => o.label.includes('Recommended')) ?? plan?.options?.[0]
+    tuiApp.commitStatic(`⏳ Goal 模式：倒计时结束，自动批准计划「${plan?.title ?? slug}」并执行`)
+    void approvePlanAndKickoff(
+      {
+        cwd: ctx!.agent.cwd,
+        agent: ctx!.agent,
+        submitToAgent: (prompt: string) => { tuiApp.submitText(prompt) },
+        notify: (content: string, isError?: boolean) => tuiApp.commitStatic(content, { isError }),
+      },
+      slug,
+      option?.label,
+    )
   }
   // ask_user_question 含单选选项时自动弹出选择面板（替代手动输入编号）。
   ctx!.agent.onAskUserQuestionRequested = (info) => {
     setImmediate(() => tuiApp.openAskUserQuestionPanel(info))
-  }
-  // TUI / 桌面共用 agent.defaultDomain（默认 auto）。非 auto 时在首个请求前钉住，
-  // 仅构建初始 frozenBase，无缓存代价；钉住后 bindSessionDomain 跳过 Auto 绑定。
-  // defaultDomain === 'auto'（默认）时保持未钉定，由 bindSessionDomain 按首条消息
-  // 在 auto 池内关键词路由（domainKeywordRouting 默认开），未命中回退天权。
-  // 尊重 STAR_SOUL 总开关。
-  if (ctx!.agent.getSessionDomain() === undefined && isStarSoulEnabled()) {
-    const key = ctx!.config.agent?.defaultDomain ?? 'auto'
-    if (key !== 'auto') {
-      const pinned = starDomainRegistry.get(key) ?? starDomainRegistry.get('tianquan')
-      if (pinned) {
-        ctx!.agent.setSessionDomain({
-          id: pinned.id as import('./agent/star-domain.js').StarDomainId,
-          name: pinned.name,
-          volatileBlock: pinned.volatileBlock,
-          motto: pinned.motto,
-          courageThreshold: pinned.courageThreshold,
-        })
-      }
-    }
   }
   const initialDomain = ctx!.agent.getSessionDomain()?.name
   if (initialDomain) {
@@ -812,14 +821,13 @@ async function main() {
         return { entries: [] }
       }
     },
-    // History search — Ctrl+R 反向搜索（实时 query 子串过滤）
+    // History search — Ctrl+R 反向搜索（searchHistory 评分排序：前缀 +10 / 词命中 +5）
     historySearchData: () => {
       const query = tuiApp.getOverlayQuery()
-      const lower = query.toLowerCase()
       const all = loadHistory()
-      const filtered = lower ? all.filter(e => e.toLowerCase().includes(lower)) : all
+      const filtered = query ? searchHistory(query, 50) : all.slice(0, 50)
       return {
-        entries: filtered.slice(0, 50),
+        entries: filtered,
         selectedIndex: 0,
         query,
       }
@@ -898,9 +906,14 @@ async function main() {
         const title = info?.title ?? '待审批计划'
         // 标题区附计划正文预览（开面板时提取，剥掉 frontmatter/留痕行的前 6 行）。
         const excerpt = tuiApp.planApprovalExcerpt
+        // Goal 倒计时行：每次渲染重算剩余秒（armed 时 1s tick 驱动重绘）。
+        const countdown = tuiApp.planAutoApproveRemainSec
+        const countdownLine = countdown !== undefined
+          ? `\n⏳ Goal 模式：${countdown}s 后自动批准（批准/驳回即取消；Esc 收起不取消）`
+          : ''
         const fullTitle = excerpt
-          ? `计划审批 / Plan Approval\n「${title}」\n──\n${excerpt}`
-          : `计划审批 / Plan Approval\n「${title}」`
+          ? `计划审批 / Plan Approval\n「${title}」${countdownLine}\n──\n${excerpt}`
+          : `计划审批 / Plan Approval\n「${title}」${countdownLine}`
         const entries = []
         const options = info?.options ?? []
         if (options.length > 1) {
@@ -1128,6 +1141,8 @@ async function main() {
     if (tuiApp.choicePanelKind === 'plan-approval') {
       // 计划审批面板回调：approve / approve:<idx> / reject / reject-exit。
       const info = tuiApp.pendingPlanApproval
+      // 任何审批决策 = 用户参与——取消倒计时自动批准
+      tuiApp.cancelPlanAutoApprove()
       tuiApp.choicePanelKind = 'effort' // reset
       tuiApp.pendingPlanApproval = undefined
       tuiApp.planApprovalExcerpt = undefined
@@ -1229,6 +1244,8 @@ async function main() {
     )
   }, /* planPickerExec: */ (slug: string) => {
     // Plan Picker Enter 回调：批准选中计划并自动 kickoff 分波执行（与 /plan-approve 共用）。
+    // 手动批准 = 用户参与——取消倒计时自动批准
+    tuiApp.cancelPlanAutoApprove()
     void approvePlanAndKickoff(
       {
         cwd: ctx!.agent.cwd,
@@ -1238,6 +1255,14 @@ async function main() {
       },
       slug,
     )
+  }, /* initExec: */ (commit, summary) => {
+    // /init 向导提交回调：逐项应用（不存在才创建，存在则补缺/跳过），输出逐项报告。
+    try {
+      const report = applyInitCommit(ctx!.agent.cwd, commit)
+      tuiApp.commitStatic(`✅ ${summary}\n${formatInitApplyReport(report)}`)
+    } catch (e) {
+      tuiApp.commitStatic(`⚠️ 项目初始化失败: ${e instanceof Error ? e.message : String(e)}`)
+    }
   })
 
   // ── Worker 直达通道（WaveC）─────────────────────────────────
@@ -1252,7 +1277,7 @@ async function main() {
   // slash 命令提示列表：静态 palette 命令 + 动态已加载 skill 的 /skill <name>
   const paletteHints = getPaletteCommands()
     .filter(c => c.name.startsWith('/'))
-    .map(c => ({ name: c.name, description: c.description }))
+    .map(c => ({ name: c.name, description: c.description, ...(c.argsHint ? { argsHint: c.argsHint } : {}) }))
   const skillHints = skillRegistry.list().map(s => ({
     name: `/skill ${s.name}`,
     description: s.description ? s.description.split('\n')[0]! : `Load skill: ${s.name}`,
@@ -1599,7 +1624,9 @@ async function main() {
 
   // ── 会话恢复入口（Claude Code parity）───────────────────────────
   // 裸 --resume/-r：自动打开 Chronicle 会话选择器（Enter 直接切换）。
-  // 普通新会话启动：有近期历史会话时打一行可发现性提示。
+  // 普通新会话启动：仅 wantSessionPicker 时开选择器。启动页的
+  // 「↺ N 个历史会话 · /resume 恢复」提示行已移除（2026-07-25）——resume
+  // 功能保留但不主动展示，降低顺手回连带来的碎缓存风险。
   {
     const recentSessions = SessionPersist.listMainSessions(process.cwd())
       .filter(s => s.id !== ctx!.sessionId && (s.turnCount ?? 0) > 0
@@ -1610,11 +1637,6 @@ async function main() {
       } else {
         app.commitStatic('没有可恢复的历史会话 — 已开启新会话。')
       }
-    } else if (existingMsgCount === 0 && recentSessions.length > 0) {
-      app.commitStatic(color(
-        `↺ ${recentSessions.length} 个历史会话 · /resume 恢复`,
-        theme.muted,
-      ))
     }
   }
 

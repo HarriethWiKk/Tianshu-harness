@@ -36,10 +36,15 @@ body { padding: 0; margin: 0; font-family: var(--vscode-font-family); color: var
 .msg.approval .approve { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
 .msg.approval .deny { background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); }
 .msg.approval .decision { margin-top: 6px; color: var(--vscode-descriptionForeground); font-size: 12px; }
+.msg.approval .approval-edit { width: 100%; box-sizing: border-box; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, transparent); border-radius: 3px; margin-top: 4px; padding: 6px 8px; font-size: 12px; font-family: var(--vscode-editor-font-family); resize: vertical; }
+.msg.approval .approval-error { margin-top: 6px; color: var(--vscode-errorForeground); font-size: 12px; }
+.msg.approval .approval-remember { display: flex; align-items: center; gap: 6px; margin-top: 8px; font-size: 12px; color: var(--vscode-descriptionForeground); cursor: pointer; user-select: none; }
 
 .toolbar { display: flex; gap: 4px; align-items: center; padding: 4px 8px; border-bottom: 1px solid var(--vscode-panel-border); flex-wrap: wrap; }
 .toolbar select { max-width: 46%; background: var(--vscode-dropdown-background); color: var(--vscode-dropdown-foreground); border: 1px solid var(--vscode-dropdown-border); padding: 1px 4px; border-radius: 2px; font-size: 11px; }
 .badge.plan { font-size: 11px; color: var(--vscode-charts-yellow, #cca700); }
+.plan-toggle { background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); border: none; padding: 1px 8px; cursor: pointer; border-radius: 2px; font-size: 11px; }
+.plan-toggle.active { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
 
 .todo-panel { border-bottom: 1px solid var(--vscode-panel-border); padding: 4px 8px; font-size: 12px; }
 .todo-panel summary { cursor: pointer; color: var(--vscode-descriptionForeground); user-select: none; }
@@ -121,4 +126,10 @@ body { padding: 0; margin: 0; font-family: var(--vscode-font-family); color: var
 .msg.plan-card .actions button { border: none; padding: 3px 12px; cursor: pointer; border-radius: 2px; background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); }
 .msg.plan-card .actions .approve { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
 .msg.plan-card .actions .deny { background: var(--vscode-inputValidation-errorBackground); color: var(--vscode-foreground); }
+.msg.plan-card .plan-edit { width: 100%; box-sizing: border-box; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, transparent); border-radius: 3px; margin-top: 8px; padding: 6px 8px; font-size: 12px; font-family: var(--vscode-editor-font-family); resize: vertical; }
+.msg.plan-card .approval-error { margin-top: 6px; color: var(--vscode-errorForeground); font-size: 12px; }
+.msg.plan-card .plan-options { margin-top: 8px; border-top: 1px dashed var(--vscode-panel-border); padding-top: 6px; }
+.msg.plan-card .plan-options-label { font-size: 11px; color: var(--vscode-descriptionForeground); margin-bottom: 4px; }
+.msg.plan-card .plan-option { display: flex; align-items: center; gap: 6px; padding: 3px 6px; border-radius: 3px; font-size: 12px; cursor: pointer; user-select: none; }
+.msg.plan-card .plan-option.active { background: var(--vscode-list-activeSelectionBackground); color: var(--vscode-list-activeSelectionForeground); }
 `

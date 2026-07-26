@@ -16,6 +16,28 @@ import type { RivetTheme } from '../theme.js'
 export interface SlashHintEntry {
   name: string
   description: string
+  /** 可选参数提示（ghost text，P3）：输入精确匹配「命令名+空格」时在光标后
+   *  暗色提示（如 /effort → 'off|low|medium|high|max'）。纯渲染层拼接，不进 buffer。 */
+  argsHint?: string
+}
+
+/**
+ * ghost text 匹配（P3-2）：输入为「/命令名 + 恰好一个空白」形态时返回该命令的
+ * argsHint；否则 null。
+ *
+ * 只在命令名已完整后出现——继续输入参数（第二个非空白字符）即失配，由调用方
+ * 每帧重算自然消失。不做前缀/模糊匹配；多行输入（含 \n）直接排除。
+ */
+export function slashArgsHint(commands: readonly SlashHintEntry[], value: string): string | null {
+  if (!value.startsWith('/') || value.includes('\n')) return null
+  const m = value.match(/^(\/\S+)\s$/)
+  if (!m) return null
+  const typed = m[1]!.toLowerCase()
+  for (const c of commands) {
+    if (!c.argsHint) continue
+    if (c.name.toLowerCase() === typed) return c.argsHint
+  }
+  return null
 }
 
 export const SLASH_HINT_MAX_VISIBLE = 5

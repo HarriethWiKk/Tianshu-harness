@@ -12,6 +12,8 @@ function fakeRes(opts: { throwOnWrite?: boolean } = {}) {
     writeHead(_status: number, h?: Record<string, unknown>) {
       if (h) headers = h
     },
+    // b6ea4e94：SseStream 构造时 flushHeaders() 立即推送响应头（治骨架屏卡 6s）
+    flushHeaders() {},
     write(chunk: string) {
       if (opts.throwOnWrite) throw new Error('EPIPE')
       writes.push(chunk)

@@ -151,6 +151,12 @@ export function createDelegateTaskTool(
             usage: r.usage,
             artifactId: r.diffArtifactId,
             changedFiles: r.changedFiles.length > 0 ? r.changedFiles : undefined,
+            findingsCount: r.findings.length > 0 ? r.findings.length : undefined,
+            topFinding: r.findings[0]?.claim,
+            verificationBrief: r.verification
+              ? { status: r.verification.status, passed: r.verification.passed, failed: r.verification.failed }
+              : undefined,
+            evidenceStatus: r.evidenceStatus,
           })
         }
       }

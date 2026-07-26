@@ -82,7 +82,7 @@ test('#1 listRewindPoints returns only user messages with string content', async
   const { manager, agents } = setup()
   const id = await makeSession(manager, agents)
 
-  const points = manager.listRewindPoints(id)!
+  const points = (await manager.listRewindPoints(id))!
   assert.equal(points.length, 3, 'should find 3 user messages')
   assert.equal(points[0]!.content, 'Hello')
   assert.equal(points[1]!.content, 'Do task A')
@@ -168,7 +168,7 @@ test('#4b rewind emits an anchorSeq matching the rewound user event', async () =
   await new Promise(r => setTimeout(r, 10))
 
   // messages: [u Hello, a ok, u Do task A, a ok, u Now do B, a ok]
-  const points = manager.listRewindPoints(s.id)!
+  const points = (await manager.listRewindPoints(s.id))!
   assert.deepEqual(points.map(p => [p.index, p.content]), [[0, 'Hello'], [2, 'Do task A'], [4, 'Now do B']])
 
   // Each point exposes the seq of its originating `user` event — the desktop
@@ -266,7 +266,7 @@ test('#10 timestamp from event log', async () => {
   // Messages injected out-of-band (no 'user' events) → timestamp falls back to 0.
   const { manager, agents } = setup()
   const id = await makeSession(manager, agents)
-  const points = manager.listRewindPoints(id)!
+  const points = (await manager.listRewindPoints(id))!
 
   // makeSession creates via createSession({ prompt: 'init' }) which fires a
   // real run → the event log contains a 'user' event for the first message.

@@ -201,8 +201,8 @@ export function renderAllCapsulesBlock(cwd: string): string | undefined {
  * 不再在冻结前缀常驻任何胶囊全文或护栏——省 ~6K tokens。
  */
 
-export function renderResidentCapsuleBlock(cwd: string): string | undefined {
-  return renderCapsuleIndexBlock(cwd)
+export function renderResidentCapsuleBlock(cwd: string, limit?: number): string | undefined {
+  return renderCapsuleIndexBlock(cwd, limit)
 }
 
 /**
@@ -210,11 +210,31 @@ export function renderResidentCapsuleBlock(cwd: string): string | undefined {
  * 替代 renderAllCapsulesBlock 的全文注入：膨胀从"每星一胶囊"降到"每星一行"，
  * 稳定、可缓存、可无限加星。完整正文经 recall_capsule 工具按需拉取
  * （落在工具结果通道 = anchor 之后，cache-safe，不篡改冻结前缀）。
+ *
+ * @param limit lean 档下只展开前 N 条 gist（sealedAt 稳定序，不引入新排序）。
+ *   被略去的星**仍列出星名**——丢的是摘要，不是可发现性；模型照样知道
+ *   该 recall 谁。若连星名都省掉，recall_capsule 就成了盲调。
  */
-export function renderCapsuleIndexBlock(cwd: string): string | undefined {
+export function renderCapsuleIndexBlock(cwd: string, limit?: number): string | undefined {
   const capsules = loadAllCapsules(cwd)
   if (capsules.length === 0) return undefined
-  const lines = capsules.map(c => `  ${c.star} — ${c.gist ?? '（无摘要）'}`)
+
+  const full = renderIndex(capsules, capsules.length)
+  if (limit === undefined || limit <= 0 || limit >= capsules.length) return full
+
+  // 省不下就不截：胶囊少或 gist 短时，「其余 N 位」尾行会比省掉的那几行更长。
+  // 没有这道闸，lean 档在小仓库下会比 standard 还胖。
+  const truncated = renderIndex(capsules, limit)
+  return truncated.length < full.length ? truncated : full
+}
+
+function renderIndex(capsules: readonly SeedCapsule[], shownCount: number): string {
+  const shown = capsules.slice(0, shownCount)
+  const lines = shown.map(c => `  ${c.star} — ${c.gist ?? '（无摘要）'}`)
+  if (shown.length < capsules.length) {
+    const rest = capsules.slice(shownCount).map(c => c.star).join(' / ')
+    lines.push(`  其余 ${capsules.length - shown.length} 位（${rest}）经 recall_capsule 取摘要与全文。`)
+  }
   return [
     '<seed-capsules note="前辈星域封存的方法索引。需要某位的完整原则时调用 recall_capsule(star)。">',
     ...lines,

@@ -37,6 +37,9 @@ export interface PerceptionInput {
   estimatedTokens: number
   pressureResult: PressureResult
   evidenceState: EvidenceState
+  /** 交付就绪（EvidenceTracker.deliveryReady()）：最近验证 passed 且绿后零编辑。
+   *  缺省回退 deliveryStatus==='verified'（手工构造输入的测试路径）。 */
+  deliveryReady?: boolean
   predictionAccumulator: PredictionAccumulator
   recentToolHistory: ToolHistoryEntry[]
   loadedPheromones: Pheromone[]
@@ -154,6 +157,10 @@ export class TurnPerceptionController {
       recentTools,
       shouldEscalate: nextStrategy.shouldEscalate,
       hasEnteredHighComplexity: this.hasEnteredHighComplexity,
+      // YOLO 证据门归航：buildStarPhaseContext 只在 maxTurns<=0 时消费。
+      // 判据用 deliveryReady（最近验证 passed 且绿后零编辑）而非 deliveryStatus——
+      // 后者的全窗口粘滞让门在正常红→绿节奏下 91% 时间打不开（近两天日志回放）。
+      deliveryVerified: input.deliveryReady ?? (input.evidenceState.deliveryStatus === 'verified'),
     })
     const event = createStarEvent(nextSensorium, starCtx)
     this.currentPhase = event.phase

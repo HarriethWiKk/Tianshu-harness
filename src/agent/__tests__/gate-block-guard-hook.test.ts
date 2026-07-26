@@ -82,4 +82,25 @@ describe('gate-block-guard hook', () => {
     assert.ok(h.submitted[0]!.content.includes('3 次'))
     assert.ok(h.submitted[0]!.content.includes('（deny）'))
   })
+
+  // 2026-07-25 桌面「退不出」复盘：plan-mode 被拦占多数时必须点名真退出通道
+  // （submit 审批 / exit_mode 放弃规划），通用文案不提，模型会口头宣布退出。
+  it('uses plan-mode-tailored content when plan-mode blocks dominate', () => {
+    const h = setup({ 1: ['plan-mode', 'plan-mode'] })
+    h.runTurn(1)
+    assert.equal(h.submitted.length, 1)
+    const adv = h.submitted[0]!
+    assert.ok(adv.content.includes('plan action=exit_mode'), 'should name the exit tool')
+    assert.ok(adv.content.includes('plan action=submit'), 'should name submit')
+    assert.ok(adv.content.includes('只认工具调用'), 'should warn text-claims do not exit')
+    assert.deepEqual(adv.expect, { kind: 'tool_appears', tools: ['plan'], withinTurns: 2 })
+  })
+
+  it('keeps generic content when plan-mode is a minority of blocks', () => {
+    const h = setup({ 1: ['plan-mode', 'tdd', 'destructive'] })
+    h.runTurn(1)
+    assert.equal(h.submitted.length, 1)
+    assert.ok(h.submitted[0]!.content.includes('替代路径'))
+    assert.ok(!h.submitted[0]!.content.includes('exit_mode'))
+  })
 })

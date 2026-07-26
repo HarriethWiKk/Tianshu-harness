@@ -93,6 +93,7 @@ export const DEFAULT_CONFIG: Config = {
       'mimo-api': cloneProviderPreset('mimo-api'),
       minimax: cloneProviderPreset('minimax'),
       codex: cloneProviderPreset('codex'),
+      ccswitch: cloneProviderPreset('ccswitch'),
     },
   },
   agent: {
@@ -100,7 +101,7 @@ export const DEFAULT_CONFIG: Config = {
     maxTurns: 200,
     mode: 'code',
     autoReasoning: true,
-    defaultDomain: 'auto',
+    defaultDomain: 'qiming',
     domainKeywordRouting: true,
     verificationSnapshot: 'auto',
     songlineEnabled: false,
@@ -167,7 +168,7 @@ export const DEFAULT_CONFIG: Config = {
     },
     review: {
       profiles: {},
-      skipAuto: false,
+      skipAuto: true,
       mechanicalFastPath: true,
     },
     goal: {
@@ -209,6 +210,10 @@ export const DEFAULT_CONFIG: Config = {
     maxRedirects: 5,
     userAgent: 'Tianshu/1.0 (terminal coding agent)',
     extractMainContent: true,
+    enablePlaywright: false,
+    renderTimeoutMs: 30_000,
+    renderWaitMs: 0,
+    cacheMaxAgeMs: 172_800_000,
   },
   network: {},
   mcp: {
@@ -258,6 +263,9 @@ export const DEFAULT_CONFIG: Config = {
   // 项目验证命令声明 — 默认空，由项目层 .rivet-config.json 覆盖（/init 生成）
   verify: {},
   tools: {},
+  // 前缀档位：空对象 = 走 schema 默认（standard）。这里刻意不写死 profile，
+  // 让「无配置 = 现状」这一不变量只有一个来源（block-policy.resolvePromptBlocks）。
+  prompt: { blocks: {} },
   // Pro 双层模式：enabled 由许可证/RIVET_PRO 决定（Basic=false）；features 与
   // schema 默认一致为 true——「Pro 激活即全部 Pro 功能可用」，显式 false 才关。
   // 注意 DEFAULT_CONFIG 是 loadConfig 的第一层，会 deep-merge 覆盖 schema 默认，

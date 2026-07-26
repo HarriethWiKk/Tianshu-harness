@@ -25,7 +25,7 @@ describe('sub-agent / review routing config', () => {
   it('getRoutingConfig returns schema defaults when nothing is configured', () => {
     const { review, workers } = getRoutingConfig()
     assert.deepEqual(review.profiles, {})
-    assert.equal(review.skipAuto, false)
+    assert.equal(review.skipAuto, true)
     assert.equal(review.mechanicalFastPath, true)
     // workers has built-in defaults (default.ts)
     assert.equal(workers.routing.code_edit, 'cheap-flash')

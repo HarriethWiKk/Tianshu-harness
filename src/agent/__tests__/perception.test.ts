@@ -82,9 +82,53 @@ describe('buildStarPhaseContext', () => {
       isWriting: true,
       isRunningTests: true,
       isFinalTurn: true,
+      readyByEvidence: false,
       shouldEscalate: true,
       hasEnteredHighComplexity: true,
     })
+  })
+
+  // maxTurns=0 是 YOLO 的「无上限」哨兵（bootstrap/serve/slash-commands 三处都这么置），
+  // turn-orchestrator 用 MAX_SAFE_INTEGER 解释它。这里若按字面算 turn >= -1 就恒为真，
+  // 于是 momentum>0.8 的帧全部落进「瑶光归航」——无限轮次的会话被一路当成在收尾。
+  it('maxTurns=0（YOLO 无上限）时永远不是最终轮', () => {
+    for (const turn of [0, 1, 50, 500]) {
+      const ctx = buildStarPhaseContext({
+        turn,
+        maxTurns: 0,
+        recentTools: [],
+        shouldEscalate: false,
+        hasEnteredHighComplexity: false,
+      })
+      assert.equal(ctx.isFinalTurn, false, `turn=${turn} 不应判为最终轮`)
+    }
+  })
+
+  // 复盘修复（2026-07-25）：YOLO 没有最终轮 → delivering 结构性不可达，
+  // 归航改由交付证据门（deliveryStatus==='verified'）抬升。
+  it('YOLO + 交付已验证 → readyByEvidence 为真（证据门归航）', () => {
+    const ctx = buildStarPhaseContext({
+      turn: 42,
+      maxTurns: 0,
+      recentTools: [],
+      shouldEscalate: false,
+      hasEnteredHighComplexity: false,
+      deliveryVerified: true,
+    })
+    assert.equal(ctx.isFinalTurn, false)
+    assert.equal(ctx.readyByEvidence, true)
+  })
+
+  it('有界会话不走证据门——交付已验证也不置 readyByEvidence（语义保持最终轮才归航）', () => {
+    const ctx = buildStarPhaseContext({
+      turn: 3,
+      maxTurns: 10,
+      recentTools: [],
+      shouldEscalate: false,
+      hasEnteredHighComplexity: false,
+      deliveryVerified: true,
+    })
+    assert.equal(ctx.readyByEvidence, false)
   })
 })
 

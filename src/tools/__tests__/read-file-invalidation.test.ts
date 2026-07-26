@@ -262,7 +262,11 @@ describe('in-process concurrent session isolation', () => {
     assert.ok(!editB.content.includes('你在当前会话中曾编辑过'), `B did not edit this file: ${editB.content.slice(0, 160)}`)
   })
 
-  it('position-only hash_edit hard-reject is session-scoped', async () => {
+  it('position-only hash_edit after edits warns about drift instead of hard-rejecting', async () => {
+    // ff25d68b 守卫减负：「仅位置锚点 + 已编辑」不再硬拒绝——仍尝试编辑
+    // （越界由行号存在性检查兜底），但必须带漂移警告。警告有两条触发路径：
+    // 本会话编辑过（session-scoped）与读后 mtime 变化（跨会话也触发——
+    // 文件确实被改了，行号漂移对 B 同样真实）。
     const fp = makeBigFile('src/pos.txt')
     await READ_FILE_TOOL.execute(params({ file_path: fp }, 'sessA'))
     await READ_FILE_TOOL.execute(params({ file_path: fp }, 'sessB'))
@@ -274,21 +278,24 @@ describe('in-process concurrent session isolation', () => {
     }, 'sessA'))
     assert.ok(!editA.isError)
 
-    // A edited the file → A's position-only hash_edit is hard-rejected
+    // A edited the file → A's position-only hash_edit succeeds WITH drift warning
     const hA = await HASH_EDIT_TOOL.execute(params({
       file_path: fp,
       anchors: ['L5'],
       new_string: 'A POS EDIT'.padEnd(80, ' '),
     }, 'sessA'))
-    assert.ok(hA.isError && hA.content.includes('仅位置锚点'), 'A blocked (edited in own session)')
+    assert.ok(!hA.isError, `A must not be hard-rejected: ${hA.content.slice(0, 160)}`)
+    assert.ok(hA.content.includes('仅位置锚点'), `A gets a drift warning: ${hA.content.slice(0, 160)}`)
 
-    // B did NOT edit → no hard reject (drift warning at most)
+    // B did not edit, but the file changed under B's feet since its read →
+    // mtime drift path also warns (and the edit still goes through).
     const hB = await HASH_EDIT_TOOL.execute(params({
       file_path: fp,
       anchors: ['L5'],
       new_string: 'B POS EDIT'.padEnd(80, ' '),
     }, 'sessB'))
-    assert.ok(!hB.content.includes('仅位置锚点'), `B must not be blocked by A's edit: ${hB.content.slice(0, 160)}`)
+    assert.ok(!hB.isError, `B must not be hard-rejected: ${hB.content.slice(0, 160)}`)
+    assert.ok(hB.content.includes('仅位置锚点'), `B gets a drift warning: ${hB.content.slice(0, 160)}`)
   })
 })
 

@@ -23,6 +23,7 @@ import type { GoalContinuationController } from './goal-continuation.js'
 import type { PostTurnDecisionController } from './post-turn-decision.js'
 import type { TelemetryRecord } from './telemetry-writer.js'
 import { emitStopReason, type StopReason } from './stop-reason.js'
+import { describeAction } from './evidence-obligation.js'
 import type { AdvisoryEntry } from './advisory-bus.js'
 import { debugLog } from '../utils/debug.js'
 import { hasActionIntent, hasWriteActionIntent, turnUsedOnlyReadTools, DELIVERY_SIGNAL_RE } from './action-intent-detector.js'
@@ -1301,7 +1302,7 @@ export class TurnOrchestrator {
             debugLog(`[obligation-gate] turn=${turn} continue_once action=${obGate.nextAction.action} claim=${obGate.nextAction.claim.slice(0, 80)}`)
             const obInjected = this.deps.appendSystemReminderAndReport(
               `<system-reminder>上一轮结论依赖尚未证实的高风险断言：「${obGate.nextAction.claim}」。`
-              + `在给出最终答案前，请先执行最短证据动作：${obGate.nextAction.action}。`
+              + `在给出最终答案前，请先执行最短证据动作：${describeAction(obGate.nextAction.action)}。`
               + `若该动作确实无法执行（缺权限/环境/依赖），请在最终答复中明确标注该结论未经验证及具体障碍，不要声称已验证。</system-reminder>`,
               'functional'
             )

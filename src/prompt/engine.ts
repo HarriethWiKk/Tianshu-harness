@@ -6,7 +6,8 @@ import { CACHE_ANCHOR_MESSAGES } from '../compact/constants.js'
 import { estimateOaiTokens } from '../compact/micro.js'
 import { buildSystemPrompt, type StaticPromptContext } from './static.js'
 import type { ToolDefinition } from '../api/types.js'
-import { buildStableVolatileBlock, buildLatestTurnVolatileBlock, buildDynamicAppendixParts, buildConsolidatedBlock, renderTaskDepthAdvisory, renderPlanMethodologyAdvisory, type VolatileContext, type ToolHistoryEntry } from './volatile.js'
+import { buildStableVolatileBlock, buildLatestTurnVolatileBlock, buildDynamicAppendixParts, buildConsolidatedBlock, renderTaskDepthAdvisory, renderPlanMethodologyAdvisory, FROZEN_BLOCK_CAPS, type VolatileContext, type ToolHistoryEntry } from './volatile.js'
+import type { BudgetInput } from './prefix-budget.js'
 import { analyzeVolatilePayload, LARGE_VOLATILE_PAYLOAD_CHARS, type VolatilePayloadReport } from '../context/payload-diagnostic.js'
 import type { TaskState } from '../agent/task-state.js'
 import type { ContextClaim } from '../context/claims.js'
@@ -115,6 +116,11 @@ export interface PromptEngineConfig {
   prefixCache?: 'deepseek-native' | 'anthropic-cache-control' | 'none'
   /** Enable append-only delta context-update (only emit changed sub-blocks). */
   appendixDelta?: boolean
+  /** /cd: inherit frozen snapshots + T7 watermark from a previous engine so a
+   *  mid-session cwd switch replays historical user messages byte-identically.
+   *  The prefix cache then only tail-cuts at the next user boundary (same cost
+   *  model as a domain switch) instead of a /resume-style byte-0 full miss. */
+  inheritFrozenFrom?: PromptEngine
 }
 
 export class PromptEngine {
@@ -240,6 +246,16 @@ export class PromptEngine {
 
   constructor(config: PromptEngineConfig) {
     this.config = config
+    // /cd frozen inheritance — adopt the previous engine's committed snapshot
+    // state BEFORE any build, so historical slots resolve to the old bytes.
+    const inherit = config.inheritFrozenFrom
+    if (inherit) {
+      this.frozenUserMerged = new Map([...inherit.frozenUserMerged].map(([k, v]) => [k, [...v]]))
+      this.frozenPendingMerged = new Map(inherit.frozenPendingMerged)
+      this.firstUserKey = inherit.firstUserKey
+      this.collapseWatermark = inherit.collapseWatermark
+      this.collapseTokenStep = inherit.collapseTokenStep
+    }
     this.systemPrompt = buildSystemPrompt(config.staticCtx)
     this.frozenBase = buildStableVolatileBlock(config.volatileCtx)
     this.volatileBlock = this.frozenBase
@@ -840,6 +856,29 @@ export class PromptEngine {
   /** Number of tool definitions (for prefix overhead estimation). */
   getToolCount(): number {
     return this.config.staticCtx.tools.length
+  }
+
+  /**
+   * 当前 frozen 前缀的分块构成（`/prefix-budget` 与 scripts/prefix-budget.ts 共用口径）。
+   *
+   * 读的是这个引擎实际持有的字节，不重新加载磁盘——脚本量的是「新会话会是什么样」，
+   * 这里量的是「本会话现在是什么样」。两者在会话中途切过 /domain 或 /cd 后会不同。
+   */
+  getPrefixBudgetInputs(): BudgetInput[] {
+    const ctx = this.config.volatileCtx
+    const caps = { ...FROZEN_BLOCK_CAPS, ...ctx.blockCaps }
+    return [
+      { name: 'static.ts BASE_PROMPT', category: 'brake', content: this.systemPrompt },
+      { name: 'star-domain volatileBlock', category: 'brake', content: ctx.activeDomain?.volatileBlock },
+      { name: '工具 schema (JSON)', category: 'tools', content: JSON.stringify(this.config.staticCtx.tools) },
+      { name: 'project-instructions', category: 'reference', content: ctx.rivetMd?.slice(0, caps.projectInstructions), cap: caps.projectInstructions, rawChars: ctx.rivetMd?.length },
+      { name: 'project-memory', category: 'reference', content: ctx.projectMemoryBlock?.slice(0, caps.projectMemory), cap: caps.projectMemory, rawChars: ctx.projectMemoryBlock?.length },
+      { name: 'knowledge-manifest', category: 'reference', content: ctx.knowledgeManifestBlock?.slice(0, caps.knowledgeManifest), cap: caps.knowledgeManifest, rawChars: ctx.knowledgeManifestBlock?.length },
+      { name: 'codebase-index', category: 'reference', content: ctx.projectIndexBlock?.slice(0, caps.codebaseIndex), cap: caps.codebaseIndex, rawChars: ctx.projectIndexBlock?.length },
+      { name: 'seed-capsule 索引', category: 'reference', content: ctx.seedCapsuleBlock },
+      { name: 'session-memory', category: 'reference', content: ctx.sessionMemoryBlock },
+      { name: 'appendix（每轮动态）', category: 'appendix', content: this.cachedAppendix },
+    ]
   }
 
   /** Current cognitive projection length in chars (for cache-log observability). */

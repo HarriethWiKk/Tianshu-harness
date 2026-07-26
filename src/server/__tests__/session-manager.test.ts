@@ -753,7 +753,9 @@ function makePlusManager() {
 
 test('PlusMenu: listDomains flags Auto by default; setDomain pins a domain', async () => {
   const { manager } = makePlusManager()
-  const s = manager.createSession({})
+  // 显式 domain —— 空 input 时起始星域由 ~/.rivet 全局配置 defaultDomain 决定
+  // （同 a976167f 对 model 的处理），在本机真实配置下不可预测，需锚定起点。
+  const s = manager.createSession({ domain: 'auto' })
   const entries = manager.listDomains(s.id)!
   assert.ok(entries.length >= 3)
   const auto = entries.find((e) => e.key === 'auto')!

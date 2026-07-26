@@ -34,9 +34,16 @@ describe('getCompletions', () => {
 })
 
 describe('applyCompletion', () => {
-  it('replaces @token with completion and adds trailing space', () => {
+  it('replaces @token with canonical @file: mention and adds trailing space', () => {
+    // 096cf2dd：补全插入规范形 @file:——mention-parser 只认该协议，
+    // 裸 @path 提交后不会被解析成引用（静默断链）。
     const result = applyCompletion('fix @src/ma', 11, 'src/main.tsx')
-    assert.equal(result.text, 'fix @src/main.tsx ')
-    assert.equal(result.cursor, 18)
+    assert.equal(result.text, 'fix @file:src/main.tsx ')
+    assert.equal(result.cursor, 'fix @file:src/main.tsx '.length)
+  })
+
+  it('quotes paths with spaces', () => {
+    const result = applyCompletion('see @my', 7, 'my dir/a.ts')
+    assert.equal(result.text, 'see @file:"my dir/a.ts" ')
   })
 })

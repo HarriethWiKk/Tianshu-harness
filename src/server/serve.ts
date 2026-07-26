@@ -505,6 +505,14 @@ export async function runServe(opts: RunServeOptions = {}): Promise<RunningServe
     // 一键续跑兜底模型（可选，用户显式配置）。未配置时原模型不可用的续跑
     // fail-closed —— 绝不静默回退默认模型（跨模型续跑会重建整条前缀缓存）。
     resumeFallbackModel: ctx.config.agent?.resumeFallbackModel,
+    // Goal 计划倒计时自动批准窗口（ms）。默认 150s（manager 内建）；
+    // RIVET_GOAL_PLAN_AUTO_APPROVE_MS 覆盖，0 = 关闭（纯手动审批）。
+    goalPlanAutoApproveMs: (() => {
+      const raw = process.env.RIVET_GOAL_PLAN_AUTO_APPROVE_MS
+      if (raw == null || raw.trim() === '') return undefined
+      const n = Number(raw)
+      return Number.isFinite(n) && n >= 0 ? n : undefined
+    })(),
     missionStore,
   })
 

@@ -20,7 +20,7 @@ type InboundMsg =
   | { type: 'steer'; sessionId: string; text: string }
   | { type: 'abort'; sessionId: string }
   | { type: 'resume'; sessionId: string }
-  | { type: 'approval'; sessionId: string; requestId: string; decision: 'approve' | 'deny' }
+  | { type: 'approval'; sessionId: string; requestId: string; decision: 'approve' | 'deny'; editedInput?: Record<string, unknown>; remember?: boolean }
   | { type: 'setApprovalMode'; sessionId: string; mode: string }
   | { type: 'listPickers'; sessionId: string }
   | { type: 'switchModel'; sessionId: string; modelId: string }
@@ -30,7 +30,9 @@ type InboundMsg =
   | { type: 'listProviders' }
   | { type: 'setupProvider'; providerName: string; apiKey: string; baseUrl?: string; custom?: boolean; modelId?: string }
   | { type: 'readPlan'; sessionId: string; slug: string }
-  | { type: 'planDecision'; sessionId: string; slug: string; decision: 'approve' | 'reject'; comment?: string }
+  | { type: 'planDecision'; sessionId: string; slug: string; decision: 'approve' | 'reject'; comment?: string; selectedApproach?: string }
+  | { type: 'editPlan'; sessionId: string; slug: string; content: string }
+  | { type: 'setPlanMode'; sessionId: string; state: 'planning' | 'off' }
 
 export class CockpitProvider implements vscode.WebviewViewProvider {
   static readonly viewType = 'tianshu.cockpit'
@@ -95,9 +97,13 @@ export class CockpitProvider implements vscode.WebviewViewProvider {
         case 'prompt':
           await client.prompt(msg.sessionId, msg.text)
           break
-        case 'steer':
-          await client.steer(msg.sessionId, msg.text)
+        case 'steer': {
+          // 提交瞬间 run 恰好收束 → server 409 返回 'idle'，回退 prompt 开新
+          // turn（桌面端同款回退），用户输入不丢、不弹错误条。
+          const r = await client.steer(msg.sessionId, msg.text)
+          if (r === 'idle') await client.prompt(msg.sessionId, msg.text)
           break
+        }
         case 'abort':
           await client.abort(msg.sessionId)
           break
@@ -105,7 +111,11 @@ export class CockpitProvider implements vscode.WebviewViewProvider {
           await client.resume(msg.sessionId)
           break
         case 'approval':
-          await client.answerApproval(msg.sessionId, msg.requestId, { decision: msg.decision })
+          await client.answerApproval(msg.sessionId, msg.requestId, {
+            decision: msg.decision,
+            ...(msg.editedInput ? { editedInput: msg.editedInput } : {}),
+            ...(msg.remember ? { remember: true } : {}),
+          })
           break
         case 'setApprovalMode':
           await client.setApprovalMode(msg.sessionId, msg.mode)
@@ -178,7 +188,7 @@ export class CockpitProvider implements vscode.WebviewViewProvider {
         }
         case 'planDecision': {
           try {
-            if (msg.decision === 'approve') await client.approvePlan(msg.sessionId, msg.slug)
+            if (msg.decision === 'approve') await client.approvePlan(msg.sessionId, msg.slug, msg.selectedApproach)
             else await client.rejectPlan(msg.sessionId, msg.slug, msg.comment)
             this.post({ type: 'planDecisionResult', sessionId: msg.sessionId, slug: msg.slug, decision: msg.decision, ok: true })
           } catch (err) {
@@ -186,6 +196,20 @@ export class CockpitProvider implements vscode.WebviewViewProvider {
           }
           break
         }
+        case 'editPlan': {
+          try {
+            await client.editPlan(msg.sessionId, msg.slug, msg.content)
+            const plan = await client.readPlan(msg.sessionId, msg.slug)
+            this.post({ type: 'plan', sessionId: msg.sessionId, plan })
+            this.post({ type: 'planEditResult', sessionId: msg.sessionId, slug: msg.slug, ok: true })
+          } catch (err) {
+            this.post({ type: 'planEditResult', sessionId: msg.sessionId, slug: msg.slug, ok: false, message: (err as Error).message })
+          }
+          break
+        }
+        case 'setPlanMode':
+          await client.setPlanMode(msg.sessionId, msg.state)
+          break
       }
     } catch (err) {
       this.post({ type: 'error', message: (err as Error).message })

@@ -1,6 +1,6 @@
 import { describe, it, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
-import { resolveProxyForUrl, shouldBypassProxy } from '../proxy-resolver.js'
+import { resolveProxyForUrl, shouldBypassProxy, parseWindowsProxyOutput } from '../proxy-resolver.js'
 
 describe('shouldBypassProxy', () => {
   it('returns false when NO_PROXY unset', () => {
@@ -101,5 +101,52 @@ describe('resolveProxyForUrl', () => {
 
   it('returns undefined for non-http protocols', () => {
     assert.equal(resolveProxyForUrl('ftp://example.com'), undefined)
+  })
+})
+
+/**
+ * parseWindowsProxyOutput 纯函数测试——readWindowsSystemProxy 的判定核心。
+ * 回归保护：历史上两个 bug——
+ *   bug 1（顺序）：先读 ProxyServer 就 return，导致 ProxyEnable=0（代理禁用）时
+ *                 仍返回残留的代理地址。Windows 关代理只翻 ProxyEnable 不清
+ *                 ProxyServer，所以这个顺序必须反过来。
+ *   bug 2（规范化）：裸 host:port 缺 http:// 前缀，new ProxyAgent 报 Invalid URL。
+ */
+describe('parseWindowsProxyOutput', () => {
+  it('ProxyEnable=1 + ProxyServer 有值 → 返回规范化后的代理', () => {
+    const enable = '    ProxyEnable    REG_DWORD    0x1'
+    const server = '    ProxyServer    REG_SZ    127.0.0.1:7890'
+    assert.equal(parseWindowsProxyOutput(enable, server), 'http://127.0.0.1:7890')
+  })
+
+  it('ProxyEnable=0（代理禁用）+ ProxyServer 残留 → 返回 undefined（bug 1 回归保护）', () => {
+    const enable = '    ProxyEnable    REG_DWORD    0x0'
+    const server = '    ProxyServer    REG_SZ    127.0.0.1:10808'
+    // 修复前：先读 ProxyServer 直接 return 'http://127.0.0.1:10808'，无视 ProxyEnable=0
+    assert.equal(parseWindowsProxyOutput(enable, server), undefined)
+  })
+
+  it('ProxyEnable 非 0x1（如空输出/键不存在）→ 返回 undefined', () => {
+    assert.equal(parseWindowsProxyOutput('', '    ProxyServer    REG_SZ    127.0.0.1:7890'), undefined)
+    assert.equal(parseWindowsProxyOutput('    ProxyEnable    REG_DWORD    0x1', ''), undefined)
+  })
+
+  it('裸 host:port 被 normalizeProxyUrl 加 http:// 前缀（bug 2 回归保护）', () => {
+    const enable = '    ProxyEnable    REG_DWORD    0x1'
+    const server = '    ProxyServer    REG_SZ    127.0.0.1:10808'
+    // 修复前：直接返回 '127.0.0.1:10808'，new ProxyAgent 报 Invalid URL
+    assert.equal(parseWindowsProxyOutput(enable, server), 'http://127.0.0.1:10808')
+  })
+
+  it('已带 http:// 前缀的 ProxyServer 原样返回', () => {
+    const enable = '    ProxyEnable    REG_DWORD    0x1'
+    const server = '    ProxyServer    REG_SZ    http://10.0.0.1:8080'
+    assert.equal(parseWindowsProxyOutput(enable, server), 'http://10.0.0.1:8080')
+  })
+
+  it('多协议格式 http=a;https=b 优先取 https', () => {
+    const enable = '    ProxyEnable    REG_DWORD    0x1'
+    const server = '    ProxyServer    REG_SZ    http=127.0.0.1:80;https=127.0.0.1:443'
+    assert.equal(parseWindowsProxyOutput(enable, server), 'http://127.0.0.1:443')
   })
 })

@@ -4,6 +4,7 @@ import { createAuthProvider } from '../auth/registry.js'
 import { PromptEngine } from '../prompt/engine.js'
 import { detectModelFamily } from '../prompt/static.js'
 import { createVolatileSnapshot } from '../prompt/volatile-snapshot.js'
+import { resolvePromptBlocks, invalidatePromptBlocks } from '../prompt/block-policy.js'
 import { FallbackStreamClient } from '../api/fallback-client.js'
 import type { AgentConfig } from './loop-types.js'
 import type { CompactionConfig } from '../compact/constants.js'
@@ -17,6 +18,7 @@ import type { PermissionConfig } from './permissions.js'
 import { getProviderProfile } from '../api/provider-profile.js'
 import { resolveCompactionEconomics } from '../compact/compaction-profile.js'
 import { gateToolDefinitions } from './tool-tiers.js'
+import { applyDescriptionMode } from '../tools/description-compact.js'
 import { inferModelTierFromName, type ModelTier } from './model-tier-policy.js'
 
 export interface ModelSpec {
@@ -51,6 +53,8 @@ export interface AgentConfigInput {
   crossSessionEnabled?: boolean
   /** Session Auto keyword routing; default true（auto 池内匹配，未命中回退天权）. */
   domainKeywordRouting?: boolean
+  /** 默认星域（qiming | … | auto）。非 auto 时 bindSessionDomain 首次钉定，auto 时走关键词路由。 */
+  defaultDomain?: string
   goalJudge?: { enabled?: boolean; maxRuns?: number; browser?: boolean }
   auth?: AuthProvider
   habituationThreshold?: number
@@ -71,6 +75,8 @@ export interface AgentConfigInput {
     prompt?: string
     maxTokens: number
   }
+  /** /cd: previous PromptEngine whose frozen snapshots the new one inherits. */
+  inheritFrozenFrom?: PromptEngine
 }
 
 export interface MainAgentConfigInputParams {
@@ -86,6 +92,8 @@ export interface MainAgentConfigInputParams {
   auth?: AuthProvider
   habituationThreshold?: number
   permissions?: PermissionConfig
+  /** /cd: previous PromptEngine whose frozen snapshots the new one inherits. */
+  inheritFrozenFrom?: PromptEngine
 }
 
 export function createMainAgentConfigInput(params: MainAgentConfigInputParams): AgentConfigInput {
@@ -109,10 +117,12 @@ export function createMainAgentConfigInput(params: MainAgentConfigInputParams): 
     autoDelegateEnabled: params.config.agent.autoDelegateEnabled,
     autoReasoning: params.config.agent.autoReasoning,
     domainKeywordRouting: params.config.agent.domainKeywordRouting,
+    defaultDomain: params.config.agent.defaultDomain,
     goalJudge: params.config.agent.goal?.judge,
     auth: params.auth,
     habituationThreshold: params.habituationThreshold,
     permissions: params.config.agent.permissions as PermissionConfig,
+    inheritFrozenFrom: params.inheritFrozenFrom,
     toolGating: params.config.agent.toolGating
       ? {
           enabled: params.config.agent.toolGating.enabled,
@@ -126,7 +136,7 @@ export function createMainAgentConfigInput(params: MainAgentConfigInputParams): 
 
 export function createAgentConfig(input: AgentConfigInput): Pick<
   AgentConfig,
-  'client' | 'promptEngine' | 'contextWindow' | 'compact' | 'cwd' | 'providerProfile' | 'providerName' | 'compactionProfile' | 'primaryClient' | 'compactClient' | 'sessionId' | 'approvalMode' | 'autoReasoning' | 'reasoningFloor' | 'turnLevelThinking' | 'songlineEnabled' | 'hearthObserveEnabled' | 'crossSessionEnabled' | 'antiAnchoring' | 'intentRetrievalRouter' | 'llmSpeculation' | 'autoDelegateEnabled' | 'domainKeywordRouting' | 'goalJudge' | 'allProviders' | 'permissions' | 'toolGating' | 'prefixCacheStrategy' | 'supportsVision' | 'visionClient' | 'visionModelPrompt' | 'visionModelMaxTokens'
+  'client' | 'promptEngine' | 'contextWindow' | 'compact' | 'cwd' | 'blockPolicy' | 'providerProfile' | 'providerName' | 'compactionProfile' | 'primaryClient' | 'compactClient' | 'sessionId' | 'approvalMode' | 'autoReasoning' | 'reasoningFloor' | 'turnLevelThinking' | 'songlineEnabled' | 'hearthObserveEnabled' | 'crossSessionEnabled' | 'antiAnchoring' | 'intentRetrievalRouter' | 'llmSpeculation' | 'autoDelegateEnabled' | 'domainKeywordRouting' | 'defaultDomain' | 'goalJudge' | 'allProviders' | 'permissions' | 'toolGating' | 'prefixCacheStrategy' | 'supportsVision' | 'visionClient' | 'visionModelPrompt' | 'visionModelMaxTokens'
 > {
   const { model, apiKey, cwd, provider } = input
   const capabilities = resolveCapabilities(provider.name, provider.capabilities)
@@ -159,8 +169,15 @@ export function createAgentConfig(input: AgentConfigInput): Pick<
 
   const modelPricing = provider.models.find(m => m.id === model.id || m.alias === model.id)?.pricing
 
+  // 复盘修复（2026-07-25）：每次创建 agent 前丢弃进程级 memo——长驻 sidecar
+  // 同进程多会话时，改完配置开新会话必须吃到新档位（文档承诺）。活会话不受
+  // 影响：解析结果快照进 AgentConfig.blockPolicy，loop 内消费点只读快照。
+  invalidatePromptBlocks()
+  const blockPolicy = resolvePromptBlocks(cwd)
+
   // 工具门控：构造期与 updateTools() 共用同一过滤（gateToolDefinitions），
   // 确保 MCP/LSP 异步注册后调用 updateTools 不会把 EXTENDED 工具整个还原。
+  // 描述档位也走同一入口——两处不一致会让描述回弹、翻转前缀字节。
   const gatedTools = input.toolGating
     ? gateToolDefinitions(input.toolDefinitions, {
         enabled: input.toolGating.enabled,
@@ -168,8 +185,9 @@ export function createAgentConfig(input: AgentConfigInput): Pick<
         extraCore: input.toolGating.extraCore,
         domainTier: input.toolGating.domainTier,
         disabledTools: input.toolGating.disabledTools,
+        toolDescriptions: blockPolicy.toolDescriptions,
       })
-    : input.toolDefinitions
+    : applyDescriptionMode(input.toolDefinitions, blockPolicy.toolDescriptions)
 
   const promptEngine = new PromptEngine({
     model: model.id,
@@ -178,10 +196,13 @@ export function createAgentConfig(input: AgentConfigInput): Pick<
     volatileCtx: createVolatileSnapshot({
       cwd,
       sessionMemoryBlock: input.sessionMemoryBlock,
+      // 会话启动期解析一次并冻结——中途改配置不生效（改前缀 = 全量重建）。
+      blockPolicy,
    }),
     habituationThreshold: input.habituationThreshold ?? 5,
     prefixCache: capabilities.prefixCacheStrategy,
     appendixDelta: process.env['RIVET_APPENDIX_DELTA'] !== '0',
+    inheritFrozenFrom: input.inheritFrozenFrom,
  })
 
   return {
@@ -190,6 +211,7 @@ export function createAgentConfig(input: AgentConfigInput): Pick<
     contextWindow: model.contextWindow,
     compact: input.compact,
     cwd: input.cwd,
+    blockPolicy,
     providerProfile: getProviderProfile(provider.name, model.contextWindow),
     providerName: provider.name,
     // Model-aware compaction economics: billing from provider identity
@@ -217,6 +239,7 @@ export function createAgentConfig(input: AgentConfigInput): Pick<
     llmSpeculation: input.llmSpeculation,
     autoDelegateEnabled: input.autoDelegateEnabled,
     domainKeywordRouting: input.domainKeywordRouting ?? true,
+    defaultDomain: input.defaultDomain ?? 'qiming',
     goalJudge: input.goalJudge,
     allProviders: input.allProviders,
     autoReasoning: input.autoReasoning ?? true,

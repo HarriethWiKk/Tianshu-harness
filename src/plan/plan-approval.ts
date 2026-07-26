@@ -12,11 +12,18 @@
 
 import { readPlan, approvePlan, type PlanDocument } from './plan-store.js'
 import { validatePlanContentForApproval } from '../tools/plan.js'
+import { extractRequiredSkills } from '../agent/skill-gate.js'
 
 /** Build the kickoff prompt that drives wave-by-wave execution of an approved plan. */
-export function buildPlanKickoff(slug: string, title: string, approach?: string, anchorDriftNote?: string): string {
+export function buildPlanKickoff(slug: string, title: string, approach?: string, anchorDriftNote?: string, requiredSkills?: string[]): string {
   let msg = `开始执行已批准方案「${title}」(.rivet/plans/${slug}.md)。先 read_file 读取该计划,然后用 plan_task(execute=true) 或 team_orchestrate 把任务按波次并行执行、逐波过审查门;开工前用 todo 列出有序步骤跟踪进度,全部完成后 plan_close。`
   if (approach) msg += `\nSelected approach: ${approach} — 只执行此方案,勿执行未选中的备选。`
+  // 技能契约指令（长庚域事故 2026-07-25）：计划点名的 skill 是该计划专属的
+  // 流程契约。skill 正文已瘦身为纯增量（与前缀纪律不重叠），警告只钉核心
+  // 语义；executePlan 入口另有技能门禁硬拦（skill-gate.ts）兜底派发路径。
+  if (requiredSkills && requiredSkills.length > 0) {
+    msg += `\n⚠ 本计划点名了流程 skill：${requiredSkills.join('、')}——这是计划专属契约,开工前先用 skill(name="…") 逐个加载并遵循,跳过将被技能门禁硬拦。`
+  }
   if (anchorDriftNote) msg += `\n\n⚠ 锚点漂移提示——以下计划引用与当前工作区不符（计划写成后代码可能已变化）:\n${anchorDriftNote}\n执行时以当前源码为准,先用工具核实真实位置再动手,并把每处偏差记入交付报告;若漂移改变了方案方向,暂停执行向用户说明。`
   return msg
 }
@@ -33,6 +40,8 @@ export interface PlanApprovalSuccess {
   kickoff: string
   /** cheap tier 产出计划的复核警告（非 cheap 时 undefined）。 */
   tierWarning?: string
+  /** 计划点名且本运行时可加载的流程 skill（技能契约，已注入 kickoff）。 */
+  requiredSkills?: string[]
 }
 
 export interface PlanApprovalFailure {
@@ -91,12 +100,26 @@ export async function approvePlanWithGuards(
     ? `⚠ 本计划由低阶模型产出（${existing.model}），建议对关键改动点复核后再放行执行。`
     : undefined
 
+  // 技能契约：提取计划点名的 skill，过滤到本运行时可加载的（点名了但注册表
+  // 没有的不指示加载——skill() 调不到只会白费一轮）。best-effort，提取失败不
+  // 影响批准。
+  let requiredSkills: string[] | undefined
+  try {
+    const { skillRegistry } = await import('../skills/skill-loader.js')
+    const available = new Set(skillRegistry.list().map(s => s.name.toLowerCase()))
+    const named = extractRequiredSkills(existing.content).filter(n => available.has(n.toLowerCase()))
+    if (named.length > 0) requiredSkills = named
+  } catch {
+    // 技能契约是增强注入；提取器故障不得阻断批准闭环。
+  }
+
   return {
     ok: true,
     approved,
     existing,
     driftNote,
-    kickoff: buildPlanKickoff(slug, approved.title, resolvedApproach, driftNote),
+    kickoff: buildPlanKickoff(slug, approved.title, resolvedApproach, driftNote, requiredSkills),
     tierWarning,
+    ...(requiredSkills ? { requiredSkills } : {}),
   }
 }

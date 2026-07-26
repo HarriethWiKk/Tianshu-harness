@@ -43,6 +43,7 @@ import {
   writePlan as storeWritePlan,
   resolvePlanOptionLabel,
   parsePlanOptions,
+  slugify,
   type PlanDocument,
 } from '../plan/plan-store.js'
 import { approvePlanWithGuards, type PlanApprovalResult } from '../plan/plan-approval.js'
@@ -163,6 +164,8 @@ export interface DelegateWorkerInput {
   authority?: string
   /** Optional files to scope the worker to. */
   files?: string[]
+  /** Phase 2: resume a previous worker session by workOrderId. */
+  resume?: string
 }
 
 /** Structured progress/terminal update emitted by a user-dispatched worker. */
@@ -193,6 +196,16 @@ export interface DelegateActivityUpdate {
   changedFiles?: string[]
   /** Terminal digest text for the desktop "汇入主会话" adopt button. */
   summary?: string
+  /** 用户契约投影（首条 running 事件携带）。 */
+  contract?: DelegationActivity['contract']
+  /** 终态 findings 计数（完整数组走 getWorkerLog pull）。 */
+  findingsCount?: number
+  /** 终态第一条 finding claim。 */
+  topFinding?: string
+  /** 终态 verification 摘要。 */
+  verificationBrief?: DelegationActivity['verificationBrief']
+  /** 终态 evidenceStatus。 */
+  evidenceStatus?: string
 }
 
 export interface ManagedAgent {
@@ -511,6 +524,17 @@ export interface SessionPersistenceAdapter {
    */
   loadEventsAsync?(sessionId: string): Promise<SessionEvent[]>
   /**
+   * 稀疏索引区间读（optional，冷通道分页加速）：返回 seq < before 的尾部
+   * 窗口（至少 minCount 条，或到日志开头）。实现方只读覆盖窗口的字节区间，
+   * 大日志分页不整本进内存；缺失时 getHistoryPage 退化为 loadEventsAsync
+   * 全量读。`atLogStart` = 窗口起点即日志开头；`firstSeq` = 磁盘最早 seq。
+   */
+  loadEventsBefore?(sessionId: string, before: number, minCount: number): Promise<{
+    events: SessionEvent[]
+    atLogStart: boolean
+    firstSeq: number
+  }>
+  /**
    * Storage-management support (optional). `sizeReport`/`sizeOf` report on-disk
    * byte usage via stat() only (never reading contents); `deleteSession`
    * irreversibly removes a session's files. Used by the manual cleanup UI.
@@ -547,6 +571,10 @@ export interface RuntimeSessionManagerOptions {
   approvalTimeoutMs?: number
   /** C2 刹车 — watchdog 停滞续跑前的可取消倒计时窗口（ms）。Default 5000. */
   watchdogContinueDelayMs?: number
+  /** Goal 模式计划提交后的倒计时自动批准窗口（ms）——仅 goal 激活时武装，
+   *  窗口内用户任何参与即取消。0 = 关闭（纯手动审批）。Default 150000（2.5min，
+   *  serve.ts 以 RIVET_GOAL_PLAN_AUTO_APPROVE_MS 覆盖）。 */
+  goalPlanAutoApproveMs?: number
   /** Optional durable store. When set, sessions survive sidecar restarts. */
   persistence?: SessionPersistenceAdapter
   /**
@@ -674,6 +702,12 @@ interface InternalSession {
   eventsLoaded: boolean
   /** In-flight async log load — concurrent async opens share it (no double read). */
   eventsLoadPromise?: Promise<void>
+  /**
+   * 磁盘日志最早 seq（冷热双通道）：内存环截尾后 events[0].seq 会漂移，
+   * 但磁盘头部仍在——replay_window 元事件靠它告诉前端"还有更早的历史"。
+   * 新建会话恒为 1；rehydrate/懒加载在 adoptLoadedEvents 里从全量读回填。
+   */
+  diskFirstSeq?: number
   seq: number
   running: boolean
   activeRunSettlement?: ActiveRunSettlement
@@ -753,6 +787,10 @@ interface InternalSession {
   watchdogRecoveryCancelled?: boolean
   /** C2 刹车 — watchdog 续跑倒计时定时器。窗口内用户 abort / 新 prompt 取消。 */
   watchdogContinueTimer?: NodeJS.Timeout
+  /** Goal 计划倒计时自动批准 — 定时器与目标 slug。窗口内用户任何参与
+   * （approve/reject/edit/prompt/steer/abort/显式取消）即取消。 */
+  planAutoApproveTimer?: NodeJS.Timeout
+  planAutoApproveSlug?: string
   /** plan_draft 节流 — 最近一次发射时刻（this.now() 读数）。 */
   planDraftLastEmit?: number
   /** plan_draft 节流 — 尾沿定时器，保证窗口内最后一次写盘总能落一发事件。 */
@@ -941,6 +979,7 @@ export class RuntimeSessionManager {
   private readonly loadedOrder: string[] = []
   private readonly approvalTimeoutMs: number
   private readonly watchdogContinueDelayMs: number
+  private readonly goalPlanAutoApproveMs: number
   private readonly persistence?: SessionPersistenceAdapter
   private readonly getRegistry?: () => SessionRegistry | undefined
   private readonly listModelsFn?: () => ModelOption[]
@@ -966,16 +1005,23 @@ export class RuntimeSessionManager {
   /** P1 任务身份化 — 可选 Mission 存储（未注入时 Mission 关联整体跳过）。 */
   private readonly missionStore?: MissionStore
   private idleSweepTimer?: ReturnType<typeof setInterval>
+  /** Per-session coordinator refs for worker steer/kill (set by main.ts after agent build). */
+  private readonly coordinatorBySession = new Map<string, () => import('../agent/coordinator.js').DelegationCoordinator | undefined>()
 
   constructor(opts: RuntimeSessionManagerOptions) {
     this.createAgent = opts.createAgent
     this.defaultCwd = opts.defaultCwd ?? process.cwd()
     this.now = opts.now ?? Date.now
     this.idGenerator = opts.idGenerator ?? (() => randomId())
-    this.maxEvents = opts.maxEvents ?? 5000
+    // RIVET_MAX_EVENTS：内存环容量旋钮（dev 调试/特殊部署）。环只约束
+    // 常驻内存与尾部回放窗口——被截头部经 getHistoryPage 从磁盘分页可达。
+    const envMaxEvents = Number(process.env.RIVET_MAX_EVENTS)
+    this.maxEvents = opts.maxEvents
+      ?? (Number.isFinite(envMaxEvents) && envMaxEvents >= 100 ? Math.floor(envMaxEvents) : 5000)
     this.maxLoadedSessions = opts.maxLoadedSessions ?? 16
     this.approvalTimeoutMs = opts.approvalTimeoutMs ?? 0
     this.watchdogContinueDelayMs = opts.watchdogContinueDelayMs ?? 5_000
+    this.goalPlanAutoApproveMs = opts.goalPlanAutoApproveMs ?? 150_000
     this.persistence = opts.persistence
     this.getRegistry = opts.getSessionRegistry
     this.listModelsFn = opts.listModels
@@ -1161,6 +1207,7 @@ export class RuntimeSessionManager {
         agent: null,
         // 内存环上限与懒加载路径一致：只保留尾部 maxEvents 进内存。
         events: events.length > this.maxEvents ? events.slice(events.length - this.maxEvents) : events,
+        diskFirstSeq: events[0]?.seq,
         eventsLoaded: true,
         seq: maxSeq,
         running: false,
@@ -1246,6 +1293,8 @@ export class RuntimeSessionManager {
     session.knownArtifacts = new Set(
       evs.filter((e) => e.type === 'artifact').map((e) => String(e.data.id)),
     )
+    // 截断前记录磁盘最早 seq——replay_window 据此告知前端头部是否被环截掉。
+    if (evs.length > 0) session.diskFirstSeq = evs[0]!.seq
     const maxSeq = evs.length ? evs[evs.length - 1]!.seq : session.record.lastSeq
     session.seq = Math.max(session.seq, maxSeq)
     // 内存环上限对懒加载路径同样生效：极长会话（磁盘日志 ≫ maxEvents）只
@@ -1312,6 +1361,100 @@ export class RuntimeSessionManager {
   }
 
   /**
+   * 回放窗口元数据（冷热双通道）。/stream 在回放最前发出 replay_window
+   * 合成事件：diskFirstSeq < floorSeq ⇔ 内存环截掉了头部，前端据此显示
+   * 「加载更早的历史」入口。须在 getEventsAsync 之后调用（events 已加载）。
+   */
+  getReplayWindow(id: string): { floorSeq: number; diskFirstSeq: number; diskLastSeq: number } | undefined {
+    const s = this.sessions.get(id)
+    if (!s) return undefined
+    const floorSeq = s.events[0]?.seq ?? s.seq + 1
+    return { floorSeq, diskFirstSeq: s.diskFirstSeq ?? floorSeq, diskLastSeq: s.seq }
+  }
+
+  /**
+   * 冷通道历史分页：绕过内存环直读磁盘日志（复用 loadEventsAsync 的
+   * off-thread parse），返回 seq < before 的最后 ~limit 条，并向前扩展到
+   * 最近的 user 事件对齐 turn 边界——前端独立 fold 一页再前插的正确性
+   * 前提（见桌面探针 history-page-fold.test.ts）。纯读，不写环不写盘；
+   * 磁盘 events.jsonl 是完整历史的唯一 source of truth。
+   *
+   * seq 允许有洞（损坏行被持久化层丢弃）——分页只依赖单调性。
+   */
+  async getHistoryPage(id: string, before: number, limit: number): Promise<{
+    events: SessionEvent[]
+    /** 磁盘日志最早 seq——events[0].seq 到达它即无更早页。 */
+    firstSeq: number
+    lastSeq: number
+  } | undefined> {
+    const s = this.sessions.get(id)
+    if (!s) return undefined
+    const p = this.persistence
+    // 快路径（Phase 2）：稀疏索引字节区间读——大日志分页不整本进内存。
+    // turn 对齐可能需要比 limit 更早的事件（页首向前扩到最近 user 事件），
+    // 窗口不够对齐时按 4 倍扩窗重试；扩窗到顶仍不成 → 全量路径兜底。
+    if (p?.loadEventsBefore) {
+      try {
+        // +500：预留一个索引桶的对齐余量，常规 turn 尺寸（~100-200 事件）
+        // 下首次取窗即可完成 user 对齐，不用二次往返。
+        let want = Math.max(1, limit) + 500
+        for (let attempt = 0; attempt < 4; attempt++) {
+          const win = await p.loadEventsBefore.call(p, id, before, want)
+          const head = win.events
+          let start = Math.max(0, head.length - Math.max(1, limit))
+          while (start > 0 && head[start]!.type !== 'user') start--
+          const aligned = start > 0 || win.atLogStart || head[0]?.type === 'user'
+          if (aligned) {
+            return { events: head.slice(start), firstSeq: win.firstSeq, lastSeq: s.seq }
+          }
+          want *= 4
+        }
+      } catch { /* 索引路径失败 → 全量兜底 */ }
+    }
+    let all: SessionEvent[]
+    if (p?.loadEventsAsync) {
+      try { all = await p.loadEventsAsync.call(p, id) } catch { all = [] }
+    } else if (p?.loadEvents) {
+      try { all = p.loadEvents.call(p, id) } catch { all = [] }
+    } else {
+      // ephemeral 模式（无持久化）：内存环即全量历史。
+      all = s.events
+    }
+    const firstSeq = all[0]?.seq ?? 0
+    const head = all.filter((e) => e.seq < before)
+    let start = Math.max(0, head.length - Math.max(1, limit))
+    // turn 边界对齐：页首必须是 user 事件（无则扩到日志开头）。对齐只向前
+    // 扩展，保证与上一页无缝衔接（下一次 before = 本页 events[0].seq）。
+    while (start > 0 && head[start]!.type !== 'user') start--
+    return { events: head.slice(start), firstSeq, lastSeq: s.seq }
+  }
+
+  /**
+   * 全历史事件读取（磁盘直读优先，Phase 2）——供 insights / getWorkerLog /
+   * listRewindPoints 等需要越过内存环截尾语义的消费者使用。这些消费者按
+   * 类型过滤全流（稀疏索引帮不上忙），直接走 loadEventsAsync 的 off-thread
+   * parse。ephemeral（无持久化）与磁盘读失败降级为环内容（可用性优先）。
+   */
+  async getAllEventsAsync(id: string): Promise<{ events: SessionEvent[]; lastSeq: number } | undefined> {
+    const s = this.sessions.get(id)
+    if (!s) return undefined
+    // 先冲掉 manager 级合并缓冲（delta/tool_result），保证磁盘含全部已 append。
+    this.flushDeltaBuf(s)
+    this.flushToolResultBuf(s)
+    const p = this.persistence
+    if (p?.loadEventsAsync) {
+      try {
+        return { events: await p.loadEventsAsync.call(p, id), lastSeq: s.seq }
+      } catch { /* fall back to ring */ }
+    } else if (p?.loadEvents) {
+      try {
+        return { events: p.loadEvents.call(p, id), lastSeq: s.seq }
+      } catch { /* fall back to ring */ }
+    }
+    return this.getEventsAsync(id, 0)
+  }
+
+  /**
    * 失败钻取(W2):单个 worker 的完整日志——活动流(会话 delegation 事件)
    * + 终态结果(loadPersistedResult)+ 转录尾部(loadWorkerSession,
    * 与 CLI worker-detail 同源 ~/.rivet/subagents/<orderId>.session.jsonl)。
@@ -1330,8 +1473,9 @@ export class RuntimeSessionManager {
     const s = this.sessions.get(id)
     if (!s) return undefined
     const full = opts?.full === true
-    // 活动日志:会话事件流中该 worker 的 progressLine / 文本增量 / 状态迁移
-    const { events } = (await this.getEventsAsync(id, 0)) ?? { events: [] as SessionEvent[] }
+    // 活动日志:会话事件流中该 worker 的 progressLine / 文本增量 / 状态迁移。
+    // 全历史读取(Phase 2):磁盘直读越过内存环截尾,早于环底的 worker 活动可见。
+    const { events } = (await this.getAllEventsAsync(id)) ?? { events: [] as SessionEvent[] }
     const activity: string[] = []
     for (const e of events) {
       if (e.type !== 'delegation') continue
@@ -1513,6 +1657,9 @@ export class RuntimeSessionManager {
     session.watchdogContinueTimer = undefined
     session.watchdogAutoResubmit = false
     session.watchdogRecoveryCancelled = true
+    if (session.planAutoApproveTimer) clearTimeout(session.planAutoApproveTimer)
+    session.planAutoApproveTimer = undefined
+    session.planAutoApproveSlug = undefined
     this.cancelToolResultBuf(session)
     for (const pending of session.pending.values()) {
       if (pending.timer) clearTimeout(pending.timer)
@@ -1590,7 +1737,7 @@ export class RuntimeSessionManager {
     // values. Explicit input.model/domain take top priority (user chose in the
     // new-session dialog); then project config; then the global default.
     let sessionModel = this.defaultModelId
-    let sessionDomain = this.defaultDomain ?? 'auto'
+    let sessionDomain = this.defaultDomain ?? 'qiming'
     try {
       const projectConfig = loadConfig({ cwd })
       // loadConfig 合并全局+项目层：取新鲜值（含 'auto'），设置页运行期改
@@ -1624,6 +1771,9 @@ export class RuntimeSessionManager {
       agent: null,
       approvalMode: input.approvalMode,
       events: [],
+      // 新会话首个事件 seq=1；live 截尾（append splice）后 events[0] 会漂移，
+      // 此值保持 1 使 replay_window 仍能暴露"头部在磁盘"。
+      diskFirstSeq: 1,
       eventsLoaded: true,
       seq: 0,
       running: false,
@@ -1687,6 +1837,8 @@ export class RuntimeSessionManager {
       clearTimeout(session.watchdogContinueTimer)
       session.watchdogContinueTimer = undefined
     }
+    // 用户新发 prompt = 对计划审批的参与——取消倒计时自动批准
+    this.cancelPlanAutoApprove(session, 'new-prompt')
     session.lastAbortReason = undefined
     session.abortWhileApprovalPending = false
     session.unattendedHaltReason = undefined
@@ -2691,6 +2843,8 @@ export class RuntimeSessionManager {
   async updatePlan(id: string, slug: string, content: string): Promise<PlanUpdateOutcome> {
     const session = this.sessions.get(id)
     if (!session) return { ok: false, code: 'session-missing', reason: 'Session not found' }
+    // 编辑计划 = 用户参与——取消倒计时自动批准
+    this.cancelPlanAutoApprove(session, 'edited')
     const trimmed = content.trim()
     if (!trimmed) return { ok: false, code: 'empty-content', reason: 'Plan content must not be empty' }
     const existing = await storeReadPlan(session.record.cwd, slug)
@@ -2727,6 +2881,9 @@ export class RuntimeSessionManager {
   async approvePlan(id: string, slug: string, selectedApproach?: string): Promise<PlanApprovalOutcome> {
     const session = this.sessions.get(id)
     if (!session) return { ok: false, code: 'session-missing', reason: 'Session not found' }
+    // 用户手动批准 = 参与——取消倒计时自动批准（自动批准定时器自身走清空后的
+    // 调用路径，此处为 no-op）。
+    this.cancelPlanAutoApprove(session, 'approved')
     if (session.running) {
       return { ok: false, code: 'session-running', reason: 'Session is running — wait for the current turn to finish before Build' }
     }
@@ -2781,6 +2938,9 @@ export class RuntimeSessionManager {
       session.record.planMode = 'off'
       this.append(session, 'plan_mode', { state: 'off' })
     }
+    // 批准终态也要发 plan_submitted——mission-projector 的 approved 离场转移与
+    // 各端审批卡清除都消费它（此前只有 reject/edit 路径发，approved 不可达）。
+    this.append(session, 'plan_submitted', { slug, title: approved.title, status: 'approved' })
     this.touch(session)
     this.persistRecord(session)
     this.run(id, kickoff)
@@ -2798,6 +2958,8 @@ export class RuntimeSessionManager {
   async rejectPlan(id: string, slug: string, comment?: string): Promise<boolean> {
     const session = this.sessions.get(id)
     if (!session) return false
+    // 驳回 = 用户参与——取消倒计时自动批准
+    this.cancelPlanAutoApprove(session, 'rejected')
     let rejected: PlanDocument | null
     try {
       rejected = await storeRejectPlan(session.record.cwd, slug)
@@ -2846,12 +3008,67 @@ export class RuntimeSessionManager {
     const session = this.sessions.get(id)
     if (!session) return 'not_found'
     if (!session.running) return 'idle'
+    // 插话 = 用户参与——取消倒计时自动批准
+    this.cancelPlanAutoApprove(session, 'steer')
     session.steer.push(text)
     // Echo into the event log so the thread reflects the queued guidance and
     // reconnecting viewers see it (append-only, like the user turn echo).
     this.append(session, 'steer_queued', { text: redactText(text) })
     this.touch(session)
     return 'queued'
+  }
+
+  /** 注册 session 的 coordinator 引用（main.ts 在 agent 构建后调用）。 */
+  setCoordinatorRef(sessionId: string, ref: () => import('../agent/coordinator.js').DelegationCoordinator | undefined): void {
+    this.coordinatorBySession.set(sessionId, ref)
+  }
+
+  /** 注销 session 的 coordinator 引用（session 关闭时调用）。 */
+  clearCoordinatorRef(sessionId: string): void {
+    this.coordinatorBySession.delete(sessionId)
+  }
+
+  /**
+   * 向指定 session 的某个在跑 worker 投递 steer 消息。
+   * 返回 null = session/coordinator 不存在；false = worker 不在跑；true = 已入队。
+   */
+  steerWorker(sessionId: string, workerId: string, text: string): true | false | null {
+    const getCoordinator = this.coordinatorBySession.get(sessionId)
+    if (!getCoordinator) return null
+    const coordinator = getCoordinator()
+    if (!coordinator) return null
+    return coordinator.steerWorker(workerId, text)
+  }
+
+  /**
+   * 终止指定 session 的某个在跑 worker（双轨：先 backgroundAborts，再 orderControllers）。
+   * 返回 null = session 不存在；false = worker 不在跑/未找到；true = 已终止。
+   */
+  killWorker(sessionId: string, workerId: string): true | false | null {
+    const session = this.sessions.get(sessionId)
+    if (!session) return null
+    // 轨 1：用户派发的后台 worker（backgroundAborts）
+    const bgAbort = session.backgroundAborts?.get(workerId)
+    if (bgAbort) {
+      try { bgAbort.abort() } catch { /* already aborted */ }
+      session.backgroundAborts?.delete(workerId)
+      return true
+    }
+    // 轨 2：agent 委派的 worker（orderControllers，通过 coordinator）
+    const getCoordinator = this.coordinatorBySession.get(sessionId)
+    if (!getCoordinator) return false
+    const coordinator = getCoordinator()
+    if (!coordinator) return false
+    return coordinator.killWorker(workerId)
+  }
+
+  /** 检查指定 session 的某个 worker 是否在跑。 */
+  isWorkerRunning(sessionId: string, workerId: string): boolean {
+    const getCoordinator = this.coordinatorBySession.get(sessionId)
+    if (!getCoordinator) return false
+    const coordinator = getCoordinator()
+    if (!coordinator) return false
+    return coordinator.isWorkerRunning(workerId)
   }
 
   /**
@@ -3086,6 +3303,8 @@ export class RuntimeSessionManager {
       s.watchdogContinueTimer = undefined
       this.append(s, 'watchdog_recovery', { cancelled: true })
     }
+    // abort = 用户参与——取消倒计时自动批准
+    this.cancelPlanAutoApprove(s, 'aborted')
     s.agent?.abort()
     this.rejectAllPending(s, 'aborted')
     this.touch(s)
@@ -3607,39 +3826,47 @@ export class RuntimeSessionManager {
    * (derived from the session event log, since OaiMessage has no ts field).
    * Returns empty for sessions without a live agent (rehydrated/idle).
    */
-  listRewindPoints(id: string): { index: number; content: string; timestamp: number; seq?: number }[] | undefined {
+  async listRewindPoints(id: string): Promise<{ index: number; content: string; timestamp: number; seq?: number }[] | undefined> {
     const s = this.sessions.get(id)
     if (!s) return undefined
     if (!s.agent) return []
-    this.ensureEvents(s)
     const msgs = s.agent.getMessages()
     // Collect user events (seq + ts + text) so we can map each user message to
     // both its submission time AND the seq of its originating `user` event. The
     // seq lets the UI anchor previews/forks on the exact `u-${seq}` block the
     // rewind reducer will cut at — same anchor rewind() emits as anchorSeq.
+    // 全历史读取(Phase 2):磁盘直读越过内存环截尾——早于环底的 user 事件也能
+    // 拿到 seq/ts 锚点,不再退化为 timestamp=0 + 客户端文本启发。
+    const { events } = (await this.getAllEventsAsync(id)) ?? { events: [] as SessionEvent[] }
     const userEvents: { seq: number; ts: number; text: string }[] = []
-    for (const e of s.events) {
+    for (const e of events) {
       if (e.type === 'user') {
         userEvents.push({ seq: e.seq, ts: e.ts, text: String((e.data as { text?: unknown }).text ?? '') })
       }
     }
     const entries: { index: number; content: string; timestamp: number; seq?: number }[] = []
-    let userIdx = 0
+    // seq 锚点用子序列匹配:从游标起找首个文本相同的 user 事件。两个方向的
+    // 序数错位都能容忍——事件比消息多(压缩丢了早期消息)向前跳过;找不到
+    // (事件日志分叉/清理)则该条目退化为无 seq,游标不动,后续条目不受连带
+    // 污染。timestamp 保留历史行为:文本未命中时回退到序数配对的事件 ts。
+    let cursor = 0
+    let ordinal = 0
     for (let i = 0; i < msgs.length; i++) {
       const m = msgs[i]!
       if (m.role === 'user' && typeof m.content === 'string') {
-        const ue = userEvents[userIdx]
-        // Emit seq only when the ordinal lines up AND the text matches, so a
-        // trimmed/diverged event log degrades to the client's text heuristic
-        // instead of anchoring on the wrong block.
-        const seq = ue && ue.text === m.content ? ue.seq : undefined
+        let hit = -1
+        for (let k = cursor; k < userEvents.length; k++) {
+          if (userEvents[k]!.text === m.content) { hit = k; break }
+        }
+        const ue = hit >= 0 ? userEvents[hit]! : undefined
+        if (hit >= 0) cursor = hit + 1
         entries.push({
           index: i,
           content: m.content,
-          timestamp: ue?.ts ?? 0,
-          ...(seq !== undefined ? { seq } : {}),
+          timestamp: ue?.ts ?? userEvents[ordinal]?.ts ?? 0,
+          ...(ue !== undefined ? { seq: ue.seq } : {}),
         })
-        userIdx++
+        ordinal++
       }
     }
     return entries
@@ -3800,6 +4027,11 @@ export class RuntimeSessionManager {
       changedFiles?: string[]
       summary?: string
       origin?: 'user' | 'agent'
+      contract?: DelegationActivity['contract']
+      findingsCount?: number
+      topFinding?: string
+      verificationBrief?: DelegationActivity['verificationBrief']
+      evidenceStatus?: string
     },
   ): void {
     const startedMap = session.delegationStartedAt ?? (session.delegationStartedAt = new Map())
@@ -3833,12 +4065,23 @@ export class RuntimeSessionManager {
       changedFiles: a.changedFiles,
       summary: a.summary ? redactText(a.summary) : undefined,
       origin: a.origin,
+      // 契约投影 + 终态证据摘要（Phase 1 字段；完整 findings 走 getWorkerLog pull）。
+      contract: a.contract,
+      findingsCount: a.findingsCount,
+      topFinding: a.topFinding ? redactText(a.topFinding) : undefined,
+      verificationBrief: a.verificationBrief,
+      evidenceStatus: a.evidenceStatus,
     })
   }
 
   private buildCallbacks(session: InternalSession): AgentCallbacks {
     const lifecycleGeneration = session.lifecycleGeneration
     const isActive = (): boolean => this.ownsSessionLifecycle(session, lifecycleGeneration)
+    // plan 工具 action=submit 的 toolId 登记（onToolUse 写入 / onToolResult 消费）。
+    // 携带 slug+title（onPlanSubmitted 同款 slugify 推导）：emitPlanSubmitted 直接
+    // 用确定 slug 发卡，不再从磁盘 plans[0] 顶替——多会话共享 cwd 时 plans[0]
+    // 可能是别会话的更新计划，审批卡因此发错/丢失（2026-07-25 修复）。
+    const planSubmitToolIds = new Map<string, { slug: string; title: string }>()
     return {
       onTextDelta: (text) => {
         if (!isActive()) return
@@ -3855,6 +4098,19 @@ export class RuntimeSessionManager {
       onToolUse: (toolId, name, input) => {
         if (!isActive()) return
         this.append(session, 'tool_use', { id: toolId, name, input: redactValue(input) })
+        // plan 工具 action=submit 的调用登记——onToolResult 没有 input，靠这里的
+        // toolId 集合在结果回调里精确识别"提交成功"，避免 plan 其它 action
+        //（enter_mode/close/list）误发 plan_submitted。title 一并登记：submit 的
+        // slug = slugify(title)（src/tools/plan.ts 同款推导），供 emitPlanSubmitted
+        // 发确定 slug 的卡。省略 plan 字段从草稿提交时 title 仍必填，推导恒成立。
+        if (name === 'plan' && (input as { action?: string } | null)?.action === 'submit') {
+          const title = (input as { title?: unknown } | null)?.title
+          if (typeof title === 'string' && title.trim()) {
+            planSubmitToolIds.set(toolId, { slug: slugify(title), title: title.trim() })
+          } else {
+            planSubmitToolIds.set(toolId, { slug: '', title: '' })
+          }
+        }
         // N3: surface delegation as a tree node, derived from the tool stream
         // (no core-loop rewrite — stays inside the server layer).
         if (DELEGATION_TOOLS.has(name)) {
@@ -3925,10 +4181,14 @@ export class RuntimeSessionManager {
             status: isError ? 'failed' : 'completed',
           })
         }
-        // Plan mode — a successful plan_submit wrote a new .rivet/plans/*.md.
+        // Plan mode — a successful `plan action=submit` wrote a new .rivet/plans/*.md.
         // Surface it as an event so the desktop's plan column refreshes live.
-        if (name === 'plan_submit' && !isError) {
-          void this.emitPlanSubmitted(session, lifecycleGeneration)
+        // （2026-07-24 断链修复：旧检查匹配已废弃的工具名 plan_submit，合并后的
+        // 工具名为 plan、靠 onToolUse 登记的 toolId 精确识别 submit action。）
+        const submittedPlan = planSubmitToolIds.get(toolId)
+        planSubmitToolIds.delete(toolId)
+        if (!isError && submittedPlan) {
+          void this.emitPlanSubmitted(session, lifecycleGeneration, submittedPlan)
         }
         // Plan mode — while planning, write_file/edit_file can only touch the
         // active draft (checkPlanMode gates every other path), so a successful
@@ -4095,6 +4355,62 @@ export class RuntimeSessionManager {
   }
 
   /**
+   * Goal 模式计划倒计时自动批准（2026-07-24，C2 watchdog 刹车同构）。
+   * 计划提交待批时若 goal 激活：发 plan_auto_approve_pending（含 deadlineMs）并
+   * 开可取消定时器——goal 是用户显式选择的自治场景，被不可见的审批门卡死与
+   * 自治初衷相悖；非 goal 会话不武装（approval 是质量门，保持纯手动审批）。
+   * 窗口内用户任何参与（approve/reject/edit/prompt/steer/abort/显式路由）即取消。
+   */
+  private maybeArmPlanAutoApprove(session: InternalSession, slug: string): void {
+    const delayMs = this.goalPlanAutoApproveMs
+    if (delayMs <= 0) return
+    if (!this.isGoalActive(session)) return
+    this.cancelPlanAutoApprove(session, 'superseded')
+    const deadlineMs = this.now() + delayMs
+    session.planAutoApproveSlug = slug
+    this.append(session, 'plan_auto_approve_pending', { slug, deadlineMs, delayMs })
+    const timer = setTimeout(() => {
+      session.planAutoApproveTimer = undefined
+      session.planAutoApproveSlug = undefined
+      if (!this.ownsSessionDurability(session)) return
+      // 触发前复核守卫：期间用户可能已驱动新 run / 归档 / 取消 goal。
+      if (session.running || session.record.archived) return
+      if (!this.isGoalActive(session)) return
+      void this.approvePlan(session.record.id, slug).then((outcome) => {
+        if (!outcome.ok) {
+          this.append(session, 'plan_auto_approve_cancelled', { slug, reason: outcome.reason })
+        }
+      })
+    }, delayMs)
+    timer.unref?.()
+    session.planAutoApproveTimer = timer
+  }
+
+  /** 取消倒计时自动批准（有 slug 才发事件——避免对未武装会话发空 cancel）。 */
+  private cancelPlanAutoApprove(session: InternalSession, reason: string): void {
+    const slug = session.planAutoApproveSlug
+    if (session.planAutoApproveTimer) clearTimeout(session.planAutoApproveTimer)
+    session.planAutoApproveTimer = undefined
+    session.planAutoApproveSlug = undefined
+    if (slug) this.append(session, 'plan_auto_approve_cancelled', { slug, reason })
+  }
+
+  /** 显式取消路由（桌面「查看计划」按钮）：用户对计划表现出参与即停止自动批准。 */
+  cancelPlanAutoApproveForUser(id: string): boolean {
+    const session = this.sessions.get(id)
+    if (!session) return false
+    this.cancelPlanAutoApprove(session, 'user')
+    return true
+  }
+
+  private isGoalActive(session: InternalSession): boolean {
+    const tracker = this.resolveGoalHandles?.(session.record.id)?.goalTrackerRef.current
+      ?? session.agent?.getGoalTracker?.()
+      ?? null
+    return tracker?.isActive() === true
+  }
+
+  /**
    * Watchdog stall 自动恢复（桌面端对齐 TUI v3）：run settle 后判定是否注入
    * 'continue'。必须经 setImmediate 延迟——给排队中的用户 HTTP 动作（run/archive）
    * 让路，执行前复核会话仍处 aborted 且无人抢跑（TUI「让位守卫」的桌面对应物）。
@@ -4178,25 +4494,44 @@ export class RuntimeSessionManager {
   }
 
   /**
-   * After a plan_submit tool result, read the newest plan off disk and emit a
-   * `plan_submitted` event. Async/best-effort: the tool already persisted the
-   * file, so a read failure here only delays the live refresh, not the data.
+   * After a plan_submit tool result, emit a `plan_submitted` event for the plan
+   * that was JUST submitted. The slug comes from the onToolUse registration
+   * (slugify(title), same derivation as the submit tool) — never `plans[0]`:
+   * with several sessions sharing one cwd, the newest plan on disk may belong
+   * to another session (or be an older APPROVED one), which used to send the
+   * wrong card or no card at all (desktop clears non-submitted cards), leaving
+   * the model waiting on an approval the user never sees. The known slug is
+   * verified against disk (status/title authoritative); plans[0] stays only as
+   * a fallback when registration had no usable title. Async/best-effort: the
+   * tool already persisted the file, so a read failure here only delays the
+   * live refresh, not the data.
    */
   private async emitPlanSubmitted(
     session: InternalSession,
     lifecycleGeneration: number,
+    known?: { slug: string; title: string },
   ): Promise<void> {
     if (!this.ownsSessionLifecycle(session, lifecycleGeneration)) return
     try {
       const plans = await this.loadPlans(session.record.cwd)
       if (!this.ownsSessionLifecycle(session, lifecycleGeneration)) return
-      const latest = plans[0]
-      if (latest) {
+      const knownHit = known?.slug ? plans.find((p) => p.slug === known.slug) : undefined
+      if (known?.slug && !knownHit) {
+        // 登记的 slug 未落盘（极端：写入被外部撤销）——按成功提交的事实发卡，
+        // 标题用登记值，状态按 submitted（与工具回执一致）。
+        this.append(session, 'plan_submitted', { slug: known.slug, title: known.title, status: 'submitted' })
+        this.maybeArmPlanAutoApprove(session, known.slug)
+        return
+      }
+      const target = knownHit ?? plans[0]
+      if (target) {
         this.append(session, 'plan_submitted', {
-          slug: latest.slug,
-          title: latest.title,
-          status: latest.status,
+          slug: target.slug,
+          title: target.title,
+          status: target.status,
         })
+        // goal 激活时武装倒计时自动批准（非 goal 会话纯手动审批）
+        if (target.status === 'submitted') this.maybeArmPlanAutoApprove(session, target.slug)
       }
     } catch {
       // non-fatal — the desktop can still poll GET /plans

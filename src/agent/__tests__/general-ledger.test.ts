@@ -207,7 +207,8 @@ describe('general-ledger', () => {
       const tool = createRecallGeneralTool(() => cwd)
       const unknown = await tool.execute({ input: { star: '未知星' }, cwd, toolUseId: 'tu_test' })
       assert.equal(unknown.isError, true)
-      assert.match(unknown.content, /unknown star/)
+      // 消息中文化第二波：recall-general 错误文案已翻译
+      assert.match(unknown.content, /未知星域/)
       const noLedger = await tool.execute({ input: { star: '天梁' }, cwd, toolUseId: 'tu_test' })
       assert.equal(noLedger.isError, true)
       assert.match(noLedger.content, /record_general_finding/)

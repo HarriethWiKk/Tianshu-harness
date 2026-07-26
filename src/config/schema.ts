@@ -185,10 +185,12 @@ export const reviewProfileOverrideSchema = z.object({
 /** Review worker configuration block.
  *  - profiles: per-profile override map; omitted profiles fall back to session model
  *  - skipAuto: bypass deliver_task post-commit auto review (per-config equivalent
- *    of RIVET_REVIEW_DISCIPLINE=0, but scoped to this config file) */
+ *    of RIVET_REVIEW_DISCIPLINE=0, but scoped to this config file). Default true:
+ *    auto review is off by default — users opt in via explicit `false` here, the
+ *    RIVET_REVIEW_DISCIPLINE env, or a manual `/review` invocation. */
 export const reviewConfigSchema = z.object({
   profiles: z.record(z.string(), reviewProfileOverrideSchema).default({}),
-  skipAuto: z.boolean().default(false),
+  skipAuto: z.boolean().default(true),
   /** Enable mechanical-change fast-path: docs-only and pure rename changes
    *  bypass verification gate (unverified RED only) and skip review workers.
    *  owned_failure RED is NEVER bypassed. Default true. */
@@ -231,19 +233,21 @@ export const agentSchema = z.object({
   maxTurns: z.number().int().nonnegative().default(200),
   mode: z.enum(['code', 'ask', 'plan']).default('code'),
   autoReasoning: z.boolean().default(true),
-  /** 默认星域（auto | tianshu | kaiyang | …）。新会话的初始星域将由此配置项决定；
-   *  'auto' 表示不钉定，由会话首条消息按关键词路由（见 domainKeywordRouting）。 */
-  defaultDomain: z.string().default('auto'),
+  /** 默认星域（qiming | tianshu | kaiyang | … | auto）。新会话的初始星域将由此
+   *  配置项决定；默认 qiming（启明）显式钉定、会话内不自动切换。'auto' 为用户
+   *  显式开启：不钉定，由会话首条消息按关键词路由（见 domainKeywordRouting）。 */
+  defaultDomain: z.string().default('qiming'),
   /**
    * 默认模型（provider:modelId 格式，如 "deepseek:deepseek-v4-pro"）。
    * 新会话的首模型——无项目覆盖时生效。未配置时使用默认 provider 的首模型。
    * 格式校验在 setDefaultModelConfig 层完成（需要校验 provider + model 存在性）。 */
   defaultModel: z.string().optional(),
   /**
-   * 会话 Auto 星域是否按消息关键词匹配换域。
-   * 默认 true：Auto 按首条消息在 auto 池（天权/开阳/瑶光/天梁/华盖 + 自定义域）
-   * 内 matchDomain，未命中回退 DEFAULT_DOMAIN（天权）。池外特化域经 defaultDomain
-   * 钉定或 /domain 手工切换进入。显式 false 时 Auto 固定落到 DEFAULT_DOMAIN。
+   * 会话 Auto 星域是否按消息关键词匹配换域（仅 defaultDomain='auto' 时生效）。
+   * 默认 true：Auto 按首条消息在 auto 池（天权/开阳/瑶光/天梁 + 自定义域）
+   * 内 matchDomain，未命中回退 DEFAULT_DOMAIN（天权）。池外特化域（含华盖）
+   * 经 defaultDomain 钉定或 /domain 手工切换进入。显式 false 时 Auto 固定落到
+   * DEFAULT_DOMAIN。
    */
   domainKeywordRouting: z.boolean().default(true),
   /**
@@ -412,6 +416,14 @@ export const fetchSchema = z.object({
   userAgent: z.string().default('Tianshu/1.0 (terminal coding agent)'),
   /** Extract <main>/<article> content from HTML instead of returning full page noise. */
   extractMainContent: z.boolean().default(true),
+  /** 本地 Playwright 渲染 SPA 页面（本地提取质量差时降级渲染；需 chromium 可用，桌面端内置）。 */
+  enablePlaywright: z.boolean().default(false),
+  /** Playwright 渲染超时（ms），独立于 timeoutMs。 */
+  renderTimeoutMs: z.number().int().positive().default(30_000),
+  /** 渲染后额外等待（ms，SPA 水合用；生效值钳制为 ≤ renderTimeoutMs/2）。 */
+  renderWaitMs: z.number().int().nonnegative().default(0),
+  /** 抓取缓存读取有效期（ms，默认 2 天；0 = 禁读仍写）。 */
+  cacheMaxAgeMs: z.number().int().nonnegative().default(172_800_000),
 }).default({})
 
 export type FetchConfig = z.infer<typeof fetchSchema>
@@ -624,6 +636,38 @@ export const proSchema = z.object({
 
 export type ProConfig = z.infer<typeof proSchema>
 
+/**
+ * 前缀预算档位 — 控制 frozen 前缀里挂多少「参考类」内容。
+ *
+ * 三档语义（解析与冻结见 prompt/block-policy.ts）：
+ * - standard（默认）：现状，与历史版本逐字节一致。不选就是它。
+ * - lean：缩减参考类块（capsule 索引 / manifest / codebase-index /
+ *   project-memory / historical-lessons），为长会话腾注意力。
+ * - full：放宽上限，适合上下文窗口大且要求全知的场景。
+ *
+ * 档位**不影响行为护栏**（static.ts 的 rules / delivery-contract /
+ * workflow、星域 volatileBlock）。护栏撤成按需召回会导致行为漂移——
+ * V3.1 (0c776b9→17b496a) 当日回滚是这条边界的来源。
+ *
+ * 会话内冻结：中途改配置不生效，下个会话才应用（改前缀 = 全量重建）。
+ */
+const promptSchema = z.object({
+  profile: z.enum(['standard', 'lean', 'full']).optional(),
+  /** 工具 schema 描述档位。compact 压缩超长描述，保留硬门禁行。
+   *  工具描述是操作手册不是护栏，压缩不影响行为纪律。 */
+  toolDescriptions: z.enum(['full', 'compact']).optional(),
+  /** 逐块显式开关，优先级高于 profile。未设时由 profile 决定。 */
+  blocks: z.object({
+    seedCapsule: z.boolean().optional(),
+    knowledgeManifest: z.boolean().optional(),
+    codebaseIndex: z.boolean().optional(),
+    projectMemory: z.boolean().optional(),
+    historicalLessons: z.boolean().optional(),
+  }).default({}),
+}).default({})
+
+export type PromptConfig = z.infer<typeof promptSchema>
+
 export const configSchema = z.object({
   provider: z.object({
     default: z.string(),
@@ -648,6 +692,7 @@ export const configSchema = z.object({
   tools: z.object({
     preset: z.enum(['minimal', 'frontend', 'full']).optional(),
   }).default({}),
+  prompt: promptSchema,
   pro: proSchema,
   plugins: z.object({
     enabled: z.record(z.boolean()).default({}),
@@ -671,6 +716,7 @@ export type Config = {
   ui: UiConfig
   verify: VerifyConfig
   tools: { preset?: 'minimal' | 'frontend' | 'full' | undefined }
+  prompt: PromptConfig
   pro: ProConfig
   plugins: { enabled: Record<string, boolean> }
 }

@@ -39,7 +39,18 @@ export interface AgentConfig {
   compact: CompactionConfig
   /** Working directory for the session. */
   cwd?: string
+  /** 会话启动期解析并冻结的提示词档位策略（2026-07-25 复盘修复）。
+   *  活会话的一切档位消费必须读这份快照而非 resolvePromptBlocks() 的进程级
+   *  memo——长驻 sidecar 里 memo 会被新会话创建时 invalidate，live 读会让
+   *  tools 描述字节中途翻转 → 整段前缀缓存 miss。缺省时回退 live 解析
+   *  （手工构造 config 的测试路径）。 */
+  blockPolicy?: import('../prompt/block-policy.js').PromptBlockPolicy
   providerProfile?: ProviderProfile
+  /** Per-agent read-cap override forwarded to tool calls (read_file/grep).
+   *  Set for worker sessions: they run compact-disabled on a 1M window, so the
+   *  window-derived 120K cap lets one full-file read permanently occupy every
+   *  subsequent turn's prompt. Absent → cap derived from contextWindow. */
+  readCapOverride?: import('../tools/model-read-cap.js').ModelReadCap
   /** Provider registry key (e.g. 'deepseek') — used as ProviderHealthTracker id. */
   providerName?: string
   /** Cost-aware reclaim profile resolved from provider+model economics
@@ -139,11 +150,16 @@ export interface AgentConfig {
    *  收敛检测以 v2 状态为准；缺省回退 v1（EvidenceState 推导）。 */
   deliveryGateV2?: (currentDirtyFiles?: string[]) => import('./delivery-gate-v2.js').DeliveryGateResult
   /**
-   * 会话 Auto 是否按消息关键词匹配换域。默认 true：按首条消息在 auto 池
-   * （DOMAIN_AUTO_POOL 五个均衡工程域 + 自定义域）内 matchDomain，未命中
-   * 回退天权。显式 false 时 Auto 固定落到 DEFAULT_DOMAIN（天权）。
+   * 会话 Auto 是否按消息关键词匹配换域（仅 defaultDomain='auto' 时生效）。
+   * 默认 true：按首条消息在 auto 池（DOMAIN_AUTO_POOL 四个均衡工程域 +
+   * 自定义域）内 matchDomain，未命中回退天权。显式 false 时 Auto 固定落到
+   * DEFAULT_DOMAIN（天权）。
    */
   domainKeywordRouting?: boolean
+  /** 默认星域（qiming | tianshu | kaiyang | … | auto）。
+   *  非 auto 时由 bindSessionDomain 首次钉定，所有入口统一。
+   *  auto 时跳过钉定，走关键词路由。默认 qiming（启明）。 */
+  defaultDomain?: string
   /** Explicit opt-in for Songline substrate post-session pheromone/cycle relay. Disabled by default. */
   songlineEnabled?: boolean
   /** Explicit opt-in for HEARTH anchor invariant observation (postTurn, diagnostic only). Disabled by default. */

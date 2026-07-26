@@ -434,6 +434,14 @@ export function buildSessionRoutes(
       return { status: 200, body: { ok: true } }
     }, apiToken),
 
+    // Goal 倒计时自动批准 — 显式取消（桌面「查看计划」= 用户参与，停止自动批准）。
+    'POST /sessions/:id/plans/:slug/auto-approve/cancel': withAuth((_body, params) => {
+      if (!manager.cancelPlanAutoApproveForUser(params!.id!)) {
+        return { status: 404, body: { error: 'Session not found' } }
+      }
+      return { status: 200, body: { ok: true } }
+    }, apiToken),
+
     // ── PlusMenu: model picker ──
     // Read — selectable models across all providers, current one flagged.
     'GET /sessions/:id/models': withAuth((_body, params) => {
@@ -750,6 +758,15 @@ export function buildSessionRoutes(
     }, apiToken),
 
     'GET /sessions/:id/events': withAuth(async (_body, params) => {
+      // 冷通道分支（?before=N&limit=M）：绕过内存环直读磁盘，分页回填被
+      // 环截掉的头部历史。turn 边界对齐由 getHistoryPage 保证。
+      const before = Number(params?.before ?? 0) || 0
+      if (before > 0) {
+        const limit = Math.min(Math.max(Number(params?.limit ?? 200) || 200, 1), 2000)
+        const page = await manager.getHistoryPage(params!.id!, before, limit)
+        if (!page) return { status: 404, body: { error: 'Session not found' } }
+        return { status: 200, body: page }
+      }
       const since = Number(params?.since ?? 0) || 0
       // Async replay: first open of a lazily-rehydrated session reads the log
       // off the main thread instead of stalling every other request on it.
@@ -781,11 +798,12 @@ export function buildSessionRoutes(
       return { status: 200, body: snap }
     }, apiToken),
 
-    'GET /sessions/:id/insights': withAuth((_body, params) => {
+    'GET /sessions/:id/insights': withAuth(async (_body, params) => {
       const id = params!.id!
       const rec = manager.getSession(id)
       if (!rec) return { status: 404, body: { error: 'Session not found' } }
-      const events = manager.getEvents(id, 0)
+      // 全历史读取（Phase 2）：磁盘直读越过内存环截尾，统计覆盖完整会话。
+      const events = await manager.getAllEventsAsync(id)
       if (!events) return { status: 404, body: { error: 'Session not found' } }
 
       const providers = config?.provider.providers ?? {}
@@ -1100,6 +1118,13 @@ export function buildSessionRoutes(
         unsubscribe = undefined
       }
       const sse = new SseStream(res, cleanup)
+      // 冷热双通道：回放最前发 replay_window 合成元事件（不落盘、seq=0），
+      // 告知前端本次回放窗口与磁盘完整范围——diskFirstSeq < floorSeq 时
+      // 前端显示「加载更早的历史」，经 GET /events?before= 分页回填。
+      const win = manager.getReplayWindow(id)
+      if (win) {
+        sse.send('replay_window', { seq: 0, ts: Date.now(), type: 'replay_window', data: win })
+      }
       // Bound replay slices by both work count and elapsed time so slow
       // serialization/socket writes cannot monopolize the event loop.
       await sendReplayTimeSliced(res, sse, existing.events)
@@ -1297,7 +1322,7 @@ export function buildSessionRoutes(
     // 用户主动派后台子代理：在已有会话上、独立于主 turn 启动一个 worker。
     // 不置 session.running，子代理跑在隔离子会话，进度走 delegation SSE。
     'POST /sessions/:id/delegate': withAuth(async (body, params) => {
-      const data = (body ?? {}) as { objective?: unknown; profile?: unknown; authority?: unknown; files?: unknown }
+      const data = (body ?? {}) as { objective?: unknown; profile?: unknown; authority?: unknown; files?: unknown; resume?: unknown }
       if (typeof data.objective !== 'string' || !data.objective.trim()) {
         return { status: 400, body: { error: 'Missing or empty "objective" field' } }
       }
@@ -1310,11 +1335,15 @@ export function buildSessionRoutes(
       if (data.files !== undefined && (!Array.isArray(data.files) || data.files.some((f: unknown) => typeof f !== 'string'))) {
         return { status: 400, body: { error: 'Invalid "files"' } }
       }
+      if (data.resume !== undefined && typeof data.resume !== 'string') {
+        return { status: 400, body: { error: 'Invalid "resume"' } }
+      }
       const result = await manager.delegate(params!.id!, {
         objective: data.objective.trim(),
         ...(data.profile ? { profile: data.profile } : {}),
         ...(data.authority ? { authority: data.authority } : {}),
         ...(data.files ? { files: data.files as string[] } : {}),
+        ...(data.resume ? { resume: data.resume } : {}),
       })
       if (result.ok) return { status: 200, body: { workerId: result.workerId } }
       switch (result.reason) {
@@ -1329,6 +1358,28 @@ export function buildSessionRoutes(
     'POST /sessions/:id/delegate/:workerId/abort': withAuth((_body, params) => {
       const ok = manager.cancelDelegate(params!.id!, params!.workerId!)
       if (!ok) return { status: 404, body: { error: 'Background worker not found' } }
+      return { status: 200, body: { ok: true } }
+    }, apiToken),
+
+    // Phase 2 — per-worker steer: 向在跑 worker 的 steer 队列投递用户消息。
+    'POST /sessions/:id/workers/:workerId/steer': withAuth((body, params) => {
+      const data = (body ?? {}) as { text?: string }
+      if (!data.text || typeof data.text !== 'string' || !data.text.trim()) {
+        return { status: 400, body: { error: 'Missing or empty "text" field' } }
+      }
+      const workerId = decodeURIComponent(params!.workerId!)
+      const result = manager.steerWorker(params!.id!, workerId, data.text.trim())
+      if (result === null) return { status: 503, body: { error: 'Agent not running' } }
+      if (!result) return { status: 409, body: { error: 'Worker not running' } }
+      return { status: 200, body: { ok: true } }
+    }, apiToken),
+
+    // Phase 2 — per-worker kill: 终止指定 worker（双轨：backgroundAborts + orderControllers）。
+    'POST /sessions/:id/workers/:workerId/kill': withAuth((_body, params) => {
+      const workerId = decodeURIComponent(params!.workerId!)
+      const result = manager.killWorker(params!.id!, workerId)
+      if (result === null) return { status: 404, body: { error: 'Session not found' } }
+      if (!result) return { status: 409, body: { error: 'Worker not running or not found' } }
       return { status: 200, body: { ok: true } }
     }, apiToken),
 
@@ -1424,8 +1475,8 @@ export function buildSessionRoutes(
     }, apiToken),
 
     // ── Rewind: list user messages that can be rewound to ──
-    'GET /sessions/:id/rewind-points': withAuth((_body, params) => {
-      const points = manager.listRewindPoints(params!.id!)
+    'GET /sessions/:id/rewind-points': withAuth(async (_body, params) => {
+      const points = await manager.listRewindPoints(params!.id!)
       if (!points) return { status: 404, body: { error: 'Session not found' } }
       return { status: 200, body: { points } }
     }, apiToken),

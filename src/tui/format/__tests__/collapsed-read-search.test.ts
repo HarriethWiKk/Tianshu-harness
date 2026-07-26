@@ -31,8 +31,8 @@ describe('formatCollapsedGroup', () => {
     const lines = formatCollapsedGroup({ group, expanded: false, theme, columns: 80 }).map(stripAnsi)
     assert.ok(lines[0]!.includes('▶'), 'collapsed indicator')
     assert.ok(lines[0]!.includes('Read 4 files'), 'summary')
-    assert.ok(lines.some(l => l.includes('│')), 'left border')
-    assert.ok(lines.some(l => l.includes('╰─')), 'tree connector')
+    // fa41ac5c 视觉改版：折叠态去掉左边框竖线，树连接符 ╰─ → └─
+    assert.ok(lines.some(l => l.includes('└─')), 'tree connector')
     assert.ok(lines.some(l => l.includes('[Ctrl+O]')), 'expand hint')
   })
 
@@ -45,7 +45,8 @@ describe('formatCollapsedGroup', () => {
     const lines = formatCollapsedGroup({ group, expanded: true, theme, columns: 80 }).map(stripAnsi)
     assert.ok(lines[0]!.includes('▼'), 'expanded indicator')
     assert.ok(lines.some(l => l.includes('├─')), 'middle connector')
-    assert.ok(lines.some(l => l.includes('╰─')), 'last connector')
+    // fa41ac5c 视觉改版：末项连接符 ╰─ → └─
+    assert.ok(lines.some(l => l.includes('└─')), 'last connector')
     assert.ok(lines.some(l => l.includes('src/a.ts')), 'first entry')
     assert.ok(lines.some(l => l.includes('src/b.ts')), 'last entry')
   })

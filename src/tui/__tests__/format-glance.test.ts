@@ -107,6 +107,16 @@ describe('formatGlanceBar', () => {
     assert.ok(plain.includes('160k/200k'), `has Xk/Yk: ${plain}`)
   })
 
+  // 过半成本提示（2026-07-25）：≥50% 常驻建议开新会话，70%+ 压缩成本高。
+  it('shows new-session hint at ≥50% context (full + compact), hides below', () => {
+    const over = stripAnsi(formatGlanceBar({ width: 140, estimatedTokens: 104_000, maxTokens: 200_000 }, theme))
+    assert.ok(over.includes('过半建议开新会话'), `full density 52% shows hint: ${over}`)
+    const under = stripAnsi(formatGlanceBar({ width: 140, estimatedTokens: 60_000, maxTokens: 200_000 }, theme))
+    assert.ok(!under.includes('建议新会话'), `30% hides hint: ${under}`)
+    const compactOver = stripAnsi(formatGlanceBar({ width: 140, density: 'compact', estimatedTokens: 104_000, maxTokens: 200_000 }, theme))
+    assert.ok(compactOver.includes('建议新会话'), `compact 52% shows short hint: ${compactOver}`)
+  })
+
   it('renders 1.0M for 1M-context windows instead of 1000k', () => {
     const result = formatGlanceBar({ width: 140, estimatedTokens: 800_000, maxTokens: 1_000_000 }, theme)
     const plain = stripAnsi(result)

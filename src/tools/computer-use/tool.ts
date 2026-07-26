@@ -131,11 +131,10 @@ const WAIT_FOR_CAP_MS = 15_000
 /** Max matched lines a find/wait_for result will carry. */
 const FIND_MAX_LINES = 40
 
-/**
- * 快照结果中可访问性树段落前缀——desktop browser-mirror 靠 includes 保留树文本。
- * 改文案必须与消费方同步（用常量共享，禁止两边各自手抄）。
- */
-export const COMPUTER_USE_A11Y_TREE_PREFIX = '可访问性树'
+// 可访问性树前缀已抽至 ../output-markers.ts（零依赖叶子，桌面端共享）；
+// 此处 re-export 保持内核调用方不变。
+export { COMPUTER_USE_A11Y_TREE_PREFIX } from '../output-markers.js'
+import { COMPUTER_USE_A11Y_TREE_PREFIX } from '../output-markers.js'
 
 interface SnapshotCacheEntry {
   refs: Map<number, SnapshotRef>

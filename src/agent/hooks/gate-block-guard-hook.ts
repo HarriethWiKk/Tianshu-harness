@@ -52,14 +52,24 @@ export function createGateBlockGuardHook(deps: GateBlockGuardHookDeps): PostTurn
       lastFiredTurn = turn
 
       const kindSummary = [...new Set(kinds)].join('/')
+      // plan-mode 专项文案（2026-07-25 桌面「退不出」复盘）：通用文案不指出退出
+      // 通道，模型被拦后倾向只在文本里宣布退出（模式实际不变，bash 仍被硬拦）。
+      // plan-mode 拦截占多数时直接点名两条真出路。
+      const planModeBlocks = kinds.filter((k) => k === 'plan-mode').length
+      const content =
+        planModeBlocks > 0 && planModeBlocks >= kinds.length / 2
+          ? `本轮 ${kinds.length} 次工具调用被 Plan Mode 写锁定拦截。被拦不是死路：① 计划成熟后用 plan action=submit 提交审批——用户批准后自动解除写锁定；② 要放弃规划直接动手，调 plan action=exit_mode 退出（无需用户批准）。只在文本里宣布「退出」不会真正退出——模式只认工具调用。`
+          : `本轮 ${kinds.length} 次工具调用被系统闸门拦截（${kindSummary}）。被拦不是死路也不是失败证据——逐条执行拦截文案里给出的替代路径；无替代路径时转只读取证（read_file/grep）+ .rivet/scratch/ 探针继续排查。不要因被拦收窄结论或放弃深入。`
       deps.advisoryBus.submit({
         key: 'gate-block-guard',
         priority: 0.6,
         tier: 'operational',
         category: 'discipline',
-        content: `本轮 ${kinds.length} 次工具调用被系统闸门拦截（${kindSummary}）。被拦不是死路也不是失败证据——逐条执行拦截文案里给出的替代路径；无替代路径时转只读取证（read_file/grep）+ .rivet/scratch/ 探针继续排查。不要因被拦收窄结论或放弃深入。`,
+        content,
         ttl: 1,
-        expect: { kind: 'tool_appears', tools: PROBE_TOOLS, withinTurns: 2 },
+        expect: planModeBlocks > 0 && planModeBlocks >= kinds.length / 2
+          ? { kind: 'tool_appears', tools: ['plan'], withinTurns: 2 }
+          : { kind: 'tool_appears', tools: PROBE_TOOLS, withinTurns: 2 },
       })
     },
   }

@@ -1,6 +1,6 @@
 {
   "name": "tianshu-tui",
-  "version": "2.21.0",
+  "version": "2.23.0",
   "description": "Terminal coding agent optimized for DeepSeek V4 prefix cache",
   "license": "Apache-2.0",
   "type": "module",
@@ -27,6 +27,7 @@
     "dist/",
     "!dist/node_modules",
     "!dist/native",
+    "scripts/fetch-native-sqlite.js",
     "README.md",
     "LICENSE",
     "completions/"
@@ -35,7 +36,7 @@
     "rivet": "dist/main.js"
   },
   "scripts": {
-    "postinstall": "patch-package || node -e 1 && node scripts/install-git-hooks.mjs || node -e 1",
+    "postinstall": "patch-package || node -e 1 && node scripts/install-git-hooks.mjs || node -e 1 && node scripts/fetch-native-sqlite.js || node -e 1",
     "prepublishOnly": "npm run build",
     "dev": "tsup --watch",
     "build": "tsup",
@@ -49,6 +50,7 @@
     "test:desktop": "node --import ./desktop/scripts/test-alias-register.mjs --import tsx --test 'desktop/src/**/__tests__/*.test.ts'",
     "test:incremental": "tsx scripts/test-incremental.ts",
     "cache:audit": "tsx src/cache/cache-audit-cli.ts",
+    "prefix:budget": "tsx scripts/prefix-budget.ts",
     "tokens:audit": "tsx scripts/analyze-output-tokens.ts",
     "diagnose:orphans": "tsx scripts/diagnose-tool-orphans.ts",
     "benchmark": "tsx scripts/run-benchmark.ts"
@@ -63,6 +65,7 @@
     "get-east-asian-width": "^1.6.0",
     "parquet-wasm": "^0.7.2",
     "parquetjs": "^0.11.2",
+    "playwright-core": "1.62.0",
     "string-width": "^8.2.1",
     "tree-sitter-wasms": "^0.1.13",
     "turndown": "^7.2.4",

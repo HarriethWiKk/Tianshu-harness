@@ -9,7 +9,7 @@ test('Auto is current when selection is undefined', () => {
   assert.equal(entries[0]!.current, true)
   // First domain entry follows Auto directly (Off removed).
   assert.notEqual(entries[1]!.key, 'off')
-  assert.match(entries[0]!.essence, /回退天枢/)
+  assert.match(entries[0]!.essence, /回退天权/)
   assert.match(entries[0]!.meta, /关键词自动匹配/)
 })
 

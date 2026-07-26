@@ -117,16 +117,49 @@ export interface SelfVerifyHookDeps {
    *  delivery/bugfix 义务时，义务块已是"改了没验证"事实的模型可见声音——
    *  跳过泛化 self-verify advisory，避免同一事实两份文案同轮出现。 */
   obligations?: Pick<import('../obligation-tracker.js').ObligationTracker, 'unresolvedHigh'>
+  /** W3 债龄阶梯（2026-07-25 advisory-ecology-repair）：验证债判据
+   *  （EvidenceTracker.hasVerificationDebt()，与 cognitive frame 同一口径）。
+   *  hook 自持连续计数——债连续在场越久，提交的 advisory priority 越高
+   *  （成本不对称：债越陈越贵）。缺省 → 阶梯禁用，priority 恒为基线。 */
+  getVerificationDebt?: () => boolean
+}
+
+// ─── W3 债龄阶梯 ────────────────────────────────────────────────
+// 债连续在场 ≥10 轮 → 0.7，≥20 轮 → 0.79 封顶。
+// 封顶 0.79 而非 0.85（复盘修复 2026-07-25）：advisory-bus 的 efficacy 负反馈环
+// 对 priority ≥ 0.8 fail-open 豁免——0.85 会让陈债提醒永久逃逸「送达多次零采纳
+// 则冷却/静默」的负向臂，重现 714c5d9b 式「照发不误」。0.79 与 bus 内正向臂
+// 同款红线（见 advisory-bus.ts 正向臂注释），涨价但不豁免问责。
+// 阶梯只调 priority，不额外发条目——发射时机仍由 hook 自身判据决定（边沿纪律不破）。
+export const DEBT_ESCALATION_STEPS: ReadonlyArray<{ minDuration: number; priority: number }> = [
+  { minDuration: 20, priority: 0.79 },
+  { minDuration: 10, priority: 0.7 },
+]
+
+export function escalatedPriority(base: number, debtDuration: number): number {
+  for (const step of DEBT_ESCALATION_STEPS) {
+    if (debtDuration >= step.minDuration) return Math.max(base, step.priority)
+  }
+  return base
 }
 
 export function createSelfVerifyHook(deps: SelfVerifyHookDeps): PostTurnRuntimeHook {
   // W5 nag 抑制：同一模块规模只提醒一次；改动继续扩到新模块才再次提醒。
   let lastMismatchModuleCount = 0
+  // W3 债龄：验证债连续为真的轮数。债消失即清零——计的是"这笔债"的驻留，
+  // 不是会话累计。
+  let debtDuration = 0
   return {
     phase: 'postTurn',
     name: 'self-verify',
     run(ctx: RuntimeHookContext) {
       const { recentToolHistory, turn } = ctx.snapshot
+
+      // 债龄计数每轮更新（在一切早退之前——早退轮的债同样在陈化）
+      if (deps.getVerificationDebt) {
+        debtDuration = deps.getVerificationDebt() ? debtDuration + 1 : 0
+      }
+
       if (recentToolHistory.length === 0) return
       if (turn < 2) return // don't nag on the very first turn
 
@@ -139,7 +172,7 @@ export function createSelfVerifyHook(deps: SelfVerifyHookDeps): PostTurnRuntimeH
           lastMismatchModuleCount = scope.moduleCount
           deps.advisoryBus.submit({
             key: 'self-verify-scope-mismatch',
-            priority: 0.55,
+            priority: escalatedPriority(0.55, debtDuration),
             category: 'discipline',
             content: `【瑶光】本任务改动已跨 ${scope.moduleCount} 个模块，但已有验证全是 targeted 单点、没有任何 full-scope 验证。引入回归是最常见的交付失败——在收尾前跑一次全量（或逐模块）验证，别等交付门禁 RED。`,
             ttl: 1,
@@ -179,7 +212,7 @@ export function createSelfVerifyHook(deps: SelfVerifyHookDeps): PostTurnRuntimeH
 
       deps.advisoryBus.submit({
         key: 'self-verify',
-        priority: 0.58,
+        priority: escalatedPriority(0.58, debtDuration),
         category: 'discipline',
         content: '【瑶光】最近几步你基于读取/编辑给出了结论，但没有独立验证（未运行测试或类型检查）。在继续推进之前，请先确认该结论有 ground truth 支撑——跑测试/读原文/用原输入自检，而非信任摘要或自己的判断。',
         ttl: 1,

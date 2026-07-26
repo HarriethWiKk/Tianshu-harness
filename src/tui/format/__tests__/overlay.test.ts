@@ -210,3 +210,75 @@ describe('renderTasks: per-worker 舰队', () => {
     assertAllWidth(renderTasks(data, width, 12, theme), width)
   })
 })
+
+/** objective 子行：`activity` 是「此刻在干什么」，objective 是「派他去干什么」。 */
+describe('renderTasks: objective 子行', () => {
+  function dataWith(workerCount: number, objective?: string): TasksData {
+    return {
+      groups: [{
+        parentToolId: 'tool_a',
+        total: workerCount,
+        done: 0,
+        failed: 0,
+        running: workerCount,
+        workers: Array.from({ length: workerCount }, (_, i) => ({
+          workerId: `wo_${i}`,
+          shortLabel: `T${i + 1}`,
+          profile: 'code_scout',
+          status: 'running' as const,
+          activity: 'grep seams',
+          objective,
+          elapsedMs: 1000,
+        })),
+      }],
+      filter: 'running',
+      completedCount: 0,
+    }
+  }
+
+  it('有 objective 时在主行下渲染缩进子行', () => {
+    const text = stripAnsi(renderTasks(dataWith(1, '定位舰队行渲染函数与列宽计算'), 70, 14, theme).join('\n'))
+    const lines = text.split('\n')
+    const mainIdx = lines.findIndex(l => l.includes('T1·code_scout'))
+    assert.ok(mainIdx >= 0, '主行存在')
+    assert.ok(lines[mainIdx + 1]!.includes('定位舰队行渲染函数'), 'objective 紧跟在主行之后')
+  })
+
+  it('无 objective 时不产生空子行', () => {
+    const text = stripAnsi(renderTasks(dataWith(1), 70, 14, theme).join('\n'))
+    const lines = text.split('\n')
+    const mainIdx = lines.findIndex(l => l.includes('T1·code_scout'))
+    // 帧内空行仍带左右边框，比较时先剥掉。
+    const innerText = lines[mainIdx + 1]!.replace(/[│┃]/g, '').trim()
+    assert.equal(innerText, '', '主行之后应是空白填充行，不是缩进子行')
+  })
+
+  it('纵向装不下时整体降级：宁可不显示 objective，也不能让 worker 掉出列表', () => {
+    // 1 组 + 3 worker × 2 行 = 7 行需求；height 12 → maxEntries 6，装不下。
+    const text = stripAnsi(renderTasks(dataWith(3, '这是一个目标'), 70, 12, theme).join('\n'))
+    assert.ok(!text.includes('这是一个目标'), 'objective 子行被整体省略')
+    for (const label of ['T1·', 'T2·', 'T3·']) {
+      assert.ok(text.includes(label), `${label} 仍在列表内`)
+    }
+  })
+
+  it('纵向够用时才展开（同样 3 worker，屏幕更高）', () => {
+    const text = stripAnsi(renderTasks(dataWith(3, '这是一个目标'), 70, 14, theme).join('\n'))
+    assert.ok(text.includes('这是一个目标'))
+  })
+
+  it('选中光标仍落在主行，不落到 objective 子行', () => {
+    const lines = renderTasks(dataWith(2, '目标文本'), 70, 16, theme, 1)
+    const text = stripAnsi(lines.join('\n'))
+    const rows = text.split('\n')
+    const secondMain = rows.findIndex(l => l.includes('T2·code_scout'))
+    assert.ok(rows[secondMain]!.includes('>'), '光标在第二个 worker 主行')
+    assert.ok(!rows[secondMain + 1]!.includes('>'), '子行不带光标')
+  })
+
+  it('CJK objective 子行仍严格等宽', () => {
+    const width = 58
+    const long = '在 src/tui/format/ 下定位舰队行的渲染函数与列宽计算，确认窄屏降级策略的实际实现位置'
+    assertAllWidth(renderTasks(dataWith(2, long), width, 16, theme), width)
+  })
+})

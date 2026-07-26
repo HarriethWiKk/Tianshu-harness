@@ -81,6 +81,8 @@ export interface AffordanceState {
   workingSetSize: number
   /** 最近使用的工具名称列表 */
   recentToolNames: string[]
+  /** 主控是否处于产出流（isInProductionFlow）。true 时解除 wuwei 抑执行惩罚。 */
+  inProductionFlow?: boolean
   /** 当前 TaskContract 状态（planning 阶段时 LSP 工具升权） */
   contractStatus?: string
 }
@@ -116,14 +118,15 @@ function epistemicModulator(state: AffordanceState): number {
  *
  * 置信度越高 → 越适合执行（知道该做什么）。
  * vigor 越高 → 能量充足，适合行动。
- * wuwei 季节 → 无为而治，抑制执行冲动。
+ * wuwei 季节 → 无为而治，抑制执行冲动；但产出流中不适用——见 prediction-error
+ * 的 seasonFactor 注释（同一处修复的两个落点）。
  */
 function instrumentalModulator(state: AffordanceState): number {
   const s = state.sensorium
   const confidence = s ? s.confidence : 0.5
   const v = state.vigor
   const vigor = v ? v.vigor : 0.5
-  const seasonPenalty = state.season === 'wuwei' ? 0.3 : 1.0
+  const seasonPenalty = state.season === 'wuwei' && !state.inProductionFlow ? 0.3 : 1.0
 
   return clamp(0.5 + 0.5 * (
     confidence * 0.40 +

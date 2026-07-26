@@ -62,6 +62,9 @@ const DOMAIN_PINYIN_MAP: Record<string, string> = {
   kaiyang: 'kāiyáng',
   yaoguang: 'yáoguāng',
   huagai: 'huágài',
+  qiming: 'qǐmíng',
+  changgeng: 'chánggēng',
+  qisha: 'qīshā',
 }
 
 export function buildDomainPickerEntries(
@@ -73,7 +76,7 @@ export function buildDomainPickerEntries(
       name: 'Auto',
       motto: '按任务匹配',
       meta: 'zìdòng · 关键词自动匹配星域',
-      essence: '根据每条消息内容自动匹配最合适的星域方法论；未命中时回退天枢。',
+      essence: '根据每条消息内容自动匹配最合适的星域方法论；未命中时回退天权。',
       // null (env kill switch) has no picker entry → also reflect as Auto-selected.
       current: current === undefined || current === null,
       uiPersona: { separator: 'thin', accent: 'primary', glyph: '❂' },

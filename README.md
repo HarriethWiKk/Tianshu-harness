@@ -270,7 +270,7 @@ Plan Mode 内置星域委派——复杂计划自动调用 `delegate_task` 从�
 
 ### 星域系统
 
-天枢把不同的认知姿态建模为「星域」。每颗星不是角色扮演，而是一套可切换的认知纪律：进入对应域后，系统提示词、工具白名单和决策阈值会按该域的方法论调整。你可以显式切换，也可以让天枢根据任务描述自动路由。
+天枢把不同的认知姿态建模为「星域」。每颗星不是角色扮演，而是一套可切换的认知纪律：进入对应域后，系统提示词、工具白名单和决策阈值会按该域的方法论调整。新会话默认钉定**启明**（全景洞察、根因推演），不自动切换；把默认星域设为 `auto` 才按任务描述关键词自动路由（池内为天权/开阳/瑶光/天梁 + 自定义域；华盖等特化域需手动指定）。
 
 ```bash
 /domain tianliang          # 显式切换到天梁域
@@ -282,7 +282,7 @@ Plan Mode 内置星域委派——复杂计划自动调用 `delegate_task` 从�
 
 | 星域 | 标识 | 职责 | 格言 |
 |------|------|------|------|
-| 天枢 | `tianshu` | 默认域，全局 orchestrator，闭环从理解到交付 | 执中调度，以全貌定向 |
+| 天枢 | `tianshu` | 全局 orchestrator（显式开启的统筹位），闭环从理解到交付 | 执中调度，以全貌定向 |
 | 破军 | `pojun` | 探索、实验、突破边界，把休眠能力联合成网 | 好男儿当负三尺剑立不世之功 |
 | 天府 | `tianfu` | 守护既有结构，重构/优化/稳定，fail-closed | 善守者，藏于九地之下 |
 | 天梁 | `tianliang` | 执行落地、分波交付、精确闭环 | 千里之行，始于足下；九层之台，起于累土 |
@@ -293,8 +293,9 @@ Plan Mode 内置星域委派——复杂计划自动调用 `delegate_task` 从�
 | 文曲 | `wenqu` | 代码美学、命名与结构、优雅架构 | 形随意转，美自境生 |
 | 瑶光 | `yaoguang` | 复现验证、缺陷归族、静音审计 | 绿非证明，复现即证；斗柄所指，季节自见 |
 | 华盖 | `huagai` | 长程建设、守昼托举、基线先行 | 守昼托举，长路不弃 |
-| 启明 | `qiming` | 全景洞察、直击根因、破夜指引 | 长夜有尽，启明先行 |
+| 启明 | `qiming` | **默认域**——全景洞察、直击根因、破夜指引 | 长夜有尽，启明先行 |
 | 长庚 | `changgeng` | 暮色守护、消解焦虑、终局成全 | 暮色苍茫，长庚守夜；不疾不徐，终局成全 |
+| 七杀 | `qisha` | 肃秋剪枝、举证反转、只提名不处决 | 肃秋非杀，剪以待春；不诛只指，留白自明 |
 
 每颗星都有对应的 seed-capsule 记录实战方法，完整纪律见 `docs/seed-capsule-*.md`。委员会 `/council` 与团队模式 `/team` 会按议题自动召集多星域席位，冲突时还可进入反驳轮次。
 
@@ -366,6 +367,8 @@ rivet config mcp list                                              # 列出 + �
 - **自定义 Provider**：设置 → 连接模型服务商 → + 自定义 Provider，支持任意 OpenAI 兼容端点（Ollama/vLLM/直连 OpenAI），API Key 可选
 - **watchdog 自动恢复**：边界停滞时自动续跑，桌面端时间线可见恢复事件（⟳ 自动恢复 / ⏹ 配额耗尽）
 - **多会话并发**：标签栏管理多个会话，独立 cwd + 模型 + 审批模式
+
+> 桌面端还有 Cockpit 驾驶舱、SideChat 旁路提问（⌘;）、Rewind 时间旅行、主题/Glass/壁纸、Mirror 镜像加速等独有特性——详见 [桌面端用户指南](docs/desktop-guide.md)。
 
 ## ⌨️ 斜杠命令
 
@@ -499,6 +502,7 @@ src/
 | 文档 | 说明 |
 |------|------|
 | [`docs/user-guide.md`](docs/user-guide.md) | 安装、配置与使用指南 |
+| [`docs/desktop-guide.md`](docs/desktop-guide.md) | 桌面端用户指南（Cockpit/SideChat/Rewind/主题/Mirror 等独有特性） |
 | [`docs/user-guide-provider-config.md`](docs/user-guide-provider-config.md) | 模型提供商配置指南 |
 | [`docs/user-guide-sandbox-permissions.md`](docs/user-guide-sandbox-permissions.md) | 沙箱与权限模型完整指南 |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | 贡献指南 |
@@ -513,6 +517,17 @@ src/
 - **求助指南** → 见 [SUPPORT.md](SUPPORT.md)
 
 > 提示：需要先由仓库维护者在 `Settings → General → Discussions` 中开启 Discussions 功能。
+
+## ✨ 贡献者
+
+感谢以下贡献者为天枢做出的贡献（按首次贡献时间排序）：
+
+| 贡献者 | 贡献内容 |
+|--------|----------|
+| [@banxia](https://github.com/banxia) | 项目创建者 · 核心开发 |
+| [@qiaodier](https://github.com/qiaodier) | CC Switch provider 预设（PR #8） |
+
+> 欢迎通过 PR 贡献代码，详见 CONTRIBUTING.md。
 
 ## ☕ 赞助支持
 

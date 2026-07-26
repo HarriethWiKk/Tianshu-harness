@@ -16,7 +16,7 @@ import { advanceContractStatus, classifyPlanMethodology, classifyTaskDepth, clas
 import { shouldSuggestPlanMode, buildPlanModeSuggestAdvisory, buildPlanModeAutoEnterAdvisory, buildStructureFlowPlanAdvisory, planModeSuggestMode } from './plan-mode-advisor.js'
 import { skillRegistry } from '../skills/skill-loader.js'
 import { renderMemoryBlock } from '../memory/unified-memory.js'
-import { parseMentions, renderMentionContext } from '../tui/mention-parser.js'
+import { parseMentions, renderMentionContext, normalizeMentionRefs } from '../tui/mention-parser.js'
 import { renderPlanCacheAdvisory } from './plan-cache-advisory.js'
 import { selectReasoningEffort } from './auto-reasoning.js'
 import { SessionPersist } from './session-persist.js'
@@ -25,6 +25,7 @@ import { loadPresence, formatPresenceForAppendix } from './companion-presence.js
 import { createWriteEvidenceProbe } from '../context/write-evidence-probe.js'
 // staleness/vigor-low advisory entries migrated to CCR hook (cognitive-capsule-router.ts)
 import { classifySeason } from './cognitive-season.js'
+import { isInProductionFlow } from './production-flow.js'
 import { renderToolContext, type AffordanceState, adaptAffordanceFromHistory, computeAffordanceScores } from './affordance.js'
 import { selectPolicy } from './policy-selection.js'
 import { checkTddGate, buildTddGateHint } from './tdd-gate.js'
@@ -138,7 +139,7 @@ export function isDocOrConfigOnly(targets: string[]): boolean {
 }
 
 /** Map StarPhase values to PromptEngine phaseClass strings. */
-const PHASE_CLASS_MAP: Record<string, string> = {
+export const PHASE_CLASS_MAP: Record<string, string> = {
   'tianshu-planning': 'plan',
   'tianxuan-locating': 'explore',
   'tianji-decomposing': 'plan',
@@ -499,7 +500,9 @@ export class TurnStepProducer {
         ? renderMemoryBlock(this.self.cwd, userInput)
         : null,
     ))
-    this.self.config.promptEngine.setMentionContextBlock(renderMentionContext(parseMentions(userInput)))
+    this.self.config.promptEngine.setMentionContextBlock(
+      renderMentionContext(normalizeMentionRefs(parseMentions(userInput), this.self.cwd)),
+    )
 
     this.self.config.promptEngine.setPlanCacheAdvisory(
       turnMode === 'task' ? renderPlanCacheAdvisory(this.self.p3.planCacheSuggest(userInput)) : null,
@@ -901,6 +904,45 @@ export class TurnStepProducer {
           risk: 'high',
         })
       }
+
+      // Acceptance 义务（用户级行为验收）：同样的资格门，但**刻意不看
+      // deliveryStatus**——delivery 那条一旦跑过任意 passed 验证就不再创建，
+      // 而"验在哪个层级"恰恰是在那之后才失守的（跑个单测就自认交付）。
+      // claim/targets 固定 → ID 稳定，每个用户任务一条，边界 supersede 回收。
+      if (eligibility.requiresEngineeringDiscipline && this.self.taskContract && gate.hasCodeEdits) {
+        const acceptanceId = this.self.obligations.upsert({
+          family: 'acceptance',
+          claim: '本任务已通过用户级行为验收（声明的可观察完成标志已实际执行）',
+          targets: [],
+          risk: 'high',
+        })
+
+        // 「请声明验收面」：每契约只响一次（义务块每轮渲染 next=user_acceptance
+        // 已是被动通道，advisory 不该逐轮加码），且只在还没有任何回写时催
+        // （open + 零 attempt；captureAcceptance 收到声明后会记一次 attempt）。
+        // 位置刻意放在首次代码编辑后的短轮而非收尾长轮——采纳率与轮长强负相关，
+        // 而且验证之前声明才有 pre-commitment 意义，交付时补写等于给已做的事编理由。
+        const acceptanceOb = this.self.obligations.getStore().obligations
+          .find(o => o.id === acceptanceId)
+        const contractId = this.self.taskContract.id
+        if (
+          acceptanceOb?.state === 'open' && acceptanceOb.attempts === 0
+          && !this.self.acceptanceAdvisedContracts.has(contractId)
+        ) {
+          this.self.acceptanceAdvisedContracts.add(contractId)
+          this.self.advisoryBus.submit({
+            key: 'acceptance-declare',
+            priority: 0.6,
+            category: 'discipline',
+            tier: 'operational',
+            content: '代码已改动，但本任务还没有用户级验收面。现在用 todo 的 acceptance 字段声明「用户做什么动作 → 看到什么可观察结果」。'
+              + '跑单测通过属于 delivery，不是验收——验收要落在用户能观察到的行为上（按某个键、访问某个地址、看到某个具体状态）。'
+              + '做完把该项回写 met + evidence；确实执行不了标 blocked 并写明障碍。',
+            ttl: 1,
+            expect: { kind: 'tool_appears', tools: ['todo'], withinTurns: 2 },
+          })
+        }
+      }
     }
     const cognitiveLedger = createCognitiveLedger({
       contract: this.self.taskContract,
@@ -1023,6 +1065,7 @@ export class TurnStepProducer {
       estimatedTokens: estTokens,
       pressureResult,
       evidenceState: this.self.evidence.getState(),
+      deliveryReady: this.self.evidence.deliveryReady(),
       predictionAccumulator: this.self.predictionAccumulator,
       recentToolHistory: this.self.recentToolHistory,
       loadedPheromones: this.self.loadedPheromones,
@@ -1063,6 +1106,9 @@ export class TurnStepProducer {
     this.self.currentSeasonIntensity = seasonResult.intensity
 
     // ── Embodied Cognition: affordance-gated tool selection hint ──
+    // 产出流与 advisory-bus 阶段抑制共用同一判据（production-flow.ts）——
+    // 那里用它决定「别打扰」，这里用它解除 wuwei 的「抑执行」。
+    const inProductionFlow = isInProductionFlow(this.self.recentToolHistory)
     const affordanceState: AffordanceState = {
       sensorium: currentSensorium,
       vigor: this.self.vigorState,
@@ -1071,11 +1117,12 @@ export class TurnStepProducer {
       workingSetSize: this.self.evidence.getState().filesModified.size,
       recentToolNames: this.self.recentToolHistory.map(t => t.tool),
       contractStatus: this.self.taskContract?.status,
+      inProductionFlow,
     }
     // ── Free Energy Engine: EFE-driven policy guidance ──
     let structuralEpistemic: number | undefined
     try { structuralEpistemic = this.self.immuneHook.getPhysarum().structuralEpistemic() } catch { /* graph signal is optional */ }
-    const efe = computeEFE(this.self.predictionAccumulator, this.self.currentSeason, this.self.vigorState, currentSensorium, structuralEpistemic)
+    const efe = computeEFE(this.self.predictionAccumulator, this.self.currentSeason, this.self.vigorState, currentSensorium, structuralEpistemic, inProductionFlow)
     this.self.latestPolicySignals = { efe, sensorium: currentSensorium }
     const affordances = computeAffordanceScores(affordanceState, this.self.sessionAffordanceAdaptations)
     const policies = selectPolicy(efe, affordances, { topK: 5 })

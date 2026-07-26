@@ -24,7 +24,8 @@ describe('createGotoDefinitionTool', () => {
 
     const tool = createGotoDefinitionTool(mgr)
     assert.equal(tool.definition.name, 'lsp_goto_definition')
-    assert.ok(tool.definition.description!.includes('Go to the definition'))
+    // 描述中文化：断言语义锚点而非英文原文
+    assert.ok(tool.definition.description!.includes('定义'))
     assert.ok(tool.definition.input_schema)
     assert.equal(tool.definition.input_schema!.required!.length, 3)
     assert.ok(tool.definition.input_schema!.required!.includes('file_path'))

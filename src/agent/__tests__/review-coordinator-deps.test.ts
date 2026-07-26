@@ -56,23 +56,23 @@ describe('createCoordinatorReviewDeps', () => {
     assert.equal(captured?.kind, 'verify')
     assert.equal(captured?.reviewDepth, 3)
     assert.deepEqual(captured?.scope.files, ['src/agent/deliver-task.ts'])
-    assert.match(captured?.objective ?? '', /Review depth: 3/)
-    assert.match(captured?.objective ?? '', /Do not call deliver_task/)
-    assert.match(captured?.objective ?? '', /Objective review stance/)
+    assert.match(captured?.objective ?? '', /审查深度: 3/)
+    assert.match(captured?.objective ?? '', /审查 worker 不得调用 deliver_task/)
+    assert.match(captured?.objective ?? '', /客观审查姿态/)
     assert.match(captured?.objective ?? '', /主动构造反例/)
-    assert.match(captured?.objective ?? '', /Dataflow verifier stance/)
-    assert.match(captured?.objective ?? '', /fact-flow graph/)
-    assert.match(captured?.objective ?? '', /condition-matrix coverage/)
-    assert.match(captured?.objective ?? '', /checklist-only implementation/)
-    assert.match(captured?.objective ?? '', /Path boundary \/ attention-gate review stance/)
+    assert.match(captured?.objective ?? '', /数据流验证姿态/)
+    assert.match(captured?.objective ?? '', /事实流图/)
+    assert.match(captured?.objective ?? '', /条件矩阵/)
+    assert.match(captured?.objective ?? '', /清单式实现/)
+    assert.match(captured?.objective ?? '', /路径边界\/注意力门控审查姿态/)
     assert.match(captured?.objective ?? '', /repo-relative.*absolute inside cwd.*absolute outside cwd.*\.\.\/ traversal/)
     assert.match(captured?.objective ?? '', /producer.*normalizer.*classifier.*consumer.*DB key.*assertion/)
     assert.match(captured?.objective ?? '', /显式目标.*默认发现/)
-    assert.match(captured?.objective ?? '', /Wiring & effectiveness review stance/)
+    assert.match(captured?.objective ?? '', /接线有效性审查姿态/)
     assert.match(captured?.objective ?? '', /零调用方传值即死参数/)
     assert.match(captured?.objective ?? '', /双渲染/)
     assert.match(captured?.objective ?? '', /过滤掉 ~100% 的门控等于静默关闭功能/)
-    assert.match(captured?.objective ?? '', /Do not stop at green tests/)
+    assert.match(captured?.objective ?? '', /不要止步于测试绿/)
     assert.equal(result.verdict, 'verified')
     assert.match(result.evidence, /ran: npm exec -- tsx --test/)
     assert.match(result.evidence, /61 passed/)
@@ -145,50 +145,50 @@ describe('createCoordinatorReviewDeps', () => {
 
     // Every inspector carries the core anti-rubber-stamp stance
     for (const req of capturedRequests) {
-      assert.match(req.objective, /Objective review stance/)
+      assert.match(req.objective, /客观审查姿态/)
       assert.match(req.objective, /提交存在、测试绿、作者声称已修/)
-      assert.match(req.objective, /severity CRITICAL\/HIGH\/MEDIUM\/LOW/)
+      assert.match(req.objective, /CRITICAL\/HIGH\/MEDIUM\/LOW/)
     }
 
     // Prompt economy: stances are assigned per axis, not stacked on all five.
     const security = capturedRequests[0]!.objective
-    assert.match(security, /^Security Inspector:/m)
-    assert.match(security, /Path boundary \/ attention-gate review stance/)
+    assert.match(security, /^【安全审查】/m)
+    assert.match(security, /路径边界\/注意力门控审查姿态/)
     assert.match(security, /repo-relative.*absolute inside cwd.*absolute outside cwd.*\.\.\/ traversal/)
-    assert.doesNotMatch(security, /Dataflow verifier stance/)
-    assert.doesNotMatch(security, /Wiring & effectiveness review stance/)
+    assert.doesNotMatch(security, /数据流验证姿态/)
+    assert.doesNotMatch(security, /接线有效性审查姿态/)
 
     const lifecycle = capturedRequests[1]!.objective
-    assert.match(lifecycle, /^Lifecycle Inspector:/m)
-    assert.match(lifecycle, /Dataflow verifier stance/)
-    assert.match(lifecycle, /outer timeouts strictly dominate inner budgets/i)
-    assert.doesNotMatch(lifecycle, /Path boundary \/ attention-gate review stance/)
+    assert.match(lifecycle, /^【生命周期】/m)
+    assert.match(lifecycle, /数据流验证姿态/)
+    assert.match(lifecycle, /外层超时严格支配内层预算/i)
+    assert.doesNotMatch(lifecycle, /路径边界\/注意力门控审查姿态/)
 
     const dataFlow = capturedRequests[2]!.objective
-    assert.match(dataFlow, /^Data Flow Inspector:/m)
-    assert.match(dataFlow, /Dataflow verifier stance/)
-    assert.match(dataFlow, /fact-flow graph/)
-    assert.match(dataFlow, /Path boundary \/ attention-gate review stance/)
+    assert.match(dataFlow, /^【数据流】/m)
+    assert.match(dataFlow, /数据流验证姿态/)
+    assert.match(dataFlow, /事实流图/)
+    assert.match(dataFlow, /路径边界\/注意力门控审查姿态/)
 
     const silence = capturedRequests[3]!.objective
-    assert.match(silence, /^Silence Inspector:/m)
-    assert.doesNotMatch(silence, /Dataflow verifier stance/)
-    assert.doesNotMatch(silence, /Path boundary \/ attention-gate review stance/)
+    assert.match(silence, /^【静默审查】/m)
+    assert.doesNotMatch(silence, /数据流验证姿态/)
+    assert.doesNotMatch(silence, /路径边界\/注意力门控审查姿态/)
 
     const wiring = capturedRequests[4]!.objective
-    assert.match(wiring, /^Wiring Inspector:/m)
-    assert.match(wiring, /Wiring & effectiveness review stance/)
-    assert.match(wiring, /zero callers/)
-    assert.match(wiring, /silent feature kill/)
-    assert.match(wiring, /Method \(run these checks/)
-    assert.doesNotMatch(wiring, /Dataflow verifier stance/)
+    assert.match(wiring, /^【接线审查】/m)
+    assert.match(wiring, /接线有效性审查姿态/)
+    assert.match(wiring, /无调用方/)
+    assert.match(wiring, /静默特性杀戮/)
+    assert.match(wiring, /方法（逐项执行/)
+    assert.doesNotMatch(wiring, /数据流验证姿态/)
 
     assert.equal(result.findings[0]?.severity, 'HIGH')
     assert.match(result.findings[0]?.claim ?? '', /race/)
     assert.deepEqual(result.infraFailures, [])
   })
 
-  it('spawns the auto wiring reviewer as two parallel inspectors (Wiring + Silence, 12 轮/240s 预算)', async () => {
+  it('spawns the auto wiring reviewer as two parallel inspectors (Wiring + Silence, 按文件数缩放预算)', async () => {
     const requests: DelegationRequest[] = []
     const coordinator: ReviewCoordinator = {
       delegate: async request => {
@@ -215,12 +215,13 @@ describe('createCoordinatorReviewDeps', () => {
     assert.equal(requests.length, 2, 'auto review spawns 2 inspectors (Wiring + Silence)')
     assert.equal(requests[0]?.profile, 'reviewer')
     assert.equal(requests[0]?.kind, 'review')
-    assert.equal(requests[0]?.budget?.timeoutMs, 240_000)
+    assert.equal(requests[0]?.budget?.timeoutMs, 180_000)
     assert.equal(requests[0]?.budget?.maxTurns, 12)
-    assert.match(requests[0]?.objective ?? '', /^Wiring Inspector:/m)
-    assert.match(requests[0]?.objective ?? '', /预算约束\(12 轮\/240s\)/)
-    assert.match(requests[0]?.objective ?? '', /best-effort 结论优于无结论/)
-    assert.match(requests[1]?.objective ?? '', /^Silence Inspector:/m)
+    assert.match(requests[0]?.objective ?? '', /^【接线审查】/m)
+    assert.match(requests[0]?.objective ?? '', /预算约束\(12 轮\/180s\)/)
+    assert.match(requests[0]?.objective ?? '', /严禁扩散探索/)
+    assert.match(requests[0]?.objective ?? '', /best-effort > 无结论/)
+    assert.match(requests[1]?.objective ?? '', /^【静默审查】/m)
     assert.ok(result.findings.length >= 0)
   })
 
