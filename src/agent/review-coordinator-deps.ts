@@ -1,5 +1,5 @@
 import type { CoordinatorRun, DelegationRequest } from './coordinator.js'
-import { formatObjectiveReviewStance, formatPathBoundaryReviewStance, formatWeighingReviewStance, formatWiringEffectivenessReviewStance, formatMethodologyVerificationStance, LARGE_FILE_WARN_THRESHOLD, type ChangeSet } from './review-discipline.js'
+import { formatObjectiveReviewStance, formatPathBoundaryReviewStance, formatWeighingReviewStance, formatWiringEffectivenessReviewStance, formatCaseSensitivityReviewStance, formatMethodologyVerificationStance, LARGE_FILE_WARN_THRESHOLD, type ChangeSet } from './review-discipline.js'
 import type { PatcherResult, ReviewFinding, ReviewInfraFailure, ReviewRouterDeps, SquadronResult, VerifierResult } from './review-router.js'
 import type { AggregationPolicy, WorkerProfile, WorkerResult, WorkOrderKind } from './work-order.js'
 
@@ -73,6 +73,13 @@ function methodologyVerificationBlock(): string {
   return [
     '方法论验证姿态（2026-06-14 PlanDesignIntentRouter 对抗审查反推；"方法论文档即代码——可执行指令需实证验证"——适用于审查知识文件、计划模板、规则、自检清单）：',
     formatMethodologyVerificationStance(),
+  ].join('\n')
+}
+
+function caseSensitivityReviewBlock(): string {
+  return [
+    '大小写审查姿态（macOS APFS 大小写不敏感→开发机不报错，Linux/CI 崩溃——专抓 import 路径、API 标识符、全局变量大小写不一致）：',
+    formatCaseSensitivityReviewStance(),
   ].join('\n')
 }
 
@@ -211,6 +218,7 @@ function verifierObjective(change: ChangeSet): string {
     pathBoundaryReviewBlock(),
     weighingReviewBlock(),
     wiringEffectivenessBlock(),
+    caseSensitivityReviewBlock(),
     methodologyVerificationBlock(),
     `范围文件: ${files(change).join(', ') || '(无)'}`,
     ...(change.focusHint ? [`**审查重点**: ${change.focusHint}`] : []),
@@ -320,18 +328,30 @@ function formatLargeFileWarnings(change: ChangeSet): string | null {
 
 function inspectorObjective(inspector: typeof INSPECTORS[number], change: ChangeSet): string {
   const largeWarn = formatLargeFileWarnings(change)
+  const fileList = files(change).join(', ') || '(无)'
+  // 有 commit message 时，用它作为目标的第一行——用户能看到审查和本次改动的关联，
+  // 而不是每次都看到同一个【接线审查】模板头。
+  const header = change.commitMessage
+    ? `【${inspector.name}】${change.commitMessage}`
+    : `【${inspector.name}】${inspector.objective}`
+  const intro = change.commitMessage
+    ? inspector.objective
+    : ''
   return [
-    `【${inspector.name}】${inspector.objective}`,
+    header,
+    `范围: ${fileList}`,
+    ...(intro ? [intro] : []),
     objectiveReviewStanceBlock(),
     ...stanceBlocks(inspector.stances),
     ...(inspector.method ? [inspector.method] : []),
-    `范围文件: ${files(change).join(', ') || '(无)'}`,
-    ...(change.focusHint ? [`**审查重点**: ${change.focusHint}`] : []),
+    ...(change.focusHint ? [`审查重点: ${change.focusHint}`] : []),
     ...(largeWarn ? [largeWarn] : []),
     ...(inspector.stances.includes('dataflow')
       ? ['For spec/integration changes, review the fact-flow graph, condition matrix, and counterexample tests before accepting checklist-style coverage.']
       : []),
     FINDING_CONTRACT,
+    '',
+    '回复语言: 中文。所有发现、摘要、risks 均用中文撰写。',
   ].join('\n')
 }
 

@@ -7,6 +7,7 @@
  * surfaces byte-identical instead of drifting copies.
  */
 import { starDomainRegistry } from './star-domain-registry.js'
+import { STAR_GENESIS } from './star-genesis-data.js'
 import type { ActiveStarDomain } from './star-domain.js'
 
 /**
@@ -18,6 +19,10 @@ import type { ActiveStarDomain } from './star-domain.js'
 export const DOMAIN_SWITCH_CACHE_WARNING =
   '⚠ 会话中途切换星域会使前缀缓存整体失效，下一次请求需全量重建上下文（成本约 10 倍+）。建议新开会话或在会话开始时选择。'
 
+/** 选择器底部的常驻预防性备注（短版；切换后的忠告用上面的 WARNING）。 */
+export const DOMAIN_SWITCH_CACHE_NOTE =
+  '⚠ 会话内切换星域会打断前缀缓存，建议在新会话切换'
+
 export interface DomainPickerEntry {
   /** Selection key: 'auto' | domain id. */
   key: string
@@ -27,6 +32,10 @@ export interface DomainPickerEntry {
   meta: string
   /** One-shot essence preview (never the full volatileBlock). */
   essence: string
+  /** 创始星短名（来自 star-genesis-data；custom 域缺省）。 */
+  founder?: string
+  /** 一句话核心专长（来自 star-genesis-data；custom 域缺省）。 */
+  expertise?: string
   /** Whether this is the session's current selection. */
   current: boolean
   uiPersona?: {
@@ -88,12 +97,15 @@ export function buildDomainPickerEntries(
         .find((s) => s.length > 0) ?? ''
       const essence = [d.motto, firstLine].filter(Boolean).join(' — ').slice(0, 400)
       const pinyin = DOMAIN_PINYIN_MAP[d.id] ?? d.id
+      const genesis = STAR_GENESIS.find((g) => g.key === d.id)
       return {
         key: d.id,
         name: d.name,
         motto: d.motto ?? '',
         meta: `${pinyin} · ${d.keywords.slice(0, 4).join(',')}`,
         essence,
+        founder: genesis?.founder,
+        expertise: genesis?.expertise,
         current: current != null && current.id === d.id,
         uiPersona: d.uiPersona,
       }

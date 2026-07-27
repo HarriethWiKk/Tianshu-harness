@@ -245,6 +245,94 @@ describe('PUT /config/mirrors', () => {
   })
 })
 
+describe('GET /config/pr-defaults', () => {
+  const prevHome = process.env.RIVET_HOME
+  let home: string
+  before(() => {
+    home = mkdtempSync(join(tmpdir(), 'rivet-pr-defaults-routes-'))
+    process.env.RIVET_HOME = home
+  })
+  after(() => {
+    if (prevHome === undefined) delete process.env.RIVET_HOME
+    else process.env.RIVET_HOME = prevHome
+    rmSync(home, { recursive: true, force: true })
+  })
+
+  it('returns the default PR defaults on a fresh install', async () => {
+    writeConfig(home, {})
+    const router = createRouter(buildConfigRoutes(TOKEN))
+    const res = await router('GET', '/config/pr-defaults', {}, AUTH)
+    assert.equal(res.status, 200)
+    const body = res.body as { mergeMethod: string; autoFix: boolean; autoMerge: boolean; ciPollSeconds: number }
+    assert.equal(body.mergeMethod, 'squash')
+    assert.equal(body.autoFix, false)
+    assert.equal(body.autoMerge, false)
+    assert.equal(body.ciPollSeconds, 10)
+  })
+
+  it('rejects unauthorized requests', async () => {
+    const router = createRouter(buildConfigRoutes(TOKEN))
+    const res = await router('GET', '/config/pr-defaults', {}, {})
+    assert.equal(res.status, 401)
+  })
+})
+
+describe('PUT /config/pr-defaults', () => {
+  const prevHome = process.env.RIVET_HOME
+  let home: string
+  before(() => {
+    home = mkdtempSync(join(tmpdir(), 'rivet-pr-defaults-put-'))
+    process.env.RIVET_HOME = home
+  })
+  after(() => {
+    if (prevHome === undefined) delete process.env.RIVET_HOME
+    else process.env.RIVET_HOME = prevHome
+    rmSync(home, { recursive: true, force: true })
+  })
+
+  it('updates mergeMethod + toggles and returns the updated config', async () => {
+    writeConfig(home, {})
+    const router = createRouter(buildConfigRoutes(TOKEN))
+    const res = await router('PUT', '/config/pr-defaults', { mergeMethod: 'rebase', autoFix: true }, AUTH)
+    assert.equal(res.status, 200)
+    const body = res.body as { ok: boolean; prDefaults: { mergeMethod: string; autoFix: boolean; autoMerge: boolean } }
+    assert.equal(body.ok, true)
+    assert.equal(body.prDefaults.mergeMethod, 'rebase')
+    assert.equal(body.prDefaults.autoFix, true)
+    assert.equal(body.prDefaults.autoMerge, false)
+  })
+
+  it('persists across requests (a follow-up GET sees the change)', async () => {
+    writeConfig(home, {})
+    const router = createRouter(buildConfigRoutes(TOKEN))
+    await router('PUT', '/config/pr-defaults', { mergeMethod: 'merge', ciPollSeconds: 30 }, AUTH)
+    const res = await router('GET', '/config/pr-defaults', {}, AUTH)
+    const body = res.body as { mergeMethod: string; ciPollSeconds: number }
+    assert.equal(body.mergeMethod, 'merge')
+    assert.equal(body.ciPollSeconds, 30)
+  })
+
+  it('rejects an invalid mergeMethod value (schema validation)', async () => {
+    writeConfig(home, {})
+    const router = createRouter(buildConfigRoutes(TOKEN))
+    const res = await router('PUT', '/config/pr-defaults', { mergeMethod: 'fast-forward' }, AUTH)
+    assert.equal(res.status, 400)
+  })
+
+  it('rejects an out-of-range ciPollSeconds', async () => {
+    writeConfig(home, {})
+    const router = createRouter(buildConfigRoutes(TOKEN))
+    const res = await router('PUT', '/config/pr-defaults', { ciPollSeconds: 1 }, AUTH)
+    assert.equal(res.status, 400)
+  })
+
+  it('rejects unauthorized requests', async () => {
+    const router = createRouter(buildConfigRoutes(TOKEN))
+    const res = await router('PUT', '/config/pr-defaults', { autoFix: true }, {})
+    assert.equal(res.status, 401)
+  })
+})
+
 describe('/config/default-domain', () => {
   const prevHome = process.env.RIVET_HOME
   let home: string

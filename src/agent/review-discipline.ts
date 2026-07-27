@@ -84,6 +84,22 @@ export function formatWeighingReviewStance(): string {
 }
 
 /**
+ * 大小写审查姿态（2026-07-28 用户反馈天枢生成 I18N vs I18n 大小写级联崩溃）：
+ * macOS APFS 默认大小写不敏感，此类错误在开发机上不报错、在 Linux/CI 上才炸。
+ * 专抓 import 路径、API 标识符、全局变量的大小写不一致。
+ */
+export const CASE_SENSITIVITY_REVIEW_STANCE: readonly string[] = [
+  'import/require 路径逐字节核对磁盘文件名：用 glob 或 ls 确认真实大小写，不凭记忆。新建文件时确认 import 语句与磁盘文件名大小写一致。',
+  '第三方 API/DOM 方法名用 web_fetch 或 web_search 查文档确认拼写——I18n ≠ I18N、applyToDOM ≠ applyToDom、innerHTML ≠ innerHtml。不确定就查，不猜。',
+  '全局变量命名一致性：window / globalThis 上的挂载与引用大小写必须统一。检查初始化脚本是否可能因某个 case 错误提前中断，导致后续脚本找不到本该挂载的全局变量。',
+  '审查时发现某个脚本/模块有报错但后续仍有大量其他报错时，先判断是否级联失败——第一条报错通常是根因，后续报错可能是初始化中断的连锁反应。修根因而非逐条扑火。',
+]
+
+export function formatCaseSensitivityReviewStance(): string {
+  return CASE_SENSITIVITY_REVIEW_STANCE.map((directive, index) => `${index + 1}. ${directive}`).join('\n')
+}
+
+/**
  * 接线生效审查姿态（2026-06-12 噪音治理/委派质量复审教训）：
  * 「功能建好」≠「接好」≠「生效」。专抓建好但断线、半做、或实际效果与声称
  * 目标相反的改动。对抗验证回答"对不对"，称量回答"值不值"，本姿态回答
@@ -159,6 +175,10 @@ export interface ChangeSet {
   /** Mechanical-change classification from deliver_task. When present with
    *  skipReview=true, auto review skips workers (nudge only). */
   changeClass?: ChangeClassification
+  /** Commit message from deliver_task. Populated for auto reviews so
+   *  inspector objectives can reference what actually changed instead of
+   *  showing the same generic template every time. Absent for slash-review paths. */
+  commitMessage?: string
   /** Files whose size exceeds {@link LARGE_FILE_WARN_THRESHOLD}. Review workers
    *  use this to avoid reading entire large files (use offset/limit instead).
    *  Set by deliver_task before spawning review; absent in test / slash-review paths. */

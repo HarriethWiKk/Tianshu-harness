@@ -1182,3 +1182,48 @@ describe('/cd 命令守卫', () => {
     assert.ok(entries[0]!.includes('历史前缀缓存保留'), `expected cache note: ${entries[0]}`)
   })
 })
+
+describe('/btw 侧问派发', () => {
+  it('把问题原样交给侧问执行器', async () => {
+    const asked: string[] = []
+    const handled = await handleSlashCommand(makeCtx({
+      parts: ['/btw', '刚才那个', 'TS2322', '是什么意思'],
+      askSideQuestion: (q) => asked.push(q),
+    }))
+    assert.equal(handled, true)
+    assert.deepEqual(asked, ['刚才那个 TS2322 是什么意思'])
+  })
+
+  it('不提交给主 agent —— 侧问不进对话历史，也不占主 turn', async () => {
+    let submitted = 0
+    const asked: string[] = []
+    await handleSlashCommand(makeCtx({
+      parts: ['/btw', '问题'],
+      askSideQuestion: (q) => asked.push(q),
+      submitToAgent: () => { submitted++ },
+    }))
+    assert.equal(asked.length, 1)
+    assert.equal(submitted, 0, '走了主 agent 就等于进了历史，功能定位就没了')
+  })
+
+  it('无参数时打印用法而不是发一次空请求', async () => {
+    const entries: string[] = []
+    let called = 0
+    await handleSlashCommand(makeCtx({
+      parts: ['/btw'],
+      askSideQuestion: () => { called++ },
+      pushStatic: (entry) => entries.push(entry.content),
+    }))
+    assert.equal(called, 0)
+    assert.ok(entries[0]!.includes('用法：/btw'), `expected usage: ${entries[0]}`)
+  })
+
+  it('未接入执行器时明确报不可用，不静默吞掉', async () => {
+    const entries: string[] = []
+    await handleSlashCommand(makeCtx({
+      parts: ['/btw', '问题'],
+      pushStatic: (entry) => entries.push(entry.content),
+    }))
+    assert.ok(entries[0]!.includes('不可用'), `expected unavailable notice: ${entries[0]}`)
+  })
+})

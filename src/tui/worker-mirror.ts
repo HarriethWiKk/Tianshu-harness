@@ -30,6 +30,8 @@ interface MirrorRecord {
   /** 进行中的 text 聚合缓冲（未封口，不计入 messages）。 */
   openText: string
   openTextAt: number
+  /** 已收到终态。再来非终态事件即为新一轮派发（见 apply）。 */
+  closed?: boolean
 }
 
 export class WorkerMirrorStore {
@@ -59,12 +61,22 @@ export class WorkerMirrorStore {
 
   apply(activity: DelegationActivity, now: number = Date.now()): void {
     const terminal = activity.status !== 'running'
-    const r = this.recordOf(activity.workOrderId)
+    let r = this.recordOf(activity.workOrderId)
+
+    // 已终态的 id 又来非终态事件 = 新一轮派发。order id 对 batch / team /
+    // council 是 `batch:0` 这类稳定值（deriveStableWorkOrderId），同一会话里
+    // 多派几次必然撞 id——不换记录的话，这一轮的转录会续在上一轮后面，worker
+    // 视图于是把两个不同目标的执行过程当成一条连续时间线。
+    if (r.closed && !terminal) {
+      r = { messages: [], openText: '', openTextAt: 0 }
+      this.records.set(activity.workOrderId, r)
+    }
 
     if (terminal) {
       this.sealText(r)
       const summary = activity.progressLine ? ` — ${activity.progressLine}` : ''
       this.push(r, { kind: 'status', content: `[${activity.status}]${summary}`, at: now })
+      r.closed = true
       return
     }
 
@@ -83,6 +95,13 @@ export class WorkerMirrorStore {
       }
       case 'tool_result': {
         this.push(r, { kind: 'tool_result', content: activity.eventDetail ?? 'done', at: now })
+        break
+      }
+      case 'lifecycle': {
+        // 补偿轮的分界线。不入镜像的话，续跑那一轮的输出会直接续在上一轮后面，
+        // 读转录的人看不出中间发生过「预算耗尽 → 接着干」。
+        this.sealText(r)
+        this.push(r, { kind: 'status', content: activity.eventDetail ?? '补偿轮', at: now })
         break
       }
       // thinking / turn / undefined（纯状态事件）不入镜像

@@ -132,4 +132,30 @@ describe('SessionJobs', () => {
     assert.equal(list.filter((j) => j.status === 'running').length, 0)
     assert.equal(store.hasRunning(), false)
   })
+
+  it('kill on an already-exited job returns false and preserves the real exit code', async () => {
+    const snap = store.spawn({ command: "sh -c 'exit 3'", rawCommand: 'exit 3', cwd: dir, env })
+    const res = await store.await(snap.id, { timeoutMs: 5000 })
+    assert.equal(res!.job.status, 'exited')
+    assert.equal(res!.job.exitCode, 3)
+
+    // 终态 guard 必须真实存在：kill 不得谎报成功（此前恒 true，
+    // TUI 据 true 把 exit 3 覆盖成 killed）。
+    assert.equal(store.kill(snap.id), false)
+    const after = store.list().find(j => j.id === snap.id)
+    assert.equal(after!.status, 'exited')
+    assert.equal(after!.exitCode, 3, '终态 job 的真实 exit code 不得被覆盖')
+  })
+
+  it('终态条目超出上限时封顶淘汰（内存有界，最新保留）', async () => {
+    const total = SessionJobs.MAX_TERMINAL_JOBS + 3
+    const ids: string[] = []
+    for (let i = 0; i < total; i++) {
+      ids.push(store.spawn({ command: "sh -c 'exit 0'", rawCommand: 'exit 0', cwd: dir, env }).id)
+    }
+    await Promise.all(ids.map(id => store.await(id, { timeoutMs: 10_000 })))
+    const list = store.list()
+    assert.ok(list.length <= SessionJobs.MAX_TERMINAL_JOBS, `终态应封顶 ${SessionJobs.MAX_TERMINAL_JOBS}，实际 ${list.length}`)
+    assert.ok(list.some(j => j.id === ids[total - 1]), '最新 job 必须保留')
+  })
 })

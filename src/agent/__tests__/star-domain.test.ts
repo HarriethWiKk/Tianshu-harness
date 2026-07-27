@@ -274,6 +274,94 @@ describe('changgeng（长庚·长夜守候，第十四域）', () => {
   })
 })
 
+describe('意境闭环：意象自辩 + 结尾回扣（2026-07-27 对齐七杀）', () => {
+  // 七杀是参照物：意象提出 → 意象自辩（预先挡住最可能的误读）→ 纪律 →
+  // 扳机 → 扳机用意象的语言收尾。缺自辩，纪律就只是规则，会被"这次情况
+  // 特殊"绕过；缺回扣，意象就是开头的装饰，读到结尾已经不在场。
+  // 这几条钉的是环本身，不是措辞——改写可以，把环删掉不行。
+
+  it('破军：意象自辩挡住「莽撞破坏」的误读，安全边界被讲成能力而非镣铐', () => {
+    // 破军 courageThreshold 0.25 是全域最低（靠 courage-hook 高频打断兜底）。
+    // 自辩这一环是让它自己收住的那句话——删了就只剩运行时打断在扛。
+    const p = STAR_DOMAINS.pojun
+    assert.match(p.volatileBlock, /开路的星，不是拆房的星/)
+    assert.match(p.volatileBlock, /因为退得回来/, '安全边界必须讲成敢前进的理由')
+    assert.match(p.volatileBlock, /地图，不是废墟/, '结尾回扣')
+  })
+
+  it('天府：九地之下的意象撑起「守不是挡」，结尾回扣到「藏」', () => {
+    const t = STAR_DOMAINS.tianfu
+    assert.match(t.volatileBlock, /善守者藏于九地之下/)
+    assert.match(t.volatileBlock, /守护不是拒绝变化/, '自辩：守 ≠ 挡')
+    assert.match(t.volatileBlock, /没人注意到它被守过/, '结尾回扣到「藏」')
+  })
+
+  it('天梁：受托—荫—回音三点连成链，结尾不再回扣空指针', () => {
+    // 旧版结尾写"天梁的承诺兑现了"，但"承诺"这个意象全文没建立过——
+    // 回扣了一个前面不存在的东西。motto 里的「所托之事，终有回音」才是它。
+    const t = STAR_DOMAINS.tianliang
+    assert.match(t.volatileBlock, /荫星/)
+    assert.match(t.volatileBlock, /所托之事终有回音/)
+    assert.match(t.volatileBlock, /不回，才是失信/, '做不到也要回，是这个域的交付定义')
+    assert.match(t.volatileBlock, /回音就到了/, '结尾回扣')
+    assert.ok(
+      t.motto.includes('所托之事，终有回音'),
+      'volatileBlock 的意象锚在 motto 上，两者不可脱钩',
+    )
+  })
+
+  it('开阳：伴星意象保留，但不点名「辅」域（跨域专名会引走注意力）', () => {
+    const k = STAR_DOMAINS.kaiyang
+    assert.match(k.volatileBlock, /双星互证/, '意象与方法论同构，是开阳最强的一环')
+    assert.match(k.volatileBlock, /看得见两颗，才算看见/, '结尾回扣')
+    assert.doesNotMatch(
+      k.volatileBlock,
+      /辅/,
+      '点名另一个域会让模型去找「辅」是什么；只留伴星意象',
+    )
+  })
+
+  it('四域都有扳机句（缺扳机 = 知道自己是谁，不知道手往哪放）', () => {
+    // 启明是反例：意境闭环完整但零扳机，读完不落地。
+    for (const id of ['pojun', 'tianfu', 'tianliang', 'kaiyang'] as const) {
+      assert.match(
+        STAR_DOMAINS[id].volatileBlock,
+        /(到达时|任务到达时)/,
+        `${id} 缺扳机句`,
+      )
+    }
+  })
+})
+
+describe('视觉自查纪律必须落在 volatileBlock（唯一通电的字段）', () => {
+  // buildActiveDomain / setSessionDomain 只搬运 volatileBlock + motto +
+  // courageThreshold；systemPromptSuffix 目前没有任何生产消费者（assembly-audit
+  // 也这么判）。提示词写进 suffix 等于没写——这条钉子防的就是下次有人凭
+  // 直觉把内容放回那个不通电的字段。
+  for (const id of ['wenqu', 'changgeng'] as const) {
+    it(`${id} 的 browser_debug 自查纪律在 volatileBlock 里`, () => {
+      const domain = STAR_DOMAINS[id]
+      assert.match(domain.volatileBlock, /browser_debug/)
+      assert.match(domain.volatileBlock, /set_viewport/)
+      assert.doesNotMatch(
+        domain.systemPromptSuffix,
+        /set_viewport/,
+        'suffix 不进 prompt，视觉纪律放这里到不了模型',
+      )
+    })
+  }
+
+  it('/domain 手动选取（registry.get）搬运的 volatileBlock 带着这条纪律', () => {
+    // 端到端：文曲/长庚不在 DOMAIN_AUTO_POOL，只经 /domain 手动或 defaultDomain
+    // 进入——真实入口是 starDomainRegistry.get（main.ts domainPickerExec）。
+    for (const id of ['wenqu', 'changgeng'] as const) {
+      const d = starDomainRegistry.get(id)
+      assert.ok(d, `${id} 不在 registry 里`)
+      assert.match(d.volatileBlock, /browser_debug/)
+    }
+  })
+})
+
 describe('buildActiveDomain（2026-07-23 auto 池收窄；2026-07-25 华盖出池手动指定）', () => {
   it('池内四域关键词正常路由', () => {
     assert.equal(buildActiveDomain('审查这个方案').id, 'tianquan')

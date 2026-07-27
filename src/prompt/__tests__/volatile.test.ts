@@ -652,14 +652,34 @@ describe('GWT salience and Top-K selection', () => {
       const selected = selectTopKBlocks(blocks, 100)
       assert.ok(selected.length >= 1)
       // First selected should be highest salience
-      assert.ok(selected[0]!.includes('star-domain'))
+      assert.ok(selected[0]!.content.includes('star-domain'))
     })
 
     it('always includes at least one block (highest salience)', () => {
       // Budget is tiny — only 1 char
       const selected = selectTopKBlocks(blocks, 1)
       assert.ok(selected.length >= 1)
-      assert.ok(selected[0]!.includes('star-domain'))
+      assert.ok(selected[0]!.content.includes('star-domain'))
+    })
+
+    it('carries caller metadata through selection so survivors stay metered', () => {
+      const tagged: SalientBlock[] = [
+        { content: '<tool-context>ctx</tool-context>', salience: 0.7, source: 'tool-context' },
+        { content: '<read-file-dedup-hint>hint</read-file-dedup-hint>', salience: 0.3 },
+      ]
+      const selected = selectTopKBlocks(tagged, 10_000)
+      assert.equal(selected.find(b => b.content.startsWith('<tool-context>'))?.source, 'tool-context')
+      assert.equal(selected.find(b => b.content.startsWith('<read-file'))?.source, undefined)
+    })
+
+    it('truncated blocks keep their source on the shortened copy', () => {
+      const big: SalientBlock[] = [
+        { content: '<tool-context>' + 'x'.repeat(5_000) + '</tool-context>', salience: 0.7, source: 'tool-context' },
+      ]
+      const selected = selectTopKBlocks(big, 3_000)
+      assert.equal(selected.length, 1)
+      assert.ok(selected[0]!.content.endsWith('[truncated]'))
+      assert.equal(selected[0]!.source, 'tool-context')
     })
 
     it('handles empty input', () => {
@@ -903,6 +923,48 @@ describe('GWT salience and Top-K selection', () => {
       assert.equal(appendixBlockName('<git-status>\nfoo\n</git-status>'), 'git-status')
       assert.equal(appendixBlockName('<star-domain name="x">y</star-domain>'), 'star-domain')
       assert.equal(appendixBlockName('no-xml-here'), 'anon:11')
+    })
+
+    it('appendixBlockName names non-ASCII tags instead of falling back to anon', () => {
+      // <星域-advisory> is the one non-ASCII appendix tag in the tree. Under the
+      // old ASCII-only pattern it became anon:<length> — a length-keyed bucket
+      // that another anon block of equal length would silently share.
+      assert.equal(appendixBlockName('<星域-advisory>\n  <entry key="k"/>\n</星域-advisory>'), '星域-advisory')
+      assert.equal(appendixBlockName('<星域-advisory>short</星域-advisory>'), '星域-advisory')
+    })
+
+    it('appendixBlockName keeps hyphenated tags whole', () => {
+      // Guards the character-class trap: a trailing `-` inside [^\s/>-] is a
+      // literal exclusion and would cut these at the first hyphen.
+      assert.equal(appendixBlockName('<historical-lessons>x'), 'historical-lessons')
+      assert.equal(appendixBlockName('<control-plane>x'), 'control-plane')
+      assert.equal(appendixBlockName('<星域-advisory>x'), '星域-advisory')
+    })
+
+    it('appendixBlockName gives the same delta key to a block whose length changed', () => {
+      // The property the anon fallback could not provide: same block, different
+      // size, same key — so the diff compares content instead of treating it as
+      // a brand-new block.
+      const short = '<星域-advisory>\n  <entry key="a"/>\n</星域-advisory>'
+      const long = '<星域-advisory>\n  <entry key="a"/>\n  <entry key="b"/>\n</星域-advisory>'
+      assert.notEqual(short.length, long.length)
+      assert.equal(appendixBlockName(short), appendixBlockName(long))
+    })
+
+    it('appendixBlockName still refuses closing tags and bare text', () => {
+      assert.equal(appendixBlockName('</star-domain>'), 'anon:14')
+      assert.equal(appendixBlockName('【瑶光·复现即证】上轮引用了文件名但未读取。'), 'anon:22')
+    })
+
+    it('appendixBlockName separates two non-ASCII blocks of identical length', () => {
+      // The failure the anon fallback made possible: equal length collapsed two
+      // unrelated blocks onto one delta key, so the second overwrote the first
+      // and an unchanged block looked changed (and vice versa).
+      const a = '<星域-advisory>xxxx</星域-advisory>'
+      const shell = '<外域-侦察>' + '</外域-侦察>'
+      const b = `<外域-侦察>${'x'.repeat(a.length - shell.length)}</外域-侦察>`
+      assert.equal(a.length, b.length, 'fixture must collide by length')
+      assert.notEqual(appendixBlockName(a), appendixBlockName(b))
     })
 
     it('returns empty array for empty context', () => {

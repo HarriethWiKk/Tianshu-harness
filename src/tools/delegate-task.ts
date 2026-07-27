@@ -3,8 +3,17 @@ import type { CoordinatorRun, DelegationRequest } from '../agent/coordinator.js'
 import type { ContextClaimStore } from '../context/claim-store.js'
 import type { ClaimProposal } from '../context/claims.js'
 import { DEFAULT_DELEGATE_PROFILE, profileRegistry, delegationToolTimeoutMs } from '../agent/profile-registry.js'
+import { formatWorkerResultDigest } from '../agent/worker-result-digest.js'
+import { formatWorkerIdentity } from '../tui/format/profile-labels.js'
 import { starDomainRegistry } from '../agent/star-domain-registry.js'
 import { validatePathSafe } from './path-validate.js'
+import {
+  MAX_TURNS_TOOL_DESCRIPTION,
+  TIMEOUT_MS_TOOL_DESCRIPTION,
+  delegateMaxTurnsSchema,
+  delegateTimeoutMsSchema,
+  toBudgetOverride,
+} from './delegate-budget.js'
 import type { Tool, ToolCallParams, ToolResult } from './types.js'
 import { createActivityStreamer, createDelegationActivityMapper, progressSnippet } from './worker-activity-stream.js'
 import type { WorkerActivityEvent } from '../agent/coordinator.js'
@@ -16,15 +25,16 @@ export interface DelegateTaskCoordinator {
 /** Dynamic profile validation — accepts built-in + user-loaded profiles */
 const profileStringSchema = z.string().refine(
   (val) => profileRegistry.getProfileNames().includes(val),
-  (val) => ({ message: `Unknown profile "${val}". Available: ${profileRegistry.getProfileNames().join(', ')}` }),
+  (val) => ({ message: `未知 profile "${val}"。可用：${profileRegistry.getProfileNames().join(', ')}` }),
 )
 
 /** Dynamic star-domain (authority) validation — accepts built-in + user-loaded domains.
- *  Injects the domain's persona (volatileBlock) + methodology (systemPromptSuffix)
- *  into the worker, and intersects the worker's tools with the domain whitelist. */
+ *  Injects the domain's persona (volatileBlock，经冻结 <star-domain> 前缀) into the
+ *  worker, and intersects the worker's tools with the domain whitelist.
+ *  （systemPromptSuffix 是展示面字段，不参与注入——见 assembly-audit 白名单注记。） */
 const authorityStringSchema = z.string().refine(
   (val) => starDomainRegistry.getDomainIds().includes(val),
-  (val) => ({ message: `Unknown authority "${val}". Available: ${starDomainRegistry.getDomainIds().join(', ')}` }),
+  (val) => ({ message: `未知星域 "${val}"。可用：${starDomainRegistry.getDomainIds().join(', ')}` }),
 )
 
 const delegateTaskInputSchema = z.object({
@@ -37,15 +47,31 @@ const delegateTaskInputSchema = z.object({
   resume: z.string().optional().describe(
     'Optional worker ID to resume instead of creating a new worker. When provided, the worker continues from its previous session history. The objective should describe the continuation task.',
   ),
+  maxTurns: delegateMaxTurnsSchema,
+  timeoutMs: delegateTimeoutMsSchema,
 })
 
-function formatUiContent(run: CoordinatorRun): string {
+export function formatUiContent(run: CoordinatorRun): string {
   if (run.status === 'skipped') return 'delegate_task 已跳过：objective 未通过预算门禁'
   const passed = run.results.filter(r => r.status === 'passed').length
-  const blocked = run.results.filter(r => r.status === 'blocked').length
-  const base = `delegate_task 已完成：${passed} 通过，${blocked} 阻塞，model=${run.selectedModel ?? 'unknown'}`
-  if (run.escalated) return `⚠️ ${base}\n[escalated] 子代理连续失败，建议改为内联执行`
-  return base
+  const total = run.results.length
+  const head = `delegate_task · ${passed}/${total} 通过 · ${run.selectedModel ?? 'unknown'}`
+  const rows = run.results.map(r => {
+    // 多 worker 时每行带派发侧身份——否则 N 行匿名摘要映射不回具体任务。
+    // profile 由 coordinator 盖章（worker-objective-gate），缺失的旧结果保持无身份。
+    const identity = r.profile ? `${formatWorkerIdentity({ profile: r.profile, authority: r.authority })} · ` : ''
+    return '  ' + identity + formatWorkerResultDigest({
+      status: r.status,
+      summary: r.summary,
+      findingsCount: r.findings?.length ?? 0,
+      changedFilesCount: r.changedFiles?.length ?? 0,
+      failureReason: r.failureReason,
+      evidenceStatus: r.evidenceStatus,
+    })
+  })
+  const body = rows.length > 0 ? '\n' + rows.join('\n') : ''
+  if (run.escalated) return `⚠️ ${head}${body}\n[escalated] 子代理连续失败，建议改为内联执行`
+  return `${head}${body}`
 }
 
 export function createDelegateTaskTool(
@@ -68,6 +94,8 @@ export function createDelegateTaskTool(
           files: { type: 'array', items: { type: 'string' }, description: '可选，要聚焦的文件路径。' },
           symbols: { type: 'array', items: { type: 'string' }, description: '可选，要聚焦的符号。' },
           resume: { type: 'string', description: '要恢复的 worker ID。worker 从之前的会话上下文继续，而不是从零开始。使用之前 delegate_task 结果中的 workOrderId。' },
+          maxTurns: { type: 'integer', description: MAX_TURNS_TOOL_DESCRIPTION },
+          timeoutMs: { type: 'integer', description: TIMEOUT_MS_TOOL_DESCRIPTION },
         },
         required: ['objective'],
       },
@@ -132,6 +160,7 @@ export function createDelegateTaskTool(
         sessionTurn: params.sessionTurnCount,
         onActivity,
         resumeWorkOrderId: parsed.data.resume,
+        budget: toBudgetOverride(parsed.data),
       }, params.abortSignal)
 
       // T4: terminal per-worker status for the subagent panel.
@@ -224,6 +253,7 @@ export function createDelegateTaskTool(
     timeoutMs: (params) => delegationToolTimeoutMs(
       params?.sessionTurnCount,
       [params?.input?.profile as string | undefined],
+      { requestedTimeoutMs: [params?.input?.timeoutMs as number | undefined] },
     ),
   }
 }

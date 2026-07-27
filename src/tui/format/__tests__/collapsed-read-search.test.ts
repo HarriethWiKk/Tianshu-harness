@@ -33,7 +33,7 @@ describe('formatCollapsedGroup', () => {
     assert.ok(lines[0]!.includes('Read 4 files'), 'summary')
     // fa41ac5c 视觉改版：折叠态去掉左边框竖线，树连接符 ╰─ → └─
     assert.ok(lines.some(l => l.includes('└─')), 'tree connector')
-    assert.ok(lines.some(l => l.includes('[Ctrl+O]')), 'expand hint')
+    assert.ok(lines.some(l => l.includes('ctrl+o 展开')), 'expand hint')
   })
 
   it('renders expanded state with nested tree connectors', () => {

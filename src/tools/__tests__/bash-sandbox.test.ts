@@ -16,3 +16,17 @@ describe('bash sandbox (wrapper)', () => {
     assert.equal(result.sandboxed, false)
   })
 })
+
+describe('bash sandbox (decision passthrough)', () => {
+  it('exposes backend so failures can be attributed', () => {
+    const result = wrapSandboxCommand('echo hi', process.cwd())
+    // Default OFF → backend 'none'; the field must still be present so the
+    // attribution call site never reads undefined.
+    assert.equal(result.backend, 'none')
+  })
+
+  it('omits writableRoots when unsandboxed', () => {
+    const result = wrapSandboxCommand('echo hi', process.cwd())
+    assert.equal(result.writableRoots, undefined)
+  })
+})

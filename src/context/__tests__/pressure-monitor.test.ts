@@ -100,7 +100,8 @@ describe('PressureMonitor', () => {
   // ── W6 (incident 20b9714e): CVM overhead accumulator lifecycle ──
   // The accumulator was monotonic (zero resetCvmOverhead call sites) while the
   // producer charged the full projection every turn — long sessions inevitably
-  // crossed the throttle thresholds. Compaction now resets the accumulator.
+  // crossed the throttle thresholds. Reset is now driven by every history
+  // rewrite via the resetAppendixBaseline callback, not compaction alone.
 
   it('W6: resetCvmOverhead clears accumulated overhead and throttle state', () => {
     const pm = new PressureMonitor(100_000)

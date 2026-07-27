@@ -48,6 +48,56 @@ function seedWorkerResult(workerId: string): void {
   writeFileSync(join(dir, `${workerId}.json`), JSON.stringify(result, null, 2))
 }
 
+function liveView(over: Partial<FleetWorkerView> = {}): FleetWorkerView {
+  return {
+    workerId: 'wo_team:T1',
+    shortLabel: 'T1',
+    parentToolId: 't1',
+    profile: 'code_scout',
+    authority: 'tianxuan',
+    status: 'running',
+    panelStatus: 'running',
+    terminal: false,
+    activityLog: ['⚙ read overlay.ts'],
+    elapsedMs: 150000,
+    toolUseCount: 5,
+    tokenCount: 1200,
+    unread: false,
+    contract: {
+      objective: '定位 /tasks 舰队行渲染函数',
+      profile: 'code_scout',
+      scope: { files: ['src/tui/format/overlay.ts'] },
+      constraints: [],
+      budget: { maxTurns: 24, timeoutMs: 480000 },
+      allowedToolsDigest: 'read+2',
+    },
+    ...over,
+  }
+}
+
+test('使用中文身份，不出现原始 profile 英文', () => {
+  const { content } = buildWorkerDetailContent('wo_team:T1', tmpCwd(), liveView())
+  assert.match(content, /天璇·侦察代码/, '必须包含中文身份')
+  assert.doesNotMatch(content, /profile: code_scout/, '不应出现原始英文 profile')
+})
+
+test('目标出现在参数段之前', () => {
+  const { content } = buildWorkerDetailContent('wo_team:T1', tmpCwd(), liveView())
+  const idxObjective = content.indexOf('定位 /tasks 舰队行渲染函数')
+  const idxParams = content.indexOf('── 参数 ──')
+  assert.ok(idxObjective >= 0, '必须包含 objective')
+  // 参数段可能不存在（无 persisted result），有则验证顺序
+  if (idxParams >= 0) {
+    assert.ok(idxObjective < idxParams, '目标应在参数段之前')
+  }
+})
+
+test('使用中文段标题', () => {
+  const { content } = buildWorkerDetailContent('wo_team:T1', tmpCwd(), liveView())
+  assert.match(content, /目标：/, '应有中文标签「目标」')
+  assert.match(content, /══ 子代理/, '应有中文标题')
+})
+
 test('buildWorkerDetailContent includes header, result, and transcript', async () => {
   const workerId = 'wo_team:T1'
   const cwd = tmpCwd()
@@ -75,7 +125,7 @@ test('buildWorkerDetailContent includes header, result, and transcript', async (
 
   assert.ok(title.includes('T1'))
   assert.ok(content.includes('wo_team:T1'))
-  assert.ok(content.includes('reviewer'))
+  assert.ok(content.includes('天权·审查'), '原始 profile 渲染为中文身份（天权·审查）')
   assert.ok(content.includes('tianquan') || content.includes('天权'))
   assert.ok(content.includes('Found the issue.'))
   assert.ok(content.includes('src/x.ts'))

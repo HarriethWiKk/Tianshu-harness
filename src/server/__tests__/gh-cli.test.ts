@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { buildReviewPayload } from '../gh-cli.js'
+import { buildReviewPayload, normalizeRollupCheck, parseActionsRunId, buildMergeArgs } from '../gh-cli.js'
 
 describe('buildReviewPayload', () => {
   it('passes the verdict event through', () => {
@@ -61,5 +61,77 @@ describe('buildReviewPayload', () => {
     assert.equal(p.comments, undefined)
     assert.equal(p.body, 'LGTM')
     assert.equal(p.event, 'APPROVE')
+  })
+})
+
+describe('normalizeRollupCheck', () => {
+  it('maps a completed CheckRun failure to FAILURE with the raw conclusion kept', () => {
+    const c = normalizeRollupCheck({
+      __typename: 'CheckRun', name: 'build', status: 'COMPLETED', conclusion: 'FAILURE',
+      detailsUrl: 'https://github.com/o/r/actions/runs/123',
+    })
+    assert.deepEqual(c, {
+      name: 'build', state: 'FAILURE', conclusion: 'FAILURE',
+      detailsUrl: 'https://github.com/o/r/actions/runs/123',
+    })
+  })
+
+  it('maps an in-progress CheckRun (no conclusion) to PENDING', () => {
+    const c = normalizeRollupCheck({ __typename: 'CheckRun', name: 'test', status: 'IN_PROGRESS', conclusion: null })
+    assert.equal(c.state, 'PENDING')
+    assert.equal(c.conclusion, undefined)
+  })
+
+  it('treats NEUTRAL/SKIPPED CheckRuns as passing; CANCELLED as ERROR', () => {
+    assert.equal(normalizeRollupCheck({ __typename: 'CheckRun', name: 'a', status: 'COMPLETED', conclusion: 'NEUTRAL' }).state, 'SUCCESS')
+    assert.equal(normalizeRollupCheck({ __typename: 'CheckRun', name: 'b', status: 'COMPLETED', conclusion: 'SKIPPED' }).state, 'SUCCESS')
+    assert.equal(normalizeRollupCheck({ __typename: 'CheckRun', name: 'c', status: 'COMPLETED', conclusion: 'CANCELLED' }).state, 'ERROR')
+    assert.equal(normalizeRollupCheck({ __typename: 'CheckRun', name: 'd', status: 'COMPLETED', conclusion: 'TIMED_OUT' }).state, 'FAILURE')
+  })
+
+  it('maps a StatusContext by its state, using context/targetUrl', () => {
+    const c = normalizeRollupCheck({
+      __typename: 'StatusContext', context: 'ci/circleci', state: 'SUCCESS',
+      targetUrl: 'https://circleci.com/gh/o/r/42',
+    })
+    assert.deepEqual(c, { name: 'ci/circleci', state: 'SUCCESS', detailsUrl: 'https://circleci.com/gh/o/r/42' })
+  })
+
+  it('detects a StatusContext without __typename via the context field', () => {
+    const c = normalizeRollupCheck({ context: 'expected-check', state: 'EXPECTED' })
+    assert.equal(c.name, 'expected-check')
+    assert.equal(c.state, 'EXPECTED')
+  })
+
+  it('falls back to PENDING for unknown state values', () => {
+    assert.equal(normalizeRollupCheck({ context: 'x', state: 'WEIRD' }).state, 'PENDING')
+    assert.equal(normalizeRollupCheck({ __typename: 'CheckRun', name: 'y', status: 'QUEUED' }).state, 'PENDING')
+  })
+})
+
+describe('parseActionsRunId', () => {
+  it('extracts the run id from an Actions detailsUrl', () => {
+    assert.equal(parseActionsRunId('https://github.com/owner/repo/actions/runs/987654321'), 987654321)
+    assert.equal(parseActionsRunId('https://github.com/owner/repo/actions/runs/123/job/456'), 123)
+  })
+
+  it('returns null for external CI or missing urls', () => {
+    assert.equal(parseActionsRunId('https://circleci.com/gh/owner/repo/42'), null)
+    assert.equal(parseActionsRunId('https://buildkite.com/owner/repo/builds/7'), null)
+    assert.equal(parseActionsRunId(undefined), null)
+    assert.equal(parseActionsRunId(''), null)
+  })
+})
+
+describe('buildMergeArgs', () => {
+  it('builds a plain squash merge', () => {
+    assert.deepEqual(buildMergeArgs(12, 'squash'), ['pr', 'merge', '12', '--squash'])
+  })
+
+  it('appends --auto and --delete-branch only when requested', () => {
+    assert.deepEqual(buildMergeArgs(3, 'merge', { auto: true, deleteBranch: true }),
+      ['pr', 'merge', '3', '--merge', '--auto', '--delete-branch'])
+    assert.deepEqual(buildMergeArgs(3, 'rebase', { auto: true }), ['pr', 'merge', '3', '--rebase', '--auto'])
+    assert.deepEqual(buildMergeArgs(3, 'rebase', {}), ['pr', 'merge', '3', '--rebase'])
   })
 })

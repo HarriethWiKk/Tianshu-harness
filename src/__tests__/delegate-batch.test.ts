@@ -4,6 +4,7 @@ import { createDelegateBatchTool, progressiveTaskCap } from '../tools/delegate-b
 import type { CoordinatorRun, DelegationRequest } from '../agent/coordinator.js'
 import { profileRegistry } from '../agent/profile-registry.js'
 import { WORKER_EXIT_GRACE_MS } from '../agent/timeout-ladder.js'
+import { MAX_BUDGET_CONTINUATIONS } from '../agent/worker-continuation.js'
 import type { ClaimProposal } from '../context/claims.js'
 
 function makeFiveTasks(): Array<{ objective: string; kind: string; profile: string }> {
@@ -139,23 +140,26 @@ describe('delegate_batch tool', () => {
   describe('progressive timeout', () => {
     const base = { input: {}, toolUseId: 'tu', cwd: '/tmp' }
     const GRACE = WORKER_EXIT_GRACE_MS
+    // 预算耗尽自动续跑，每一轮都是一次带完整 budget 的 runWorker——外层必须覆盖
+    // 最坏运行次数，否则续跑撞上工具层硬 reject，连首轮 partial 都一起丢。
+    const RUNS = 1 + MAX_BUDGET_CONTINUATIONS
 
-    it('returns 120s+grace for turn 0-1 (cold open)', () => {
+    it('returns 120s × runs + grace for turn 0-1 (cold open)', () => {
       const tool = createDelegateBatchTool({ delegateBatch: async () => ({ status: 'completed', results: [], packet: '' }) as CoordinatorRun })
-      assert.equal(tool.timeoutMs?.({ ...base, sessionTurnCount: 0 }), 120_000 + GRACE)
-      assert.equal(tool.timeoutMs?.({ ...base, sessionTurnCount: 1 }), 120_000 + GRACE)
+      assert.equal(tool.timeoutMs?.({ ...base, sessionTurnCount: 0 }), 120_000 * RUNS + GRACE)
+      assert.equal(tool.timeoutMs?.({ ...base, sessionTurnCount: 1 }), 120_000 * RUNS + GRACE)
     })
 
-    it('returns 240s+grace for turn 2-4 (warming)', () => {
+    it('returns 240s × runs + grace for turn 2-4 (warming)', () => {
       const tool = createDelegateBatchTool({ delegateBatch: async () => ({ status: 'completed', results: [], packet: '' }) as CoordinatorRun })
-      assert.equal(tool.timeoutMs?.({ ...base, sessionTurnCount: 2 }), 240_000 + GRACE)
-      assert.equal(tool.timeoutMs?.({ ...base, sessionTurnCount: 4 }), 240_000 + GRACE)
+      assert.equal(tool.timeoutMs?.({ ...base, sessionTurnCount: 2 }), 240_000 * RUNS + GRACE)
+      assert.equal(tool.timeoutMs?.({ ...base, sessionTurnCount: 4 }), 240_000 * RUNS + GRACE)
     })
 
-    it('returns 480s+grace for turn 5+ (mature)', () => {
+    it('returns 480s × runs + grace for turn 5+ (mature)', () => {
       const tool = createDelegateBatchTool({ delegateBatch: async () => ({ status: 'completed', results: [], packet: '' }) as CoordinatorRun })
-      assert.equal(tool.timeoutMs?.({ ...base, sessionTurnCount: 5 }), 480_000 + GRACE)
-      assert.equal(tool.timeoutMs?.({ ...base, sessionTurnCount: 20 }), 480_000 + GRACE)
+      assert.equal(tool.timeoutMs?.({ ...base, sessionTurnCount: 5 }), 480_000 * RUNS + GRACE)
+      assert.equal(tool.timeoutMs?.({ ...base, sessionTurnCount: 20 }), 480_000 * RUNS + GRACE)
     })
 
     it('tiers are monotonically increasing', () => {
@@ -167,10 +171,10 @@ describe('delegate_batch tool', () => {
       assert.ok(warming < mature)
     })
 
-    it('defaults to mature (480s+grace) when sessionTurnCount is undefined', () => {
+    it('defaults to mature when sessionTurnCount is undefined', () => {
       const tool = createDelegateBatchTool({ delegateBatch: async () => ({ status: 'completed', results: [], packet: '' }) as CoordinatorRun })
-      assert.equal(tool.timeoutMs?.(base), 480_000 + GRACE)
-      assert.equal(tool.timeoutMs?.(), 480_000 + GRACE)
+      assert.equal(tool.timeoutMs?.(base), 480_000 * RUNS + GRACE)
+      assert.equal(tool.timeoutMs?.(), 480_000 * RUNS + GRACE)
     })
   })
 

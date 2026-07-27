@@ -3,11 +3,27 @@ import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { DANGEROUS_BASH_PATTERNS } from '../agent/approval-risk.js'
-import type { Tool, ToolCallParams } from './types.js'
+import type { Tool, ToolCallParams, ToolResult } from './types.js'
 import { track } from './process-tracker.js'
 import { killProcessTree } from './process-kill.js'
 import { getShellCommand, getShellDiagnostics, WinStreamDecoder, rewriteWindowsNullRedirect, rewritePowershellNullRedirect } from '../platform.js'
 import { wrapSandboxCommand as sandboxWrap } from './sandbox-profile.js'
+import type { SandboxBackendKind } from './sandbox-profile.js'
+import { classifySandboxDenial, buildSandboxDenialHint, recordSandboxLearn } from './sandbox-diagnose.js'
+import type { SandboxDenial } from './sandbox-diagnose.js'
+import { grantPath } from './path-grants.js'
+import { rivetHome } from '../config/paths.js'
+
+/**
+ * ToolResult plus the sandbox attribution that the learn-mode retry inspects.
+ * Declared rather than inferred: executeBashOnce's early-return branches
+ * (client-terminal delegate, background job) never carry the field, so an
+ * inferred union would make `first.sandboxDenial` a type error. Optional here,
+ * and extending ToolResult keeps the value assignable to the Tool contract.
+ */
+interface BashExecResult extends ToolResult {
+  sandboxDenial?: SandboxDenial | null
+}
 import { persistRawOutput, buildModelOutput, buildUiOutput } from './output-store.js'
 import { applyCommandFilter } from './command-filters.js'
 import { denoiseWindowsError } from './powershell-filter.js'
@@ -215,9 +231,21 @@ export function buildAssemblyFailureResult(
  * Wrap a command in a workspace-scoped sandbox. Default-OFF.
  * Enable with RIVET_SANDBOX=1.
  */
-export function wrapSandboxCommand(command: string, cwd?: string): { command: string; sandboxed: boolean; note?: string } {
+export function wrapSandboxCommand(command: string, cwd?: string): {
+  command: string
+  sandboxed: boolean
+  backend: SandboxBackendKind
+  note?: string
+  writableRoots?: readonly string[]
+} {
   const decision = sandboxWrap(command, { cwd: cwd ?? process.cwd() })
-  return { command: decision.command, sandboxed: decision.sandboxed, note: decision.note }
+  return {
+    command: decision.command,
+    sandboxed: decision.sandboxed,
+    backend: decision.backend,
+    note: decision.note,
+    writableRoots: decision.writableRoots,
+  }
 }
 
 /**
@@ -407,6 +435,442 @@ export function isLongRunner(command: string): boolean {
   return LONG_RUNNER_PATTERNS.some((p) => p.test(command))
 }
 
+/** One full attempt. Extracted verbatim so execute() can retry it in learn mode. */
+async function executeBashOnce(params: ToolCallParams): Promise<BashExecResult> {
+  const rawCommand = params.input.command as string
+  const rewritten = rtkRewrite(rawCommand, params.toolUseId)
+  const mirrorConfig = loadConfig({ cwd: params.cwd }).mirrors
+  const rewrittenWithMirrors = rewriteGitHubUrls(rewritten, mirrorConfig)
+  const sandbox = wrapSandboxCommand(rewrittenWithMirrors, params.cwd)
+  const command = sandbox.command
+  const timeout = (params.input.timeout as number) ?? 120_000
+  const startTime = Date.now()
+
+  // Background path: explicit run_in_background=true, or auto-detected long-runner
+  // (unless explicitly disabled). Requires a session job registry (server / TUI
+  // with sessionId); otherwise falls through to normal foreground execution.
+  const explicitBg = params.input.run_in_background
+  const wantBackground = explicitBg === true || (explicitBg !== false && isLongRunner(rawCommand))
+  // E4 — foreground only: visible-terminal landing. Background jobs stay local.
+  if (!wantBackground && params.onClientDelegate) {
+    const delegated = await tryClientTerminalExec(params, command, params.cwd)
+    if (delegated) {
+      return {
+        ...delegatedToToolResult(delegated),
+        command: rawCommand,
+      }
+    }
+  }
+  if (wantBackground && params.jobs) {
+    const mirrorEnv = buildMirrorEnv(mirrorConfig)
+    const earlyFailEnv = gitCloneEarlyFailEnv(rawCommand, mirrorConfig)
+    const env = { ...sanitizeEnv(getResolvedEnv(params.cwd)), ...mirrorEnv, ...earlyFailEnv }
+    const snap = params.jobs.spawn({ command, rawCommand, cwd: params.cwd, env })
+    const auto = explicitBg !== true
+    const sandboxNote = sandbox.sandboxed && sandbox.note ? `\n${sandbox.note}` : ''
+    const content =
+      `[job:${snap.id}] ${auto ? '已自动转入后台' : '已在后台启动'}: ${rawCommand}\n` +
+      `不阻塞当前轮次。用 job(action="await", id="${snap.id}", pattern="Ready|listening|compiled") 等待就绪/退出，` +
+      `job(action="logs", id="${snap.id}") 看输出，job(action="kill", id="${snap.id}") 终止。${sandboxNote}`
+    const shortCmd = rawCommand.length > 80 ? rawCommand.slice(0, 80) + '…' : rawCommand
+    return Promise.resolve({
+      content,
+      uiContent: `▶ 后台任务 ${snap.id}: ${shortCmd}`,
+      isError: false,
+      command: rawCommand,
+    })
+  }
+
+  return new Promise((resolve) => {
+    const shell = getShellCommand()
+    // Wrap by shell FAMILY (not fragile cmd-string matching): Git Bash needs
+    // no encoding prefix (UTF-8 native) but must not emit literal `nul` files;
+    // PowerShell needs UTF-8 console encoding; cmd needs no prefix (WinStreamDecoder
+    // auto-detects GBK vs UTF-8 on the first chunk).
+    let commandToRun = command
+    if (shell.kind === 'bash') {
+      commandToRun = rewriteWindowsNullRedirect(command)
+    } else if (shell.kind === 'powershell') {
+      // Normalize stray `2>nul`/`2>/dev/null` (bash/cmd habit) → `2>$null`
+      // before prefixing the UTF-8 encoding setup.
+      commandToRun = `$OutputEncoding = [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; ${rewritePowershellNullRedirect(command)}`
+    } else if (shell.kind === 'cmd') {
+      // NOTE: removed `chcp 65001 > nul &&` prefix — the `nul` device redirect
+      // fails in sandboxed/WSL Windows environments (exit=1, empty stdout).
+      // WinStreamDecoder already auto-detects GBK vs UTF-8 on the first chunk,
+      // so the explicit chcp is unnecessary.
+      commandToRun = command
+    }
+
+    const mirrorEnv = buildMirrorEnv(mirrorConfig)
+    const earlyFailEnv = gitCloneEarlyFailEnv(rawCommand, mirrorConfig)
+    debugLog(`[bash-spawn] kind=${shell.kind} shell=${shell.cmd} args=${JSON.stringify(shell.args)} cwd=${params.cwd ?? process.cwd()}`)
+    const child = track(spawn(shell.cmd, [...shell.args, commandToRun], {
+      cwd: params.cwd,
+      env: { ...sanitizeEnv(getResolvedEnv(params.cwd)), ...mirrorEnv, ...earlyFailEnv },
+      stdio: ['ignore', 'pipe', 'pipe'],
+      // detached: true breaks stdio pipes on Windows cmd.exe — the new
+      // console created in detached mode doesn't connect back to the parent's
+      // pipes, causing all commands to return exit=0 with empty output.
+      detached: process.platform !== 'win32',
+      // Hide the transient console window on Windows (no-op elsewhere) — also
+      // avoids stdio handoff quirks in some Windows environments.
+      windowsHide: true,
+    }))
+
+    let stdout = ''
+    let stderr = ''
+    let timedOut = false
+    let stdoutTruncated = false
+    let stderrTruncated = false
+    let stdoutRawBytes = 0
+    let stderrRawBytes = 0
+
+    const stdoutDecoder = new WinStreamDecoder()
+    const stderrDecoder = new WinStreamDecoder()
+    const uiOutput = new OutputStreamBudget({
+      emit: (text) => params.onOutput?.(text),
+      maxVisible: 64 * 1024,
+    })
+    // W1-A1: capture the raw stream (arrival order, both streams) BEFORE the
+    // in-memory preview truncation below — persistence must not consume the
+    // tail-truncated preview buffer.
+    const rawSpool = new BoundedRawSpool()
+
+    child.stdout!.on('data', (data: Buffer) => {
+      const text = stdoutDecoder.write(data)
+      stdoutRawBytes += data.length
+      rawSpool.append(text)
+      stdout += text
+      uiOutput.push(text)
+      if (stdout.length > 32_000) {
+        if (!stdoutTruncated) {
+          stdoutTruncated = true
+        }
+        stdout = stdout.slice(-24_000)
+      }
+    })
+
+    child.stderr!.on('data', (data: Buffer) => {
+      const text = stderrDecoder.write(data)
+      stderrRawBytes += data.length
+      rawSpool.append(text)
+      stderr += text
+      uiOutput.push(text)
+      if (stderr.length > 32_000) {
+        stderrTruncated = true
+        stderr = stderr.slice(-24_000)
+      }
+    })
+
+    const buildResult = async (code: number, isTimeout = false) => {
+      const stdoutTail = stdoutDecoder.end()
+      const stderrTail = stderrDecoder.end()
+      stdout += stdoutTail
+      stderr += stderrTail
+      rawSpool.append(stdoutTail)
+      rawSpool.append(stderrTail)
+      uiOutput.push(stdoutTail)
+      uiOutput.push(stderrTail)
+      uiOutput.flush()
+      uiOutput.dispose()
+      // Shell 降级一次性警告（session 首次）：Windows 上 Git Bash 缺失时 fallback 到
+      // PowerShell/cmd，告诉模型/用户根因，避免"命令大面积失败但不知为什么"。
+      let shellFallbackNote = ''
+      if (!_shellFallbackWarned) {
+        const diag = getShellDiagnostics()
+        if (diag.fallbackReason) {
+          _shellFallbackWarned = true
+          shellFallbackNote = `⚠ ${diag.fallbackReason}\n` +
+            `建议：安装 Git for Windows（https://git-scm.com）或设置 RIVET_GIT_BASH_PATH 指向 bash.exe。\n`
+        }
+      }
+      const truncNote = stdoutTruncated
+        ? `[stdout truncated: output exceeded 32KB (${stdoutRawBytes} bytes total), showing last 24KB — full output at rawPath below]\n`
+        : ''
+      const stderrNote = stderrTruncated
+        ? `[stderr truncated: output exceeded 32KB, showing last 24KB]\n`
+        : ''
+      const raw = truncNote + stderrNote + stdout + (stderr ? '\n' + stderr : '')
+      const totalRawBytes = stdoutRawBytes + stderrRawBytes
+      // W1-A1: persistence consumes the spool (complete within the cap), not
+      // the tail-truncated preview buffer. Beyond the cap we declare honestly.
+      const capNote = rawSpool.capped
+        ? `[raw capture capped at ${RAW_SPOOL_CAP_BYTES} bytes (stream total ${totalRawBytes} bytes) — content beyond the cap was NOT captured]\n`
+        : ''
+      const persistedRaw = capNote + rawSpool.content()
+      // Persistence failure must degrade honestly (no rawPath, no silent loss
+      // claim) instead of rejecting the whole tool call.
+      const persistRawSafe = async (): Promise<string | undefined> => {
+        try {
+          return await persistRawOutput(params.toolUseId, persistedRaw)
+        } catch (e) {
+          debugLog(`[bash-raw-persist-failed] ${e instanceof Error ? e.message : String(e)}`)
+          return undefined
+        }
+      }
+      const totalRawLines = raw.split('\n').length - (truncNote ? truncNote.split('\n').length - 1 : 0) - (stderrNote ? stderrNote.split('\n').length - 1 : 0)
+      const durationMs = Date.now() - startTime
+      const exitCode = isTimeout ? -1 : code
+      debugLog(`[bash-done] exit=${exitCode} stdoutBytes=${stdoutRawBytes} stderrBytes=${stderrRawBytes} durationMs=${durationMs}`)
+      // When rtk rewrote the command (e.g. `ls` → `rtk ls`), surface the
+      // EXECUTED command in the result header. Hiding the rewrite let a
+      // filtered `rtk ls` "(empty)" result masquerade as native ls output —
+      // the model concluded existing files were lost and rewrote them
+      // (session 4df36bcd). The header must never claim a command ran when
+      // a different one did.
+      const headerCommand = rewritten !== rawCommand ? rewritten : rawCommand
+      const meta = { command: headerCommand, exitCode, durationMs }
+      const { isError, errorClass } = classifyBashOutcome(exitCode, stderr, process.platform === 'win32')
+      // Sandbox attribution: a bare "Operation not permitted" sends the model
+      // into a sudo/chmod retry loop. Name the path and route it to
+      // request_path_access instead. Computed before the modelBody branches
+      // because a denial can land in either (exit 1 for a refused redirect,
+      // exit 127 for a bwrap construction failure).
+      //
+      // Gate on exitCode, NOT isError: a refused shell redirect exits 1, and
+      // isExecFailure only recognizes -1/126/127/>128 — so classifyBashOutcome
+      // calls that case benign. Gating on isError would silently drop the most
+      // common denial shape.
+      const sandboxDenial = sandbox.sandboxed && exitCode !== 0
+        ? classifySandboxDenial({
+            stderr,
+            backend: sandbox.backend,
+            writableRoots: sandbox.writableRoots ?? [],
+          })
+        : null
+      // P1: Command-Aware filtering — apply before content construction so the
+      // model sees a condensed, semantically-relevant version. Raw output is
+      // still persisted for artifact recovery.
+      const commandFiltered = applyCommandFilter(rawCommand, raw, code) ?? raw
+      // Windows: strip PowerShell/cmd error noise (CategoryInfo/FullyQualifiedErrorId/
+      // carets) and prepend a recovery hint for command-not-found so the wall of red
+      // text neither pollutes context nor misleads the model into self-assessed failure.
+      let filtered = process.platform === 'win32'
+        ? denoiseWindowsError(commandFiltered, { exitCode, errorClass, command: rawCommand })
+        : commandFiltered
+      // POSIX / macOS / Linux: append install guidance for missing python/git/uv.
+      if (errorClass === 'environment' && process.platform !== 'win32') {
+        filtered += buildNotFoundHint(extractMissingCommand(filtered, rawCommand), process.platform)
+      }
+      const rereadWarn = checkBashReread(rawCommand, params.toolUseId)
+
+      // Empty stdout on success must NOT be back-filled with a synthetic
+      // "Exit code: 0" body. Doing so rendered as "lines=1 — output complete\n
+      // Exit code: 0", which the model (especially on Windows, where it already
+      // distrusts bash) misreads as "output was swallowed / bash is a no-op" —
+      // the documented doom-loop trigger (writes & `… > file` redirects produce
+      // no stdout, so this hit constantly). Pass empty through so buildModelOutput
+      // emits the explicit "confirmed empty" marker instead. Failures/timeouts
+      // keep a synthetic body so the reason is never blank.
+      // environment 类失败（127/126/9009 = 命令缺失/不可执行）：给模型标准化简洁体，
+      // 不把整墙红字灌进上下文（会污染前缀缓存、误导模型自判"代码出错"）。完整原文仍走
+      // uiContent（buildUiOutput(filtered)），用户在 TUI 能看到全部。
+      let modelBody: string
+      if (errorClass === 'environment') {
+        const missing = extractMissingCommand(filtered, rawCommand)
+        const notFound = exitCode === 127 || exitCode === 9009
+        const reason = notFound
+          ? `command not found${missing ? `: ${missing}` : ''}`
+          : exitCode === 126
+            ? 'command found but not executable (permission denied)'
+            : `environment error (exit ${exitCode})`
+        const hint = buildNotFoundHint(missing, process.platform)
+        modelBody = `环境/配置问题：${reason}。属环境/依赖缺失，非代码缺陷——请修复环境后重试，勿反复重跑相同命令。${hint}`
+      } else {
+        modelBody = filtered || (isTimeout ? '命令超时。' : code === 0 ? '' : `退出码：${code}`)
+      }
+      if (sandboxDenial) modelBody = buildSandboxDenialHint(sandboxDenial) + '\n\n' + modelBody
+
+      // Use ArtifactStore if available (preferred); otherwise fall back to output-store.
+      // Skip persistRawOutput in artifact mode — ArtifactStore owns raw persistence,
+      // so we don't double-write to output-store/.
+      if (params.artifactStore) {
+        // Skip artifact wrapping for output small enough that prune won't touch it.
+        // Critical for bash: a `cat file.ts` or `sed -n '1,200p'` returns a few KB,
+        // and wrapping that in [artifact:X] makes the model think the output was
+        // truncated even though it has the whole thing in modelOutput. Tianshu's
+        // post-mortem: every bash result became "[artifact:X] ... use read_section"
+        // → the model started writing /tmp files just to escape the artifact loop.
+        const artifactThreshold = getToolArtifactThreshold('bash', params.contextWindow)
+        const wrapInArtifact = filtered.length >= artifactThreshold
+
+        if (!wrapInArtifact) {
+          debugLog(`[artifact-skip] tool=bash cmd=${rawCommand.slice(0, 60)} raw=${raw.length} threshold=${artifactThreshold}`)
+          const rawPath = await persistRawSafe()
+          const baseContent = buildModelOutput(modelBody, { ...meta, rawPath })
+          const prefix = shellFallbackNote + (rereadWarn ? rereadWarn + '\n' : '')
+          return {
+            content: prefix ? prefix + baseContent : baseContent,
+            uiContent: buildUiOutput(filtered, meta),
+            rawPath,
+            isError,
+            errorClass,
+            errorKind: toErrorKind(errorClass),
+            lossiness: (stdoutTruncated || stderrTruncated) ? 'truncated' as const : 'lossless' as const,
+            rawBytes: totalRawBytes,
+            rawLines: totalRawLines,
+            exitCode,
+            command: rawCommand,
+            sandboxDenial,
+          }
+        }
+
+        debugLog(`[artifact-wrap] tool=bash cmd=${rawCommand.slice(0, 60)} raw=${raw.length} threshold=${artifactThreshold}`)
+        const { summary, sections } = summarizeBashOutput(filtered, rawCommand, exitCode)
+        const artifactId = await params.artifactStore.save({
+          tool: 'bash',
+          target: rawCommand,
+          rawContent: persistedRaw,
+          summary,
+          sections,
+        })
+        const artifact = params.artifactStore.get(artifactId)
+        // Even when wrapping, prepend the model-formatted output so the model
+        // sees the head/tail directly — the [artifact:X] marker is a back-up
+        // recovery path, not the only way to access content.
+        const lineCount = filtered.split('\n').length
+        const successFold = exitCode === 0 && lineCount > SUCCESS_INLINE_LINES
+        const modelOutput = successFold
+          ? `[${rawCommand}] exit=0 (${lineCount} lines) — success output folded, full output recoverable below`
+          : buildModelOutput(modelBody, meta)
+        const baseContent = `${modelOutput}\n\nUse read_section(artifactId="${artifactId}", section="L1-L500") to load full output if the head/tail above is not enough.\n[artifact:${artifactId}]`
+        const prefix = shellFallbackNote + (rereadWarn ? rereadWarn + '\n' : '')
+        return {
+          content: prefix ? prefix + baseContent : baseContent,
+          uiContent: buildUiOutput(filtered, meta),
+          rawPath: artifact?.rawPath,
+          isError,
+          errorClass,
+          errorKind: toErrorKind(errorClass),
+          lossiness: (stdoutTruncated || stderrTruncated) ? 'truncated' as const : 'lossless' as const,
+          rawBytes: totalRawBytes,
+          rawLines: totalRawLines,
+          exitCode,
+          command: rawCommand,
+          sandboxDenial,
+        }
+      }
+
+      const rawPath = await persistRawSafe()
+      const baseContent = buildModelOutput(modelBody, { ...meta, rawPath })
+      return {
+        content: rereadWarn ? rereadWarn + '\n' + baseContent : baseContent,
+        uiContent: buildUiOutput(filtered, meta),
+        rawPath,
+        isError,
+        errorClass,
+        errorKind: toErrorKind(errorClass),
+        lossiness: (stdoutTruncated || stderrTruncated) ? 'truncated' as const : 'lossless' as const,
+        rawBytes: totalRawBytes,
+        rawLines: totalRawLines,
+        exitCode,
+        command: rawCommand,
+        sandboxDenial,
+      }
+    }
+
+    let settled = false
+    let timer: ReturnType<typeof setTimeout> | null = null
+    let forceKillTimer: ReturnType<typeof setTimeout> | null = null
+
+    const signal = params.abortSignal
+    const cleanupAbort = () => {
+      if (signal) signal.removeEventListener('abort', onAbort)
+    }
+
+    const finish = async (code: number, isTimeout = false, clearForceKill = true) => {
+      if (settled) return
+      settled = true
+      if (timer) clearTimeout(timer)
+      if (clearForceKill && forceKillTimer) clearTimeout(forceKillTimer)
+      cleanupAbort()
+      // 结果装配兜底：buildResult 内任何异常（如 dist 混构导致的
+      // ReferenceError，session 22d00a37）从 child 事件处理器逃逸时不会变成
+      // promise rejection——execute() 永不 settle，只能等管线 120s 看门狗，
+      // 模型干等两分钟后拿到一句误导性的 "spawn 卡住"。异常必须降级为带
+      // 根因的工具结果：命令真实执行过、输出尾部在、错误可见。
+      try {
+        resolve(await buildResult(code, isTimeout))
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        debugLog(`[bash-buildResult-failed] exit=${code} ${msg}`)
+        const tail = (stdout + (stderr ? `\n${stderr}` : '')).slice(-2000)
+        resolve(buildAssemblyFailureResult(msg, code, tail))
+      }
+    }
+
+    // 用户中止（Esc/Ctrl+C → AgentLoop.abort → pipeline abortSignal）：
+    // 协作式取消——杀掉 detached 进程树（SIGTERM，3s 后 SIGKILL 兜底），立即 settle。
+    // 没有这一步，bash 子进程会在 abort 后继续在后台运行（detached），是会话"假死"
+    // 期间资源泄漏与副作用的来源。结果值本身可能被 withToolTimeout 的竞速丢弃，
+    // 真正的目的是确保进程被杀。
+    const onAbort = () => {
+      if (settled) return
+      settled = true
+      if (timer) clearTimeout(timer)
+      cleanupAbort()
+      killProcessTree(child, 'SIGTERM')
+      forceKillTimer = setTimeout(() => killProcessTree(child, 'SIGKILL'), 3000)
+      const stdoutTail = stdoutDecoder.end()
+      const stderrTail = stderrDecoder.end()
+      const finalStdout = stdout + stdoutTail
+      const finalStderr = stderr + stderrTail
+      uiOutput.push(stdoutTail)
+      uiOutput.push(stderrTail)
+      uiOutput.flush()
+      uiOutput.dispose()
+      const raw = finalStdout + (finalStderr ? '\n' + finalStderr : '')
+      resolve({
+        content: raw ? `[aborted] 命令被用户中止，部分输出:\n${raw.slice(-2000)}` : '命令被用户中止。',
+        uiContent: '⏹ aborted',
+        isError: false,
+      })
+    }
+    if (signal) {
+      if (signal.aborted) onAbort()
+      else signal.addEventListener('abort', onAbort, { once: true })
+    }
+
+    timer = setTimeout(() => {
+      timedOut = true
+      killProcessTree(child, 'SIGTERM')
+      forceKillTimer = setTimeout(() => killProcessTree(child, 'SIGKILL'), 3000)
+      void finish(0, true, false)
+    }, timeout)
+
+    child.on('close', (code) => {
+      void finish(code ?? 1, timedOut)
+    })
+
+    child.on('error', (err) => {
+      if (settled) return
+      settled = true
+      if (timer) clearTimeout(timer)
+      if (forceKillTimer) clearTimeout(forceKillTimer)
+      cleanupAbort()
+      uiOutput.flush()
+      uiOutput.dispose()
+      // spawn ENOENT（shell 二进制找不到）走环境分级——给根因而非裸 err.message。
+      const msg = err.message
+      if ('code' in err && (err as NodeJS.ErrnoException).code === 'ENOENT') {
+        const diag = getShellDiagnostics()
+        const hint = diag.fallbackReason
+          ? `\n${diag.fallbackReason}\n建议：设置 RIVET_GIT_BASH_PATH 环境变量指向 bash.exe，或安装 Git for Windows。`
+          : `\nShell 路径无效：${diag.cmd}。建议检查 shell 是否已安装。`
+        resolve({
+          content: `Shell 执行失败：找不到 shell 二进制 (${diag.cmd})。${hint}`,
+          isError: true,
+          errorClass: 'environment',
+          errorKind: 'missing_dep',
+        })
+        return
+      }
+      resolve({ content: msg, isError: true })
+    })
+  })
+}
+
 export const BASH_TOOL: Tool = {
   definition: {
     name: 'bash',
@@ -425,417 +889,42 @@ export const BASH_TOOL: Tool = {
   },
 
   async execute(params: ToolCallParams) {
-    const rawCommand = params.input.command as string
-    const rewritten = rtkRewrite(rawCommand, params.toolUseId)
-    const mirrorConfig = loadConfig({ cwd: params.cwd }).mirrors
-    const rewrittenWithMirrors = rewriteGitHubUrls(rewritten, mirrorConfig)
-    const sandbox = wrapSandboxCommand(rewrittenWithMirrors, params.cwd)
-    const command = sandbox.command
-    const timeout = (params.input.timeout as number) ?? 120_000
-    const startTime = Date.now()
+    const first = await executeBashOnce(params)
 
-    // Background path: explicit run_in_background=true, or auto-detected long-runner
-    // (unless explicitly disabled). Requires a session job registry (server / TUI
-    // with sessionId); otherwise falls through to normal foreground execution.
-    const explicitBg = params.input.run_in_background
-    const wantBackground = explicitBg === true || (explicitBg !== false && isLongRunner(rawCommand))
-    // E4 — foreground only: visible-terminal landing. Background jobs stay local.
-    if (!wantBackground && params.onClientDelegate) {
-      const delegated = await tryClientTerminalExec(params, command, params.cwd)
-      if (delegated) {
-        return {
-          ...delegatedToToolResult(delegated),
-          command: rawCommand,
-        }
-      }
-    }
-    if (wantBackground && params.jobs) {
-      const mirrorEnv = buildMirrorEnv(mirrorConfig)
-      const earlyFailEnv = gitCloneEarlyFailEnv(rawCommand, mirrorConfig)
-      const env = { ...sanitizeEnv(getResolvedEnv(params.cwd)), ...mirrorEnv, ...earlyFailEnv }
-      const snap = params.jobs.spawn({ command, rawCommand, cwd: params.cwd, env })
-      const auto = explicitBg !== true
-      const sandboxNote = sandbox.sandboxed && sandbox.note ? `\n${sandbox.note}` : ''
-      const content =
-        `[job:${snap.id}] ${auto ? '已自动转入后台' : '已在后台启动'}: ${rawCommand}\n` +
-        `不阻塞当前轮次。用 job(action="await", id="${snap.id}", pattern="Ready|listening|compiled") 等待就绪/退出，` +
-        `job(action="logs", id="${snap.id}") 看输出，job(action="kill", id="${snap.id}") 终止。${sandboxNote}`
-      const shortCmd = rawCommand.length > 80 ? rawCommand.slice(0, 80) + '…' : rawCommand
-      return Promise.resolve({
-        content,
-        uiContent: `▶ 后台任务 ${snap.id}: ${shortCmd}`,
-        isError: false,
-        command: rawCommand,
-      })
+    // learn mode: a boundary denial should teach, not block. Grant the refused
+    // path for this session, retry ONCE, and log the observation so the
+    // toolchain profile (sandbox-toolchain.ts) is filled from evidence rather
+    // than guesswork.
+    //
+    // NOT for production. The command prefix that ran before the denial runs a
+    // second time — non-idempotent work (network POSTs, appends, migrations)
+    // duplicates. Bounded to: learn mode only, at most one retry, and the
+    // duplication is declared in the result.
+    if (
+      process.env.RIVET_SANDBOX !== 'learn'
+      || !first.sandboxDenial
+      || first.sandboxDenial.paths.length === 0
+    ) {
+      return first
     }
 
-    return new Promise((resolve) => {
-      const shell = getShellCommand()
-      // Wrap by shell FAMILY (not fragile cmd-string matching): Git Bash needs
-      // no encoding prefix (UTF-8 native) but must not emit literal `nul` files;
-      // PowerShell needs UTF-8 console encoding; cmd needs no prefix (WinStreamDecoder
-      // auto-detects GBK vs UTF-8 on the first chunk).
-      let commandToRun = command
-      if (shell.kind === 'bash') {
-        commandToRun = rewriteWindowsNullRedirect(command)
-      } else if (shell.kind === 'powershell') {
-        // Normalize stray `2>nul`/`2>/dev/null` (bash/cmd habit) → `2>$null`
-        // before prefixing the UTF-8 encoding setup.
-        commandToRun = `$OutputEncoding = [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; ${rewritePowershellNullRedirect(command)}`
-      } else if (shell.kind === 'cmd') {
-        // NOTE: removed `chcp 65001 > nul &&` prefix — the `nul` device redirect
-        // fails in sandboxed/WSL Windows environments (exit=1, empty stdout).
-        // WinStreamDecoder already auto-detects GBK vs UTF-8 on the first chunk,
-        // so the explicit chcp is unnecessary.
-        commandToRun = command
-      }
+    for (const p of first.sandboxDenial.paths) grantPath(p, 'write')
+    recordSandboxLearn({
+      cwd: params.cwd,
+      command: String(params.input.command ?? ''),
+      backend: first.sandboxDenial.backend,
+      deniedPaths: first.sandboxDenial.paths,
+      retried: true,
+    }, rivetHome())
 
-      const mirrorEnv = buildMirrorEnv(mirrorConfig)
-      const earlyFailEnv = gitCloneEarlyFailEnv(rawCommand, mirrorConfig)
-      debugLog(`[bash-spawn] kind=${shell.kind} shell=${shell.cmd} args=${JSON.stringify(shell.args)} cwd=${params.cwd ?? process.cwd()}`)
-      const child = track(spawn(shell.cmd, [...shell.args, commandToRun], {
-        cwd: params.cwd,
-        env: { ...sanitizeEnv(getResolvedEnv(params.cwd)), ...mirrorEnv, ...earlyFailEnv },
-        stdio: ['ignore', 'pipe', 'pipe'],
-        // detached: true breaks stdio pipes on Windows cmd.exe — the new
-        // console created in detached mode doesn't connect back to the parent's
-        // pipes, causing all commands to return exit=0 with empty output.
-        detached: process.platform !== 'win32',
-        // Hide the transient console window on Windows (no-op elsewhere) — also
-        // avoids stdio handoff quirks in some Windows environments.
-        windowsHide: true,
-      }))
-
-      let stdout = ''
-      let stderr = ''
-      let timedOut = false
-      let stdoutTruncated = false
-      let stderrTruncated = false
-      let stdoutRawBytes = 0
-      let stderrRawBytes = 0
-
-      const stdoutDecoder = new WinStreamDecoder()
-      const stderrDecoder = new WinStreamDecoder()
-      const uiOutput = new OutputStreamBudget({
-        emit: (text) => params.onOutput?.(text),
-        maxVisible: 64 * 1024,
-      })
-      // W1-A1: capture the raw stream (arrival order, both streams) BEFORE the
-      // in-memory preview truncation below — persistence must not consume the
-      // tail-truncated preview buffer.
-      const rawSpool = new BoundedRawSpool()
-
-      child.stdout!.on('data', (data: Buffer) => {
-        const text = stdoutDecoder.write(data)
-        stdoutRawBytes += data.length
-        rawSpool.append(text)
-        stdout += text
-        uiOutput.push(text)
-        if (stdout.length > 32_000) {
-          if (!stdoutTruncated) {
-            stdoutTruncated = true
-          }
-          stdout = stdout.slice(-24_000)
-        }
-      })
-
-      child.stderr!.on('data', (data: Buffer) => {
-        const text = stderrDecoder.write(data)
-        stderrRawBytes += data.length
-        rawSpool.append(text)
-        stderr += text
-        uiOutput.push(text)
-        if (stderr.length > 32_000) {
-          stderrTruncated = true
-          stderr = stderr.slice(-24_000)
-        }
-      })
-
-      const buildResult = async (code: number, isTimeout = false) => {
-        const stdoutTail = stdoutDecoder.end()
-        const stderrTail = stderrDecoder.end()
-        stdout += stdoutTail
-        stderr += stderrTail
-        rawSpool.append(stdoutTail)
-        rawSpool.append(stderrTail)
-        uiOutput.push(stdoutTail)
-        uiOutput.push(stderrTail)
-        uiOutput.flush()
-        uiOutput.dispose()
-        // Shell 降级一次性警告（session 首次）：Windows 上 Git Bash 缺失时 fallback 到
-        // PowerShell/cmd，告诉模型/用户根因，避免"命令大面积失败但不知为什么"。
-        let shellFallbackNote = ''
-        if (!_shellFallbackWarned) {
-          const diag = getShellDiagnostics()
-          if (diag.fallbackReason) {
-            _shellFallbackWarned = true
-            shellFallbackNote = `⚠ ${diag.fallbackReason}\n` +
-              `建议：安装 Git for Windows（https://git-scm.com）或设置 RIVET_GIT_BASH_PATH 指向 bash.exe。\n`
-          }
-        }
-        const truncNote = stdoutTruncated
-          ? `[stdout truncated: output exceeded 32KB (${stdoutRawBytes} bytes total), showing last 24KB — full output at rawPath below]\n`
-          : ''
-        const stderrNote = stderrTruncated
-          ? `[stderr truncated: output exceeded 32KB, showing last 24KB]\n`
-          : ''
-        const raw = truncNote + stderrNote + stdout + (stderr ? '\n' + stderr : '')
-        const totalRawBytes = stdoutRawBytes + stderrRawBytes
-        // W1-A1: persistence consumes the spool (complete within the cap), not
-        // the tail-truncated preview buffer. Beyond the cap we declare honestly.
-        const capNote = rawSpool.capped
-          ? `[raw capture capped at ${RAW_SPOOL_CAP_BYTES} bytes (stream total ${totalRawBytes} bytes) — content beyond the cap was NOT captured]\n`
-          : ''
-        const persistedRaw = capNote + rawSpool.content()
-        // Persistence failure must degrade honestly (no rawPath, no silent loss
-        // claim) instead of rejecting the whole tool call.
-        const persistRawSafe = async (): Promise<string | undefined> => {
-          try {
-            return await persistRawOutput(params.toolUseId, persistedRaw)
-          } catch (e) {
-            debugLog(`[bash-raw-persist-failed] ${e instanceof Error ? e.message : String(e)}`)
-            return undefined
-          }
-        }
-        const totalRawLines = raw.split('\n').length - (truncNote ? truncNote.split('\n').length - 1 : 0) - (stderrNote ? stderrNote.split('\n').length - 1 : 0)
-        const durationMs = Date.now() - startTime
-        const exitCode = isTimeout ? -1 : code
-        debugLog(`[bash-done] exit=${exitCode} stdoutBytes=${stdoutRawBytes} stderrBytes=${stderrRawBytes} durationMs=${durationMs}`)
-        // When rtk rewrote the command (e.g. `ls` → `rtk ls`), surface the
-        // EXECUTED command in the result header. Hiding the rewrite let a
-        // filtered `rtk ls` "(empty)" result masquerade as native ls output —
-        // the model concluded existing files were lost and rewrote them
-        // (session 4df36bcd). The header must never claim a command ran when
-        // a different one did.
-        const headerCommand = rewritten !== rawCommand ? rewritten : rawCommand
-        const meta = { command: headerCommand, exitCode, durationMs }
-        const { isError, errorClass } = classifyBashOutcome(exitCode, stderr, process.platform === 'win32')
-        // P1: Command-Aware filtering — apply before content construction so the
-        // model sees a condensed, semantically-relevant version. Raw output is
-        // still persisted for artifact recovery.
-        const commandFiltered = applyCommandFilter(rawCommand, raw, code) ?? raw
-        // Windows: strip PowerShell/cmd error noise (CategoryInfo/FullyQualifiedErrorId/
-        // carets) and prepend a recovery hint for command-not-found so the wall of red
-        // text neither pollutes context nor misleads the model into self-assessed failure.
-        let filtered = process.platform === 'win32'
-          ? denoiseWindowsError(commandFiltered, { exitCode, errorClass, command: rawCommand })
-          : commandFiltered
-        // POSIX / macOS / Linux: append install guidance for missing python/git/uv.
-        if (errorClass === 'environment' && process.platform !== 'win32') {
-          filtered += buildNotFoundHint(extractMissingCommand(filtered, rawCommand), process.platform)
-        }
-        const rereadWarn = checkBashReread(rawCommand, params.toolUseId)
-
-        // Empty stdout on success must NOT be back-filled with a synthetic
-        // "Exit code: 0" body. Doing so rendered as "lines=1 — output complete\n
-        // Exit code: 0", which the model (especially on Windows, where it already
-        // distrusts bash) misreads as "output was swallowed / bash is a no-op" —
-        // the documented doom-loop trigger (writes & `… > file` redirects produce
-        // no stdout, so this hit constantly). Pass empty through so buildModelOutput
-        // emits the explicit "confirmed empty" marker instead. Failures/timeouts
-        // keep a synthetic body so the reason is never blank.
-        // environment 类失败（127/126/9009 = 命令缺失/不可执行）：给模型标准化简洁体，
-        // 不把整墙红字灌进上下文（会污染前缀缓存、误导模型自判"代码出错"）。完整原文仍走
-        // uiContent（buildUiOutput(filtered)），用户在 TUI 能看到全部。
-        let modelBody: string
-        if (errorClass === 'environment') {
-          const missing = extractMissingCommand(filtered, rawCommand)
-          const notFound = exitCode === 127 || exitCode === 9009
-          const reason = notFound
-            ? `command not found${missing ? `: ${missing}` : ''}`
-            : exitCode === 126
-              ? 'command found but not executable (permission denied)'
-              : `environment error (exit ${exitCode})`
-          const hint = buildNotFoundHint(missing, process.platform)
-          modelBody = `环境/配置问题：${reason}。属环境/依赖缺失，非代码缺陷——请修复环境后重试，勿反复重跑相同命令。${hint}`
-        } else {
-          modelBody = filtered || (isTimeout ? '命令超时。' : code === 0 ? '' : `退出码：${code}`)
-        }
-
-        // Use ArtifactStore if available (preferred); otherwise fall back to output-store.
-        // Skip persistRawOutput in artifact mode — ArtifactStore owns raw persistence,
-        // so we don't double-write to output-store/.
-        if (params.artifactStore) {
-          // Skip artifact wrapping for output small enough that prune won't touch it.
-          // Critical for bash: a `cat file.ts` or `sed -n '1,200p'` returns a few KB,
-          // and wrapping that in [artifact:X] makes the model think the output was
-          // truncated even though it has the whole thing in modelOutput. Tianshu's
-          // post-mortem: every bash result became "[artifact:X] ... use read_section"
-          // → the model started writing /tmp files just to escape the artifact loop.
-          const artifactThreshold = getToolArtifactThreshold('bash', params.contextWindow)
-          const wrapInArtifact = filtered.length >= artifactThreshold
-
-          if (!wrapInArtifact) {
-            debugLog(`[artifact-skip] tool=bash cmd=${rawCommand.slice(0, 60)} raw=${raw.length} threshold=${artifactThreshold}`)
-            const rawPath = await persistRawSafe()
-            const baseContent = buildModelOutput(modelBody, { ...meta, rawPath })
-            const prefix = shellFallbackNote + (rereadWarn ? rereadWarn + '\n' : '')
-            return {
-              content: prefix ? prefix + baseContent : baseContent,
-              uiContent: buildUiOutput(filtered, meta),
-              rawPath,
-              isError,
-              errorClass,
-              errorKind: toErrorKind(errorClass),
-              lossiness: (stdoutTruncated || stderrTruncated) ? 'truncated' as const : 'lossless' as const,
-              rawBytes: totalRawBytes,
-              rawLines: totalRawLines,
-              exitCode,
-              command: rawCommand,
-            }
-          }
-
-          debugLog(`[artifact-wrap] tool=bash cmd=${rawCommand.slice(0, 60)} raw=${raw.length} threshold=${artifactThreshold}`)
-          const { summary, sections } = summarizeBashOutput(filtered, rawCommand, exitCode)
-          const artifactId = await params.artifactStore.save({
-            tool: 'bash',
-            target: rawCommand,
-            rawContent: persistedRaw,
-            summary,
-            sections,
-          })
-          const artifact = params.artifactStore.get(artifactId)
-          // Even when wrapping, prepend the model-formatted output so the model
-          // sees the head/tail directly — the [artifact:X] marker is a back-up
-          // recovery path, not the only way to access content.
-          const lineCount = filtered.split('\n').length
-          const successFold = exitCode === 0 && lineCount > SUCCESS_INLINE_LINES
-          const modelOutput = successFold
-            ? `[${rawCommand}] exit=0 (${lineCount} lines) — success output folded, full output recoverable below`
-            : buildModelOutput(modelBody, meta)
-          const baseContent = `${modelOutput}\n\nUse read_section(artifactId="${artifactId}", section="L1-L500") to load full output if the head/tail above is not enough.\n[artifact:${artifactId}]`
-          const prefix = shellFallbackNote + (rereadWarn ? rereadWarn + '\n' : '')
-          return {
-            content: prefix ? prefix + baseContent : baseContent,
-            uiContent: buildUiOutput(filtered, meta),
-            rawPath: artifact?.rawPath,
-            isError,
-            errorClass,
-            errorKind: toErrorKind(errorClass),
-            lossiness: (stdoutTruncated || stderrTruncated) ? 'truncated' as const : 'lossless' as const,
-            rawBytes: totalRawBytes,
-            rawLines: totalRawLines,
-            exitCode,
-            command: rawCommand,
-          }
-        }
-
-        const rawPath = await persistRawSafe()
-        const baseContent = buildModelOutput(modelBody, { ...meta, rawPath })
-        return {
-          content: rereadWarn ? rereadWarn + '\n' + baseContent : baseContent,
-          uiContent: buildUiOutput(filtered, meta),
-          rawPath,
-          isError,
-          errorClass,
-          errorKind: toErrorKind(errorClass),
-          lossiness: (stdoutTruncated || stderrTruncated) ? 'truncated' as const : 'lossless' as const,
-          rawBytes: totalRawBytes,
-          rawLines: totalRawLines,
-          exitCode,
-          command: rawCommand,
-        }
-      }
-
-      let settled = false
-      let timer: ReturnType<typeof setTimeout> | null = null
-      let forceKillTimer: ReturnType<typeof setTimeout> | null = null
-
-      const signal = params.abortSignal
-      const cleanupAbort = () => {
-        if (signal) signal.removeEventListener('abort', onAbort)
-      }
-
-      const finish = async (code: number, isTimeout = false, clearForceKill = true) => {
-        if (settled) return
-        settled = true
-        if (timer) clearTimeout(timer)
-        if (clearForceKill && forceKillTimer) clearTimeout(forceKillTimer)
-        cleanupAbort()
-        // 结果装配兜底：buildResult 内任何异常（如 dist 混构导致的
-        // ReferenceError，session 22d00a37）从 child 事件处理器逃逸时不会变成
-        // promise rejection——execute() 永不 settle，只能等管线 120s 看门狗，
-        // 模型干等两分钟后拿到一句误导性的 "spawn 卡住"。异常必须降级为带
-        // 根因的工具结果：命令真实执行过、输出尾部在、错误可见。
-        try {
-          resolve(await buildResult(code, isTimeout))
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err)
-          debugLog(`[bash-buildResult-failed] exit=${code} ${msg}`)
-          const tail = (stdout + (stderr ? `\n${stderr}` : '')).slice(-2000)
-          resolve(buildAssemblyFailureResult(msg, code, tail))
-        }
-      }
-
-      // 用户中止（Esc/Ctrl+C → AgentLoop.abort → pipeline abortSignal）：
-      // 协作式取消——杀掉 detached 进程树（SIGTERM，3s 后 SIGKILL 兜底），立即 settle。
-      // 没有这一步，bash 子进程会在 abort 后继续在后台运行（detached），是会话"假死"
-      // 期间资源泄漏与副作用的来源。结果值本身可能被 withToolTimeout 的竞速丢弃，
-      // 真正的目的是确保进程被杀。
-      const onAbort = () => {
-        if (settled) return
-        settled = true
-        if (timer) clearTimeout(timer)
-        cleanupAbort()
-        killProcessTree(child, 'SIGTERM')
-        forceKillTimer = setTimeout(() => killProcessTree(child, 'SIGKILL'), 3000)
-        const stdoutTail = stdoutDecoder.end()
-        const stderrTail = stderrDecoder.end()
-        const finalStdout = stdout + stdoutTail
-        const finalStderr = stderr + stderrTail
-        uiOutput.push(stdoutTail)
-        uiOutput.push(stderrTail)
-        uiOutput.flush()
-        uiOutput.dispose()
-        const raw = finalStdout + (finalStderr ? '\n' + finalStderr : '')
-        resolve({
-          content: raw ? `[aborted] 命令被用户中止，部分输出:\n${raw.slice(-2000)}` : '命令被用户中止。',
-          uiContent: '⏹ aborted',
-          isError: false,
-        })
-      }
-      if (signal) {
-        if (signal.aborted) onAbort()
-        else signal.addEventListener('abort', onAbort, { once: true })
-      }
-
-      timer = setTimeout(() => {
-        timedOut = true
-        killProcessTree(child, 'SIGTERM')
-        forceKillTimer = setTimeout(() => killProcessTree(child, 'SIGKILL'), 3000)
-        void finish(0, true, false)
-      }, timeout)
-
-      child.on('close', (code) => {
-        void finish(code ?? 1, timedOut)
-      })
-
-      child.on('error', (err) => {
-        if (settled) return
-        settled = true
-        if (timer) clearTimeout(timer)
-        if (forceKillTimer) clearTimeout(forceKillTimer)
-        cleanupAbort()
-        uiOutput.flush()
-        uiOutput.dispose()
-        // spawn ENOENT（shell 二进制找不到）走环境分级——给根因而非裸 err.message。
-        const msg = err.message
-        if ('code' in err && (err as NodeJS.ErrnoException).code === 'ENOENT') {
-          const diag = getShellDiagnostics()
-          const hint = diag.fallbackReason
-            ? `\n${diag.fallbackReason}\n建议：设置 RIVET_GIT_BASH_PATH 环境变量指向 bash.exe，或安装 Git for Windows。`
-            : `\nShell 路径无效：${diag.cmd}。建议检查 shell 是否已安装。`
-          resolve({
-            content: `Shell 执行失败：找不到 shell 二进制 (${diag.cmd})。${hint}`,
-            isError: true,
-            errorClass: 'environment',
-            errorKind: 'missing_dep',
-          })
-          return
-        }
-        resolve({ content: msg, isError: true })
-      })
-    })
+    // The retry re-enters executeBashOnce, which re-wraps the command —
+    // defaultWritableRoots is recomputed per wrap, so the grants just recorded
+    // are already in the new profile.
+    const second = await executeBashOnce(params)
+    const banner =
+      `[sandbox learn] 首次执行被写边界拒绝，已临时授权 ${first.sandboxDenial.paths.join(', ')} 并重跑一次。` +
+      `注意：首次执行在被拒之前产生的副作用可能已重复发生。\n\n`
+    return { ...second, content: banner + second.content }
   },
 
   requiresApproval(params: ToolCallParams): boolean {

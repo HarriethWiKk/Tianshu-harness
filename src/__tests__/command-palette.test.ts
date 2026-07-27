@@ -30,17 +30,15 @@ describe('filterCommands', () => {
     assert.equal(result[0]!.name, 'model')
   })
 
-  it('includes discoverable surface entries with palette hotkeys', () => {
+  it('includes discoverable surface entries, none claiming an unbound hotkey', () => {
     const surfaces = getPaletteCommands().filter(c => c.category === 'surface')
     assert.deepEqual(
-      surfaces.map(c => [c.name, c.hotkey]),
-      [
-        ['__surface:cockpit', 'c'],
-        ['__surface:pager', 'p'],
-        ['__surface:starmap', 's'],
-        ['__surface:chronicle', 'h'],
-      ]
+      surfaces.map(c => c.name),
+      ['__surface:cockpit', '__surface:pager', '__surface:starmap', '__surface:chronicle'],
     )
+    // 键位提示只能标真的能按的键。面板把可打印字符全导向过滤框，单字母 hotkey
+    // 无消费方——渲染出来就是骗用户按一个不响应的键。
+    assert.deepEqual(surfaces.filter(c => c.hotkey !== undefined), [])
   })
 
   it('includes plan close and team command entries', () => {

@@ -38,3 +38,12 @@ test('every domain entry carries a non-empty essence + meta', () => {
   assert.ok(tianshu.essence.length > 0)
   assert.ok(tianshu.meta.length > 0)
 })
+
+test('built-in domain entries carry founder + expertise from genesis data', () => {
+  const entries = buildDomainPickerEntries(undefined)
+  const tianshu = entries.find((e) => e.key === 'tianshu')!
+  assert.equal(tianshu.founder, 'GPT-5.5')
+  assert.ok(tianshu.expertise && tianshu.expertise.length >= 10)
+  const auto = entries.find((e) => e.key === 'auto')!
+  assert.equal(auto.founder, undefined, 'Auto 无创始星')
+})

@@ -4,17 +4,20 @@
  * 数据来源：
  * - liveView（FleetRegistry）→ profile、authority、status、elapsed、activityLog
  * - ~/.rivet/subagents/<workerId>.json（loadPersistedResult）→ result summary / changed files / artifacts / usage
+ * - ~/.rivet/subagents/<workerId>.<nonce>.json（listPersistedResultRounds）→ 稳定 id 复用时的逐轮归档
  * - ~/.rivet/sessions/<slug>/worker-<id>.jsonl（SessionPersist.loadOai）→ 完整对话转录
  */
 
 import { SessionPersist, getSessionDir } from '../agent/session-persist.js'
-import { loadPersistedResult } from '../agent/coordinator.js'
+import { listPersistedResultRounds, loadPersistedResult, loadPersistedResultRound } from '../agent/coordinator.js'
 import type { FleetWorkerView } from './fleet-registry.js'
 import type { TranscriptMessage } from './scrollback-transcript.js'
 import { parseScrollbackTranscript } from './scrollback-transcript.js'
 import type { OaiMessage } from '../api/oai-types.js'
 import { shortOrderLabel } from '../tools/worker-activity-stream.js'
-import { formatAuthorityLabel } from './format/profile-labels.js'
+import { formatAuthorityLabel, formatWorkerIdentity, statusWord } from './format/profile-labels.js'
+import { formatElapsed } from './worker-panel-model.js'
+import { formatWorkerResultDigest } from '../agent/worker-result-digest.js'
 
 const MAX_CONTENT_CHARS = 500
 
@@ -33,19 +36,12 @@ function formatTokens(usage?: { input_tokens?: number; output_tokens?: number; c
   return parts.join(' · ') || '-'
 }
 
-/** 诚实标签：根据 failureReason / evidenceStatus 返回人类可读的警告文本。 */
-function honestyLabel(failureReason?: string, evidenceStatus?: string): string | null {
-  switch (failureReason) {
-    case 'max_turns': return '预算耗尽 · 摘要可能不完整'
-    case 'json_parse': return '结果解析失败 · 已从碎片恢复'
-    case 'worker_crash': return 'Worker 异常终止'
-    case 'timeout': return 'Worker 超时'
-    case 'caller_aborted': return '已被取消'
-    case 'worker_blocked': return 'Worker 被阻断'
-    default: break
-  }
-  if (evidenceStatus === 'failed') return '验收证据验证失败'
-  return null
+/** 轮次归档时间：MM-DD HH:MM（mtime 缺失时占位）。 */
+function formatRoundTime(ms: number): string {
+  if (!ms) return '-- --:--'
+  const d = new Date(ms)
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
 }
 
 function formatOaiMessages(messages: OaiMessage[]): string {
@@ -109,38 +105,33 @@ export function buildWorkerDetailContent(
   const shortLabel = liveView?.shortLabel ?? shortOrderLabel(workerId)
   const lines: string[] = []
 
-  lines.push(`══ Worker ${shortLabel} ══`)
-  lines.push(`id: ${workerId}`)
-  if (liveView?.profile) lines.push(`profile: ${liveView.profile}`)
-  if (liveView?.authority) {
-    lines.push(`authority: ${formatAuthorityLabel(liveView.authority, liveView.authorityReason)}`)
+  lines.push(`══ 子代理 ${shortLabel} ══`)
+  const identity = liveView ? formatWorkerIdentity({ profile: liveView.profile, authority: liveView.authority }) : shortLabel
+  // 状态词/耗时与 fleet 行同口径（statusWord/formatElapsed），不再自造英文态 + 150s。
+  const statusText = liveView ? statusWord(liveView.status) : 'unknown'
+  const elapsedText = liveView?.elapsedMs !== undefined ? ` · ${formatElapsed(liveView.elapsedMs)}` : ''
+  lines.push(`${identity} · ${statusText}${elapsedText}`)
+  if (liveView?.contract?.objective) {
+    lines.push(`目标：${truncate(liveView.contract.objective)}`)
   }
-  const statusLineParts: string[] = []
-  statusLineParts.push(`status: ${liveView?.status ?? 'unknown'}`)
-  if (liveView?.elapsedMs !== undefined) {
-    const sec = Math.floor(liveView.elapsedMs / 1000)
-    statusLineParts.push(`elapsed: ${sec}s`)
-  }
-  lines.push(statusLineParts.join(' · '))
 
-  // ── 契约摘要（首条 running 事件携带） ──
+  // ── 参数（机械信息下沉）──
+  const paramLines: string[] = []
   if (liveView?.contract) {
     const c = liveView.contract
-    lines.push('')
-    lines.push('── Contract ──')
-    lines.push(`objective: ${truncate(c.objective)}`)
-    lines.push(`profile: ${c.profile} · tools: ${c.allowedToolsDigest}`)
-    if (c.authority) lines.push(`authority: ${formatAuthorityLabel(c.authority, c.authorityReason)}`)
-    lines.push(`budget: ${c.budget.maxTurns} turns · ${Math.floor(c.budget.timeoutMs / 1000)}s timeout`)
+    paramLines.push(`工具：${c.allowedToolsDigest}`)
+    paramLines.push(`预算：${c.budget.maxTurns} 轮 · ${Math.floor(c.budget.timeoutMs / 1000)}s`)
     if (c.scope.files?.length) {
-      lines.push(`scope: ${c.scope.files.slice(0, 5).join(', ')}${c.scope.files.length > 5 ? ` +${c.scope.files.length - 5}` : ''}`)
+      paramLines.push(`范围：${c.scope.files.slice(0, 5).join(', ')}${c.scope.files.length > 5 ? ` +${c.scope.files.length - 5}` : ''}`)
     }
   }
+  paramLines.push(`id: ${workerId}`)
+  if (liveView?.authority) paramLines.push(`星域：${formatAuthorityLabel(liveView.authority, liveView.authorityReason)}`)
 
   // ── 活动日志 ──
   if (liveView?.activityLog && liveView.activityLog.length > 0) {
     lines.push('')
-    lines.push('── Activity ──')
+    lines.push('── 活动 ──')
     for (const entry of liveView.activityLog) {
       lines.push(`  ${entry}`)
     }
@@ -150,58 +141,72 @@ export function buildWorkerDetailContent(
   const result = loadPersistedResult(workerId)
   if (result) {
     lines.push('')
-    lines.push('── Result ──')
-    lines.push(`status: ${result.status}`)
-    if (result.model) lines.push(`model: ${result.model}`)
-    if (result.provider) lines.push(`provider: ${result.provider}`)
-    if (result.usage) lines.push(`usage: ${formatTokens(result.usage)}`)
-    // 诚实标签（failureReason 驱动）
-    const honesty = honestyLabel(result.failureReason, result.evidenceStatus)
-    if (honesty) lines.push(`⚠ ${honesty}`)
-    lines.push(`summary: ${truncate(result.summary)}`)
+    lines.push('── 结果 ──')
+    lines.push(formatWorkerResultDigest({
+      status: result.status,
+      summary: result.summary,
+      findingsCount: result.findings?.length ?? 0,
+      changedFilesCount: result.changedFiles?.length ?? 0,
+      failureReason: result.failureReason,
+      evidenceStatus: result.evidenceStatus,
+    }))
     if (result.findings && result.findings.length > 0) {
-      lines.push(`findings: ${result.findings.length}`)
+      lines.push('发现：')
       for (const f of result.findings.slice(0, 5)) {
         const conf = f.confidence ? ` [${f.confidence}]` : ''
         lines.push(`  ·${conf} ${truncate(f.claim, 120)}`)
       }
-      if (result.findings.length > 5) {
-        lines.push(`  … +${result.findings.length - 5} more`)
-      }
+      if (result.findings.length > 5) lines.push(`  … 还有 ${result.findings.length - 5} 条`)
     }
     if (result.verification) {
       const v = result.verification
-      const statusGlyph = v.status === 'passed' ? '✅' : v.status === 'failed' ? '❌' : '⚠'
-      lines.push(`verification: ${statusGlyph} ${v.passed}/${v.passed + v.failed} passed · ${v.command}`)
-    }
-    if (result.nextActions && result.nextActions.length > 0) {
-      lines.push('next actions:')
-      for (const a of result.nextActions.slice(0, 5)) {
-        lines.push(`  · ${truncate(a, 120)}`)
-      }
+      const g = v.status === 'passed' ? '✅' : v.status === 'failed' ? '❌' : '⚠'
+      lines.push(`验证：${g} ${v.passed}/${v.passed + v.failed} 通过 · ${v.command}`)
     }
     if (result.changedFiles && result.changedFiles.length > 0) {
-      lines.push('changed files:')
-      for (const f of result.changedFiles.slice(0, 20)) {
-        lines.push(`  · ${f}`)
-      }
-      if (result.changedFiles.length > 20) {
-        lines.push(`  … +${result.changedFiles.length - 20} more`)
-      }
+      lines.push('改动文件：')
+      for (const f of result.changedFiles.slice(0, 20)) lines.push(`  · ${f}`)
+      if (result.changedFiles.length > 20) lines.push(`  … 还有 ${result.changedFiles.length - 20} 个`)
+    }
+    if (result.nextActions && result.nextActions.length > 0) {
+      lines.push('后续动作：')
+      for (const a of result.nextActions.slice(0, 5)) lines.push(`  · ${truncate(a, 120)}`)
+    }
+    if (result.risks && result.risks.length > 0) {
+      lines.push('风险：')
+      for (const r of result.risks.slice(0, 10)) lines.push(`  · ${r}`)
     }
     if (result.artifacts && result.artifacts.length > 0) {
-      lines.push('artifacts:')
+      lines.push('产物：')
       for (const a of result.artifacts) {
         lines.push(`  · [${a.kind}] ${a.title}`)
         lines.push(`    ${truncate(a.content, 200)}`)
       }
     }
-    if (result.risks && result.risks.length > 0) {
-      lines.push('risks:')
-      for (const r of result.risks.slice(0, 10)) {
-        lines.push(`  · ${r}`)
-      }
-    }
+
+    lines.push('')
+    lines.push('── 参数 ──')
+    if (result.model) lines.push(`模型：${result.model}`)
+    if (result.provider) lines.push(`提供商：${result.provider}`)
+    if (result.usage) lines.push(`用量：${formatTokens(result.usage)}`)
+    lines.push(...paramLines)
+  } else if (paramLines.length > 0) {
+    lines.push('')
+    lines.push('── 参数 ──')
+    lines.push(...paramLines)
+  }
+
+  // ── 派发轮次（L1：稳定 id 复用时每轮各一份归档，上面 Result 展示最新一轮） ──
+  const rounds = listPersistedResultRounds(workerId)
+  if (rounds.length > 1) {
+    lines.push('')
+    lines.push(`── Rounds ── 该 id 派发了 ${rounds.length} 次，Result 为最新一轮`)
+    rounds.forEach((round, i) => {
+      const r = loadPersistedResultRound(workerId, round.nonce)
+      const status = r?.status ?? '?'
+      const summary = r ? ` · ${truncate(r.summary, 60)}` : ''
+      lines.push(`  #${i + 1} ${formatRoundTime(round.savedAt)} · ${status}${summary}`)
+    })
   }
 
   // ── 完整会话转录 ──
@@ -217,14 +222,14 @@ export function buildWorkerDetailContent(
 
   if (transcriptText) {
     lines.push('')
-    lines.push('── Transcript ──')
+    lines.push('── 转录 ──')
     lines.push(transcriptText)
   }
 
   const content = lines.join('\n')
   return {
     content,
-    title: `Worker ${shortLabel}`,
+    title: `子代理 ${shortLabel}`,
     messages: parseScrollbackTranscript(content),
   }
 }

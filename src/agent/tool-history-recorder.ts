@@ -1,10 +1,12 @@
 import type { AgentLoop } from './loop.js'
 import type { HealthSignal } from './trajectory-health.js'
 import type { ToolErrorClass } from '../tools/types.js'
+import type { FailureClass } from './failure-classifier.js'
 import { createHash } from 'node:crypto'
 import { TYPECHECK_CMD_RE } from './typecheck-gate.js'
 import { toolTargetFromInput } from './tool-target.js'
 import { isUiFilePath, isVisualVerifyTool } from './hooks/render-verify-hook.js'
+import { POINTER_GUARD_ERROR_MARKER } from '../tools/pointer-guard.js'
 
 /**
  * Record tool execution history and trigger deferred post-tool processing.
@@ -17,6 +19,7 @@ export function recordToolHistory(
   isError: boolean,
   result: string,
   errorClass?: ToolErrorClass,
+  errorKind?: FailureClass,
 ): void {
     // Environment-class failures (host lacks the command — common on Windows) are
     // not competence failures. The immune system must not amplify them into
@@ -29,6 +32,16 @@ export function recordToolHistory(
       .update(`${name}:${JSON.stringify(input, Object.keys(input).sort())}`)
       .digest('hex')
       .slice(0, 8)
+    // Transient guard failures (pointer-guard, syntax-check false-positive, etc.)
+    // are format-level mistakes the model fixes next turn — not competence failures.
+    // Tag them so the convergence detector excludes them from errorPenalty.
+    // syntax_error 走结构化 errorKind 管道（edit/apply-patch/hash-edit/write-file
+    // 的结果对象自带）——不再按「已自动回滚」子串匹配：agent 在本仓库跑失败的
+    // 测试套件时，断言文本里的同一子串会把真实失败误标为 transient。
+    const isTransientGuard = isError && (
+      result.includes(POINTER_GUARD_ERROR_MARKER) ||
+      errorKind === 'syntax_error'
+    )
     self.recentToolHistory.push({
       tool: name,
       target,
@@ -36,6 +49,7 @@ export function recordToolHistory(
       argsHash,
       error: isError ? result.slice(0, 50) : undefined,
       ...(isError && errorClass ? { errorClass } : {}),
+      ...(isTransientGuard ? { transient: true } : {}),
     })
     if (self.recentToolHistory.length > 5) self.recentToolHistory.shift()
 

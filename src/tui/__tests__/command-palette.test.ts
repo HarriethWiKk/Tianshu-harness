@@ -3,12 +3,14 @@ import assert from 'node:assert/strict'
 import { getPaletteCommands } from '../command-palette.js'
 
 describe('getPaletteCommands', () => {
-  it('exposes the pager surface with p hotkey', () => {
+  it('exposes the pager surface, without a decorative single-letter hotkey', () => {
     const pager = getPaletteCommands().find(command => command.name === '__surface:pager')
 
     assert.ok(pager)
     assert.equal(pager.category, 'surface')
-    assert.equal(pager.hotkey, 'p')
+    // 面板里可打印字符一律进过滤框，没有按键路径消费单字母 hotkey。渲染一个按不动的
+    // ` [p]` 是假可供性——surface 已可经打名字过滤或 /pager 抵达。
+    assert.equal(pager.hotkey, undefined)
   })
 
   // ── T9 提示面板补全：每个 case handler 在 slash-commands.ts 已注册，

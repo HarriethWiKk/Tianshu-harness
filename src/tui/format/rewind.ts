@@ -19,7 +19,7 @@ import {
   keyHints,
 } from './overlay-frame.js'
 
-export type RewindMode = 'convo' | 'code' | 'both'
+export type RewindMode = 'convo' | 'code' | 'both' | 'summarize-from' | 'summarize-to'
 
 export interface RewindFile {
   path: string
@@ -43,12 +43,19 @@ export interface RewindData {
   actionIndex?: number
   /** Files a precise code rewind to the selected message would touch. */
   previewFiles?: RewindFile[]
+  /** Whether the active provider bills exact-prefix cache (DeepSeek et al.).
+   *  Drives whether the cache-cost annotations are shown at all — on providers
+   *  that don't reuse an exact prefix these notes would be noise, and worse,
+   *  would discourage a perfectly free action. */
+  cachePreserving?: boolean
 }
 
-const ACTIONS: { mode: RewindMode; title: string; desc: string }[] = [
+export const ACTIONS: { mode: RewindMode; title: string; desc: string }[] = [
   { mode: 'convo', title: '仅恢复对话', desc: '截断对话到此消息，不改动文件' },
   { mode: 'code', title: '仅恢复代码', desc: '把 agent 编辑的文件恢复到此消息时的状态' },
   { mode: 'both', title: '对话 + 代码', desc: '截断对话并把文件恢复到此刻' },
+  { mode: 'summarize-from', title: '从此处摘要', desc: '把此消息之后的内容压成摘要，之前的对话原样保留' },
+  { mode: 'summarize-to', title: '摘要到此处', desc: '把此消息之前的内容压成摘要，之后的对话原样保留' },
 ]
 
 function relativeTime(ts: number | undefined, now = Date.now()): string {
@@ -142,6 +149,20 @@ function buildActionBody(body: string[], data: RewindData, selected: number, w: 
   })
 
   const mode = ACTIONS[actIdx]?.mode
+
+  // 缓存代价标注：只在按前缀缓存计费的 provider 上出现。两个摘要动作的代价天差地别
+  // ——「从此处」只动尾部，截断点之前的前缀照常命中；「摘要到此处」改写靠前的字节，
+  // 之后整段前缀要重建。措辞给代价而不是劝阻：吃不吃这个成本由用户判断。
+  if (data.cachePreserving && (mode === 'summarize-from' || mode === 'summarize-to')) {
+    body.push('')
+    if (mode === 'summarize-from') {
+      body.push(`  ${color('缓存：此消息之前的前缀原样保留，命中不受影响。', theme.muted)}`)
+    } else {
+      body.push(`  ${color('⚠ 缓存：改写靠前的历史 → 下次请求整段前缀需重建（长会话可达十万 token 量级）。', theme.warning)}`)
+      body.push(`  ${color('  换取的是把冗长的早期历史压成摘要，腾出上下文窗口。', theme.dim)}`)
+    }
+  }
+
   if (mode === 'code' || mode === 'both') {
     body.push('')
     const files = data.previewFiles ?? []

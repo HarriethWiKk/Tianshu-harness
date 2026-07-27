@@ -529,6 +529,19 @@ export const mirrorsSchema = z.object({
   fallbackTimeoutSec: z.number().default(60),
 }).default({})
 
+/** GitHub PR panel defaults (desktop CI loop). Initial values for the per-PR
+ *  toggles/method — the panel can override them per PR without writing back. */
+export const prDefaultsSchema = z.object({
+  /** Default merge method for the PR panel's merge action. */
+  mergeMethod: z.enum(['squash', 'merge', 'rebase']).default('squash'),
+  /** Auto-fix default: offer to dispatch a fix worker when a PR's CI fails. */
+  autoFix: z.boolean().default(false),
+  /** Auto-merge default: offer the merge confirm when checks go green. */
+  autoMerge: z.boolean().default(false),
+  /** CI checks polling interval (seconds) while any check is pending. */
+  ciPollSeconds: z.number().int().min(5).max(300).default(10),
+}).default({})
+
 export const envSchema = z.object({
   /** Auto-resolve the real login-shell / registry PATH + toolchain vars so the
    *  agent finds tools (mvn/git/...) even when the app is launched from a GUI
@@ -571,6 +584,10 @@ export const uiSchema = z.object({
   spinnerVerbsMode: z.enum(['replace', 'append']).optional(),
   /** Accessibility: freeze spinner animation frames and verb rotation. */
   reducedMotion: z.boolean().optional(),
+  /** Accessibility: drop the live region's dynamic segment (which repaints every
+   *  120ms and gets re-announced endlessly) and speak activity starts as static
+   *  lines instead. Implies reducedMotion. CLI: `--screen-reader`. */
+  screenReader: z.boolean().optional(),
   /** GlanceBar density on startup. 'compact' (default) = mode/model/context%/elapsed;
    *  'full' = everything (goal/todo/effort/cache/cost). Runtime `/glance` toggles. */
   glanceDensity: z.enum(['compact', 'full']).optional(),
@@ -684,6 +701,7 @@ export const configSchema = z.object({
   workers: workersSchema,
   skills: skillsSchema,
   mirrors: mirrorsSchema,
+  prDefaults: prDefaultsSchema,
   env: envSchema,
   ui: uiSchema,
   verify: verifySchema,
@@ -712,6 +730,7 @@ export type Config = {
   workers: WorkersConfig
   skills: SkillsConfig
   mirrors: MirrorsConfig
+  prDefaults: PrDefaultsConfig
   env: EnvConfig
   ui: UiConfig
   verify: VerifyConfig
@@ -735,6 +754,7 @@ export type SearchConfig = z.infer<typeof searchSchema>
 export type WorkersConfig = z.infer<typeof workersSchema>
 export type SkillsConfig = z.infer<typeof skillsSchema>
 export type MirrorsConfig = z.infer<typeof mirrorsSchema>
+export type PrDefaultsConfig = z.infer<typeof prDefaultsSchema>
 export type EnvConfig = z.infer<typeof envSchema>
 export type UiConfig = z.infer<typeof uiSchema>
 export type VerifyConfig = z.infer<typeof verifySchema>

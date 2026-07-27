@@ -112,26 +112,27 @@ describe('CompactionController reclaim gate (2026-07-16 cost-aware reclaim plan 
     assert.deepEqual(decisions[0], { commit: true, reason: 'reclaim-above-floor' })
   })
 
-  it('1M precision band (task 4): deterministic reclaim commits at turn 0 through the gate', async () => {
-    // ~510k tokens on a 1M window: past the 0.5 precision ceiling, below the
-    // 0.60 partial-llm rung. Old code returned early from the dedicated 1M
-    // branch and did nothing; the unified decision now surfaces a gated
-    // deterministic reclaim. Four 500k-char tool results truncate to 200k
-    // chars each → ~300k tokens reclaimed, far above the 50k large floor.
+  it('1M half-full window is left alone once the precision ceiling moved to 0.7', async () => {
+    // ~510k tokens on a 1M window. Under the old 0.5 ceiling this fell in the
+    // "precision band" (past the ceiling, below the 0.60 partial-llm rung) and
+    // triggered a gated deterministic reclaim. At 0.7 a half-full window is no
+    // longer a precision concern, and shattering a hot 500k prefix to reclaim
+    // it was exactly the cost this ceiling change set out to stop paying.
     const session = new SessionContext()
     session.replaceMessages(Array.from({ length: 4 }, (_, i) => (
       { role: 'tool', tool_call_id: `read_file_${i}`, content: 'w'.repeat(500_000) } as OaiMessage
     )))
+    const before = session.getMessages()
     const controller = makeController(session, {
       contextWindow: 1_000_000,
       providerProfile: { cacheType: 'exact-prefix', persistent: true } as ProviderProfile,
     })
     const result = await controller.maybeCompact({ loopTurn: 0, failures: { consecutiveFailures: 0 } })
-    assert.equal(result.compacted, true)
-    assert.ok(session.getEstimatedTokens() < 300_000, 'giant tool results were truncated')
+    assert.equal(result.compacted, false)
+    assert.equal(session.getMessages(), before, 'history untouched at 51% of a 1M window')
   })
 
-  it('1M precision band (task 4): never rewrites mid-turn (loopTurn ≠ 0)', async () => {
+  it('1M window: never rewrites mid-turn (loopTurn ≠ 0)', async () => {
     const session = new SessionContext()
     session.replaceMessages(Array.from({ length: 4 }, (_, i) => (
       { role: 'tool', tool_call_id: `read_file_${i}`, content: 'w'.repeat(500_000) } as OaiMessage

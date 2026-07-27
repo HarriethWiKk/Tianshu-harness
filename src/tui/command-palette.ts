@@ -9,6 +9,13 @@ export interface PaletteCommand {
   name: string
   description: string
   category?: 'command' | 'surface'
+  /** 已生效的键位提示，渲染为 ` [x]`。**只填真的能按的键**（如 `Ctrl+R`）。
+   *
+   *  这里曾给 4 个 surface 填过 `c`/`p`/`s`/`h`，但面板里任何可打印字符都进过滤框，
+   *  从没有按键路径消费它们——纯装饰的可供性。要让单字母生效就得像 lazygit 那样把
+   *  过滤改成显式前缀（`/` 过名字、`@` 过键位），代价是砸掉当前正常工作的「打字即
+   *  过滤」；而这 4 个界面本就各有两条可达路径（面板打名字、或 /cockpit /pager
+   *  /starmap /chronicle），并没有能力缺口。故移除假标记，保留本字段给真实绑定。 */
   hotkey?: string
   /** 可选参数提示（ghost text）：见 format/slash-hint.ts slashArgsHint。 */
   argsHint?: string
@@ -36,11 +43,12 @@ export function filterCommands(commands: PaletteCommand[], query: string): Palet
 
 export function getPaletteCommands(): PaletteCommand[] {
   return [
-    { name: '__surface:cockpit', description: 'Cockpit — trace / verify / context', category: 'surface', hotkey: 'c' },
-    { name: '__surface:pager', description: 'Scrollback — browse session history', category: 'surface', hotkey: 'p' },
-    { name: '__surface:starmap', description: 'Starmap — 星图总览', category: 'surface', hotkey: 's' },
-    { name: '__surface:chronicle', description: 'Chronicle — 阶段传说', category: 'surface', hotkey: 'h' },
+    { name: '__surface:cockpit', description: 'Cockpit — trace / verify / context', category: 'surface' },
+    { name: '__surface:pager', description: 'Scrollback — browse session history', category: 'surface' },
+    { name: '__surface:starmap', description: 'Starmap — 星图总览', category: 'surface' },
+    { name: '__surface:chronicle', description: 'Chronicle — 阶段传说', category: 'surface' },
     { name: '/help', description: 'Show all commands', category: 'command' },
+    { name: '/btw', description: '侧问 — 就当前会话问一句，不进对话历史', argsHint: '<问题>' },
     { name: '/compact', description: 'Compact conversation context' },
     { name: '/connect', description: '连接模型服务商（选内置或自定义，填写 API 密钥）' },
     { name: '/model', description: 'Show or switch model', argsHint: 'list|<model-id>' },
@@ -48,6 +56,7 @@ export function getPaletteCommands(): PaletteCommand[] {
     { name: '/chat', description: 'Switch to lightweight chat mode' },
     { name: '/task', description: '任务模式（已废弃：意图自动检测；子代理面板用 /tasks）' },
     { name: '/tasks', description: '打开子代理任务面板（查看/切入 f/停止 x，运行中·已完成·全部）' },
+    { name: '/jobs', description: '打开后台任务面板（bash 后台启动的 shell 任务列表）' },
     { name: '/mode', description: 'Show or switch prompt mode' },
     { name: '/verify', description: 'Show verification status' },
     { name: '/verbose', description: 'Toggle verbose tool output' },

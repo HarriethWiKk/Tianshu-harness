@@ -4,192 +4,250 @@ import { homedir } from 'node:os'
 import stringWidth from 'string-width'
 import { formatWelcome } from '../format/welcome.js'
 import { getTheme } from '../theme.js'
+import { displayWidth } from '../width.js'
+import { boxCharsFor, boxInnerWidth, boxOuterWidth } from '../box-chars.js'
 
 const theme = getTheme()
 
 const strip = (s: string) => s.replace(/\x1B\[[0-9;]*m/g, '')
 
-test('welcome renders 「启明」masthead with breathing blanks', () => {
+/** 标准入参，按需覆盖。 */
+const base = {
+  modelName: 'deepseek-v4',
+  cwd: '/tmp/x/proj',
+  sessionId: '878e2108abcd',
+  priorMsgCount: 0,
+  columns: 80,
+  rows: 40,
+  version: '2.15.1',
+  approvalMode: 'auto-safe',
+}
+
+const render = (over: Partial<typeof base> & Record<string, unknown> = {}) =>
+  formatWelcome({ ...base, ...over } as Parameters<typeof formatWelcome>[0], theme)
+
+/** 某字符在行内的显示起列（含 `│ ` 前缀，按指定口径度量）。 */
+const colOf = (line: string, ch: string, cal: { ambiguousAsWide?: boolean } = {}) => {
+  const plain = strip(line)
+  const idx = plain.indexOf(ch)
+  return idx < 0 ? -1 : displayWidth(plain.slice(0, idx), cal)
+}
+
+/** 框体行（剥掉首尾呼吸空行）。 */
+const boxOf = (lines: string[]) => lines.slice(1, -1)
+
+// ── 结构契约 ────────────────────────────────────────────────────────
+
+test('星阁定稿：9 行框体 + 首尾呼吸空行 = 11 行', () => {
+  const lines = render()
+  assert.equal(lines.length, 11, `框 9 行加首尾空行共 11 行，实得 ${lines.length}`)
+  assert.equal(lines[0], '', '首行留空，清屏后不贴顶边')
+  assert.equal(lines[10], '', '末行留空，底框不与输入框顶框粘连')
+  const box = boxOf(lines)
+  assert.equal(box.length, 9)
+  assert.ok(strip(box[0]!).startsWith('╭'), '框首行是顶框')
+  assert.ok(strip(box[8]!).startsWith('╰'), '框末行是底框')
+  for (const line of box.slice(1, 8)) {
+    assert.ok(strip(line).startsWith('│ ') && strip(line).endsWith(' │'), `内容行两侧有竖边线: "${strip(line)}"`)
+  }
+})
+
+test('框宽与输入框逐列一致：每行显示宽度恒等于 boxOuterWidth(cols)', () => {
+  for (const cols of [48, 60, 80, 100, 120, 200]) {
+    const box = boxOf(render({ columns: cols }))
+    const want = boxOuterWidth(cols)
+    for (const [i, line] of box.entries()) {
+      assert.equal(
+        displayWidth(strip(line)), want,
+        `cols=${cols} 框内第 ${i + 1} 行宽度应为 ${want}，实得 ${displayWidth(strip(line))}："${strip(line)}"`,
+      )
+    }
+  }
+})
+
+test('底框与 app.ts 输入框底边同构（tl/bl + h×(inner+2) + tr/br）', () => {
+  const cols = 80
+  const chars = boxCharsFor('thin')
+  const inner = boxInnerWidth(cols)
+  const box = boxOf(render({ columns: cols }))
+  assert.equal(strip(box[8]!), `${chars.bl}${chars.h.repeat(inner + 2)}${chars.br}`)
+})
+
+// ── 北斗 ────────────────────────────────────────────────────────────
+
+test('北斗占两行：顶行斗身上边接斗柄，次行 ╰…╯ 收口成斗', () => {
+  const box = boxOf(render({ columns: 100 }))
+  const top = strip(box[1]!)
+  const bowl = strip(box[2]!)
+  assert.equal((top.match(/[✦✧∙]/g) ?? []).length, 5, '顶行 5 颗：天枢 天权 玉衡 开阳 瑶光')
+  assert.equal((bowl.match(/[✦✧∙]/g) ?? []).length, 2, '次行 2 颗：天璇 天玑')
+  assert.ok(bowl.includes('╰') && bowl.includes('╯'), '次行用圆角收口成勺')
+  assert.ok(top.startsWith('│ ✦'), `天枢是最亮档实心星: "${top}"`)
+})
+
+test('星等三档编码：✦ 最亮双星 · ✧ 次亮四星 · ∙ 最暗的天权', () => {
+  const box = boxOf(render({ columns: 100 }))
+  const dipper = strip(box[1]!) + strip(box[2]!)
+  assert.equal((dipper.match(/✦/g) ?? []).length, 2, '天枢 1.79 与玉衡 1.77 是实心 ✦')
+  assert.equal((dipper.match(/✧/g) ?? []).length, 4, '天璇/天玑/开阳/瑶光 是空心 ✧')
+  assert.equal((dipper.match(/∙/g) ?? []).length, 1, '天权 3.31 是微点 ∙')
+})
+
+test('斗身收口对齐天权，且 narrow / wide 两档下列位一致', () => {
+  const prev = process.env.RIVET_AMBIGUOUS_WIDTH
+  try {
+    for (const mode of ['narrow', 'wide'] as const) {
+      process.env.RIVET_AMBIGUOUS_WIDTH = mode
+      const box = boxOf(render({ columns: 100 }))
+      const cal = { ambiguousAsWide: mode === 'wide' }
+      assert.equal(
+        colOf(box[2]!, '╯', cal), colOf(box[1]!, '∙', cal),
+        `${mode} 档下 ╯ 应正落在天权 ∙ 的列位`,
+      )
+    }
+  } finally {
+    if (prev === undefined) delete process.env.RIVET_AMBIGUOUS_WIDTH
+    else process.env.RIVET_AMBIGUOUS_WIDTH = prev
+  }
+})
+
+test('星图字形宽度恒定：不含 East-Asian Ambiguous 字符（★ · 等）', () => {
+  const box = boxOf(render({ columns: 100 }))
+  for (const line of [box[1]!, box[2]!]) {
+    const plain = strip(line)
+    assert.equal(
+      displayWidth(plain), displayWidth(plain, { ambiguousAsWide: true }),
+      `星图行在两档下宽度必须相同，否则右边线随终端参差: "${plain}"`,
+    )
+    assert.ok(!/[★·]/.test(plain), '不得使用 ambiguous 的 ★ / ·')
+  }
+})
+
+// ── 内容 ────────────────────────────────────────────────────────────
+
+test('顶框嵌 wordmark，版本号贴右', () => {
+  const head = strip(boxOf(render())[0]!)
+  assert.ok(head.includes('天枢'), '中文品牌名')
+  assert.ok(head.includes('T I Ā N S H Ū'), '宽字距拼音')
+  assert.ok(head.includes('Code'), '英文后缀')
+  assert.ok(/v2\.15\.1 ─╮$/.test(head), `版本号贴右边线: "${head}"`)
+})
+
+test('wordmark 在版本号过长时逐级降级', () => {
+  const head = strip(boxOf(render({ columns: 48, version: '2.23.0-nightly.20260726' }))[0]!)
+  assert.ok(head.includes('天枢'), '最窄也保留中文品牌名')
+  assert.ok(!head.includes('T I Ā N S H Ū'), '宽字距拼音让位给版本号')
+})
+
+test('模型 / effort / 权限模式 / 路径 / 会话号各就其位', () => {
+  const box = boxOf(render({ columns: 100, reasoningEffort: 'high', numericId: 7281 }))
+  assert.ok(strip(box[4]!).includes('deepseek-v4'), '配置行含模型')
+  assert.ok(strip(box[4]!).includes('◎high'), '配置行含 effort')
+  assert.ok(strip(box[4]!).includes('auto-safe'), '配置行含权限模式')
+  assert.ok(strip(box[5]!).includes('/tmp/x/proj'), '路径行含 cwd')
+  assert.ok(strip(box[5]!).includes('#7281'), '路径行优先展示友好会话号')
+  assert.ok(!strip(box[5]!).includes('878e2108'), '有 numericId 时不再显示会话前缀')
+})
+
+test('无 numericId 时路径行回落到会话前缀', () => {
+  const box = boxOf(render({ columns: 100, sessionId: '8938a88f-c865-4c49-9c75-2c69e5b49e24' }))
+  assert.ok(strip(box[5]!).includes('8938a88f'))
+})
+
+test('yolo 模式与 auto effort 正常显示', () => {
+  const box = boxOf(render({ columns: 100, approvalMode: 'dangerously-skip-permissions', reasoningEffort: 'auto' }))
+  const config = strip(box[4]!)
+  assert.ok(config.includes('yolo'), 'dangerously-skip-permissions 简写为 yolo')
+  assert.ok(config.includes('◎auto'))
+})
+
+test('缺省 version / approvalMode 时不留悬挂文本', () => {
   const lines = formatWelcome({
-    modelName: 'opus-4-8',
-    cwd: '/Users/x/app/deepseek-tui/opencode-tui',
-    sessionId: '878e2108abcd',
-    priorMsgCount: 0,
-    columns: 80,
-    version: '2.15.1',
-    approvalMode: 'auto-safe',
+    modelName: 'm', cwd: '/x', sessionId: 'abcdefgh', priorMsgCount: 0, columns: 80, rows: 40,
   }, theme)
-  assert.equal(lines.length, 6, `masthead is 6 lines (blank + 4 + blank), got ${lines.length}`)
-  assert.equal(lines[0], '', 'leading blank line for breathing room')
-  assert.equal(lines[lines.length - 1], '', 'trailing blank line for breathing room')
+  const joined = strip(lines.join('\n'))
+  assert.ok(joined.includes('天枢'), '品牌仍在')
+  assert.ok(!/v ?(undefined|null)/.test(joined), '无悬挂版本文本')
+  assert.equal(displayWidth(strip(boxOf(lines)[0]!)), boxOuterWidth(80), '无版本时顶框仍然等宽')
 })
 
-test('welcome contains brand, version, model, approval mode and cwd', () => {
+test('home 下的 cwd 缩写为 ~', () => {
+  const box = boxOf(render({ columns: 100, cwd: `${homedir()}/app/proj` }))
+  assert.ok(strip(box[5]!).includes('~/app/proj'))
+})
+
+test('上手行按框宽贪心装填，窄框只留装得下的条目', () => {
+  const wide = strip(boxOf(render({ columns: 100 }))[7]!)
+  assert.ok(wide.includes('/init') && wide.includes('/domain') && wide.includes('/help'), '宽框三条齐上')
+  const narrow = strip(boxOf(render({ columns: 56 }))[7]!)
+  assert.ok(narrow.includes('/init'), '窄框保留第一条')
+  assert.ok(!narrow.includes('/help'), '装不下的条目整条略去，不截半句')
+})
+
+// ── 降级 ────────────────────────────────────────────────────────────
+
+test('compact 模式（恢复会话）折成单行', () => {
+  const lines = render({ columns: 80, priorMsgCount: 7, compact: true })
+  assert.equal(lines.length, 1)
+  const line = strip(lines[0]!)
+  assert.ok(line.includes('天枢') && line.includes('deepseek-v4') && line.includes('/help'))
+  assert.ok(line.includes('7 prior'), '显示历史消息数')
+})
+
+test('矮终端（放不下星阁 + 输入框）退单行', () => {
+  const lines = render({ columns: 100, rows: 12 })
+  assert.equal(lines.length, 1, `rows=12 → 单行，实得 ${lines.length}`)
+  assert.ok(strip(lines[0]!).includes('天枢'))
+})
+
+test('窄终端（< 48 列）退单行——框内挤不下正文时单行更诚实', () => {
+  assert.equal(render({ columns: 47 }).length, 1)
+  assert.equal(render({ columns: 48 }).length, 11, '48 列是星阁下限')
+})
+
+test('未提供 rows 时按完整星阁渲染（向后兼容）', () => {
   const lines = formatWelcome({
-    modelName: 'glm-5.1',
-    cwd: '/tmp/x/proj',
-    sessionId: 'deadbeef1234',
-    priorMsgCount: 0,
-    columns: 80,
-    version: '2.15.1',
-    approvalMode: 'auto-safe',
+    modelName: 'm', cwd: '/x', sessionId: 'abcdefgh', priorMsgCount: 0, columns: 100,
   }, theme)
-  const joined = lines.join('\n')
-  assert.ok(joined.includes('Tianshu Code'), 'should show brand')
-  assert.ok(joined.includes('天枢'), 'should show Chinese brand name')
-  assert.ok(joined.includes('v2.15.1'), 'should show version')
-  assert.ok(joined.includes('glm-5.1'), 'should show model')
-  assert.ok(joined.includes('auto-safe'), 'should show approval mode')
-  assert.ok(joined.includes('/tmp/x/proj'), 'should show cwd')
+  assert.equal(lines.length, 11)
 })
 
-test('version is right-aligned as masthead right column on wide terminals', () => {
-  const lines = formatWelcome({
-    modelName: 'm', cwd: '/x', sessionId: 'abcdefgh', priorMsgCount: 0, columns: 80,
-    version: '2.15.1',
-  }, theme)
-  const head = strip(lines[1]!)
-  assert.ok(head.endsWith('v2.15.1'), `version sits at the right edge: "${head}"`)
-  assert.ok(/Code {2,}v2\.15\.1$/.test(head), `right column separated by padding: "${head}"`)
+test('ASCII 降级：框线与星形同时退到 ASCII，斗身仍收口成勺', () => {
+  const prev = process.env.RIVET_ASCII_UI
+  try {
+    process.env.RIVET_ASCII_UI = '1'
+    const box = boxOf(render({ columns: 80 }))
+    assert.equal(box.length, 9)
+    assert.ok(strip(box[0]!).startsWith('+-'), '顶框走 ASCII')
+    assert.ok(!/[✦✧∙╭╮╰╯│─]/.test(strip(box[1]!) + strip(box[2]!)), '星图不留 Unicode 字形')
+    assert.ok(strip(box[2]!).includes('\\') && strip(box[2]!).includes('/'), 'ASCII 斗身用 \\ / 收口')
+    for (const line of box) {
+      assert.equal(displayWidth(strip(line)), boxOuterWidth(80), 'ASCII 档仍逐列等宽')
+    }
+  } finally {
+    if (prev === undefined) delete process.env.RIVET_ASCII_UI
+    else process.env.RIVET_ASCII_UI = prev
+  }
 })
 
-test('welcome omits version/mode gracefully when not provided', () => {
-  const lines = formatWelcome({
-    modelName: 'm', cwd: '/x', sessionId: 'abcdefgh', priorMsgCount: 0, columns: 80,
-  }, theme)
-  const joined = lines.join('\n')
-  assert.ok(joined.includes('Tianshu Code'), 'brand still present')
-  assert.ok(!joined.includes('v undefined') && !joined.includes('vnull'), 'no dangling version text')
-})
+// ── 不折行 ──────────────────────────────────────────────────────────
 
-test('masthead rule line recedes (no box frame, no shortcut matrix)', () => {
-  const lines = formatWelcome({
-    modelName: 'm', cwd: '/x', sessionId: 'abcdefgh', priorMsgCount: 0, columns: 120, rows: 40,
-    version: '2.15.1',
-  }, theme)
-  const joined = lines.join('\n')
-  assert.ok(!/[╭╮╰╯┌┐└┘│]/.test(joined), 'no box frame characters')
-  assert.ok(joined.includes('─'), 'thin masthead rule present')
-  assert.ok(!joined.includes('Ctrl+'), 'no shortcut matrix')
-  // 刊头线是第 2 行内容（索引 2），宽度 ≤ 72 封顶
-  const rule = strip(lines[2]!)
-  assert.ok(stringWidth(rule) <= 72 + 6, `rule capped at RULE_MAX + indent, got ${stringWidth(rule)}`)
-})
-
-test('welcome shows session prefix and reasoning effort', () => {
-  const lines = formatWelcome({
-    modelName: 'over2',
-    cwd: '/tmp/x/proj',
-    sessionId: '8938a88f-c865-4c49-9c75-2c69e5b49e24',
-    priorMsgCount: 0,
-    columns: 120,
-    rows: 40,
-    version: '2.18.0',
-    approvalMode: 'yolo',
-    reasoningEffort: 'high',
-  }, theme)
-  const joined = lines.join('\n')
-  assert.ok(joined.includes('8938a88f'), 'should show session prefix when no numericId')
-  assert.ok(joined.includes('◎high'), 'should show reasoning effort')
-})
-
-test('welcome prefers friendly #numericId over session prefix on place line', () => {
-  const lines = formatWelcome({
-    modelName: 'over2',
-    cwd: '/tmp/x/proj',
-    sessionId: '8938a88f-c865-4c49-9c75-2c69e5b49e24',
-    priorMsgCount: 0,
-    columns: 120,
-    rows: 40,
-    numericId: 7281,
-  }, theme)
-  const placeLine = strip(lines[4]!)
-  assert.ok(placeLine.includes('#7281'), `numericId shown: "${placeLine}"`)
-  assert.ok(!placeLine.includes('8938a88f'), 'session prefix replaced by numericId')
-})
-
-test('welcome shows auto reasoning effort', () => {
-  const lines = formatWelcome({
-    modelName: 'over2',
-    cwd: '/tmp/x/proj',
-    sessionId: '8938a88f-c865-4c49-9c75-2c69e5b49e24',
-    priorMsgCount: 0,
-    columns: 120,
-    rows: 40,
-    reasoningEffort: 'auto',
-  }, theme)
-  const joined = lines.join('\n')
-  assert.ok(joined.includes('◎auto'), 'should show auto reasoning effort')
-})
-
-test('cwd under home is tildified', () => {
-  const home = homedir()
-  const lines = formatWelcome({
-    modelName: 'm', cwd: `${home}/app/proj`, sessionId: 'abcdefgh', priorMsgCount: 0, columns: 120,
-  }, theme)
-  assert.ok(lines.join('\n').includes('~/app/proj'), 'home prefix collapsed to ~')
-})
-
-test('compact mode renders single line with essentials', () => {
-  const lines = formatWelcome({
-    modelName: 'glm-5.1',
-    cwd: '/tmp/x',
-    sessionId: 'deadbeef1234',
-    priorMsgCount: 7,
-    columns: 80,
-    compact: true,
-  }, theme)
-  assert.equal(lines.length, 1, 'compact welcome is a single line')
-  const joined = lines[0]!
-  assert.ok(joined.includes('天枢'), 'should show branding')
-  assert.ok(joined.includes('glm-5.1'), 'should show model')
-  assert.ok(joined.includes('deadbeef'), 'should show session prefix')
-  assert.ok(joined.includes('/help'), 'should hint /help')
-})
-
-test('compact mode shows prior count', () => {
-  const lines = formatWelcome({
-    modelName: 'm', cwd: '/x', sessionId: 'abcdefgh', priorMsgCount: 7, columns: 80, compact: true,
-  }, theme)
-  assert.ok(lines.join('\n').includes('7 prior'), 'should show prior message count')
-})
-
-test('height-aware: very short terminal (<11 rows) collapses to single line', () => {
-  const lines = formatWelcome({
-    modelName: 'gpt-5.5', cwd: '/x', sessionId: 'abcdef012345', priorMsgCount: 0, columns: 100, rows: 6,
-  }, theme)
-  assert.equal(lines.length, 1, `very short terminal → single line, got ${lines.length}`)
-  assert.ok(lines[0]!.includes('天枢'), 'single line still branded')
-})
-
-test('24-row terminal keeps the full masthead (fits easily)', () => {
-  const lines = formatWelcome({
-    modelName: 'deepseek-v4', cwd: '/x/proj', sessionId: 'abcdef012345', priorMsgCount: 0, columns: 80, rows: 24,
-    version: '2.15.1', approvalMode: 'auto-safe',
-  }, theme)
-  assert.equal(lines.length, 6, `80×24 → full masthead, got ${lines.length}`)
-})
-
-test('no rows provided → full masthead (back-compat)', () => {
-  const lines = formatWelcome({ modelName: 'm', cwd: '/x', sessionId: 'abcdefgh', priorMsgCount: 0, columns: 100 }, theme)
-  assert.equal(lines.length, 6, 'defaults to full masthead')
-})
-
-test('no line exceeds terminal width (display width ≤ columns)', () => {
-  for (const cols of [20, 40, 80]) {
-    const lines = formatWelcome({
+test('任何输入下都不超出终端宽度（含 ambiguous 恒 2 列的上界）', () => {
+  for (const cols of [20, 40, 48, 60, 80, 120]) {
+    const lines = render({
+      columns: cols,
       modelName: '天枢模型-超长名字测试-deepseek-v4-pro',
       cwd: '/Users/banxia/app/深度求索/超长中文目录名/opencode-tui',
-      sessionId: '012345678',
       priorMsgCount: 3,
-      columns: cols,
-      version: '2.15.1',
       approvalMode: 'dangerously-skip-permissions',
-    }, theme)
+      reasoningEffort: 'high',
+    })
     for (const line of lines) {
+      const plain = strip(line)
+      assert.ok(stringWidth(plain) <= cols, `cols=${cols}：窄档 ${stringWidth(plain)} 应 ≤ ${cols}`)
       assert.ok(
-        stringWidth(strip(line)) <= cols,
-        `at cols=${cols}, line width ${stringWidth(strip(line))} should be ≤ ${cols}`,
+        displayWidth(plain, { ambiguousAsWide: true }) <= cols,
+        `cols=${cols}：宽档上界 ${displayWidth(plain, { ambiguousAsWide: true })} 应 ≤ ${cols}，否则 CJK 终端折行`,
       )
     }
   }

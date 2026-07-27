@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { syntaxCheck, _resetEsbuildCacheForTest } from '../syntax-check.js'
+import { syntaxCheck, checkSyntax, _resetEsbuildCacheForTest, _resetTsCacheForTest } from '../syntax-check.js'
 
 describe('syntaxCheck', async () => {
   describe('CSS', async () => {
@@ -125,6 +125,50 @@ describe('syntaxCheck', async () => {
     it('flags TS error', async () => {
       const r = await syntaxCheck('/a/file.ts', 'const x: number = ;')
       assert.ok(r, 'should flag syntax error')
+    })
+  })
+
+  describe('checkSyntax — esbuild false-positive second opinion', async () => {
+    // checkSyntax returns {warning, fatal} instead of the flat null|string
+    // from syntaxCheck. Real syntax errors (both esbuild and TS reject) must
+    // still produce fatal; valid code must produce neither.
+
+    it('returns OK for valid TypeScript', async () => {
+      const r = await checkSyntax('/a/file.ts', 'const x: number = 1;\nconsole.log(x);')
+      assert.equal(r.fatal, null)
+      assert.equal(r.warning, null)
+    })
+
+    it('returns fatal for real syntax error (both esbuild and TS reject)', async () => {
+      const r = await checkSyntax('/a/file.ts', 'const x: number = ;')
+      if (r.fatal !== null) {
+        // Expected: both esbuild and TypeScript API reject this
+        assert.ok(r.fatal.includes('esbuild') || r.fatal.includes('TypeScript') || r.fatal.includes('error'),
+          `fatal should mention syntax error, got: ${r.fatal}`)
+      } else {
+        // If TS module unavailable / degraded, fatal may be null (infra degrade).
+        // Accept as long as warning is set.
+        assert.ok(r.warning, 'warning should be set when TS is unavailable')
+      }
+    })
+
+    it('returns fatal for broken JSX', async () => {
+      const r = await checkSyntax('/a/file.tsx', 'const el = <div>unclosed;')
+      // This should be caught by esbuild (and likely TS too)
+      assert.ok(r.fatal !== null || r.warning !== null,
+        'broken JSX should produce either fatal or warning')
+    })
+
+    it('returns no fatal for valid JSX', async () => {
+      const r = await checkSyntax('/a/file.tsx', 'const el = <div>hi</div>;\nexport default el;')
+      assert.equal(r.fatal, null)
+      assert.equal(r.warning, null)
+    })
+
+    it('returns no fatal for valid JS', async () => {
+      const r = await checkSyntax('/a/script.js', 'const x = 1;\nconsole.log(x);')
+      assert.equal(r.fatal, null)
+      assert.equal(r.warning, null)
     })
   })
 

@@ -125,10 +125,19 @@ export class FleetRegistry {
    */
   apply(activity: DelegationActivity, now: number = Date.now()): void {
     const terminal = TERMINAL_STATUSES.has(activity.status)
-    // 若之前在归档区被终态后重新收到 running，则移回 active（resume/重跑场景）
-    const archived = this.terminalRecords.get(activity.workOrderId)
-    if (archived && !terminal) {
-      this.records.set(activity.workOrderId, archived)
+
+    // 已终态的 id 又收到非终态事件 = **新一轮派发**（或 resume 续跑），不是旧
+    // worker 复活。必须丢掉旧记录走下面的新建路径。
+    //
+    // 这条路会真实走到，因为 order id 并非每次都新生成：`deriveStableWorkOrderId`
+    // 让 batch / team / council 用 `batch:0`、`team:T1` 这类稳定 id（dependsOn 与
+    // resume 都依赖它们可预测）。此前的做法是把旧记录移回 active 再合并，于是
+    // 下面「只在缺失时才写」的 contract / summary（:163-165）永远停在第一轮的值
+    // 上——/tasks 的目标行逐次相同、与本轮任务毫无关系，上一轮的结论还会挂到这
+    // 一轮的 worker 上。
+    const prior = this.records.get(activity.workOrderId) ?? this.terminalRecords.get(activity.workOrderId)
+    if (prior?.terminal && !terminal) {
+      this.records.delete(activity.workOrderId)
       this.terminalRecords.delete(activity.workOrderId)
     }
 

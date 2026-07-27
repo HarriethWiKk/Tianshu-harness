@@ -196,4 +196,21 @@ describe('formatMarkdown', () => {
     assert.ok(lastLine)
     assert.ok(stripAnsi(lastLine).includes('⚡ 是否执行？'))
   })
+
+  it('陈述句以「需要/确认」开头但不是提问——不加 ⚡', () => {
+    for (const text of ['需要我可以继续。', '确认无误。', '是否如此已核实，没问题。']) {
+      const lines = formatMarkdown({ text, columns: 80 }, theme)
+      const lastLine = lines[lines.length - 1]
+      assert.ok(!stripAnsi(lastLine!).includes('⚡'), `误染：${text}`)
+    }
+  })
+
+  it('提问行加 ⚡ 时行内既有格式不被剥掉', () => {
+    const text = '要执行 `rm -rf build` 吗？'
+    const lines = formatMarkdown({ text, columns: 80 }, theme)
+    const lastLine = lines[lines.length - 1]!
+    assert.ok(stripAnsi(lastLine).includes('⚡'))
+    // 行内的代码段仍带着自己的 ANSI 颜色（整行去色重染会把它剥成纯文本）
+    assert.ok(lastLine.replace(/\x1b\[0?m/g, '').includes('\x1b['), '行内代码高亮应保留')
+  })
 })

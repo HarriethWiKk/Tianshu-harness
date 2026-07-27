@@ -1,10 +1,12 @@
-import { describe, it, beforeEach } from 'node:test'
+import { describe, it, beforeEach, before, after } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdirSync, rmSync, existsSync, writeFileSync, readFileSync } from 'fs'
+import { mkdirSync, rmSync, existsSync, writeFileSync, readFileSync, mkdtempSync } from 'fs'
 import { join } from 'path'
+import { tmpdir } from 'os'
 import {
   detectPointerPlaceholder,
   pointerPlaceholderError,
+  resolveIdempotentPointer,
   POINTER_PLACEHOLDER_PREFIXES,
   EDIT_NEW_BLOCK_POINTER_PREFIX,
   PLAN_POINTER_PREFIX,
@@ -130,7 +132,7 @@ describe('cross-tool pointer rejection', () => {
     assert.ok(!existsSync(file), 'no file created from pointer content')
   })
 
-  it('edit_file rejects a pointer as new_string (no garbage written)', async () => {
+  it('edit_file gracefully resolves a regurgitated write pointer as new_string (file untouched)', async () => {
     const file = join(TEST_DIR, 'target.md')
     writeFileSync(file, 'line one\nline two\n')
     const result = await EDIT_FILE_TOOL.execute(makeParams({
@@ -138,12 +140,12 @@ describe('cross-tool pointer rejection', () => {
       old_string: 'line two',
       new_string: `[file written to ${file} — 507 lines, 12744 chars. Use read_file to review.]`,
     }))
-    assert.ok(result.isError, 'pointer new_string must be rejected')
-    assert.ok(result.content.includes(POINTER_GUARD_ERROR_MARKER))
+    // 幂等化解：路径一致 + 文件存在 → 视为编辑已应用，按 no-op 成功返回。
+    assert.ok(!result.isError, `idempotent resolution must succeed, got: ${result.content}`)
     assert.equal(readFileSync(file, 'utf-8'), 'line one\nline two\n', 'file untouched')
   })
 
-  it('edit_file rejects a pointer as old_string (model must read_file first)', async () => {
+  it('edit_file gracefully resolves a regurgitated edit pointer as old_string', async () => {
     const file = join(TEST_DIR, 'target2.md')
     writeFileSync(file, 'alpha\nbeta\n')
     const result = await EDIT_FILE_TOOL.execute(makeParams({
@@ -151,11 +153,11 @@ describe('cross-tool pointer rejection', () => {
       old_string: `[edit on ${file}: replaced 9000-char block, preview: "x". Display placeholder — never emit this as content; use read_file for current content.]`,
       new_string: 'gamma',
     }))
-    assert.ok(result.isError)
-    assert.ok(result.content.includes(POINTER_GUARD_ERROR_MARKER))
+    assert.ok(!result.isError, `idempotent resolution must succeed, got: ${result.content}`)
+    assert.equal(readFileSync(file, 'utf-8'), 'alpha\nbeta\n', 'file untouched')
   })
 
-  it('hash_edit rejects a pointer as new_string (the batch-12 corruption path)', async () => {
+  it('hash_edit gracefully resolves a regurgitated pointer as new_string (file untouched)', async () => {
     const file = join(TEST_DIR, 'batch12.md')
     writeFileSync(file, '### part\n\ncontent\n')
     const result = await HASH_EDIT_TOOL.execute(makeParams({
@@ -163,8 +165,8 @@ describe('cross-tool pointer rejection', () => {
       anchors: ['L1'],
       new_string: `[hash_edit applied to ${file} — new block 12 lines, 400 chars. Use read_file to review.]`,
     }))
-    assert.ok(result.isError, 'pointer new_string must be rejected')
-    assert.ok(result.content.includes(POINTER_GUARD_ERROR_MARKER))
+    // 幂等化解：路径一致 + 文件存在 → 视为编辑已应用，按 no-op 成功返回。
+    assert.ok(!result.isError, `idempotent resolution must succeed, got: ${result.content}`)
     assert.equal(readFileSync(file, 'utf-8'), '### part\n\ncontent\n', 'file untouched')
   })
 
@@ -178,5 +180,69 @@ describe('cross-tool pointer rejection', () => {
     }))
     assert.ok(!result.isError, `real edit must pass: ${result.content}`)
     assert.equal(readFileSync(file, 'utf-8'), 'new heading\nbody\n')
+  })
+})
+
+describe('resolveIdempotentPointer', () => {
+  let dir = ''
+  before(() => { dir = mkdtempSync(join(tmpdir(), 'rivet-ptr-')) })
+  after(() => { try { rmSync(dir, { recursive: true, force: true }) } catch { /* best-effort */ } })
+
+  it('full mode: resolves when disk matches the write pointer stats', async () => {
+    const fp = join(dir, 'a.ts')
+    writeFileSync(fp, 'line1\nline2\nline3')
+    const value = `[file written to ${fp} — 3 lines, 17 chars. #RIVET-POINTER-DISPLAY-ONLY# Display placeholder — never emit this as content; use read_file to review.]`
+    const r = await resolveIdempotentPointer({ mode: 'full', filePath: fp, value, matchedPrefix: '[file written to' })
+    assert.ok(r, 'should resolve as idempotent success')
+    assert.match(r!.content, /幂等|已是|未做写入/)
+    assert.equal(r!.isError ?? false, false)
+  })
+
+  it('full mode: returns null when the pointer path differs from target', async () => {
+    const fp = join(dir, 'b.ts')
+    writeFileSync(fp, 'x')
+    const value = `[file written to ${join(dir, 'OTHER.ts')} — 1 lines, 1 chars. #RIVET-POINTER-DISPLAY-ONLY# Display placeholder.]`
+    const r = await resolveIdempotentPointer({ mode: 'full', filePath: fp, value, matchedPrefix: '[file written to' })
+    assert.equal(r, null)
+  })
+
+  it('full mode: returns null when disk stats do not match', async () => {
+    const fp = join(dir, 'c.ts')
+    writeFileSync(fp, 'only one line')
+    const value = `[file written to ${fp} — 99 lines, 9999 chars. #RIVET-POINTER-DISPLAY-ONLY# Display placeholder.]`
+    const r = await resolveIdempotentPointer({ mode: 'full', filePath: fp, value, matchedPrefix: '[file written to' })
+    assert.equal(r, null)
+  })
+
+  it('edit mode: resolves when target file exists and pointer path matches (hash_edit pointer)', async () => {
+    const fp = join(dir, 'd.ts')
+    writeFileSync(fp, 'edited content already on disk')
+    const value = `[hash_edit applied to ${fp} — new block 2 lines, 40 chars. #RIVET-POINTER-DISPLAY-ONLY# Display placeholder.]`
+    const r = await resolveIdempotentPointer({ mode: 'edit', filePath: fp, value, matchedPrefix: '[hash_edit applied to' })
+    assert.ok(r, 'edit pointer with matching path + existing file resolves as no-op')
+    assert.match(r!.content, /已应用|幂等|无需/)
+  })
+
+  it('edit mode: resolves for edit_file old_string pointer (colon separator)', async () => {
+    const fp = join(dir, 'e.ts')
+    writeFileSync(fp, 'some content here')
+    const value = `[edit on ${fp}: replaced 5000-char block, preview: "x". #RIVET-POINTER-DISPLAY-ONLY# Display placeholder — never emit this as content; use read_file for current content.]`
+    const r = await resolveIdempotentPointer({ mode: 'edit', filePath: fp, value, matchedPrefix: '[edit on' })
+    assert.ok(r, 'edit_file colon-separated pointer path must be parsed correctly')
+  })
+
+  it('edit mode: returns null when target file is missing', async () => {
+    const fp = join(dir, 'missing.ts')
+    const value = `[hash_edit applied to ${fp} — new block 1 lines, 5 chars. #RIVET-POINTER-DISPLAY-ONLY# Display placeholder.]`
+    const r = await resolveIdempotentPointer({ mode: 'edit', filePath: fp, value, matchedPrefix: '[hash_edit applied to' })
+    assert.equal(r, null)
+  })
+
+  it('edit mode: returns null when pointer contains no path (edit_file new_string [new block ...] pattern)', async () => {
+    const fp = join(dir, 'f.ts')
+    writeFileSync(fp, 'content')
+    const value = `[new block 40 chars — #RIVET-POINTER-DISPLAY-ONLY# placeholder, never emit as content]`
+    const r = await resolveIdempotentPointer({ mode: 'edit', filePath: fp, value, matchedPrefix: '[new block' })
+    assert.equal(r, null, 'pathless pointer must not resolve')
   })
 })

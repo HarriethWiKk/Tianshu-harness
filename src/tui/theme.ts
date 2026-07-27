@@ -38,6 +38,8 @@ export interface RivetTheme {
   userColor: string
   assistantColor: string
   systemColor: string
+  /** 品牌词专用色（「天枢」字样、品牌星 ✦）。缺省 = primary。 */
+  brandColor: string
   toolColor: (toolName: string) => string
   contextColor: (pct: number) => string
 }
@@ -77,6 +79,7 @@ function buildTheme(colors: ColorSet, overrides?: ThemeOverrides): RivetTheme {
     userColor: overrides?.userColor ?? colors.primary,
     assistantColor: overrides?.assistantColor ?? colors.secondary,
     systemColor: overrides?.systemColor ?? '#9aa2b1',
+    brandColor: overrides?.brandColor ?? colors.primary,
     toolColor: makeToolColor(colors),
     contextColor: makeContextColor(colors),
   }

@@ -31,23 +31,18 @@ export interface CollapseResult {
 const CONSECUTIVE_THRESHOLD = 4
 
 /**
- * Reader tools (read_file, glob, grep) provide the model with source code context.
- * Collapsing their output — the very content the model needs to understand and edit
- * the codebase — is counterproductive. The summaries ("929 lines, 158 lines" etc.)
- * carry no actionable signal.
+ * Reader tools (read_file, glob, grep, read_section, run_tests) are EXEMPT from
+ * storm collapse. Collapsing their output — the very content the model needs to
+ * understand and edit the codebase — is counterproductive: the read_file summary
+ * kept only a path list, so the model lost every file it had just read and was
+ * forced into a read → collapse → re-read loop (桌面端实测 2026-07-27).
  *
- * These tools are already bounded: read_file has per-call line limits, grep caps
- * at 100 results, glob at 500 files. The request-time context collapse (2+ turns
- * old) still applies, so stale reads are eventually compacted.
- *
- * Consecutive threshold of 12 means the model can make up to 11 sequential
- * read_file/glob/grep calls without triggering storm collapse — enough for
- * any reasonable exploration pattern without flooding context.
+ * Read volume is already bounded by five other chains: per-call line limits,
+ * per-message aggregate budget, per-turn read budget (15% of window), 70%
+ * context-pressure truncation, and request-time collapse of 2+ turn-old reads.
+ * The storm collapse was the sixth and the only content-destroying one.
  */
-const READER_CONSECUTIVE_THRESHOLD = 12
-
 const READER_TOOLS = new Set(['read_file', 'glob', 'grep', 'read_section', 'run_tests'])
-const MAX_AGGREGATE_LINES = 30
 
 export class ToolAccumulator {
   private entries: AccumulatorEntry[] = []
@@ -76,12 +71,13 @@ export class ToolAccumulator {
   /**
    * When consecutive same-type calls reach the threshold, generates a
    * collapse summary for all but the most recent result.
-   * Returns null if no collapse is needed.
+   * Returns null if no collapse is needed — and always null for reader tools
+   * (see READER_TOOLS above: collapsing read content制造重读循环，弊大于利).
    */
   tryCollapse(toolName: string): CollapseResult | null {
-    const threshold = READER_TOOLS.has(toolName) ? READER_CONSECUTIVE_THRESHOLD : CONSECUTIVE_THRESHOLD
+    if (READER_TOOLS.has(toolName)) return null
     const consecutive = this.getConsecutiveTail(toolName)
-    if (consecutive.length < threshold) return null
+    if (consecutive.length < CONSECUTIVE_THRESHOLD) return null
 
     const stale = consecutive.slice(0, -1)
     const collapsedIds = stale.map(e => e.toolUseId)
@@ -103,58 +99,10 @@ export class ToolAccumulator {
     const count = entries.length
     const totalChars = entries.reduce((sum, e) => sum + e.content.length, 0)
 
-    if (toolName === 'grep' || toolName === 'search') {
-      return this.buildGrepSummary(entries, count, totalChars)
-    }
-    if (toolName === 'read_file') {
-      return this.buildReadFileSummary(entries, count, totalChars)
-    }
     if (toolName === 'bash') {
       return this.buildBashSummary(entries, count, totalChars)
     }
     return this.buildGenericSummary(toolName, entries, count, totalChars)
-  }
-
-  private buildGrepSummary(entries: AccumulatorEntry[], count: number, totalChars: number): string {
-    const matchCounts: number[] = []
-    const filesSeen = new Set<string>()
-
-    for (const e of entries) {
-      const lines = e.content.split('\n')
-      let matches = 0
-      for (const line of lines) {
-        const fileMatch = line.match(/^([^\s:]+):/)
-        if (fileMatch) {
-          filesSeen.add(fileMatch[1]!)
-          matches++
-        }
-      }
-      matchCounts.push(matches || lines.length)
-    }
-
-    const totalMatches = matchCounts.reduce((a, b) => a + b, 0)
-    const topFiles = [...filesSeen].slice(0, 10)
-
-    const lines = [
-      `[storm-collapsed: ${count} grep calls → ${totalMatches} total matches across ${filesSeen.size} files, ${totalChars} chars collapsed]`,
-      `Top files: ${topFiles.join(', ')}${filesSeen.size > 10 ? ` (+${filesSeen.size - 10} more)` : ''}`,
-    ]
-    return lines.join('\n')
-  }
-
-  private buildReadFileSummary(entries: AccumulatorEntry[], count: number, totalChars: number): string {
-    // Extract file paths from content headers like "── src/tools/hash-edit.ts ──"
-    const paths: string[] = []
-    for (const e of entries) {
-      const headerMatch = e.content.match(/──\s*(.+?)\s*──/)
-      if (headerMatch) {
-        paths.push(headerMatch[1]!)
-      }
-    }
-    const pathInfo = paths.length > 0
-      ? `files: ${paths.join(', ')}`
-      : `sizes: ${entries.map(e => e.content.split('\n').length + ' lines').join(', ')}`
-    return `[storm-collapsed: ${count} read_file calls, ${totalChars} chars collapsed, ${pathInfo}]`
   }
 
   private buildBashSummary(entries: AccumulatorEntry[], count: number, totalChars: number): string {

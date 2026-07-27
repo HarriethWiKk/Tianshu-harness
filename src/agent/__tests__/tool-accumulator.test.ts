@@ -28,29 +28,27 @@ describe('ToolAccumulator', () => {
     assert.ok(result!.summary.includes('4 bash calls'))
   })
 
-  it('reader tools (read_file/grep/run_tests) use higher threshold (12)', () => {
-    // 11 read_file calls: below threshold (12), no collapse
-    for (let i = 0; i < 11; i++) {
+  it('reader tools are exempt — 12+ consecutive read_file calls never collapse', () => {
+    // 折叠 read_file 只剩路径清单：模型刚读的内容全丢，被迫逐个重读
+    // （读→折→重读循环）。读取量另有五道预算链兜底，风暴折叠对读类豁免。
+    for (let i = 0; i < 13; i++) {
       acc.record({ toolName: 'read_file', toolUseId: `r${i}`, content: 'x'.repeat(500), turn: 1 })
     }
     assert.equal(acc.tryCollapse('read_file'), null)
-
-    // 12th call: hits threshold, collapses first 11
-    acc.record({ toolName: 'read_file', toolUseId: 'r11', content: 'x'.repeat(500), turn: 1 })
-    const result = acc.tryCollapse('read_file')
-    assert.notEqual(result, null)
-    assert.equal(result!.collapsedIds.length, 11)
-    assert.ok(result!.summary.includes('storm-collapsed'))
-    assert.ok(result!.summary.includes('read_file'))
   })
 
-  it('run_tests uses reader threshold — 4 calls should NOT collapse', () => {
-    // 4 calls with default threshold (4) would trigger collapse. With reader
-    // threshold (12), they should be safe.
-    for (let i = 0; i < 4; i++) {
+  it('grep/glob/read_section 同样豁免（13 次连续也不折叠）', () => {
+    for (let i = 0; i < 13; i++) {
+      acc.record({ toolName: 'grep', toolUseId: `g${i}`, content: `src/a.ts:${i}:  const foo = bar`, turn: 1 })
+    }
+    assert.equal(acc.tryCollapse('grep'), null)
+  })
+
+  it('run_tests exempt — consecutive calls never collapse', () => {
+    for (let i = 0; i < 13; i++) {
       acc.record({ toolName: 'run_tests', toolUseId: `t${i}`, content: `✓ ${i + 1} passed`, turn: 1 })
     }
-    assert.equal(acc.tryCollapse('run_tests'), null, '4 run_tests should not collapse (reader threshold=12)')
+    assert.equal(acc.tryCollapse('run_tests'), null)
   })
 
   it('does not collapse different tool types', () => {
@@ -84,29 +82,6 @@ describe('ToolAccumulator', () => {
     acc.reset()
     assert.equal(acc.consecutiveCount('bash'), 0)
     assert.equal(acc.tryCollapse('bash'), null)
-  })
-
-  it('builds grep summary with file extraction after reader threshold', () => {
-    const grepContent = (n: number) =>
-      `src/a.ts:${n}:  const foo = bar\nsrc/b.ts:${n}:  const baz = qux`
-    // 13 grep calls to trigger reader threshold (12 collapsed)
-    for (let i = 0; i < 13; i++) {
-      acc.record({ toolName: 'grep', toolUseId: `g${i}`, content: grepContent(i), turn: 1 })
-    }
-    const result = acc.tryCollapse('grep')!
-    assert.ok(result.summary.includes('grep calls'))
-    assert.ok(result.summary.includes('src/a.ts'))
-    assert.ok(result.summary.includes('src/b.ts'))
-  })
-
-  it('builds read_file summary with file path extraction from headers', () => {
-    for (let i = 0; i < 13; i++) {
-      acc.record({ toolName: 'read_file', toolUseId: `r${i}`, content: `── src/tools/hash-edit.ts ──\n${'x'.repeat(500)}`, turn: 1 })
-    }
-    const result = acc.tryCollapse('read_file')!
-    assert.ok(result.summary.includes('read_file calls'))
-    assert.ok(result.summary.includes('src/tools/hash-edit.ts'))
-    assert.ok(result.summary.includes('files: '))
   })
 
   it('builds bash summary with per-command metadata', () => {

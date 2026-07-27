@@ -4,8 +4,9 @@ import { writeFileSync, rmSync, mkdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
-import { ProfileRegistry, delegationToolTimeoutMs, DEFAULT_DELEGATE_CONCURRENCY } from '../profile-registry.js'
+import { ProfileRegistry, profileRegistry, delegationToolTimeoutMs, DEFAULT_DELEGATE_CONCURRENCY } from '../profile-registry.js'
 import { progressiveTimeout, WORKER_EXIT_GRACE_MS } from '../timeout-ladder.js'
+import { MAX_BUDGET_CONTINUATIONS, MAX_HANDS_EXTRA_RUNS } from '../worker-continuation.js'
 
 function makeTmpDir(): string {
   const dir = join(tmpdir(), `rivet-test-agents-${randomUUID()}`)
@@ -257,33 +258,62 @@ describe('ProfileRegistry', () => {
 
 describe('delegationToolTimeoutMs (A2: wave-scaled batch timeout)', () => {
   const mature = progressiveTimeout(undefined) // mature tier (see timeout-ladder)
+  // 可续跑的 profile 按最坏运行次数放宽（首轮 + MAX_BUDGET_CONTINUATIONS 次续跑），
+  // 否则续跑撞上工具层硬 reject，连首轮 partial 一起丢。
+  const runs = 1 + MAX_BUDGET_CONTINUATIONS
 
-  it('single wave (taskCount <= maxWorkers) equals legacy budget + grace', async () => {
+  it('single wave (taskCount <= maxWorkers) equals budget × runs + grace', async () => {
     const single = delegationToolTimeoutMs(undefined, [undefined, undefined], { taskCount: 2 })
-    assert.equal(single, mature + WORKER_EXIT_GRACE_MS)
+    assert.equal(single, mature * runs + WORKER_EXIT_GRACE_MS)
   })
 
   it('backward-compatible: no opts defaults taskCount to profiles.length', async () => {
-    // 3 profiles, default concurrency 3 → 1 wave → unchanged from the old behavior.
+    // 3 profiles, default concurrency 3 → 1 wave.
     const legacy = delegationToolTimeoutMs(undefined, [undefined, undefined, undefined])
-    assert.equal(legacy, mature + WORKER_EXIT_GRACE_MS)
+    assert.equal(legacy, mature * runs + WORKER_EXIT_GRACE_MS)
   })
 
   it('scales by ceil(taskCount / maxWorkers) waves', async () => {
     // 5 tasks on the default 3-worker pool → ceil(5/3)=2 waves.
     const twoWaves = delegationToolTimeoutMs(undefined, [], { taskCount: 5 })
-    assert.equal(twoWaves, mature * 2 + WORKER_EXIT_GRACE_MS)
+    assert.equal(twoWaves, mature * 2 * runs + WORKER_EXIT_GRACE_MS)
     assert.equal(DEFAULT_DELEGATE_CONCURRENCY, 3)
   })
 
   it('honors explicit maxWorkers when provided', async () => {
     // 10 tasks / 3 workers → ceil = 4 waves.
     const fourWaves = delegationToolTimeoutMs(undefined, [], { taskCount: 10, maxWorkers: 3 })
-    assert.equal(fourWaves, mature * 4 + WORKER_EXIT_GRACE_MS)
+    assert.equal(fourWaves, mature * 4 * runs + WORKER_EXIT_GRACE_MS)
   })
 
   it('never returns less than one wave for empty/zero input', async () => {
     const floor = delegationToolTimeoutMs(undefined, [], { taskCount: 0 })
-    assert.equal(floor, mature + WORKER_EXIT_GRACE_MS)
+    assert.equal(floor, mature * runs + WORKER_EXIT_GRACE_MS)
+  })
+
+  it('全是写工时按 hands 总账放宽——Wave 7 起写工也在工作树内续跑', async () => {
+    const patcherBudget = profileRegistry.get('patcher')?.defaultTimeoutMs ?? mature
+    const budget = Math.max(mature, patcherBudget)
+    const handsRuns = 1 + MAX_HANDS_EXTRA_RUNS
+    const handsOnly = delegationToolTimeoutMs(undefined, ['patcher'], { taskCount: 1 })
+    assert.equal(handsOnly, budget * handsRuns + WORKER_EXIT_GRACE_MS)
+  })
+
+  it('按次 timeoutMs 抬高天花板；调小则不收紧（内层自己先开枪）', async () => {
+    const raised = delegationToolTimeoutMs(undefined, [undefined], { taskCount: 1, requestedTimeoutMs: [900_000] })
+    assert.equal(raised, 900_000 * runs + WORKER_EXIT_GRACE_MS)
+    const lowered = delegationToolTimeoutMs(undefined, [undefined], { taskCount: 1, requestedTimeoutMs: [1000] })
+    assert.equal(lowered, mature * runs + WORKER_EXIT_GRACE_MS)
+    const mixed = delegationToolTimeoutMs(undefined, [undefined, undefined], { taskCount: 2, requestedTimeoutMs: [undefined, 700_000] })
+    assert.equal(mixed, 700_000 * runs + WORKER_EXIT_GRACE_MS, '取批内最大的按次预算')
+  })
+
+  it('profile 省略时按可续跑放宽——默认落到只读 code_scout', async () => {
+    // delegate 工具层 profile 可选，模型省略时这里收到 undefined，而实际 worker
+    // 是能续跑的 code_scout。按「只有确定全是写工才不放宽」判据，这里必须放宽。
+    const scoutBudget = profileRegistry.get('code_scout')?.defaultTimeoutMs ?? mature
+    const omitted = delegationToolTimeoutMs(undefined, [undefined], { taskCount: 1 })
+    assert.equal(omitted, mature * runs + WORKER_EXIT_GRACE_MS)
+    assert.ok(omitted >= scoutBudget, '放宽后的天花板不得低于 code_scout 单轮预算')
   })
 })

@@ -55,9 +55,10 @@ describe('worker prompts', () => {
       'discipline names the fields most prone to bare quotes')
   })
 
-  // 天枢 agent 的默认项目约定文件是 .rivet.md / AGENTS.md——worker 的发现引导
-  // 不指向其他工具的记忆文件（CLAUDE.md 曾在此处被引用，误导 worker 采信外部记忆）。
-  it('project discovery points workers at rivet defaults, not other tools\' memory files', () => {
+  // 发现引导不再叫 worker 去读项目约定文件：文件存在时其内容已经在冻结块的
+  // <project-instructions> 里，不存在时条件本身不成立——两种情况下都是死条文。
+  // 原有的硬约束（不指向其他工具的记忆文件）在整行删除后自然成立，继续钉住。
+  it('project discovery no longer tells workers to read convention files', () => {
     const order = createReadOnlyWorkOrder({
       id: 'wo_disc',
       parentTurnId: 'turn_1',
@@ -67,8 +68,41 @@ describe('worker prompts', () => {
       scope: { files: [] },
     })
     const prompt = buildWorkerPrompt(order)
-    assert.ok(prompt.includes('.rivet.md or AGENTS.md'), 'discovery preamble cites rivet defaults')
+    assert.ok(prompt.includes('## Project Context Discovery'), 'discovery preamble still orients read-only workers')
+    assert.ok(!prompt.includes('.rivet.md'), 'convention files travel in <project-instructions>, not as a tool-call instruction')
+    assert.ok(!prompt.includes('AGENTS.md'), 'convention files travel in <project-instructions>, not as a tool-call instruction')
     assert.ok(!prompt.includes('CLAUDE.md'), 'no reference to other agents\' memory files')
+  })
+
+  // 只读 worker 一个写工具都没有，changedFiles 相关的三条前件不可能成立，
+  // 结果卡模板里 changedFiles 也写死成 []。给它们只会占前缀、不产生约束。
+  it('gates changedFiles instructions to write-capable workers', () => {
+    const readOnly = buildWorkerPrompt(createReadOnlyWorkOrder({
+      id: 'wo_ro_gate',
+      parentTurnId: 'turn_1',
+      kind: 'code_search',
+      profile: 'code_scout',
+      objective: 'Trace the routing seam.',
+      scope: { files: [] },
+    }))
+    const write = buildWorkerPrompt(createWriteWorkOrder({
+      id: 'wo_w_gate',
+      parentTurnId: 'turn_1',
+      kind: 'patch_proposal',
+      objective: 'Fix the evidence gate bypass.',
+      scope: { files: ['src/agent/coordinator.ts'] },
+    }))
+
+    assert.ok(!readOnly.includes('Do not claim that files were changed'))
+    assert.ok(!readOnly.includes('If you changed files and did not run relevant verification'))
+    assert.ok(!readOnly.includes('Use changedFiles ONLY'))
+    assert.ok(readOnly.includes('Do not call disallowed tools.'), 'the disallowed-tools gate still applies')
+    assert.ok(readOnly.includes('Use examinedFiles for files you read/inspected.'),
+      'examinedFiles guidance is the half that still applies to read-only workers')
+
+    assert.ok(write.includes('Do not claim that files were changed'))
+    assert.ok(write.includes('If you changed files and did not run relevant verification'))
+    assert.ok(write.includes('Use changedFiles ONLY'))
   })
 
   it('builds a write-capable worker prompt for write work orders', () => {
@@ -226,8 +260,8 @@ describe('worker prompts', () => {
         .filter(f => prompt.includes(f)).length
       assert.equal(x1Count, 1, 'top-3 cap keeps exactly one ×1 family')
       assert.ok(prompt.includes('record_general_finding'), 'points at the write-back tool')
-      // 段落位置：权域指令之后（末尾注意力权重）
-      assert.ok(prompt.indexOf('## 权域指令') < prompt.indexOf('## 将星战绩'))
+      // 段落位置：任务卡之后（末尾注意力权重）
+      assert.ok(prompt.indexOf('## Task') < prompt.indexOf('## 将星战绩'))
     })
 
     it('no ledger / no authority / no cwd → no section', () => {
@@ -276,6 +310,51 @@ describe('worker prompts', () => {
     assert.ok(packet.includes('</worker_results>'))
     // Compact JSON — no pretty-print indentation
     assert.ok(!packet.includes('\n  '))
+  })
+
+  describe('packet 带上派发目标', () => {
+    const withObjective = (over: Record<string, unknown> = {}) => ({
+      workOrderId: 'batch:3',
+      status: 'passed' as const,
+      summary: '改完了',
+      findings: [],
+      artifacts: [],
+      changedFiles: [],
+      risks: [],
+      nextActions: [],
+      evidenceStatus: 'unverified' as const,
+      ...over,
+    })
+
+    it('objective 出现在 packet 里', async () => {
+      // 缺了它，主控看到的只是「batch:3 说：改完了」——批量派五个再隔几轮，
+      // 模型无从判断交回物是否对得上当初派它去做的事。
+      const packet = await buildPrimaryWorkerPacket([
+        withObjective({ objective: '把 fleet-registry 的 id 复用改成另起一条记录' }),
+      ])
+      assert.ok(packet.includes('把 fleet-registry 的 id 复用改成另起一条记录'), 'packet 必须带上派发目标')
+    })
+
+    it('objective 排在 summary 之前', async () => {
+      const packet = await buildPrimaryWorkerPacket([
+        withObjective({ objective: 'OBJECTIVE_MARKER' }),
+      ])
+      const at = packet.indexOf('OBJECTIVE_MARKER')
+      assert.ok(at >= 0, 'objective 必须在 packet 里')
+      assert.ok(at < packet.indexOf('改完了'), '先看见目标再看见交付')
+    })
+
+    it('过长的 objective 被截断，不挤占 packet 预算', async () => {
+      const long = 'x'.repeat(600)
+      const packet = await buildPrimaryWorkerPacket([withObjective({ objective: long })])
+      assert.ok(!packet.includes(long), '不能原样带进 packet')
+      assert.ok(packet.includes(`${'x'.repeat(300)}…`), '截断到 300 字并留省略号')
+    })
+
+    it('没有 objective 的结果不留空字段', async () => {
+      const packet = await buildPrimaryWorkerPacket([withObjective()])
+      assert.ok(!packet.includes('"objective"'), '缺省时应被 stripEmpty 剥掉')
+    })
   })
 
   it('strips empty arrays from packet to reduce size', async () => {
@@ -452,6 +531,70 @@ describe('worker prompts', () => {
     assert.equal(parsed[0].evidenceStatus, 'unverified', 'truncated verified claims must be downgraded')
   })
 
+  it('字段裁剪时保住续跑指引——它是主控知道「这活能接着干」的唯一线索', async () => {
+    // packet 超预算恰恰发生在派了一批 worker 的时候，也正是最需要续跑的场景。
+    // 整字段删 nextActions 会把 captureAbortCheckpoint 写入的那条 Resumable
+    // 一起删掉，被截断的 salvage 摘要就此被当成交付（7-24 假摘要事故的形状）。
+    const resumeHint = "Resumable: re-dispatch with delegate_task/delegate_batch resume:'wo_cut' — the worker's partial progress (12 tool calls, 4096 chars) is checkpointed and will be injected as context."
+    const manyFindings = Array.from({ length: 70 }, (_, i) => ({
+      claim: `Finding ${i}: ${'detail '.repeat(40)}`,
+      evidence: `src/file-${i}.ts`,
+      confidence: 'high' as const,
+    }))
+
+    const packet = await buildPrimaryWorkerPacket([
+      {
+        workOrderId: 'wo_cut',
+        status: 'blocked',
+        summary: 'Cut off by the turn budget mid-scan.',
+        findings: manyFindings,
+        artifacts: [],
+        changedFiles: [],
+        examinedFiles: Array.from({ length: 100 }, (_, i) => `src/other-${i}.ts`),
+        risks: Array.from({ length: 50 }, (_, i) => `risk-${i}: ${'word '.repeat(20)}`),
+        nextActions: ['narrow the scope next time', resumeHint, 'or split into two orders'],
+        evidenceStatus: 'unverified',
+        failureReason: 'max_turns',
+      },
+    ])
+
+    const jsonMatch = packet.match(/<worker_results>([\s\S]*?)<\/worker_results>/)
+    assert.ok(jsonMatch, 'packet must contain <worker_results> tags')
+    const parsed = JSON.parse(jsonMatch[1]!)
+
+    assert.equal(parsed[0]._truncated, true, '前提：这个用例确实触发了字段裁剪')
+    assert.deepEqual(parsed[0].nextActions, [resumeHint], '只保留续跑指引，其余 nextActions 照删')
+    assert.equal(parsed[0].failureReason, 'max_turns', 'failureReason 不参与裁剪')
+  })
+
+  it('没有续跑指引时 nextActions 仍整字段删掉', async () => {
+    const manyFindings = Array.from({ length: 70 }, (_, i) => ({
+      claim: `Finding ${i}: ${'detail '.repeat(40)}`,
+      evidence: `src/file-${i}.ts`,
+      confidence: 'high' as const,
+    }))
+
+    const packet = await buildPrimaryWorkerPacket([
+      {
+        workOrderId: 'wo_plain',
+        status: 'passed',
+        summary: 'Finished, no checkpoint involved.',
+        findings: manyFindings,
+        artifacts: [],
+        changedFiles: [],
+        examinedFiles: Array.from({ length: 100 }, (_, i) => `src/other-${i}.ts`),
+        risks: Array.from({ length: 50 }, (_, i) => `risk-${i}: ${'word '.repeat(20)}`),
+        nextActions: ['ship it', 'tell the user'],
+        evidenceStatus: 'verified',
+      },
+    ])
+
+    const jsonMatch = packet.match(/<worker_results>([\s\S]*?)<\/worker_results>/)
+    const parsed = JSON.parse(jsonMatch![1]!)
+    assert.equal(parsed[0]._truncated, true, '前提：这个用例确实触发了字段裁剪')
+    assert.equal('nextActions' in parsed[0], false, '普通 nextActions 不该被保留，避免白占预算')
+  })
+
   it('produces valid JSON when progressive field drop is insufficient and hard truncation fires', async () => {
     // Extreme case: findings so large that even after dropping all non-core
     // fields the JSON still exceeds 32K. The hard truncation must still
@@ -484,5 +627,61 @@ describe('worker prompts', () => {
       () => JSON.parse(jsonMatch[1]!),
       'hard-truncated packet JSON must be parseable',
     )
+  })
+
+  describe('派发未完成的告知（Wave 9）', () => {
+    function result(over: Partial<import('../work-order.js').WorkerResult>): import('../work-order.js').WorkerResult {
+      return {
+        workOrderId: 'wo',
+        status: 'passed',
+        summary: 'done',
+        findings: [],
+        artifacts: [],
+        changedFiles: [],
+        risks: [],
+        nextActions: [],
+        evidenceStatus: 'unverified',
+        ...over,
+      }
+    }
+
+    it('有 worker 没完成时，hint 顶部单列一段，并把 failureReason 翻成可操作的下一步', async () => {
+      const packet = await buildPrimaryWorkerPacket([
+        result({ workOrderId: 'wo_ok', status: 'passed', summary: '查到了' }),
+        result({ workOrderId: 'wo_cut', status: 'blocked', summary: '干到一半', failureReason: 'max_turns' }),
+      ])
+      assert.ok(packet.includes('<worker_dispatch_incomplete>'), '未完成时必须显式告知')
+      assert.ok(packet.includes('1/2'), '说清有几个没完成')
+      assert.ok(packet.includes('wo_cut'), '点名是哪个 worker')
+      assert.ok(packet.includes('maxTurns'), 'max_turns 要给出可操作的下一步')
+      assert.ok(
+        packet.indexOf('<worker_dispatch_incomplete>') < packet.indexOf('<worker_results>'),
+        '告知在结果之前——主控最先读到的应当是「这次没干完」',
+      )
+    })
+
+    it('全部通过时不加噪音', async () => {
+      const packet = await buildPrimaryWorkerPacket([result({ workOrderId: 'wo_ok' })])
+      assert.ok(!packet.includes('worker_dispatch_incomplete'))
+    })
+
+    it('可续跑的失败额外给出 resume 指引', async () => {
+      const packet = await buildPrimaryWorkerPacket([
+        result({ workOrderId: 'wo_cut', status: 'blocked', failureReason: 'timeout', nextActions: ['Resumable: 断点已存'] }),
+      ])
+      assert.ok(packet.includes('resume:'), '带断点的失败要告诉主控怎么接着干')
+    })
+
+    it('失败结果在 packet 里置顶——裁剪从尾部丢，置顶让它活到最后', async () => {
+      const packet = await buildPrimaryWorkerPacket([
+        result({ workOrderId: 'wo_ok_1', status: 'passed' }),
+        result({ workOrderId: 'wo_cut', status: 'blocked', failureReason: 'worker_crash' }),
+        result({ workOrderId: 'wo_ok_2', status: 'passed' }),
+      ])
+      const body = packet.match(/<worker_results>([\s\S]*?)<\/worker_results>/)![1]!
+      const parsed = JSON.parse(body) as Array<{ workOrderId: string }>
+      assert.equal(parsed[0]!.workOrderId, 'wo_cut')
+      assert.deepEqual(parsed.map(r => r.workOrderId), ['wo_cut', 'wo_ok_1', 'wo_ok_2'], '通过的结果之间保持原有顺序')
+    })
   })
 })

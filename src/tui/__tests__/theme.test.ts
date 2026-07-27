@@ -18,7 +18,7 @@ describe('getTheme', () => {
   it('tianshu uses cinnabar user mark + bright neutral body + readable muted', () => {
     setTheme('tianshu')
     const theme = getTheme(3)
-    assert.equal(theme.userColor, '#d4453a')      // 朱砂印 ▌ mark
+    assert.equal(theme.userColor, '#d86459')      // 朱砂印 ▌ mark (softened & brightened)
     assert.equal(theme.assistantColor, '#d2d5dd') // 亮灰正文 (提亮至 #d2d5dd)
     assert.equal(theme.muted, '#adb2bf')          // 元信息灰 (提亮 ~6.5:1)
     assert.equal(theme.systemColor, '#adb2bf')    // 与 muted 对齐
@@ -61,8 +61,8 @@ describe('getTheme', () => {
   it('tianshu uses cinnabar seal for user mark + alert pulse', () => {
     setTheme('tianshu')
     const theme = getTheme(3)
-    assert.equal(theme.userColor, '#d4453a')   // 朱砂印 — user ▌ mark
-    assert.equal(theme.pulseAlert, '#d4453a')  // vivid seal, distinct from desaturated error
+    assert.equal(theme.userColor, '#d86459')   // 朱砂印 — user ▌ mark
+    assert.equal(theme.pulseAlert, '#d86459')  // vivid seal, distinct from desaturated error
     assert.equal(theme.assistantColor, '#d2d5dd') // brightened neutral body
   })
 
@@ -108,8 +108,8 @@ describe('theme switching', () => {
     setTheme('cyberpunk')
     assert.equal(getActiveThemeName(), 'cyberpunk')
     const theme = getTheme(3)
-    assert.equal(theme.primary, '#22d3ee')
-    assert.equal(theme.error, '#fb7185')
+    assert.equal(theme.primary, '#48c6e2')
+    assert.equal(theme.error, '#e27585')
   })
 
   it('switches back to ziwei theme', () => {

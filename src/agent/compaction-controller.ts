@@ -686,9 +686,7 @@ export class CompactionController {
       this.deps.promptEngine.resetAppendixBaseline()
       this.deps.session.markCompacted(input.loopTurn)
       this.deps.pressureMonitor.recordCompaction(this.deps.session.getTurnCount())
-      // W6：压缩重写历史后，被压掉的 CVM 注入已不在上下文里——开销计数
-      // 随之归零（appendix baseline 同步重置，后续块重新入场重新计费）。
-      this.deps.pressureMonitor.resetCvmOverhead()
+      // CVM 开销计数由 resetAppendixBaseline 的回调归零，此处不再单独调用。
       const afterTokens = this.deps.session.getEstimatedTokens()
       this.deps.session.recordCompactEvent({
         turn: this.deps.session.getTurnCount(),
@@ -1321,6 +1319,63 @@ export class CompactionController {
   }
 
   /**
+   * Issue one side-path summary request and return its text (null on
+   * error/timeout/empty).
+   *
+   * Callers pass the full live history plus a trailing instruction message, so
+   * the request prefix stays identical to the main conversation and the side
+   * path reuses the prefix cache rather than paying for a fresh read.
+   *
+   * Side-path discipline (CLAUDE.md): `buildOaiRequest` is called with
+   * `{ sidePath: true }` so the main path's wire baseline is never touched, and
+   * the caller's message objects are only spread — never mutated in place,
+   * which would flip system bytes mid-flight for a concurrent `stream()`.
+   */
+  private async streamSummary(
+    requestMessages: OaiMessage[],
+    timeoutMs: number,
+    userSignal?: AbortSignal,
+  ): Promise<string | null> {
+    const summaryClient = this.summaryClient()
+    if (!summaryClient) return null
+
+    const request = this.deps.promptEngine.buildOaiRequest(
+      requestMessages,
+      undefined,
+      this.deps.contextWindow,
+      { sidePath: true },
+    )
+    request.tools = undefined
+
+    const chunks: string[] = []
+    let errored = false
+    const timeoutSignal = AbortSignal.timeout(timeoutMs)
+    const signal = userSignal
+      ? AbortSignal.any([userSignal, timeoutSignal])
+      : timeoutSignal
+    try {
+      await summaryClient.stream(request, {
+        onTextDelta: (text) => { chunks.push(text) },
+        onThinkingDelta: () => {},
+        onContentBlock: () => {},
+        // Same usage booking as tryPartialCompact — see recordSummaryUsage.
+        onStopReason: (_reason, usage) => {
+          if (usage && (usage.input_tokens ?? 0) > 0) {
+            this.deps.recordSummaryUsage?.(usage, request.model)
+          }
+        },
+        onError: () => { errored = true },
+      }, signal)
+    } catch {
+      return null
+    }
+
+    if (errored || chunks.length === 0) return null
+    const text = chunks.join('').trim()
+    return text.length > 0 ? text : null
+  }
+
+  /**
    * Forked Agent LLM compaction: sends a compact-summary request through the
    * primary model's StreamClient, reusing cache anchors (first 2 messages)
    * for ~90% prefix cache hit rate.
@@ -1381,41 +1436,8 @@ export class CompactionController {
         },
       ]
 
-      const request = this.deps.promptEngine.buildOaiRequest(
-        compactMessages,
-        undefined,
-        this.deps.contextWindow,
-        { sidePath: true },
-      )
-      request.tools = undefined
-
-      const chunks: string[] = []
-      let errored = false
-      const timeoutSignal = AbortSignal.timeout(timeoutMs)
-      const signal = userSignal
-        ? AbortSignal.any([userSignal, timeoutSignal])
-        : timeoutSignal
-      try {
-        await summaryClient.stream(request, {
-          onTextDelta: (text) => { chunks.push(text) },
-          onThinkingDelta: () => {},
-          onContentBlock: () => {},
-          // Same usage booking as tryPartialCompact — see recordSummaryUsage.
-          onStopReason: (_reason, usage) => {
-            if (usage && (usage.input_tokens ?? 0) > 0) {
-              this.deps.recordSummaryUsage?.(usage, request.model)
-            }
-          },
-          onError: () => { errored = true },
-        }, signal)
-      } catch {
-        return null
-      }
-
-      if (errored || chunks.length === 0) return null
-
-      const summary = chunks.join('').trim()
-      if (summary.length === 0) return null
+      const summary = await this.streamSummary(compactMessages, timeoutMs, userSignal)
+      if (summary === null) return null
 
       // P6: post-check — if the summary reflects none of the material state
       // (failed error classes / touched files) recorded in the trajectory, fall
@@ -1430,6 +1452,111 @@ export class CompactionController {
     } finally {
       this._llmCompactInFlight = false
     }
+  }
+
+  /**
+   * Rewind point-summarisation: replace ONE contiguous range of the history
+   * with an LLM summary, leaving everything outside the range byte-identical.
+   * `/compact` compresses everything; this compresses a span the user picked.
+   *
+   * Cache cost differs sharply by scope, which is why the two are distinct
+   * actions rather than one with a flag:
+   *  - `from`: keeps `messages[0..messageIndex)` verbatim, so the prefix still
+   *    hits all the way up to the cut. Only the new tail is paid for.
+   *  - `to`:   rewrites near the head, so every byte after the cache anchors
+   *    changes → full prefix rebuild on the next request. Callers must surface
+   *    that cost to the user (see the rewind overlay's risk line), and only for
+   *    providers where it is actually a cost — `isCachePreservingProvider()`.
+   *
+   * Unlike the automatic ladder this deliberately runs NO reclaim gate: that
+   * gate is an economic veto for compaction the system chose to do on its own.
+   * Here the user explicitly asked, so vetoing it would just look broken.
+   */
+  async summarizeRange(params: {
+    scope: 'from' | 'to'
+    messageIndex: number
+    timeoutMs?: number
+    signal?: AbortSignal
+  }): Promise<{ ok: true; beforeTokens: number; afterTokens: number; replaced: number } | { ok: false; reason: string }> {
+    if (!this.summaryClient()) return { ok: false, reason: '未配置可用于摘要的模型客户端' }
+
+    const messages = this.deps.session.getMessages()
+    const idx = Math.max(0, Math.min(params.messageIndex, messages.length))
+
+    // The replaced span. `to` keeps the cache anchors verbatim for the same
+    // reason replaceWithCheckpoint does — they are the cheapest bytes to hold
+    // on to, and dropping them buys nothing.
+    //
+    // 边界含选中消息的方向是 `to`（idx 不进 [from, to)）；`from` 必须 idx+1——
+    // UI 文案承诺「把此消息之后的内容压成摘要」，选中消息本身是用户挑的保留
+    // 锚点，卷进摘要就违背承诺（off-by-one，2026-07-27 审查发现）。
+    const from = params.scope === 'from' ? idx + 1 : Math.min(CACHE_ANCHOR_MESSAGES, idx)
+    const to = params.scope === 'from' ? messages.length : idx
+    const span = to - from
+    if (span < 2) return { ok: false, reason: '选定范围内的消息太少，无需摘要' }
+
+    const budget = this.summaryBudget().partial
+    const scopeClause = params.scope === 'from'
+      ? `本次**只总结上述对话的最后 ${span} 条消息**，此前的内容原样保留、不要复述。`
+      : `本次**只总结上述对话最前面的第 ${from + 1} 至 ${to} 条消息**，其后的内容原样保留、不要复述。`
+
+    const summary = await this.streamSummary(
+      [
+        ...messages,
+        {
+          role: 'user' as const,
+          content: [
+            '请对下述指定范围内的对话做压缩摘要。',
+            '',
+            scopeClause,
+            '',
+            '## 保留',
+            '1. 用户在该范围内的核心需求与意图演变（用户纠正过 agent 的理解时，以用户的纠正为准）',
+            '2. 关键技术决策及其原因',
+            '3. 涉及的文件路径与变更摘要',
+            '4. 遇到的错误及修复方法',
+            '5. 该范围结束时的工作状态与未完成事项',
+            '',
+            '## 丢弃',
+            '- 工具输出的详细内容（只保留结论）',
+            '- 探索性搜索的中间过程与重复的状态汇报',
+            '（只读探索可丢弃，但**写操作本身不可丢**——只丢弃其冗长输出）',
+            '',
+            `只输出总结内容，不要调用工具。格式用 markdown，控制在 ${budget} 字以内。`,
+          ].join('\n'),
+        },
+      ],
+      params.timeoutMs ?? 60_000,
+      params.signal,
+    )
+    if (summary === null) return { ok: false, reason: '摘要生成失败（模型无响应、超时或被中断）' }
+
+    const beforeTokens = estimateOaiTokens(messages)
+    const archive = await this.archiveDiscardedHistory(
+      messages.slice(from, to),
+      `rewind summarize-${params.scope}`,
+    )
+    const body = `<rewind-summary scope="${params.scope}" messages="${span}">\n${summary}\n</rewind-summary>${archive?.ref ?? ''}`
+
+    const candidate: OaiMessage[] = [
+      ...messages.slice(0, from),
+      { role: 'user', content: body },
+      ...messages.slice(to),
+    ]
+
+    this.safeReplaceMessages(candidate)
+    this.deps.promptEngine.resetAppendixBaseline()
+    const afterTokens = this.deps.session.getEstimatedTokens()
+    this.deps.session.recordCompactEvent({
+      turn: this.deps.session.getTurnCount(),
+      tier: 2,
+      reason: `rewind summarize-${params.scope} (${span} messages)`,
+      beforeTokens,
+      afterTokens,
+      createdAt: Date.now(),
+    })
+    this.deps.refreshLedger()
+    return { ok: true, beforeTokens, afterTokens, replaced: span }
   }
 
   /**

@@ -9,8 +9,10 @@ import { TurnCacheObservability } from '../cache-log-observability.js'
  * Vision channel contract (Computer Use Wave B): when a batch's ToolResults
  * carry `images` (data URLs), the batch layer forwards them as ONE trailing
  * multimodal user message AFTER addToolResults — and only when the active
- * model declares supportsVision. Text-only models must observe byte-identical
- * behavior to the pre-vision pipeline (images silently dropped).
+ * model declares supportsVision. A text-only model with a separate vision
+ * model configured gets the bridge instead: the images are described and the
+ * description is appended as text. With neither, behavior is byte-identical
+ * to the pre-vision pipeline (images silently dropped).
  */
 describe('ToolExecutionController vision-channel injection', () => {
   interface Captured {
@@ -23,7 +25,14 @@ describe('ToolExecutionController vision-channel injection', () => {
 
   function makeController(
     captured: Captured,
-    opts: { supportsVision: boolean; images?: string[]; wireInjector?: boolean; throwRegistryGetOnce?: boolean },
+    opts: {
+      supportsVision: boolean
+      images?: string[]
+      wireInjector?: boolean
+      throwRegistryGetOnce?: boolean
+      /** Vision bridge stub. `'throw'` simulates the side model failing. */
+      describe?: ((images: string[]) => Promise<string | null>) | 'throw'
+    },
   ) {
     let throwRegistryGet = opts.throwRegistryGetOnce ?? false
     const deps = {
@@ -83,6 +92,13 @@ describe('ToolExecutionController vision-channel injection', () => {
             captured.events.push('inject')
             captured.injected.push({ text, images })
           },
+      describeToolImages: opts.describe === undefined
+        ? undefined
+        : ((describe) => async (images: string[]) => {
+            captured.events.push('describe')
+            if (describe === 'throw') throw new Error('vision model unreachable')
+            return describe(images)
+          })(opts.describe),
       recordToolHistory: () => {},
       buildRuntimeSnapshot: () => ({}),
       requestThetaCheck: () => {},
@@ -135,16 +151,61 @@ describe('ToolExecutionController vision-channel injection', () => {
     assert.equal(captured.injected.length, 1)
     assert.deepEqual(captured.injected[0]!.images, [IMG])
     assert.match(captured.injected[0]!.text, /<system-reminder>/)
-    assert.match(captured.injected[0]!.text, /computer_use/)
+    assert.match(captured.injected[0]!.text, /Screenshot/)
     assert.deepEqual(captured.events, ['observe-begin', 'observe-ui', 'addToolResults', 'inject', 'observe-end'], 'append-only: injection strictly after tool results')
   })
 
-  it('supportsVision=false → images silently dropped (legacy behavior)', async () => {
+  it('supportsVision=false and no bridge → images silently dropped (legacy behavior)', async () => {
     const captured: Captured = { injected: [], events: [] }
     const controller = makeController(captured, { supportsVision: false, images: [IMG] })
     await controller.executeBatch(makeInput())
     assert.equal(captured.injected.length, 0)
     assert.deepEqual(captured.events, ['observe-begin', 'observe-ui', 'addToolResults', 'observe-end'])
+  })
+
+  it('text-only model + configured vision model → description appended as text', async () => {
+    const captured: Captured = { injected: [], events: [] }
+    const controller = makeController(captured, {
+      supportsVision: false,
+      images: [IMG],
+      describe: async () => 'A settings window with a back button at top left.',
+    })
+    await controller.executeBatch(makeInput())
+    assert.equal(captured.injected.length, 1)
+    assert.deepEqual(captured.injected[0]!.images, [], 'text-only model must not receive image parts')
+    assert.match(captured.injected[0]!.text, /back button at top left/)
+    assert.deepEqual(
+      captured.events,
+      ['observe-begin', 'observe-ui', 'addToolResults', 'describe', 'inject', 'observe-end'],
+      'bridge runs after tool results, injection stays append-only',
+    )
+  })
+
+  it('vision model preferred over the bridge when the primary model can see', async () => {
+    const captured: Captured = { injected: [], events: [] }
+    const controller = makeController(captured, {
+      supportsVision: true,
+      images: [IMG],
+      describe: async () => 'should not be called',
+    })
+    await controller.executeBatch(makeInput())
+    assert.equal(captured.events.includes('describe'), false)
+    assert.deepEqual(captured.injected[0]!.images, [IMG])
+  })
+
+  it('failing vision bridge leaves the tool results intact', async () => {
+    const captured: Captured = { injected: [], events: [] }
+    const controller = makeController(captured, { supportsVision: false, images: [IMG], describe: 'throw' })
+    await controller.executeBatch(makeInput())
+    assert.equal(captured.injected.length, 0)
+    assert.deepEqual(captured.events, ['observe-begin', 'observe-ui', 'addToolResults', 'describe', 'observe-end'])
+  })
+
+  it('empty description from the bridge injects nothing', async () => {
+    const captured: Captured = { injected: [], events: [] }
+    const controller = makeController(captured, { supportsVision: false, images: [IMG], describe: async () => '' })
+    await controller.executeBatch(makeInput())
+    assert.equal(captured.injected.length, 0)
   })
 
   it('no images in the batch → no injection even for vision models', async () => {

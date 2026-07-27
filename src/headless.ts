@@ -1,5 +1,7 @@
 import type { Usage } from './api/types.js'
 import type { AgentCallbacks, AgentLoop } from './agent/loop.js'
+import { serializeEvent } from './stream-json.js'
+import { redactText, redactValue } from './server/redact.js'
 
 export interface HeadlessCliArgs {
   headless: boolean
@@ -32,6 +34,10 @@ export interface HeadlessRunConfig {
   prompt: string
   json: boolean
   streamJson: boolean
+  /** For the stream-json `system/init` + `result` envelopes. Optional so the
+   *  existing text/json callers stay unchanged. */
+  sessionId?: string
+  model?: string
   createAgent: () => Pick<AgentLoop, 'run'> | HeadlessAgent
 }
 
@@ -60,28 +66,38 @@ export async function runHeadless(config: HeadlessRunConfig): Promise<HeadlessRu
   let usage: Partial<Usage> | undefined
   let error: string | undefined
 
+  // 脱敏纪律与 sidecar/event-tap 同口径：stdout 进 CI 日志即成泄漏面。
+  const emit = (ev: import('./stream-json.js').StreamJsonEvent) => process.stdout.write(serializeEvent(ev))
+
   const callbacks: AgentCallbacks = config.streamJson
     ? {
-        onTextDelta: delta => {
-          text += delta
-          process.stdout.write(JSON.stringify({ type: 'text_delta', text: delta }) + '\n')
-        },
-        onThinkingDelta: () => {},
-        onToolUse: (id, name, input) => {
-          process.stdout.write(JSON.stringify({ type: 'tool_use', id, name, input }) + '\n')
-        },
+        onTextDelta: delta => { text += delta; emit({ type: 'text_delta', text: redactText(delta) }) },
+        onThinkingDelta: delta => emit({ type: 'thinking_delta', text: redactText(delta) }),
+        onToolUse: (id, name, input) => emit({ type: 'tool_use', id, name, input: redactValue(input) as Record<string, unknown> }),
         onToolResult: (id, name, result, isError) => {
           if (isError) error = result
-          process.stdout.write(JSON.stringify({ type: 'tool_result', id, name, isError, result: result.slice(0, 500) }) + '\n')
+          emit({ type: 'tool_result', id, name, result: redactText(result), isError: isError ?? false })
         },
-        onTurnComplete: turnUsage => {
+        onTurnComplete: (turnUsage, turnNumber, isFinal) => {
           usage = turnUsage
-          process.stdout.write(JSON.stringify({ type: 'turn_complete', usage: turnUsage }) + '\n')
+          emit({ type: 'turn_complete', usage: turnUsage, turn: turnNumber, is_final: isFinal ?? false })
         },
-        onError: err => {
-          error = err.message
-          process.stdout.write(JSON.stringify({ type: 'error', error: err.message }) + '\n')
-        },
+        onPhaseChange: (phase, detail) => emit({ type: 'phase', phase, tool: detail?.tool, reason: detail?.reason }),
+        onDelegationActivity: activity => emit({
+          type: 'worker',
+          work_order_id: activity.workOrderId,
+          parent_tool_id: activity.parentToolId,
+          status: activity.status,
+          profile: activity.profile,
+          authority: activity.authority,
+          objective: activity.objective,
+          progress_line: activity.progressLine ? redactText(activity.progressLine) : undefined,
+          tool_use_count: activity.toolUseCount,
+          token_count: activity.tokenCount,
+          model: activity.model,
+          failure_reason: activity.failureReason,
+        }),
+        onError: err => { error = err.message; emit({ type: 'error', error: redactText(err.message) }) },
         onAbort: () => { error = 'Aborted' },
         onApprovalRequired: async () => false,
       }
@@ -89,18 +105,31 @@ export async function runHeadless(config: HeadlessRunConfig): Promise<HeadlessRu
         onTextDelta: delta => { text += delta },
         onThinkingDelta: () => {},
         onToolUse: () => {},
-        onToolResult: (_id, _name, result, isError) => {
-          if (isError) error = result
-        },
+        onToolResult: (_id, _name, result, isError) => { if (isError) error = result },
         onTurnComplete: turnUsage => { usage = turnUsage },
         onError: err => { error = err.message },
         onAbort: () => { error = 'Aborted' },
         onApprovalRequired: async () => false,
       }
 
+  if (config.streamJson) {
+    emit({ type: 'system', subtype: 'init', session_id: config.sessionId ?? '', model: config.model ?? '', cwd: process.cwd() })
+  }
+
   await agent.run(config.prompt, callbacks)
 
   const success = !error
+  if (config.streamJson) {
+    emit({
+      type: 'result',
+      subtype: success ? 'success' : 'error',
+      session_id: config.sessionId ?? '',
+      is_error: !success,
+      result: redactText(success ? text : (error ?? 'Unknown error')),
+      ...(usage ? { usage } : {}),
+    })
+  }
+
   const payload: HeadlessJsonOutput = success
     ? { success: true, text, ...(usage ? { usage } : {}) }
     : { success: false, text, error: error ?? 'Unknown error' }
@@ -110,6 +139,9 @@ export async function runHeadless(config: HeadlessRunConfig): Promise<HeadlessRu
   return {
     exitCode: success ? 0 : 1,
     stdout,
-    json: (config.json || config.streamJson) ? payload : undefined,
+    // streamJson 的终止态已由 result 信封承载——遗留 payload 一并输出会在同一条
+    // NDJSON 流里出现两个 schema 的收尾（且无 type 字段），消费者按 type 分派
+    // 会在最后一行拿到 undefined。
+    json: config.json ? payload : undefined,
   }
 }

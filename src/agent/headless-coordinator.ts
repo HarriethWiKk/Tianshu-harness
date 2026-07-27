@@ -20,6 +20,8 @@ import type { AuthProvider } from '../auth/types.js'
 import { createProviderClient } from '../api/factory.js'
 import { resolveCapabilities } from '../api/provider.js'
 import { PromptEngine } from '../prompt/engine.js'
+import { subagentPromptBlocks } from '../prompt/block-policy.js'
+import { applyDescriptionMode } from '../tools/description-compact.js'
 import { profileRegistry } from './profile-registry.js'
 import type { CompactionConfig } from '../compact/constants.js'
 
@@ -79,13 +81,14 @@ export function createHeadlessCoordinator(input: HeadlessCoordinatorInput): Dele
   const modelCards = buildModelCards(input.provider)
   const runtimeFactory: WorkerRuntimeFactory = (order, card, workerRegistry) => {
     const isWrite = profileRegistry.listWriteProfiles().includes(order.profile)
+    const blocks = subagentPromptBlocks()
     const modelSpec = input.provider.models.find(
       m => m.id === card.model || m.alias === card.model,
     )
     const ctxWindow = modelSpec?.contextWindow ?? card.contextWindow
     const maxTokens = isWrite
-      ? Math.min(8192, modelSpec?.maxTokens ?? ctxWindow)
-      : Math.min(4096, modelSpec?.maxTokens ?? ctxWindow)
+      ? Math.min(16384, modelSpec?.maxTokens ?? ctxWindow)
+      : Math.min(16384, modelSpec?.maxTokens ?? ctxWindow)
     return {
       order,
       client: createProviderClient(
@@ -103,10 +106,11 @@ export function createHeadlessCoordinator(input: HeadlessCoordinatorInput): Dele
       promptEngine: new PromptEngine({
         model: card.model,
         maxTokens,
-        staticCtx: { tools: workerRegistry.getDefinitions() },
-        volatileCtx: { cwd: input.cwd },
+        staticCtx: { tools: applyDescriptionMode(workerRegistry.getDefinitions(), blocks.toolDescriptions), audience: 'subagent' },
+        volatileCtx: { cwd: input.cwd, blockCaps: blocks.caps },
       }),
       toolRegistry: workerRegistry,
+      blockPolicy: blocks,
       cwd: input.cwd,
       // Far backstop only — the work order budget (clamped via clampWorkerMaxTurns)
       // is the real turn controller.

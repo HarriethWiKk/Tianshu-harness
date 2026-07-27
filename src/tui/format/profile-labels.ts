@@ -56,6 +56,35 @@ export function authorityStarName(authority: string | undefined): string | undef
   return domain?.name
 }
 
+/** 紧凑职能标签（去掉 role·scope 中点，使「星名·职能」的分隔唯一）。
+ *  code_scout → '侦察代码'（而非 profileLabel 的 '侦察·代码'）。 */
+function compactRole(profile: string): string {
+  const entry = PROFILE_LABELS[profile]
+  if (!entry) return 'worker'
+  return entry.scope ? `${entry.role}${entry.scope}` : entry.role
+}
+
+/** 统一身份表达：`星名·紧凑职能` 或纯职能。四个渲染面（inline/overlay/detail/
+ *  派发卡）共用，消除「面板中文 vs detail 原始 profile」的不一致。 */
+export function formatWorkerIdentity(view: { profile: string; authority?: string }): string {
+  const role = compactRole(view.profile)
+  const star = authorityStarName(view.authority)
+  return star ? `${star}·${role}` : role
+}
+
+/** 状态词（中文）——fleet 行尾状态列与 detail 头部共用，同一状态不得两种说法。 */
+export function statusWord(status: string): string {
+  switch (status) {
+    case 'running': return '执行中'
+    case 'passed': return '完成'
+    case 'completed': return '完成'
+    case 'failed': return '失败'
+    case 'blocked': return '受阻'
+    case 'escalated': return '升级'
+    default: return status
+  }
+}
+
 /**
  * Authority display for fleet detail: `破军（命中: 重构+回归）` or `tianquan（显式指定）`.
  * Unknown domains fall back to the raw id; reason omitted when absent.

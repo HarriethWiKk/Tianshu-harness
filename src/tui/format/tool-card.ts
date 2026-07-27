@@ -2,11 +2,11 @@
  * T9 格式化函数 — 工具卡片（Claude Code 风格）。
  *
  * 渲染结构：
- *   ● Run(npm test) (1.2s)
+ *   › Run(npm test) (1.2s)
  *     ⎿  前 4 行输出
- *        … +25 lines (ctrl+o to expand)
+ *        … +25 行 · ctrl+o 展开
  *
- * - 状态色：成功绿 ●、失败红 ●、进行中 dim ●
+ * - 状态形色双通道：› 成功绿 / ✗ 失败红 / ⠋ 进行中 dim / ? 待答黄
  * - 参数摘要：复用 tool-label.ts 的 toolArgSummary + tool-family.ts 动词体系
  * - 截断：默认头 N 行 + `… +N lines` 尾注；read 族用头+尾预览
  * - diff 检测：write/edit 族结果经 isDiffContent() 检测后走红绿渲染
@@ -23,6 +23,7 @@ import { formatDiff, isDiffContent, computeDiffStats } from './diff.js'
 import { brailleSpinnerFrame } from '../braille-spinner.js'
 import { displayWidth, truncateToDisplayWidth } from '../width.js'
 import { useAsciiGlyphs } from '../term-caps.js'
+import { EXPAND_HINT, truncationHint } from '../truncation-marker.js'
 
 /** 宽度口径：与 LiveEngine.rowsForLine 一致。工具输出（git diff/代码/日志）常含
  *  `— … │ →` 等 ambiguous 符号 + CJK，按 .length/stringWidth(narrow) 截断会低估
@@ -114,9 +115,17 @@ export function formatToolCard(input: FormatToolCardInput, theme: RivetTheme): s
   const isQuestion = toolName === 'ask_user_question'
 
   // ── Header: ● Verb(arg) (elapsed) ───────────────────────────
-  // ask_user_question needs to stand out: use a '?' bullet and warning color.
+  // Bullet 形色双通道：状态不能只靠颜色编码——16 色终端与红绿色觉障碍下
+  // 「成功」和「失败」会是同一个 ›。形状同时承载状态，颜色只做强化。
+  // 成功态 › 不走 ASCII 降级：useAsciiGlyphs 的门槛是 chalk.level<3，tmux(level 2)
+  // 也会命中，而 › 在那里渲染正常——降级它等于给绝大多数会话的主流状态换字形。
+  // 新引入的 ✗ / ⠋ 才降级（braille 与 dingbat 在 legacy conhost 是 tofu）。
+  const useAscii = useAsciiGlyphs()
   const bulletColor = isError ? theme.error : isQuestion ? theme.warning : streaming ? theme.dim : theme.success
-  const bulletGlyph = isQuestion ? '?' : '›'
+  const bulletGlyph = isError ? (useAscii ? 'x' : '✗')
+    : isQuestion ? '?'
+    : streaming ? (useAscii ? '-' : '⠋')
+    : '›'
   const title = toolCardTitle(toolName, toolInput, rawPath)
   const tColor = isQuestion ? theme.warning : theme.toolColor(toolName)
   // 文件路径 → OSC 8 可点击链接（支持的终端 Cmd/Ctrl+Click 直接打开；其余纯文本降级）
@@ -149,7 +158,7 @@ export function formatToolCard(input: FormatToolCardInput, theme: RivetTheme): s
 
   const trimmed = content.replace(/\n+$/, '')
   if (!trimmed) {
-    lines.push(`${indent}${color(BODY_FIRST_PREFIX, theme.dim)}${color('(no output)', theme.muted)}`)
+    lines.push(`${indent}${color(BODY_FIRST_PREFIX, theme.dim)}${color('(无输出)', theme.muted)}`)
     return lines
   }
 
@@ -168,7 +177,7 @@ export function formatToolCard(input: FormatToolCardInput, theme: RivetTheme): s
       const hunkLabel = stats.hunks > 0 ? `${stats.hunks} 处修改` : `${changeCount} 行修改`
       const summary = `⎿ ${hunkLabel} (+${stats.adds} −${stats.dels})`
       lines.push(`${indent}${color(BODY_FIRST_PREFIX, theme.dim)}${color(summary, theme.muted)}`)
-      lines.push(`${indent}${BODY_CONT_PREFIX}${color('[Ctrl+O] 展开完整 diff', theme.secondary)}`)
+      lines.push(`${indent}${BODY_CONT_PREFIX}${color(`${EXPAND_HINT}完整 diff`, theme.secondary)}`)
     }
     return lines
   }
@@ -180,7 +189,7 @@ export function formatToolCard(input: FormatToolCardInput, theme: RivetTheme): s
     const shown = expanded || allLines.length <= maxLines ? allLines : allLines.slice(0, maxLines)
     const body = shown.map((l) => colorBrowserDebugLine(l, theme))
     if (!expanded && allLines.length > maxLines) {
-      body.push(color(`… +${allLines.length - maxLines} lines [Ctrl+O]`, theme.secondary))
+      body.push(color(truncationHint(allLines.length - maxLines), theme.secondary))
     }
     lines.push(...indentBody(body, indent, theme))
     return lines
@@ -214,7 +223,7 @@ export function formatToolCard(input: FormatToolCardInput, theme: RivetTheme): s
     const omitted = totalLines - READ_HEAD_LINES - READ_TAIL_LINES
     const body = [
       ...head.map(renderLine),
-      color(`… +${omitted} lines [Ctrl+O]`, theme.secondary),
+      color(truncationHint(omitted), theme.secondary),
       ...tail.map(renderLine),
     ]
     lines.push(...indentBody(body, indent, theme))
@@ -225,7 +234,7 @@ export function formatToolCard(input: FormatToolCardInput, theme: RivetTheme): s
   const omitted = totalLines - maxLines
   const body = [
     ...head.map(renderLine),
-    color(`… +${omitted} lines [Ctrl+O]`, theme.secondary),
+    color(truncationHint(omitted), theme.secondary),
   ]
   lines.push(...indentBody(body, indent, theme))
   return lines
@@ -339,12 +348,14 @@ function renderDelegationPreview(
     const cap = Math.min(tasks.length, DELEGATION_PREVIEW_MAX)
     for (let i = 0; i < cap; i++) {
       const task = tasks[i] as Record<string, unknown> | undefined
-      const rawId = typeof task?.id === 'string' ? task.id.trim() : ''
-      const idLabel = rawId || `#${i + 1}`
-      const desc = typeof task?.description === 'string' ? task.description.trim() : ''
-      let line = `${prefix}${bullet} ${color(idLabel, theme.secondary, { bold: true })}`
-      if (desc) {
-        line += color(`: ${truncatePreview(desc, 60)}`, theme.muted)
+      // 目标取自 `objective` —— delegate_batch 的任务 schema 里只有它
+      // （delegate-batch.ts required: ['objective']）。此处一度读 `description`
+      // 与 `id`，两个字段都不存在，于是每次批量派发都只渲染出 `• #1 • #2`：
+      // 逐次一模一样、与真实任务毫无关系。
+      const objective = typeof task?.objective === 'string' ? task.objective.trim() : ''
+      let line = `${prefix}${bullet} ${color(`#${i + 1}`, theme.secondary, { bold: true })}`
+      if (objective) {
+        line += color(`: ${truncatePreview(objective, 60)}`, theme.muted)
       }
       lines.push(line)
     }
@@ -357,11 +368,13 @@ function renderDelegationPreview(
   // delegate_task (single): render objective
   if (toolName === 'delegate_task') {
     const objective = typeof toolInput.objective === 'string' ? toolInput.objective.trim() : ''
-    const agent = typeof toolInput.agent === 'string' ? toolInput.agent : ''
+    // 参数还在流式到达时 objective 可能尚未成形；此处退到 profile
+    // （schema 里真实存在的字段，`agent` 不是）。
+    const profile = typeof toolInput.profile === 'string' ? toolInput.profile : ''
     if (objective) {
       lines.push(`${prefix}${color(truncatePreview(objective, 72), theme.muted)}`)
-    } else if (agent) {
-      lines.push(`${prefix}${color(`… 派发 ${agent}`, theme.dim)}`)
+    } else if (profile) {
+      lines.push(`${prefix}${color(`… 派发 ${profile}`, theme.dim)}`)
     } else {
       lines.push(`${prefix}${color('… 派发中', theme.dim)}`)
     }

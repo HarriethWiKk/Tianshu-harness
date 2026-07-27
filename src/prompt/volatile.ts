@@ -11,10 +11,12 @@ import { summarizeGitStatus } from './git-status-summary.js'
 import type { PlaybookBullet } from '../agent/playbook.js'
 import type { WorktreeReality } from '../agent/worktree-reality.js'
 import type { TaskDepthLayer } from '../context/task-contract.js'
+import type { CvmInjectionSource } from '../context/pressure-monitor.js'
 import { loadDeclaredVerify } from '../config/verify-config.js'
 import type { VerifyConfig } from '../config/schema.js'
 import { detectRuntimeEnvBlock } from './runtime-env.js'
 import { FROZEN_BLOCK_CAPS, type FrozenBlockCaps, type PromptBlockToggles } from './block-policy.js'
+import { selectProjectInstructions } from './project-instructions.js'
 
 export { FROZEN_BLOCK_CAPS, type FrozenBlockCaps }
 
@@ -193,6 +195,10 @@ export interface ToolHistoryEntry {
   /** Failure classification — dead-end pheromone deposition uses this to exclude
    *  timeout/environment (non-semantic) failures from the dead-end signal. */
   errorClass?: import('../tools/types.js').ToolErrorClass
+  /** True when this 'failed' entry is a transient format guard (e.g. pointer-guard
+   *  rejection) — the model can fix it in the next turn. Convergence detector
+   *  excludes these from errorPenalty to avoid false stagnation signals. */
+  transient?: boolean
 }
 
 export interface VolatileContext {
@@ -466,12 +472,29 @@ export function buildConsolidatedBlock(habituatedContent: Map<string, string>): 
   return `<consolidated>\n${parts.join('\n\n')}\n</consolidated>`
 }
 
-/** A selected context-update sub-block with its identifying tag name. */
-export interface AppendixPart { name: string; content: string }
+/**
+ * A selected context-update sub-block with its identifying tag name.
+ *
+ * `source` marks the block as CVM-metered: when the block is actually written
+ * into a `<context-update>`, the emitting engine books its bytes under this
+ * tag. Blocks without a source (progress, git status, plan trace, …) are not
+ * CVM injections and stay unmetered.
+ */
+export interface AppendixPart { name: string; content: string; source?: CvmInjectionSource }
 
-/** Extract the leading XML tag name from a sub-block, for cross-turn diffing. */
+/**
+ * Extract the leading XML tag name from a sub-block, for cross-turn diffing.
+ *
+ * The tag may be non-ASCII: `<星域-advisory>` is a real block. An ASCII-only
+ * pattern fell through to the `anon:<length>` fallback, which is a content
+ * hash in disguise — two such blocks of equal length would share a delta key,
+ * so a change in one would be attributed to the other. Match anything up to
+ * whitespace, `/` or `>`; do NOT add `-` to the excluded set, as a trailing
+ * `-` in a character class is a literal and truncates `historical-lessons`
+ * to `historical`.
+ */
 export function appendixBlockName(content: string): string {
-  const m = /^<([A-Za-z][\w-]*)/.exec(content)
+  const m = /^<([^\s/>]+)/.exec(content)
   return m ? m[1]! : `anon:${content.length}`
 }
 
@@ -488,7 +511,11 @@ export function appendixBlockName(content: string): string {
  * cache-stable order.
  */
 export function buildDynamicAppendixParts(ctx: VolatileContext, maxChars?: number): AppendixPart[] {
-  const parts: string[] = []
+  const parts: Array<{ content: string; source?: CvmInjectionSource }> = []
+  /** Collect an ordinary appendix block; pass a source only for CVM-metered ones. */
+  const push = (content: string, source?: CvmInjectionSource): void => {
+    parts.push({ content, source })
+  }
 
   // ── Protected blocks: must render whole even under appendix budget pressure ──
   // Explicitly-invoked skill bodies are high-salience by user intent: they should
@@ -518,8 +545,10 @@ export function buildDynamicAppendixParts(ctx: VolatileContext, maxChars?: numbe
   // Historical lessons: session-constant pool (loaded once by refreshPlaybookLessons,
   //  ranked by matchBullets). No per-boundary re-ranking — the pool is already
   //  domain-filtered and top-K=3; re-sorting adds churn without information gain.
-  // lean 档关掉它：这是 appendix 里唯一按 recentQuery 每边界重排的 churner，
-  // 且同样的教训可经 memory recall 拿到。
+  // lean 档关掉它：同样的教训可经 memory recall 按需拿到，无须常驻 appendix。
+  // （历史注记：这里曾是 appendix 里唯一按 recentQuery 每边界重排的 churner。
+  //  上游 refreshPlaybookLessons 现已改为每会话只查一次，且整条注入路径默认关，
+  //  churn 已消除——此处保留 lean 开关只为进一步瘦身，不再是缓存止血措施。）
   if (ctx.blockToggles?.historicalLessons !== false && ctx.playbookLessons && ctx.playbookLessons.length > 0) {
     const lessons = ctx.playbookLessons
       .map(b => {
@@ -527,7 +556,7 @@ export function buildDynamicAppendixParts(ctx: VolatileContext, maxChars?: numbe
         return b.details ? `${base}\n  details: ${escapeXml(b.details)}` : base
       })
       .join('\n')
-    parts.push(`<historical-lessons>\n${lessons}\n</historical-lessons>`)
+    push(`<historical-lessons>\n${lessons}\n</historical-lessons>`)
     ctx.onLessonsRendered?.(ctx.playbookLessons.map(b => b.id))
   }
 
@@ -535,7 +564,7 @@ export function buildDynamicAppendixParts(ctx: VolatileContext, maxChars?: numbe
   // uncertainty framing. Rarely changes within a task (only on status transitions
   // or evidence updates). Under appendixDelta, emitted only when changed.
   if (ctx.cognitiveProjection) {
-    parts.push(ctx.cognitiveProjection)
+    push(ctx.cognitiveProjection, 'projection')
   }
 
   // Unified progress block: merges session-state, task-progress, and decisions
@@ -547,7 +576,7 @@ export function buildDynamicAppendixParts(ctx: VolatileContext, maxChars?: numbe
   // both progress AND projection. Gate on the real <objective> marker instead.
   const projHasObjective = !!ctx.cognitiveProjection && ctx.cognitiveProjection.includes('<objective>')
   const progressBlock = renderProgressBlock(ctx, projHasObjective)
-  if (progressBlock) parts.push(progressBlock)
+  if (progressBlock) push(progressBlock)
 
   // tool-history block removed (2026-07-06): redundant with message history —
   // assistant tool_calls + tool results are already visible, and the recent-8
@@ -567,7 +596,7 @@ export function buildDynamicAppendixParts(ctx: VolatileContext, maxChars?: numbe
     if (readFiles.length > 5 || ctx.toolHistory.length > 8) {
       const listed = readFiles.slice(0, 5).map(f => escapeXml(f)).join(', ')
       const tail = readFiles.length > 5 ? ` …及另外 ${readFiles.length - 5} 个文件` : ''
-      parts.push(`<read-file-dedup-hint>已读取 ${readFiles.length} 个文件：${listed}${tail}。上述文件无需重复读取，除非磁盘内容已变更。</read-file-dedup-hint>`)
+      push(`<read-file-dedup-hint>已读取 ${readFiles.length} 个文件：${listed}${tail}。上述文件无需重复读取，除非磁盘内容已变更。</read-file-dedup-hint>`)
     }
   }
 
@@ -580,47 +609,47 @@ export function buildDynamicAppendixParts(ctx: VolatileContext, maxChars?: numbe
     if (commitIdx >= 0) {
       const statusPart = lines.slice(0, commitIdx).join('\n').trim()
       const commitsPart = lines.slice(commitIdx + 1).join('\n').trim()
-      if (statusPart) parts.push(`<git-status>\n${escapeXml(statusPart)}\n</git-status>`)
-      if (commitsPart) parts.push(`<recent-commits>\n${escapeXml(commitsPart)}\n</recent-commits>`)
+      if (statusPart) push(`<git-status>\n${escapeXml(statusPart)}\n</git-status>`)
+      if (commitsPart) push(`<recent-commits>\n${escapeXml(commitsPart)}\n</recent-commits>`)
     } else {
-      parts.push(`<git-status>\n${escapeXml(git)}\n</git-status>`)
+      push(`<git-status>\n${escapeXml(git)}\n</git-status>`)
     }
   }
 
   // Intent retrieval route: current-turn advisory, cache-safe dynamic appendix.
   // Place after git/status awareness and before cognitive policy hints.
   if (ctx.intentRetrievalRoute) {
-    parts.push(ctx.intentRetrievalRoute)
+    push(ctx.intentRetrievalRoute)
   }
 
   // Task depth advisory: TDD strategy for wiring/system tasks
   if (ctx.taskDepthAdvisory) {
-    parts.push(ctx.taskDepthAdvisory)
+    push(ctx.taskDepthAdvisory)
   }
 
   // Plan methodology advisory: which template (lightweight/full) to use
   if (ctx.planMethodologyAdvisory) {
-    parts.push(ctx.planMethodologyAdvisory)
+    push(ctx.planMethodologyAdvisory)
   }
 
   if (ctx.skillAdvisoryBlock) {
-    parts.push(ctx.skillAdvisoryBlock)
+    push(ctx.skillAdvisoryBlock)
   }
 
   // invokedSkillsBlock is rendered once via protectedParts (above) — do not
   // push it again here or the activated skill body gets injected twice.
 
   if (ctx.crossSessionMemoryBlock) {
-    parts.push(ctx.crossSessionMemoryBlock)
+    push(ctx.crossSessionMemoryBlock)
   }
 
   if (ctx.mentionContextBlock) {
-    parts.push(ctx.mentionContextBlock)
+    push(ctx.mentionContextBlock)
   }
 
   // Cross-session events: rare, keep at end
   if (ctx.crossSessionEvents) {
-    parts.push(ctx.crossSessionEvents)
+    push(ctx.crossSessionEvents)
   }
 
   // Companion presence is NOT rendered into the model context — it is ambient
@@ -633,39 +662,39 @@ export function buildDynamicAppendixParts(ctx: VolatileContext, maxChars?: numbe
   // Unified tool context: theta + EFE + top-3 ranking.
   // Replaces old separate affordance-hint + policy-guidance blocks.
   if (ctx.toolContext) {
-    parts.push(ctx.toolContext)
+    push(ctx.toolContext, 'tool-context')
   }
 
   // PlanCache advisory: current-turn, informational-only hint.
   // Keep near policy guidance so it informs planning without becoming stable prompt.
   if (ctx.planCacheAdvisory) {
-    parts.push(ctx.planCacheAdvisory)
+    push(ctx.planCacheAdvisory)
   }
 
   // U6: serialized PlanExecutionTrace — refreshed at compaction so the plan
   // baseline + progress survive history pruning. Cache-safe (appendix only).
   if (ctx.planTraceAppendix) {
-    parts.push(ctx.planTraceAppendix)
+    push(ctx.planTraceAppendix)
   }
 
   // Approved-plan pointer: tiny slug/title/path reminder of the plan under
   // execution. Body lives on disk; agent reads on demand. Cache-safe (appendix
   // only) — keeps approve/revise from rebuilding the frozen base.
   if (ctx.activePlanPointer) {
-    parts.push(ctx.activePlanPointer)
+    push(ctx.activePlanPointer)
   }
 
   // Repair hint: routed through A1 harness-advisory bus — legacy <repair-hint> block removed.
 
   // Harness advisory: unified corrective guidance (A1 bus, max 3 entries)
   if (ctx.harnessAdvisoryBlock) {
-    parts.push(ctx.harnessAdvisoryBlock)
+    push(ctx.harnessAdvisoryBlock, 'advisory-appendix')
   }
 
   // Control-plane appendix (Wave 4): active-mode only, revision-driven —
   // byte-stable while the frame's model-visible state is unchanged.
   if (ctx.controlPlaneBlock) {
-    parts.push(ctx.controlPlaneBlock)
+    push(ctx.controlPlaneBlock, 'control-appendix')
   }
 
   // Worktree warning: cache-safe — rendered ONLY into dynamic appendix
@@ -673,22 +702,22 @@ export function buildDynamicAppendixParts(ctx: VolatileContext, maxChars?: numbe
     const reasons = ctx.worktreeReality.mismatchReasons
       .map(r => `  ${escapeXml(r)}`)
       .join('\n')
-    parts.push(`<worktree-warning severity="${escapeXml(ctx.worktreeReality.severity)}">\n${reasons}\n</worktree-warning>`)
+    push(`<worktree-warning severity="${escapeXml(ctx.worktreeReality.severity)}">\n${reasons}\n</worktree-warning>`)
   }
 
   // Plan-mode instruction block: governs the whole planning turn (read-only +
   // plan quality standard + diagram skeletons). Cache-safe — appendix only.
   if (ctx.planModeState === 'planning') {
-    parts.push(renderPlanModeBlock(ctx.activePlanFilePath))
+    push(renderPlanModeBlock(ctx.activePlanFilePath))
   } else if (ctx.planExitReminderPending) {
-    parts.push(renderPlanExitReminder())
+    push(renderPlanExitReminder())
   }
 
   // Ask-mode instruction block — mutually exclusive with plan at the UI layer;
   // if both somehow set, plan block already rendered above (appending ask is ok
   // as a soft reminder, but gate already blocks writes).
   if (ctx.askModeState === 'asking') {
-    parts.push(renderAskModeBlock())
+    push(renderAskModeBlock())
   }
 
   // Phase 2B: output verbosity steering (opt-in via RIVET_TERSE=1, off by default).
@@ -696,24 +725,27 @@ export function buildDynamicAppendixParts(ctx: VolatileContext, maxChars?: numbe
   // unchanged. Escalates on doom-loop/storm turns when the caller signals it.
   const tersenessEnabled = ctx.tersenessEnabled ?? (process.env['RIVET_TERSE'] === '1')
   if (tersenessEnabled) {
-    parts.push(renderTersenessNudge(ctx.tersenessEscalate ?? false))
+    push(renderTersenessNudge(ctx.tersenessEscalate ?? false))
   }
+
+  const toPart = (p: { content: string; source?: CvmInjectionSource }): AppendixPart =>
+    ({ name: appendixBlockName(p.content), content: p.content, source: p.source })
 
   const protectedResult = protectedParts.map(content => ({ name: appendixBlockName(content), content }))
 
   if (parts.length === 0) return protectedResult
 
   // ── GWT Top-K selection (when budget is set) ────────────────────
+  // Selection carries `source` through: dropped blocks never reach a
+  // <context-update>, so they must not be metered either. Truncated blocks
+  // come back with their shortened content, which is what actually ships.
   if (regularMaxChars !== undefined && regularMaxChars > 0) {
-    const scored = parts.map(content => ({
-      content,
-      salience: assignSalience(content),
-    }))
+    const scored = parts.map(p => ({ ...p, salience: assignSalience(p.content) }))
     const selected = selectTopKBlocks(scored, regularMaxChars)
-    return [...protectedResult, ...selected.map(content => ({ name: appendixBlockName(content), content }))]
+    return [...protectedResult, ...selected.map(toPart)]
   }
 
-  return [...protectedResult, ...parts.map(content => ({ name: appendixBlockName(content), content }))]
+  return [...protectedResult, ...parts.map(toPart)]
 }
 
 /** Backward-compatible wrapper: full <context-update> block (no seq). */
@@ -729,6 +761,7 @@ export function buildDynamicAppendix(ctx: VolatileContext, maxChars?: number): s
 export interface SalientBlock {
   content: string
   salience: number
+  source?: CvmInjectionSource
 }
 
 /**
@@ -863,10 +896,14 @@ export function assignSalience(blockContent: string): number {
  * Select blocks in descending salience order until the character budget is exhausted.
  * Every block that fits is included; blocks beyond the budget are dropped.
  * At least one block is always included (the highest-salience block).
+ *
+ * Returns the surviving blocks themselves (not bare strings) so caller-attached
+ * metadata such as `source` survives selection. A block that had to be
+ * truncated comes back as a copy carrying the shortened content.
  */
-export function selectTopKBlocks(blocks: SalientBlock[], maxChars: number): string[] {
+export function selectTopKBlocks<T extends SalientBlock>(blocks: T[], maxChars: number): T[] {
   const sorted = [...blocks].sort((a, b) => b.salience - a.salience)
-  const selected: string[] = []
+  const selected: T[] = []
   let used = 0
   const blockCap = Math.max(Math.floor(maxChars * 0.4), 2_000)
 
@@ -878,7 +915,7 @@ export function selectTopKBlocks(blocks: SalientBlock[], maxChars: number): stri
     if (used + overhead + content.length > maxChars && selected.length > 0) {
       continue
     }
-    selected.push(content)
+    selected.push(content === block.content ? block : { ...block, content })
     used += overhead + content.length
   }
 
@@ -1000,7 +1037,17 @@ function buildVolatileBlockInternal(ctx: VolatileContext): string {
     // (seeded from AGENTS.md via loadProjectModuleMap). Strip the redundant table
     // from project-instructions to avoid ~600-800 chars of duplication.
     const stripped = ctx.projectIndexBlock ? stripFirstMarkdownTable(md) : md
-    parts.push(truncateBlock(`<project-instructions>\n${escapeXml(stripped)}\n</project-instructions>`, caps.projectInstructions, 'project-instructions'))
+    // 超预算时按节取舍，而不是从头切到 cap 为止。文档顺序不等于重要性——
+    // AGENTS.md 一类文档惯例是索引在前、纪律在后，从头切正好切掉硬闸门。
+    // 预算按**转义后**长度计：转义在截断之前做，按原文计费会让块超出 cap
+    // 后再被 truncateBlock 从头切一刀，等于白选。
+    const wrap = '<project-instructions>\n\n</project-instructions>'.length
+    const selected = selectProjectInstructions(
+      stripped,
+      caps.projectInstructions - wrap,
+      t => escapeXml(t).length,
+    )
+    parts.push(truncateBlock(`<project-instructions>\n${escapeXml(selected.text)}\n</project-instructions>`, caps.projectInstructions, 'project-instructions'))
   }
 
   // A3: declared verify commands (from .rivet-config.json) rendered as the

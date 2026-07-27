@@ -213,3 +213,66 @@ test('FleetRegistry: authorityReason 透传到 view', () => {
   assert.equal(view.authority, 'tianfu')
   assert.equal(view.authorityReason, '命中: 重构+优化')
 })
+
+// ── 稳定 order id 跨轮复用 ───────────────────────────────────────────
+//
+// batch / team / council 走 deriveStableWorkOrderId，order id 是 `batch:0`
+// 这类可预测值而非 wo_<uuid>，同一会话里多次派发必然撞 id。此前旧记录会被
+// 移回 active 再合并，而 contract / summary 是「只在缺失时才写」，于是第一轮
+// 的目标与结论永久粘住：/tasks 逐次显示同一个目标，与本轮任务毫无关系。
+
+const CONTRACT_A = { objective: '审查缓存边界', profile: 'reviewer', scope: {}, constraints: [], budget: { maxTurns: 8, timeoutMs: 1000 }, allowedToolsDigest: 'grep +2' }
+const CONTRACT_B = { objective: '为 rewind 补回归测试', profile: 'reviewer', scope: {}, constraints: [], budget: { maxTurns: 8, timeoutMs: 1000 }, allowedToolsDigest: 'grep +2' }
+
+test('FleetRegistry: 稳定 id 再派发 → 契约换成本轮的，不粘住第一轮', () => {
+  const fleet = new FleetRegistry()
+  fleet.apply({ workOrderId: 'batch:0', parentToolId: 'tool_1', status: 'running', contract: CONTRACT_A }, 0)
+  fleet.apply({ workOrderId: 'batch:0', parentToolId: 'tool_1', status: 'passed', summary: '第一轮结论' }, 100)
+  fleet.apply({ workOrderId: 'batch:0', parentToolId: 'tool_2', status: 'running', contract: CONTRACT_B }, 200)
+
+  const w = fleet.getWorkerById('batch:0', 300)!
+  assert.equal(w.contract?.objective, '为 rewind 补回归测试', '目标必须是本轮派发的')
+  assert.equal(w.summary, undefined, '上一轮的结论不得挂到这一轮的 worker 上')
+  assert.equal(w.status, 'running')
+  assert.equal(w.terminal, false)
+  assert.equal(w.parentToolId, 'tool_2', '归属应换到发起本轮的那次工具调用')
+})
+
+test('FleetRegistry: 稳定 id 再派发 → 计数与耗时从本轮重新起算', () => {
+  const fleet = new FleetRegistry()
+  fleet.apply({ workOrderId: 'team:T1', parentToolId: 'tool_1', status: 'running', toolUseCount: 7, tokenCount: 5000 }, 0)
+  fleet.apply({ workOrderId: 'team:T1', parentToolId: 'tool_1', status: 'passed' }, 100)
+  fleet.apply({ workOrderId: 'team:T1', parentToolId: 'tool_2', status: 'running' }, 1000)
+
+  const w = fleet.getWorkerById('team:T1', 1500)!
+  assert.equal(w.toolUseCount, 0, '计数只增不减是同轮内的防御，跨轮必须归零')
+  assert.equal(w.tokenCount, 0)
+  assert.equal(w.elapsedMs, 500, 'elapsed 应自本轮 startedAt 计')
+})
+
+test('FleetRegistry: 归档后再派发同一 id → 走新记录，不复活归档记录', () => {
+  const fleet = new FleetRegistry()
+  fleet.apply({ workOrderId: 'batch:0', parentToolId: 'toolA', status: 'running', contract: CONTRACT_A }, 0)
+  fleet.apply({ workOrderId: 'batch:0', parentToolId: 'toolA', status: 'passed', summary: '旧结论' }, 100)
+  fleet.clearGroup('toolA')
+  assert.equal(fleet.completedSize(), 1)
+
+  fleet.apply({ workOrderId: 'batch:0', parentToolId: 'toolB', status: 'running', contract: CONTRACT_B }, 200)
+  const w = fleet.getWorkerById('batch:0', 300)!
+  assert.equal(w.contract?.objective, '为 rewind 补回归测试')
+  assert.equal(w.summary, undefined)
+  assert.equal(fleet.getActiveWorkers(300).length, 1, '新一轮应在 active 列表里')
+})
+
+test('FleetRegistry: 同轮内的终态重放不被误判成新一轮', () => {
+  const fleet = new FleetRegistry()
+  fleet.apply({ workOrderId: 'batch:0', parentToolId: 'toolA', status: 'running', contract: CONTRACT_A }, 0)
+  fleet.apply({ workOrderId: 'batch:0', parentToolId: 'toolA', status: 'passed', summary: '结论' }, 100)
+  // settle 即时事件 + 批末兜底循环双发是设计使然
+  fleet.apply({ workOrderId: 'batch:0', parentToolId: 'toolA', status: 'passed', summary: '结论' }, 150)
+
+  const w = fleet.getWorkerById('batch:0', 200)!
+  assert.equal(w.summary, '结论')
+  assert.equal(w.contract?.objective, '审查缓存边界', '重放不得清掉本轮契约')
+  assert.equal(w.terminal, true)
+})

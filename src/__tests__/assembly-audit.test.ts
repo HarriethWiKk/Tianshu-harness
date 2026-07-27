@@ -79,6 +79,13 @@ const FIELD_ALLOWLIST: AllowlistEntry[] = [
     reviewDate: '2027-01-22',
   },
   {
+    field: 'systemPromptSuffix',
+    source: 'StarDomain',
+    category: 'display-only',
+    note: '行为注入由 volatileBlock 承载（冻结 <star-domain> 前缀，主循环与 worker 同源，volatile.ts:1027）；本字段仅桌面图鉴法则面板展示（desktop CouncilSurface）。若恢复注入属独立设计决策——辅的 volatileBlock 自述「suffix 定义你怎么做」与此现状有张力，发版后需决议（2026-07-27 审查记录）。',
+    reviewDate: '2027-01-22',
+  },
+  {
     field: 'defaultKind',
     source: 'ProfileDefinition',
     category: 'pending',

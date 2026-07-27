@@ -26,6 +26,10 @@
  *   GET    /worktrees                                  list git worktrees
  *   GET    /github/prs                                 list open PRs (via gh CLI)
  *   GET    /github/prs/:number                         PR detail with comments/files
+ *   GET    /github/prs/:number/checks                  CI checks overview (gh pr checks)
+ *   GET    /github/prs/:number/checks/:checkIndex/log  single check failure log
+ *   POST   /github/prs/:number/merge                   merge a PR (confirm-gated)
+ *   POST   /github/prs/:number/push-fix                push auto-fix diff to PR head (confirm-gated)
  */
 import type { RouteHandler } from './index.js'
 import { isAuthorizedRequest } from './auth.js'
@@ -40,7 +44,8 @@ import type { Config } from '../config/schema.js'
 import { computeUsageCost, findModelPricing } from '../utils/pricing.js'
 import { getRollbackPreview, rollbackToCheckpoint, makeOwnershipGuard } from '../agent/checkpoint.js'
 import { listProjectFiles, rankFiles, listDirEntries } from './file-list.js'
-import { listPrs, getPrDetail, isGhAvailable, getPrDiff, submitPrReview, type PrReviewInput } from './gh-cli.js'
+import { listPrs, getPrDetail, isGhAvailable, getPrDiff, submitPrReview, listPrChecks, getCheckRunLog, mergePr, type PrReviewInput } from './gh-cli.js'
+import { pushFixToPrBranch } from './pr-fix-push.js'
 import { resolveAppPromptInput } from '../tui/slash-commands.js'
 import { getPaletteCommands } from '../tui/command-palette.js'
 import { RECOMMENDED_MAX_SKILLS } from '../skills/skill-loader.js'
@@ -72,6 +77,9 @@ type SessionRouteDependencies = {
 
 /** Vision upload guards — provider-safe formats and a per-image byte ceiling. */
 const MAX_IMAGES = 4
+
+/** Cap on a single CI check log payload returned to the desktop (tail-kept). */
+const MAX_CHECK_LOG_CHARS = 200_000
 /** Per-image decoded byte cap (safety net; the client compresses to ~256KB). */
 const MAX_IMAGE_BYTES = 1.5 * 1024 * 1024
 const ACCEPTED_IMAGE_DATA_URL = /^data:image\/(png|jpeg|webp|gif);base64,.+$/i
@@ -215,7 +223,7 @@ export function buildSessionRoutes(
       // from SSE/stream issues. See docs/dev/render-debug-playbook.md.
       const __dbg = process.env.RIVET_DEBUG_RENDER === '1'
       const __t0 = __dbg ? Date.now() : 0
-      const data = (body ?? {}) as { cwd?: string; title?: string; prompt?: string; missionId?: string; approvalMode?: unknown; isolatedWorktree?: unknown; model?: string; domain?: string }
+      const data = (body ?? {}) as { cwd?: string; title?: string; prompt?: string; missionId?: string; approvalMode?: unknown; isolatedWorktree?: unknown; model?: string; domain?: string; planAutoApproveUi?: unknown }
       if (data.approvalMode !== undefined && !isApprovalMode(data.approvalMode)) {
         return { status: 400, body: { error: 'Invalid "approvalMode"' } }
       }
@@ -229,6 +237,9 @@ export function buildSessionRoutes(
         isolatedWorktree: data.isolatedWorktree === true,
         model: typeof data.model === 'string' && data.model.trim() ? data.model.trim() : undefined,
         domain: typeof data.domain === 'string' && data.domain.trim() ? data.domain.trim() : undefined,
+        // P1b：客户端自报「我有自动批准倒计时 UI」。缺省即 fail-closed，
+        // 不武装定时器——宿主看不见倒计时就不该被静默自动批准。
+        planAutoApproveUi: data.planAutoApproveUi === true,
       })
       if (__dbg) console.log(`[createSession] +${Date.now() - __t0}ms id=${rec.id} cwd=${data.cwd}`)
       return { status: 201, body: rec }
@@ -1663,6 +1674,95 @@ export function buildSessionRoutes(
         return { status: 502, body: { ok: false, error: result.stderr.trim() || 'gh review submission failed' } }
       }
       return { status: 200, body: { ok: true } }
+    }, apiToken),
+
+    // CI checks overview for one PR (detail view; list rows read the rollup
+    // embedded in listPrs results instead of calling this per row).
+    'GET /github/prs/:number/checks': withAuth(async (_body, params) => {
+      const cwd = manager.getDefaultCwd()
+      const num = Number(params?.number)
+      if (!num || num <= 0) return { status: 400, body: { error: 'Invalid PR number' } }
+      const checks = await listPrChecks(cwd, num)
+      if (checks == null) return { status: 502, body: { error: 'gh pr checks failed or gh not available' } }
+      return { status: 200, body: { checks } }
+    }, apiToken),
+
+    // Single check's failure log (auto-fix context). checkIndex is the index
+    // into the checks list — checks expose no stable numeric id to the client.
+    'GET /github/prs/:number/checks/:checkIndex/log': withAuth(async (_body, params) => {
+      const cwd = manager.getDefaultCwd()
+      const num = Number(params?.number)
+      const idx = Number(params?.checkIndex)
+      if (!num || num <= 0) return { status: 400, body: { error: 'Invalid PR number' } }
+      if (!Number.isInteger(idx) || idx < 0) return { status: 400, body: { error: 'Invalid check index' } }
+      const checks = await listPrChecks(cwd, num)
+      if (checks == null) return { status: 502, body: { error: 'gh pr checks failed or gh not available' } }
+      const check = checks[idx]
+      if (!check) return { status: 404, body: { error: 'Check not found' } }
+      const result = await getCheckRunLog(cwd, check)
+      if (result == null) return { status: 502, body: { error: 'Failed to fetch check log' } }
+      if ('externalUrl' in result) return { status: 200, body: { name: check.name, externalUrl: result.externalUrl } }
+      // Cap the payload — raw logs can be megabytes; the panel only uses an excerpt.
+      const truncated = result.log.length > MAX_CHECK_LOG_CHARS
+      const log = truncated ? result.log.slice(-MAX_CHECK_LOG_CHARS) : result.log
+      return { status: 200, body: { name: check.name, log, truncated } }
+    }, apiToken),
+
+    // Merge a PR. Irreversible — requires { confirm: true }; without it the
+    // route returns needsConfirm so the UI can show the confirm bar first.
+    'POST /github/prs/:number/merge': withAuth(async (body, params) => {
+      const cwd = manager.getDefaultCwd()
+      const num = Number(params?.number)
+      if (!num || num <= 0) return { status: 400, body: { error: 'Invalid PR number' } }
+      const data = (body ?? {}) as { method?: unknown; auto?: unknown; deleteBranch?: unknown; confirm?: unknown }
+      if (data.method !== 'squash' && data.method !== 'merge' && data.method !== 'rebase') {
+        return { status: 400, body: { error: 'Invalid merge method (squash|merge|rebase)' } }
+      }
+      if (data.confirm !== true) return { status: 200, body: { needsConfirm: true } }
+      const result = await mergePr(cwd, num, data.method, {
+        auto: data.auto === true,
+        deleteBranch: data.deleteBranch === true,
+      })
+      if (!result.ok) {
+        const stderr = result.stderr.trim().slice(0, 2048)
+        // Map the common auto-merge-not-enabled failure to an actionable hint.
+        const autoMergeDisabled = data.auto === true && /auto.?merge/i.test(stderr)
+        return {
+          status: 502,
+          body: {
+            ok: false,
+            error: stderr || 'gh pr merge failed',
+            ...(autoMergeDisabled
+              ? { hint: 'Repository does not allow auto-merge — enable it in repo settings, or merge without auto.' }
+              : {}),
+          },
+        }
+      }
+      return { status: 200, body: { ok: true } }
+    }, apiToken),
+
+    // Push an auto-fix worker's diff artifact back to the PR head branch so CI
+    // re-runs. Fast-forward only (no force-push); requires { confirm: true }.
+    'POST /github/prs/:number/push-fix': withAuth(async (body, params) => {
+      const cwd = manager.getDefaultCwd()
+      const num = Number(params?.number)
+      if (!num || num <= 0) return { status: 400, body: { error: 'Invalid PR number' } }
+      const data = (body ?? {}) as { sessionId?: unknown; artifactId?: unknown; confirm?: unknown }
+      if (typeof data.sessionId !== 'string' || !data.sessionId) return { status: 400, body: { error: 'Missing "sessionId"' } }
+      if (typeof data.artifactId !== 'string' || !data.artifactId) return { status: 400, body: { error: 'Missing "artifactId"' } }
+      if (data.confirm !== true) return { status: 200, body: { needsConfirm: true } }
+      const list = manager.listArtifacts(data.sessionId)
+      if (!list) return { status: 404, body: { error: 'Session not found' } }
+      if (!list.some((a) => a.id === (data.artifactId as string))) return { status: 404, body: { error: 'Artifact not found' } }
+      const diff = await manager.readArtifact(data.sessionId, data.artifactId)
+      if (!diff?.trim()) return { status: 422, body: { ok: false, error: 'Artifact is empty or unreadable' } }
+      const pr = await getPrDetail(cwd, num)
+      if (!pr) return { status: 404, body: { error: 'PR not found or gh not available' } }
+      const result = await pushFixToPrBranch(cwd, pr.headRefName, diff)
+      if (!result.ok) {
+        return { status: 502, body: { ok: false, stage: result.stage, error: (result.error ?? '').slice(0, 2048) } }
+      }
+      return { status: 200, body: { ok: true, sha: result.sha, nothingToCommit: result.nothingToCommit === true } }
     }, apiToken),
 
     // ── W3: Team checkpoint / resume ──

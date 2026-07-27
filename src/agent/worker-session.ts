@@ -114,8 +114,11 @@ export interface WorkerSessionConfig {
 
 /** `turn` 事件在每个 worker turn 结束时上报，detail 为累计 token 总数（字符串）。
  *  `retry` 事件在 API 层内部瞬时重试的每次 attempt 起始上报——重试中的健康
- *  请求必须喂 liveness，否则被 stall sweep 误判为静默（慢 ≠ 死）。 */
-export type WorkerActivityKind = 'text' | 'thinking' | 'tool_use' | 'tool_result' | 'turn' | 'retry'
+ *  请求必须喂 liveness，否则被 stall sweep 误判为静默（慢 ≠ 死）。
+ *  `lifecycle` 由 coordinator / hands-session 在补偿轮开始时上报（续跑、证据
+ *  复核），detail 是给人看的中文短语。它不是 worker 自己发的——worker 不知道
+ *  自己在第几次续跑，只有派发侧知道。 */
+export type WorkerActivityKind = 'text' | 'thinking' | 'tool_use' | 'tool_result' | 'turn' | 'retry' | 'lifecycle'
 
 /** tool_use 活动行:`name(关键参数)`。toolArgSummary 覆盖常见工具;未覆盖的
  *  回退到常见参数键,再退到裸名。所有消费方(桌面 feed/TUI mirror)按纯文本展示。 */
@@ -531,6 +534,11 @@ export async function runWorkerSession(config: WorkerSessionConfig): Promise<Wor
     // issues carries it and the coordinator can cap recursion.
     delegationDepth: config.order.delegationDepth,
     thetaCheckDisabled: true,
+    // V3: pin the worker's frozen <star-domain> to order.authority so the
+    // structural constant position carries the correct domain identity.
+    // authority 缺席时 bindSessionDomain 的 `?? 'qiming'` 兜底会钉定启明——
+    // 不会落到关键词路由（那条分支只有显式传字符串 'auto' 才进得去）。
+    defaultDomain: config.order.authority,
   }, session, config.cwd)
 
   // Record the selected model into the worker session JSONL so the actual
@@ -721,7 +729,8 @@ export async function runWorkerSession(config: WorkerSessionConfig): Promise<Wor
             config.client,
             config.promptEngine.getModel(),
             buildWorkerRepairPrompt(config.order, latestText, message),
-            Math.min(8192, config.order.budget.maxTokens ?? config.contextWindow),
+            // 修复再生与首发同档（16384）——报告当初写大被截，修复照样需要这份空间。
+            Math.min(16384, config.order.budget.maxTokens ?? config.contextWindow),
             config.abortSignal,
           )
           if (jsonText) {

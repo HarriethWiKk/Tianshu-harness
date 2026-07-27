@@ -88,6 +88,8 @@ export interface GitBashProbeDeps {
   env: NodeJS.ProcessEnv
   /** Absolute path to git.exe if on PATH, otherwise undefined. */
   whichGit: () => string | undefined
+  /** Absolute path to bash.exe if on PATH, otherwise undefined（2.5 路探针，可选）。 */
+  whichBash?: () => string | undefined
   exists: (p: string) => boolean
 }
 
@@ -96,7 +98,10 @@ export interface GitBashProbeDeps {
  * claude code's probe order so behavior is predictable across environments:
  *   1. `RIVET_GIT_BASH_PATH` override
  *   2. derive from `where git` (…\Git\cmd\git.exe → …\Git\bin\bash.exe)
- *   3. common install locations (Program Files / LocalAppData)
+ *   2.5. `where bash`——bash.exe 在 PATH 但 git.exe 不在（或 Scoop shim 布局，
+ *        第 2 步的 gitRoot 推导必然失败）时的兜底；排除 WSL
+ *        （System32\bash.exe，路径语义完全不同，拿它当 shell 是事故）
+ *   3. common install locations (Program Files / LocalAppData / Scoop)
  *   4. bundled PortableGit shipped with the desktop app (`RIVET_BUNDLED_GIT_DIR`,
  *      extracted by the Tauri launcher on first run) — LAST so a system Git,
  *      with the user's own version and config, always wins.
@@ -117,12 +122,25 @@ export function resolveGitBashPath(deps: GitBashProbeDeps): string | null {
     if (deps.exists(bashPath)) return bashPath
   }
 
+  // 2.5: bash.exe itself on PATH（Scoop/MSYS2/自定义 PATH 布局）。WSL 的
+  // bash.exe 在 System32——它的根是 Linux 文件系统，/mnt/c 慢且行尾地狱，
+  // 绝不用作项目 shell。
+  const bashOnPath = deps.whichBash?.()
+  if (bashOnPath && !/^[A-Za-z]:\\Windows\\(System32|SysWOW64)\\bash\.exe$/i.test(bashOnPath) && deps.exists(bashOnPath)) {
+    return bashOnPath
+  }
+
   const candidates = [
     'C:\\Program Files\\Git\\bin\\bash.exe',
     'C:\\Program Files (x86)\\Git\\bin\\bash.exe',
   ]
   const localApp = deps.env['LOCALAPPDATA']
   if (localApp) candidates.push(winPath.join(localApp, 'Programs', 'Git', 'bin', 'bash.exe'))
+  // Scoop 安装（gitRoot 推导对 ~\scoop\shims 必然失败，常见开发机布局）。
+  const scoopRoot = deps.env['SCOOP']
+  if (scoopRoot) candidates.push(winPath.join(scoopRoot, 'apps', 'git', 'current', 'bin', 'bash.exe'))
+  const userProfile = deps.env['USERPROFILE']
+  if (userProfile) candidates.push(winPath.join(userProfile, 'scoop', 'apps', 'git', 'current', 'bin', 'bash.exe'))
   for (const c of candidates) {
     if (deps.exists(c)) return c
   }
@@ -144,6 +162,18 @@ export function resolveGitBashPath(deps: GitBashProbeDeps): string | null {
 function whichGitWindows(): string | undefined {
   try {
     const result = spawnSync('where', ['git'], { stdio: ['ignore', 'pipe', 'ignore'], timeout: 3000 })
+    if (result.status === 0) {
+      const first = result.stdout.toString().split('\n')[0]?.trim()
+      return first && first.length > 0 ? first : undefined
+    }
+  } catch { /* best-effort */ }
+  return undefined
+}
+
+/** Locate bash.exe on PATH via `where` (Windows)。Returns first hit or undefined. */
+function whichBashWindows(): string | undefined {
+  try {
+    const result = spawnSync('where', ['bash'], { stdio: ['ignore', 'pipe', 'ignore'], timeout: 3000 })
     if (result.status === 0) {
       const first = result.stdout.toString().split('\n')[0]?.trim()
       return first && first.length > 0 ? first : undefined
@@ -176,6 +206,7 @@ export function findGitBashPath(): string | null {
     isWindows: isWin,
     env: process.env,
     whichGit: whichGitWindows,
+    whichBash: whichBashWindows,
     exists: existsSync,
   })
   return _cachedGitBash

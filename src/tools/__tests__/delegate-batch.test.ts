@@ -200,4 +200,44 @@ describe('DELEGATE_BATCH_TOOL', () => {
     assert.equal(result.isError, false)
     assert.equal(calls[0]?.requests.length, 1)
   })
+
+  describe('按次预算（Wave 9）', () => {
+    it('逐任务的 maxTurns / timeoutMs 透传成各自的 budget 覆盖', async () => {
+      const calls: Array<{ requests: DelegationRequest[] }> = []
+      const tool = createDelegateBatchTool({
+        delegateBatch: async requests => { calls.push({ requests }); return makeRun() },
+      })
+
+      await tool.execute({
+        toolUseId: 'tu_budget',
+        cwd: '/repo',
+        sessionTurnCount: 10,
+        input: {
+          tasks: [
+            { objective: '只查一个入口在哪，给点预算就够。', maxTurns: 6 },
+            { objective: '扫一遍整个模块的调用关系，慢慢来。', timeoutMs: 900_000 },
+            { objective: '按 profile 默认预算跑就行，不做覆盖。' },
+          ],
+        },
+      })
+
+      assert.deepEqual(calls[0]?.requests[0]?.budget, { maxTurns: 6 })
+      assert.deepEqual(calls[0]?.requests[1]?.budget, { timeoutMs: 900_000 })
+      assert.equal(calls[0]?.requests[2]?.budget, undefined)
+    })
+
+    it('外层工具超时覆盖批内最大的按次 timeoutMs', () => {
+      const tool = createDelegateBatchTool({ delegateBatch: async () => makeRun() })
+      const withOverride = tool.timeoutMs?.({
+        toolUseId: 'tu', cwd: '/repo', sessionTurnCount: 0,
+        input: { tasks: [{ objective: 'a' }, { objective: 'b', timeoutMs: 900_000 }] },
+      })!
+      const withoutOverride = tool.timeoutMs?.({
+        toolUseId: 'tu', cwd: '/repo', sessionTurnCount: 0,
+        input: { tasks: [{ objective: 'a' }, { objective: 'b' }] },
+      })!
+      assert.ok(withOverride > withoutOverride, '调大的内层预算必须先抬高外层天花板')
+      assert.ok(withOverride >= 900_000, '外层至少覆盖单个任务的按次预算')
+    })
+  })
 })

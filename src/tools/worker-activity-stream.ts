@@ -22,16 +22,17 @@ export function progressSnippet(text: string, max = 80): string {
 
 /**
  * One concise progress line for a worker activity event, for the structured
- * subagent fleet panel. Uses minimal English labels — tools already cycle
- * between types, so the label just records the current state without noise.
+ * subagent fleet panel.
  */
 export function activityProgressLine(event: WorkerActivityEvent): string {
-  if (event.kind === 'tool_use') return `⚙ ${event.detail ? progressSnippet(event.detail, 60) : 'tool'}`
-  if (event.kind === 'tool_result') return `✓ ${event.detail ? progressSnippet(event.detail, 50) : 'done'}`
-  if (event.kind === 'thinking') return 'thinking'
-  if (event.kind === 'retry') return '↻ upstream retry'
+  if (event.kind === 'tool_use') return `⚙ ${event.detail ? progressSnippet(event.detail, 60) : '工具调用'}`
+  if (event.kind === 'tool_result') return `✓ ${event.detail ? progressSnippet(event.detail, 50) : '完成'}`
+  if (event.kind === 'thinking') return '思考中'
+  if (event.kind === 'retry') return '↻ 上游重试'
+  // lifecycle：派发侧补发的阶段短语（续跑 / 证据复核），detail 已是成句中文。
+  if (event.kind === 'lifecycle') return event.detail ? `↻ ${progressSnippet(event.detail, 60)}` : '↻ 补偿轮'
   if (event.kind === 'turn') return ''
-  return 'writing'
+  return '写入中'
 }
 
 export interface DelegationActivityMapperOpts {
@@ -135,6 +136,12 @@ export function createActivityStreamer(
     if (event.kind === 'tool_result') {
       const resultHint = event.detail ? ` (${progressSnippet(event.detail, 40)})` : ''
       emit(`  ↳ [${label}] ✓ 完成${resultHint}\n`)
+      return
+    }
+    // lifecycle: 补偿轮开场（续跑 / 证据复核）。整次派发最多几条，不去重——
+    // 「第几次续跑」正是用户想看的，压掉就只剩一段无解释的沉默。
+    if (event.kind === 'lifecycle') {
+      if (event.detail) emit(`  ↳ [${label}] ↻ ${progressSnippet(event.detail, 60)}\n`)
       return
     }
     // retry: 上游内部重试（慢 ≠ 死）——每个 worker 只报一次，避免刷屏

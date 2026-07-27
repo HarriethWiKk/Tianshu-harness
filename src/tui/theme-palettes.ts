@@ -39,6 +39,9 @@ export interface ThemeOverrides {
   assistantColor?: string
   muted?: string
   systemColor?: string
+  /** 品牌词专用色（「天枢」字样、品牌星 ✦）。缺省 = primary。
+   *  独立于 userColor：品牌色跟品牌走，不随「用户消息」语义色漂移。 */
+  brandColor?: string
 }
 
 export interface ThemePaletteDef {
@@ -84,15 +87,15 @@ const CYBERPUNK: ThemePaletteDef = {
   background: 'dark',
   description: '赛博朋克。霓虹极高对比，酷炫亮眼。',
   truecolor: {
-    primary: '#22d3ee',   // cyan-400
+    primary: '#48c6e2',   // cyan-400 — desaturated cyan to avoid rgb halation
     secondary: '#c4a3ff', // lavender — readable violet 9:1
     success: '#4ade80',   // green-400
     warning: '#fbbf24',   // amber-400
-    error: '#fb7185',     // rose-400 — no pure-red halation on black
+    error: '#e27585',     // rose-400 — softened rose red
     dim: '#9494b8',
     pulseQuiet: '#2f3048',
-    pulseActive: '#22d3ee',
-    pulseAlert: '#fb7185',
+    pulseActive: '#48c6e2',
+    pulseAlert: '#e27585',
   },
   fallback: {
     primary: 'cyan', secondary: 'magenta', success: 'green', warning: 'yellow',
@@ -175,20 +178,20 @@ const TIANSHU: ThemePaletteDef = {
     primary: '#dfb282',   // 星金 accent
     secondary: '#a49ac7', // 墨紫灰
     success: '#75a399',   // 归航青
-    warning: '#b09155',   // 星金
+    warning: '#c7a767',   // 星金 (提亮暗黄色，提升明度可读性)
     error: '#c1655c',     // 朱砂赤
     dim: '#8a8fa0',       // 暗墨（深底 ≥4.5:1 提亮档）
     pulseQuiet: '#3a3d4a',
     pulseActive: '#dfb282',
-    pulseAlert: '#d4453a', // 朱砂印
+    pulseAlert: '#d86459', // 朱砂印 (柔化提亮朱砂红，降低暗底光晕与眼睛干涩度)
     toolShell: '#a0a3b0',
     toolEdit: '#a49ac7',
     toolTest: '#9c8a63',
-    toolDelegate: '#b09155',
+    toolDelegate: '#c7a767',
   },
   // userColor = 朱砂印 (the one warm point); assistantColor = 亮中性正文;
   // muted/systemColor = 元信息灰对齐。
-  overrides: { userColor: '#d4453a', assistantColor: '#d2d5dd', muted: '#adb2bf', systemColor: '#adb2bf' },
+  overrides: { userColor: '#d86459', assistantColor: '#d2d5dd', muted: '#adb2bf', systemColor: '#adb2bf' },
   fallback: {
     primary: 'yellow', secondary: 'magenta', success: 'cyan', warning: 'yellow',
     error: 'red', dim: 'white', pulseQuiet: 'gray', pulseActive: 'yellow', pulseAlert: 'red',
@@ -387,7 +390,7 @@ const GRAPHITE: ThemePaletteDef = {
     success: '#7fbf8e',   // 鼠尾草绿
     warning: '#d9b36c',   // 哑琥珀
     error: '#e07a6f',     // 软珊瑚红（非纯红防光晕）
-    dim: '#78828f',       // 结构灰
+    dim: '#828d9c',       // 结构灰（提亮档 >4.6:1 WCAG AA）
     pulseQuiet: '#2f3540',
     pulseActive: '#7cc4e8',
     pulseAlert: '#e07a6f',
@@ -397,7 +400,7 @@ const GRAPHITE: ThemePaletteDef = {
     toolDelegate: '#d9b36c',
   },
   // userColor 暖金琥珀 / assistantColor 中性灰：靠 ▌贯穿导轨 + 专属亮彩与灰度区分说话人
-  overrides: { userColor: '#f59e0b', assistantColor: '#c8cdd6', muted: '#9aa4b0', systemColor: '#8b95a1' },
+  overrides: { userColor: '#e0aa53', assistantColor: '#c8cdd6', muted: '#9aa4b0', systemColor: '#8b95a1' },
   fallback: {
     primary: 'cyan', secondary: 'blue', success: 'green', warning: 'yellow',
     error: 'red', dim: 'gray', pulseQuiet: 'gray', pulseActive: 'cyan', pulseAlert: 'red',

@@ -170,11 +170,20 @@ export function requiresBashWriteApproval(toolName: string, input: Record<string
  *
  * computer_use js_eval runs arbitrary JS inside the user's real browser
  * (cookies/localStorage/logged-in sessions); browser_adopt takes over an
- * external DevTools endpoint. The tool's own requiresApproval() already
- * returns true for these, but that is only consulted in manual mode — the
- * "always needs approval" promise must be enforced as a pipeline hard gate.
+ * external DevTools endpoint.
+ *
+ * request_path_access WIDENS THE KERNEL WRITE BOUNDARY. YOLO means "stop asking
+ * me about ordinary tool calls"; it must not mean "silently dissolve the only
+ * boundary that exists when nobody is watching". This is the one approval that
+ * stays — it fires only on an actual denial, and `remember: true` makes it a
+ * once-per-path-per-workspace cost, not a per-command one.
+ *
+ * In every case the tool's own requiresApproval() already returns true, but
+ * that is only consulted in manual mode — the "always needs approval" promise
+ * must be enforced as a pipeline hard gate.
  */
 export function requiresUnconditionalApproval(toolName: string, input: Record<string, unknown>): boolean {
+  if (toolName === 'request_path_access') return true
   if (toolName !== 'computer_use') return false
   const action = typeof input.action === 'string' ? input.action : ''
   return action === 'js_eval' || action === 'browser_adopt'

@@ -30,7 +30,7 @@ import { assessToolRisk, CONFIDENCE_THRESHOLDS, isDestructiveGitAction, isSafeWr
 import type { Sensorium } from './sensorium.js'
 import { isToolAllowed, isToolDenied, isBashCommandAllowlisted, isBashCommandDenied, learnBashPrefix, learnFileApproval } from './permissions.js'
 import { isSelfDestructiveKill, selfProcessTree } from './self-preservation.js'
-import { isSandboxActive } from '../tools/sandbox-profile.js'
+import { isSandboxActive, sandboxCoversCommand } from '../tools/sandbox-profile.js'
 import { applyApprovalEdit, type ApprovalResult } from './approval-edit.js'
 import { debugEnabled, debugLog } from '../utils/debug.js'
 import { suggestStrategyShift, type TrajectorySummary } from './strategy-shift.js'
@@ -358,7 +358,7 @@ export interface ToolPipelineDeps {
   onSkillInvoked?: (name: string) => void
   /** Called when the model explicitly marks a skill as complete via the skill tool. */
   onSkillCompleted?: (name: string) => void
-  recordToolHistory(name: string, input: Record<string, unknown>, isError: boolean, content: string, errorClass?: ToolErrorClass): void
+  recordToolHistory(name: string, input: Record<string, unknown>, isError: boolean, content: string, errorClass?: ToolErrorClass, errorKind?: FailureClass): void
   getInterventionLevel?(): InterventionLevel
   recordPrediction?(correct: boolean): void
   /** Current sensorium snapshot — enables confidence-driven adaptive approval. */
@@ -1072,8 +1072,13 @@ export async function executeToolUse(
     // interrupt an unattended run for approval. When no sandbox is available we
     // stay fail-closed for risky writes, but auto-safe mode auto-approves safe
     // writes (mkdir/touch/cp/echo>file) to avoid approval fatigue on Windows.
-    const noSandbox = !isSandboxActive()
     const bashCommand = tu.name === 'bash' && typeof tu.input.command === 'string' ? tu.input.command : ''
+    // Per-command, not per-process: an incompatible-command bypass (brew /
+    // docker / codesign) runs unsandboxed even when the sandbox is on, and must
+    // stay fail-closed for approval.
+    const noSandbox = bashCommand.length > 0
+      ? !sandboxCoversCommand(bashCommand)
+      : !isSandboxActive()
     const safeWriteInNoSandbox = noSandbox
       && approvalMode === 'auto-safe'
       && bashCommand.length > 0
@@ -1091,13 +1096,12 @@ export async function executeToolUse(
     // Out-of-workspace file op: the path is outside the workspace and not yet
     // granted. Instead of hard-blocking in execute(), route through the approval
     // flow — on approval we record a directory-subtree grant so the op proceeds.
-    let pathGrantNeed = outOfWorkspaceFilePaths(deps.cwd, tu.name, tu.input)
-    // In dangerously-skip-permissions the user opted out of all prompts: record
-    // the grant directly so the op isn't blocked by the path guard.
-    if (skipAllApproval && pathGrantNeed) {
-      for (const p of pathGrantNeed.paths) grantPath(dirname(p), pathGrantNeed.mode)
-      pathGrantNeed = null
-    }
+    //
+    // NOT relaxed under dangerously-skip-permissions: widening the write
+    // boundary is the one decision YOLO does not get to make for the user
+    // (see requiresUnconditionalApproval). Unattended runs pre-authorize via
+    // permissions.additionalWriteDirs instead.
+    const pathGrantNeed = outOfWorkspaceFilePaths(deps.cwd, tu.name, tu.input)
 
     // Hard gate: arbitrary-JS / endpoint-takeover actions (computer_use
     // js_eval / browser_adopt) always ask — no approval mode (incl. YOLO),
@@ -1166,7 +1170,7 @@ export async function executeToolUse(
         // Re-emitting the identical call only re-hits the same gate, so tell the
         // model to stop and hand control back to the user instead of retrying.
         const noSandboxReason = bashWriteRequiresApproval && noSandbox
-          ? '\n根因：当前环境无文件系统沙箱（Windows 原生 / 沙箱未启用），写命令需人工审批。这不是命令本身的问题——审批后即可执行。要减少审批频率，可切换到 auto-safe 模式（低风险写命令自动放行）或使用 WSL（Linux 子系统下有沙箱）。'
+          ? '\n根因：当前命令不在文件系统沙箱保护下（原生 Windows 无内核沙箱 / 未装 bwrap / 该命令走了沙箱旁路），故写命令需人工审批。这不是命令本身的问题——审批后即可执行。要减少审批频率：Linux 装 bubblewrap、Windows 走 WSL，或用 permissions.bash.allowlist 为可信命令前缀免审批。'
           : ''
         const denyMsg = deps.config.headless
           ? [
@@ -1174,6 +1178,7 @@ export async function executeToolUse(
               `Tool "${tu.name}"${target} is ${HEADLESS_DENY_MARKER}: it requires an approval that no human can grant in this context.`,
               'Do NOT re-emit this call — it will keep hitting the same gate and waste your turn budget.',
               'Instead: accomplish the task using an allowed tool if possible, or finish now by returning your result JSON with status "blocked" and explain in the summary which operation was gated.',
+              'If the gate was an out-of-workspace path grant, the operator must pre-authorize it in config: permissions.additionalWriteDirs.',
             ].join('\n')
           : [
               `Tool "${tu.name}"${target} was not executed: it requires explicit user approval, which you cannot grant yourself.${noSandboxReason}`,
@@ -1550,7 +1555,7 @@ export async function executeToolUse(
     void emitToolResultTrace({ cwd: deps.cwd, sessionId: deps.sessionId, id: tu.id, name: tu.name, isError: harnessResult.isError, contentLen: finalContent.length, source: 'pipeline' })
     callbacks.onToolResult(tu.id, tu.name, finalContent, harnessResult.isError ?? false, rawToolResult?.rawPath, rawToolResult?.uiContent)
 
-    deps.recordToolHistory(tu.name, tu.input, harnessResult.isError, harnessResult.content, rawToolResult?.errorClass)
+    deps.recordToolHistory(tu.name, tu.input, harnessResult.isError, harnessResult.content, rawToolResult?.errorClass, rawToolResult?.errorKind)
 
     // Destructive gate 窗口计数:只数实际执行到这里的工具(被拦截的调用在
     // evaluate 处已短路返回,不计数,窗口保持)。

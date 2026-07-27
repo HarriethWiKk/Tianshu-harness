@@ -139,6 +139,15 @@ export const CONSTITUTIONAL_PRIORITY = 0.9
 
 /** 每轮最大渲染条数（non-constitutional 上限） */
 const MAX_ADVISORIES_PER_TURN = 3
+/** 天权/瑶光等自主判断型星域的上限——这些星域有自己的判断力，过度提醒是噪音 */
+const SELF_DIRECTED_DOMAIN_BUDGET = 1
+
+/** 星域感知的 advisory 轮预算：自主判断型（天权/瑶光）减量，其余保持全局上限 */
+function advisoryBudgetForDomain(activeStarDomain?: string): number {
+  if (activeStarDomain === '天权' || activeStarDomain === '瑶光') return SELF_DIRECTED_DOMAIN_BUDGET
+  return MAX_ADVISORIES_PER_TURN
+}
+
 /** 每个 category 最多保留条数，防止单一信号源垄断 advisory 预算 */
 const MAX_PER_CATEGORY = 2
 /** W2 SR 有界携带：SR 被 cap 拦截后最多 requeue 次数（跨轮延迟送达上限） */
@@ -168,6 +177,11 @@ const MUTEX_PAIRS: ReadonlyArray<{ winner: string; loser: string }> = [
  *  门禁放 bus 层而非 hook 层——送达历史在 bus 手边，且天然覆盖未来任何调用方。 */
 export const KEY_COOLDOWN_TURNS: ReadonlyMap<string, number> = new Map([
   ['virtue-encouragement', 5],
+  // 系统提醒冷却（2026-07-28 session 0087edf0）：readonly-spiral 和
+  // turn-call-limit 在 advisory 洪水期反复弹窗加剧噪音。key 级冷却确保
+  // 同一提醒不在连续轮次重复注入。
+  ['readonly-spiral', 3],
+  ['turn-call-limit', 3],
 ])
 
 // ─── F-fix（session 803d897d）：纪律抗习惯化重锚 ─────────────────────
@@ -724,11 +738,16 @@ export class AdvisoryBus {
 
     // ── W2 key 级送达冷却：注册 key 距上次实际送达不足 N 轮 → 吞掉计 dropped ──
     // 放在一切竞争逻辑之前——冷却中的条目不该占 MUTEX/预算/挂起任何一席。
+    // system-reminder 通道不受 key 级冷却影响：SR 有独立的 requeue/carry/confirm 生命周期。
     this.lastRenderTurn = turn
     {
       const cooled: AdvisoryEntry[] = []
       const swallowed: string[] = []
       for (const e of all) {
+        if (e.channel === 'system-reminder') {
+          cooled.push(e) // SR lifecycle managed separately — skip cooldown
+          continue
+        }
         const cooldown = KEY_COOLDOWN_TURNS.get(e.key)
         const last = cooldown !== undefined ? this.lastDeliveredTurnByKey.get(e.key) : undefined
         if (cooldown !== undefined && last !== undefined && turn - last < cooldown) {
@@ -1036,13 +1055,14 @@ export class AdvisoryBus {
     // Operational first, then informational fills remaining
     const operational = catFiltered.filter(e => e.tier !== 'informational')
     const informational = catFiltered.filter(e => e.tier === 'informational')
+    const budget = advisoryBudgetForDomain(activeStarDomain)
     const taken: AdvisoryEntry[] = []
     for (const e of operational) {
-      if (taken.length >= MAX_ADVISORIES_PER_TURN) break
+      if (taken.length >= budget && e.category !== 'star_domain') break
       taken.push(e)
     }
     for (const e of informational) {
-      if (taken.length >= MAX_ADVISORIES_PER_TURN) break
+      if (taken.length >= budget && e.category !== 'star_domain') break
       taken.push(e)
     }
 

@@ -68,7 +68,9 @@ function makeResult(orderId: string, status: 'passed' | 'blocked' | 'failed', su
     changedFiles: [],
     risks: [],
     nextActions: [],
-    evidenceStatus: status === 'passed' ? 'verified' : 'blocked',
+    // 只读工不宣称 verified：这批用例测的是 summary 扩写，宣称 verified 会额外
+    // 触发证据打回复核（worker-revision），把两条补偿路径搅在一起。
+    evidenceStatus: status === 'passed' ? 'unverified' : 'blocked',
   }
 }
 

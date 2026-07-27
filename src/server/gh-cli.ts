@@ -5,6 +5,18 @@
  */
 import { spawnHidden } from '../tools/spawn-hidden.js'
 
+/** Normalized CI check tri-state (+ anomalous states), shared by rollup and `gh pr checks`. */
+export type CiCheckState = 'SUCCESS' | 'FAILURE' | 'PENDING' | 'ERROR' | 'EXPECTED'
+
+export interface CiCheck {
+  name: string
+  /** Normalized state — drives the badge tri-state (green/red/yellow). */
+  state: CiCheckState
+  /** Raw state/conclusion as reported by gh (preserved for display). */
+  conclusion?: string
+  detailsUrl?: string
+}
+
 export interface PrSummary {
   number: number
   title: string
@@ -18,6 +30,10 @@ export interface PrSummary {
   deletions: number
   reviewDecision: string
   isDraft: boolean
+  mergeable?: 'MERGEABLE' | 'CONFLICTING' | 'UNKNOWN'
+  mergeStateStatus?: 'CLEAN' | 'BLOCKED' | 'UNSTABLE' | 'HAS_HOOKS' | 'BEHIND' | 'DIRTY' | 'DRAFT' | 'UNKNOWN'
+  statusCheckRollup?: CiCheck[]
+  autoMergeRequest?: { mergeMethod: string } | null
 }
 
 export interface PrDetail extends PrSummary {
@@ -73,6 +89,8 @@ export interface GhResult {
 }
 
 const TIMEOUT_MS = 15_000
+/** CI-flavored calls (checks listing, log retrieval, merge) can be slow. */
+const CI_TIMEOUT_MS = 60_000
 
 async function runGh(args: string[], cwd: string): Promise<string | null> {
   const res = await runGhCapture(args, cwd)
@@ -84,13 +102,14 @@ async function runGh(args: string[], cwd: string): Promise<string | null> {
  * Unlike {@link runGh} (which drops stderr and collapses failures to null),
  * this surfaces gh's error message so write operations can report why they
  * failed. `input` is piped to stdin then closed (for `gh api --input -`).
+ * `timeoutMs` defaults to the shared 15s; CI/log calls pass CI_TIMEOUT_MS.
  */
-export async function runGhCapture(args: string[], cwd: string, input?: string): Promise<GhResult> {
+export async function runGhCapture(args: string[], cwd: string, input?: string, timeoutMs: number = TIMEOUT_MS): Promise<GhResult> {
   return new Promise((resolve) => {
     const child = spawnHidden('gh', args, {
       cwd,
       stdio: [input !== undefined ? 'pipe' : 'ignore', 'pipe', 'pipe'],
-      timeout: TIMEOUT_MS,
+      timeout: timeoutMs,
     })
     const out: Buffer[] = []
     const err: Buffer[] = []
@@ -111,9 +130,83 @@ export async function runGhCapture(args: string[], cwd: string, input?: string):
   })
 }
 
+/** JSON field string shared by `pr list` / `pr view` (same GraphQL PR field set). */
+const PR_FIELDS = 'number,title,state,url,headRefName,author,createdAt,updatedAt,additions,deletions,reviewDecision,isDraft,mergeable,mergeStateStatus,statusCheckRollup,autoMergeRequest'
+
+const MERGEABLE_VALUES = ['MERGEABLE', 'CONFLICTING', 'UNKNOWN'] as const
+const MERGE_STATE_VALUES = ['CLEAN', 'BLOCKED', 'UNSTABLE', 'HAS_HOOKS', 'BEHIND', 'DIRTY', 'DRAFT', 'UNKNOWN'] as const
+const CI_CHECK_STATES = ['SUCCESS', 'FAILURE', 'PENDING', 'ERROR', 'EXPECTED'] as const
+
+function asCiCheckState(raw: string): CiCheckState {
+  return (CI_CHECK_STATES as readonly string[]).includes(raw) ? (raw as CiCheckState) : 'PENDING'
+}
+
+/**
+ * Map a CheckRun-style conclusion to the tri-state. NEUTRAL/SKIPPED count as
+ * passing (GitHub treats them as mergeable); CANCELLED surfaces as ERROR.
+ */
+function ciStateFromConclusion(conclusion: string): CiCheckState {
+  switch (conclusion) {
+    case 'SUCCESS':
+    case 'NEUTRAL':
+    case 'SKIPPED':
+      return 'SUCCESS'
+    case 'FAILURE':
+    case 'TIMED_OUT':
+    case 'ACTION_REQUIRED':
+    case 'STARTUP_FAILURE':
+      return 'FAILURE'
+    case 'CANCELLED':
+      return 'ERROR'
+    default:
+      return 'PENDING'
+  }
+}
+
+/**
+ * Normalize one statusCheckRollup item (CheckRun | StatusContext union) to
+ * CiCheck. CheckRun carries status+conclusion; StatusContext carries state
+ * directly. Pure (no IO) so it can be unit-tested without spawning gh.
+ */
+export function normalizeRollupCheck(item: Record<string, unknown>): CiCheck {
+  const isStatusContext = item.__typename === 'StatusContext' || (item.context != null && item.name == null)
+  if (isStatusContext) {
+    const raw = String(item.state ?? 'PENDING')
+    return {
+      name: String(item.context ?? ''),
+      state: asCiCheckState(raw),
+      detailsUrl: item.targetUrl ? String(item.targetUrl) : undefined,
+    }
+  }
+  // CheckRun (also the defensive fallback for unknown shapes).
+  const conclusion = item.conclusion ? String(item.conclusion) : undefined
+  return {
+    name: String(item.name ?? ''),
+    state: conclusion ? ciStateFromConclusion(conclusion) : 'PENDING',
+    conclusion,
+    detailsUrl: item.detailsUrl ? String(item.detailsUrl) : undefined,
+  }
+}
+
+/** Extract the CI fields from a `gh pr list/view --json` record. */
+function mapCiFields(p: Record<string, unknown>): Pick<PrSummary, 'mergeable' | 'mergeStateStatus' | 'statusCheckRollup' | 'autoMergeRequest'> {
+  const mergeable = (MERGEABLE_VALUES as readonly string[]).includes(String(p.mergeable))
+    ? (p.mergeable as PrSummary['mergeable'])
+    : undefined
+  const mergeStateStatus = (MERGE_STATE_VALUES as readonly string[]).includes(String(p.mergeStateStatus))
+    ? (p.mergeStateStatus as PrSummary['mergeStateStatus'])
+    : undefined
+  const statusCheckRollup = Array.isArray(p.statusCheckRollup)
+    ? (p.statusCheckRollup as Record<string, unknown>[]).map(normalizeRollupCheck).filter(c => c.name)
+    : undefined
+  const autoMergeRequest = typeof p.autoMergeRequest === 'object' && p.autoMergeRequest !== null
+    ? { mergeMethod: String((p.autoMergeRequest as Record<string, unknown>).mergeMethod ?? '') }
+    : null
+  return { mergeable, mergeStateStatus, statusCheckRollup, autoMergeRequest }
+}
+
 export async function listPrs(cwd: string, limit = 10): Promise<PrSummary[] | null> {
-  const fields = 'number,title,state,url,headRefName,author,createdAt,updatedAt,additions,deletions,reviewDecision,isDraft'
-  const raw = await runGh(['pr', 'list', '--json', fields, '--limit', String(limit)], cwd)
+  const raw = await runGh(['pr', 'list', '--json', PR_FIELDS, '--limit', String(limit)], cwd)
   if (!raw) return null
   try {
     const arr = JSON.parse(raw) as Record<string, unknown>[]
@@ -130,6 +223,7 @@ export async function listPrs(cwd: string, limit = 10): Promise<PrSummary[] | nu
       deletions: Number(p.deletions ?? 0),
       reviewDecision: String(p.reviewDecision ?? ''),
       isDraft: Boolean(p.isDraft),
+      ...mapCiFields(p),
     }))
   } catch {
     return null
@@ -137,7 +231,7 @@ export async function listPrs(cwd: string, limit = 10): Promise<PrSummary[] | nu
 }
 
 export async function getPrDetail(cwd: string, number: number): Promise<PrDetail | null> {
-  const fields = 'number,title,state,url,headRefName,author,createdAt,updatedAt,additions,deletions,reviewDecision,isDraft,body'
+  const fields = `${PR_FIELDS},body`
   const raw = await runGh(['pr', 'view', String(number), '--json', fields], cwd)
   if (!raw) return null
   try {
@@ -155,6 +249,7 @@ export async function getPrDetail(cwd: string, number: number): Promise<PrDetail
       deletions: Number(p.deletions ?? 0),
       reviewDecision: String(p.reviewDecision ?? ''),
       isDraft: Boolean(p.isDraft),
+      ...mapCiFields(p),
       body: String(p.body ?? ''),
       comments: [],
       files: [],
@@ -308,4 +403,102 @@ export async function createPr(
   // gh prints the PR URL as the last stdout line.
   const url = res.stdout.split('\n').map(l => l.trim()).filter(l => l.startsWith('https://')).pop()
   return { ok: true, url }
+}
+
+// ── CI checks / merge (PR CI loop) ─────────────────────────────────────
+
+/**
+ * List a PR's check runs via `gh pr checks --json` (gh 2.20+; the `bucket`
+ * field gives the tri-state directly). 60s timeout — checks listing hits the
+ * rollup API which can lag. Null when gh fails.
+ */
+export async function listPrChecks(cwd: string, number: number): Promise<CiCheck[] | null> {
+  const res = await runGhCapture(
+    ['pr', 'checks', String(number), '--json', 'name,state,link,bucket,workflow,startedAt,completedAt'],
+    cwd,
+    undefined,
+    CI_TIMEOUT_MS,
+  )
+  if (!res.ok) return null
+  try {
+    const arr = JSON.parse(res.stdout) as Record<string, unknown>[]
+    if (!Array.isArray(arr)) return []
+    return arr.map(c => ({
+      name: String(c.name ?? ''),
+      state: checkStateFromBucket(String(c.bucket ?? '')),
+      conclusion: c.state ? String(c.state) : undefined,
+      detailsUrl: c.link ? String(c.link) : undefined,
+    })).filter(c => c.name)
+  } catch {
+    return null
+  }
+}
+
+/** `gh pr checks` bucket → tri-state. `skipping` passes; `cancel` is anomalous. */
+function checkStateFromBucket(bucket: string): CiCheckState {
+  switch (bucket) {
+    case 'pass':
+    case 'skipping':
+      return 'SUCCESS'
+    case 'fail':
+      return 'FAILURE'
+    case 'cancel':
+      return 'ERROR'
+    default:
+      return 'PENDING'
+  }
+}
+
+/**
+ * Extract a GitHub Actions run id from a check's detailsUrl
+ * (`…/actions/runs/<id>`). Null for external CI (CircleCI/Buildkite/…) —
+ * their logs are not reachable via gh. Pure, unit-tested.
+ */
+export function parseActionsRunId(detailsUrl: string | undefined): number | null {
+  if (!detailsUrl) return null
+  const m = /github\.com\/[^/]+\/[^/]+\/actions\/runs\/(\d+)/.exec(detailsUrl)
+  return m ? Number(m[1]) : null
+}
+
+export type CheckRunLogResult = { log: string } | { externalUrl: string }
+
+/**
+ * Fetch a failed check's log. Primary path: parse the Actions run id from
+ * detailsUrl, then `gh run view <id> --log-failed` (plain text, works with the
+ * gh CLI user token). External CI (non-Actions detailsUrl) degrades to
+ * { externalUrl } — the caller offers the link instead of a log.
+ * NOTE: the check-runs/<id>/logs API endpoint is GitHub-App-credentials only
+ * and is deliberately not used. Null when gh fails or no URL is available.
+ */
+export async function getCheckRunLog(cwd: string, check: Pick<CiCheck, 'detailsUrl'>): Promise<CheckRunLogResult | null> {
+  const runId = parseActionsRunId(check.detailsUrl)
+  if (runId == null) return check.detailsUrl ? { externalUrl: check.detailsUrl } : null
+  const res = await runGhCapture(['run', 'view', String(runId), '--log-failed'], cwd, undefined, CI_TIMEOUT_MS)
+  if (!res.ok) return null
+  return { log: res.stdout }
+}
+
+export type MergeMethod = 'squash' | 'merge' | 'rebase'
+
+/** Pure: assemble `gh pr merge` args (unit-tested). */
+export function buildMergeArgs(number: number, method: MergeMethod, opts?: { auto?: boolean; deleteBranch?: boolean }): string[] {
+  const args = ['pr', 'merge', String(number), `--${method}`]
+  if (opts?.auto) args.push('--auto')
+  if (opts?.deleteBranch) args.push('--delete-branch')
+  return args
+}
+
+/**
+ * Merge a PR via `gh pr merge`. `opts.auto` arms GitHub native auto-merge
+ * (the repo must have it enabled — gh surfaces the error otherwise, and the
+ * caller maps stderr to an actionable message). Returns GhResult so stderr
+ * reaches the UI.
+ */
+export async function mergePr(
+  cwd: string,
+  number: number,
+  method: MergeMethod,
+  opts?: { auto?: boolean; deleteBranch?: boolean },
+): Promise<GhResult> {
+  return runGhCapture(buildMergeArgs(number, method, opts), cwd, undefined, CI_TIMEOUT_MS)
 }

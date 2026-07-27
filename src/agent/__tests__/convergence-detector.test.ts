@@ -506,7 +506,8 @@ describe('evaluateConvergence', () => {
   })
 
   it('deliver phase is strict', () => {
-    // deliver phase weights editRatio high, so no edits → low score
+    // deliver phase emphasizes verification signals (errorPenalty, tokenEfficiency)
+    // over edits, so a read-only window still scores low
     const history = makeHistory([
       { tool: 'read_file', target: 'a.ts' },
       { tool: 'read_file', target: 'b.ts' },

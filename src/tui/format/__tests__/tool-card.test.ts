@@ -114,7 +114,7 @@ describe('formatToolCard — diff 内联阈值 (adds+dels ≤ 10)', () => {
     assert.match(plain, /\+6 −6/, 'summary with line counts')
     assert.ok(!plain.includes('-a'), 'removal lines NOT rendered inline')
     assert.ok(!plain.includes('+A'), 'addition lines NOT rendered inline')
-    assert.match(plain, /Ctrl\+O/, 'expand hint present')
+    assert.match(plain, /ctrl\+o 展开/, 'expand hint present')
   })
 
   it('isToolCardTruncated returns false for ≤10 changes', () => {
@@ -125,5 +125,44 @@ describe('formatToolCard — diff 内联阈值 (adds+dels ≤ 10)', () => {
   it('isToolCardTruncated returns true for >10 changes', () => {
     const diff = 'diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1,6 +1,6 @@\n-a\n-b\n-c\n-d\n-e\n-f\n+A\n+B\n+C\n+D\n+E\n+F\n'
     assert.equal(isToolCardTruncated({ toolName: 'edit_file', content: diff }), true)
+  })
+})
+
+describe('派发预览：字段名必须与 delegate 工具 schema 对齐', async () => {
+  // 这里曾读 `task.id` 与 `task.description`，而 delegate_batch 的任务 schema
+  // 只有 `objective`（delegate-batch.ts required: ['objective']）。两个字段都不
+  // 存在，于是每次批量派发都只渲染出 `• #1 • #2`：逐次一模一样、与真实任务无关。
+  const preview = (toolName: string, toolInput: Record<string, unknown>): string =>
+    formatToolCard({ toolName, toolInput, content: '', streaming: true }, theme)
+      .map(stripAnsi).join('\n')
+
+  it('delegate_batch 渲染每个任务的 objective', async () => {
+    const out = preview('delegate_batch', {
+      tasks: [{ objective: '审查缓存边界' }, { objective: '补 rewind 回归测试' }],
+    })
+    assert.match(out, /审查缓存边界/)
+    assert.match(out, /补 rewind 回归测试/)
+  })
+
+  it('delegate_batch 两次不同派发渲染出不同内容', async () => {
+    const a = preview('delegate_batch', { tasks: [{ objective: '审查缓存边界' }] })
+    const b = preview('delegate_batch', { tasks: [{ objective: '补 rewind 回归测试' }] })
+    assert.notEqual(a, b, '不同任务不得渲染成同一段文本')
+  })
+
+  it('objective 尚未流式到达时不报错，也不编造内容', async () => {
+    const out = preview('delegate_batch', { tasks: [{}] })
+    assert.match(out, /#1/, '编号仍要有，否则用户看不出派了几个')
+    assert.doesNotMatch(out, /undefined/)
+  })
+
+  it('delegate_task 单任务渲染 objective', async () => {
+    const out = preview('delegate_task', { objective: '定位 /tasks 舰队行的渲染函数' })
+    assert.match(out, /定位 \/tasks 舰队行的渲染函数/)
+  })
+
+  it('delegate_task 参数未成形时退到 profile（schema 里没有 agent 字段）', async () => {
+    const out = preview('delegate_task', { profile: 'reviewer' })
+    assert.match(out, /reviewer/)
   })
 })

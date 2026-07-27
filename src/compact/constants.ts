@@ -222,7 +222,12 @@ export function precisionCeilingRatio(contextWindow: number, override?: number):
   // window, below the cache-preserving compact ratio of 0.86). The ceiling
   // exists for the 1M-window regime where cache-economics-only defers compaction
   // well past the accuracy cliff. Returning 1 = no ceiling (cache strategy rules).
-  if (contextWindow >= LARGE_CONTEXT_WINDOW_TOKENS) return 0.5
+  //
+  // 0.7 rather than 0.5 (2026-07-26): at 0.5 the ceiling halved the
+  // cache-preserving watch threshold (0.72) — the same mistake the autoFloor
+  // clamp above was fixed for. It fires just before watch now, so it is an
+  // early accuracy-first guard rather than a replacement compaction schedule.
+  if (contextWindow >= LARGE_CONTEXT_WINDOW_TOKENS) return 0.7
   if (contextWindow >= 200_000) return 0.55
   return 1
 }

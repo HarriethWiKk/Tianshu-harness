@@ -30,7 +30,7 @@ import { ArtifactStore } from '../artifact/store.js'
 import type { OaiMessage } from '../api/oai-types.js'
 import { isAssistantWithTools, oaiMessageText, type OaiToolCall } from '../api/oai-types.js'
 import { toolArgSummary } from '../tui/tool-label.js'
-import { loadPersistedResult } from '../agent/coordinator.js'
+import { listPersistedResultRounds, loadPersistedResult, type PersistedResultRound } from '../agent/coordinator.js'
 import { loadWorkerSession } from '../agent/worker-session-persist.js'
 import type { SessionRegistry } from '../agent/session-registry.js'
 import type { DecisionShift } from '../agent/loop-types.js'
@@ -85,6 +85,7 @@ import type {
   SessionRecord,
   PlanDraft,
 } from './protocol.js'
+import { redactValue, redactText, truncateUtf16Safe } from './redact.js'
 
 // The session wire contract (event types, records, statuses) lives in
 // protocol.ts so the desktop can share it type-only. Re-export so existing
@@ -184,7 +185,7 @@ export interface DelegateActivityUpdate {
   /** 该 worker 累计 token 总数（turn 事件携带的累计快照）。 */
   tokenCount?: number
   /** 原始活动事件种类（桌面端 worker 活动镜像用；terminal 事件缺省）。 */
-  eventKind?: 'text' | 'thinking' | 'tool_use' | 'tool_result' | 'turn' | 'retry'
+  eventKind?: 'text' | 'thinking' | 'tool_use' | 'tool_result' | 'turn' | 'retry' | 'lifecycle'
   /** 原始事件内容：text/thinking 为 delta，tool_use/tool_result 为工具名。 */
   eventDetail?: string
   /** Terminal failure classification (blocked/failed 终态事件携带)。 */
@@ -466,6 +467,12 @@ export interface CreateSessionInput {
    * 立即拒绝并 fail-closed 中止本次运行（中止原因入事件流 + 走查工件）。
    */
   unattended?: boolean
+  /**
+   * P1b（安全）：客户端是否具备计划倒计时自动批准 UI。
+   * 仅 desktop/TUI 设置 true；vscode-extension 不设置（默认 false）→ sidecar
+   * 不武装 goal 模式倒计时定时器（fail-closed：无可见性即不自动批准）。
+   */
+  planAutoApproveUi?: boolean
 }
 
 /** Persisted snapshot of a session: a record + its full event log. */
@@ -798,6 +805,8 @@ interface InternalSession {
   planDraftTimerGeneration?: number
   /** 无人值守运行：审批请求 fail-closed 中止（付费版 v1 · T2）。 */
   unattended?: boolean
+  /** P1b：客户端是否具备 plan 自动批准倒计时 UI。默认 false = fail-closed。 */
+  planAutoApproveUi?: boolean
   /** 无人值守中止原因（首个被拦截的审批），随 done/summary 上报。 */
   unattendedHaltReason?: string
   /** 无人值守中止时缺授权的 app 名（结构化，供「补授权→重跑」修复闭环）。 */
@@ -814,9 +823,6 @@ interface InternalSession {
   /** Reject streaming callbacks from an archived/deleted agent closure. */
   toolResultClosed?: boolean
 }
-
-const REDACTED = '[REDACTED]'
-const SENSITIVE_KEY = /(?:api[_-]?key|token|secret|password|authorization)/i
 
 /** Tools that spawn worker agents — surfaced as delegation-tree nodes (N3). */
 const DELEGATION_TOOLS = new Set(['delegate_task', 'delegate_batch', 'team_orchestrate', 'council_convene'])
@@ -859,16 +865,6 @@ function takeUtf8Prefix(text: string, maxBytes: number): { head: string; tail: s
   return { head: text.slice(0, end), tail: text.slice(end) }
 }
 
-function truncateUtf16Safe(text: string, maxUnits: number): string {
-  let units = 0
-  let end = 0
-  for (const point of text) {
-    if (units + point.length > maxUnits) break
-    units += point.length
-    end += point.length
-  }
-  return text.slice(0, end)
-}
 
 /** Result of a user-dispatch request — lets the route map a precise status code. */
 export type DelegateResult =
@@ -1144,6 +1140,7 @@ export class RuntimeSessionManager {
           disabledSkills: new Set(),
           skillLoadErrors: [],
           reasoningEffort: rec.reasoningEffort as import('../agent/auto-reasoning.js').ReasoningEffort | 'auto' | undefined,
+          planAutoApproveUi: rec.planAutoApproveUi === true,
         }
         this.sessions.set(session.record.id, session)
         if (wasRunning) {
@@ -1225,6 +1222,7 @@ export class RuntimeSessionManager {
         disabledSkills: new Set(),
         skillLoadErrors: [],
         reasoningEffort: ps.record.reasoningEffort as import('../agent/auto-reasoning.js').ReasoningEffort | 'auto' | undefined,
+        planAutoApproveUi: ps.record.planAutoApproveUi === true,
       }
       this.sessions.set(session.record.id, session)
       if (wasRunning) {
@@ -1461,10 +1459,12 @@ export class RuntimeSessionManager {
    * 返回 undefined = 会话不存在;三段数据均可独立为空(worker 无存档时)。
    * `full` 模式(桌面「查看完整转录」):不截尾部 50 条,单条正文上限放宽,
    * 工具调用帧带参数摘要(toolInput)。默认模式保持轻载荷。
+   * rounds:稳定 id 复用时的逐轮归档索引(L1),result 始终是最新一轮。
    */
   async getWorkerLog(id: string, workerId: string, opts?: { full?: boolean }): Promise<{
     activity: string[]
     result: ReturnType<typeof loadPersistedResult>
+    rounds: PersistedResultRound[]
     transcript: { role: string; text: string; toolName?: string; toolInput?: string }[]
     savedAt: number | null
     /** true = 默认模式下转录尾部有被截断的更早消息(可用 full=1 拉全量)。 */
@@ -1500,6 +1500,7 @@ export class RuntimeSessionManager {
     return {
       activity: full ? activity : activity.slice(-50),
       result,
+      rounds: listPersistedResultRounds(workerId),
       transcript,
       savedAt: record?.savedAt ?? null,
       truncated: !full && messages.length > 50,
@@ -1767,6 +1768,9 @@ export class RuntimeSessionManager {
         worktreeBranch,
         worktreePath,
         baselineHead,
+        // P1b：随 record 持久化，sidecar 重启/rehydrate 后由恢复路径读回——
+        // 否则重启后静默失去倒计时自动批准（fail-closed 但前后不一致）。
+        ...(input.planAutoApproveUi === true ? { planAutoApproveUi: true } : {}),
       },
       agent: null,
       approvalMode: input.approvalMode,
@@ -1789,6 +1793,7 @@ export class RuntimeSessionManager {
       disabledSkills: new Set(),
       skillLoadErrors: [],
       unattended: input.unattended === true,
+      planAutoApproveUi: input.planAutoApproveUi === true,
     }
     // P1 — Mission 关联（显式路径）。projectId 用原项目根（input.cwd），
     // 不用 worktree 变异后的 cwd——worktree 路径是临时的，projectId 会漂移。
@@ -3286,6 +3291,19 @@ export class RuntimeSessionManager {
     const s = this.sessions.get(id)
     if (!s) return false
     const wasRunning = s.running
+    // Is there actually anything to stop? Must be sampled before the timers
+    // below are cleared. rehydrate() loads EVERY persisted session into memory,
+    // so abortAll() (sidecar shutdown + the global POST /abort) walks all of
+    // them — without this gate each pass appended a `status: aborted` marker to
+    // and re-touched updatedAt on hundreds of long-finished sessions, flattening
+    // the recency order every list in the UI sorts by.
+    const abortable =
+      wasRunning ||
+      s.record.status === 'running' ||
+      s.pending.size > 0 ||
+      s.pendingDelegations.size > 0 ||
+      s.watchdogContinueTimer !== undefined ||
+      s.planAutoApproveTimer !== undefined
     if (s.record.status === 'running') {
       s.record.status = 'aborted'
     }
@@ -3307,9 +3325,16 @@ export class RuntimeSessionManager {
     this.cancelPlanAutoApprove(s, 'aborted')
     s.agent?.abort()
     this.rejectAllPending(s, 'aborted')
-    this.touch(s)
-    this.append(s, 'status', { status: 'aborted' })
-    this.persistRecord(s)
+    // Idle sessions keep their timestamps and their log stays clean. The
+    // in-memory suppression flag above still applies — a stall recovery waiting
+    // on setImmediate is cancelled either way, it just no longer re-stamps a
+    // session whose status is already 'aborted'. Returns true regardless: the
+    // route reads false as "no such session" (404).
+    if (abortable) {
+      this.touch(s)
+      this.append(s, 'status', { status: 'aborted' })
+      this.persistRecord(s)
+    }
     return true
   }
 
@@ -4017,7 +4042,7 @@ export class RuntimeSessionManager {
       progressLine?: string
       toolUseCount?: number
       tokenCount?: number
-      eventKind?: 'text' | 'thinking' | 'tool_use' | 'tool_result' | 'turn' | 'retry'
+      eventKind?: 'text' | 'thinking' | 'tool_use' | 'tool_result' | 'turn' | 'retry' | 'lifecycle'
       eventDetail?: string
       failureReason?: string
       model?: string
@@ -4365,6 +4390,8 @@ export class RuntimeSessionManager {
     const delayMs = this.goalPlanAutoApproveMs
     if (delayMs <= 0) return
     if (!this.isGoalActive(session)) return
+    // P1b fail-closed：客户端无自动批准倒计时 UI 时不武装定时器
+    if (!session.planAutoApproveUi) return
     this.cancelPlanAutoApprove(session, 'superseded')
     const deadlineMs = this.now() + delayMs
     session.planAutoApproveSlug = slug
@@ -4890,20 +4917,3 @@ function resolveDomainPersona(key: string | undefined): { glyph: string; accent:
   return { glyph: d.uiPersona.glyph, accent: d.uiPersona.accent }
 }
 
-function redactValue(value: unknown): unknown {
-  if (typeof value === 'string') return redactText(value)
-  if (Array.isArray(value)) return value.map(redactValue)
-  if (!value || typeof value !== 'object') return value
-  if (value instanceof Date) return value.toISOString()
-  const redacted: Record<string, unknown> = {}
-  for (const [key, child] of Object.entries(value)) {
-    redacted[key] = SENSITIVE_KEY.test(key) ? REDACTED : redactValue(child)
-  }
-  return redacted
-}
-
-function redactText(text: string): string {
-  return String(text)
-    .replace(/(Bearer\s+)[A-Za-z0-9._~+/=-]+/gi, `$1${REDACTED}`)
-    .replace(/((?:api[_-]?key|token|secret|password)\s*[:=]\s*)[^\s,'"]+/gi, `$1${REDACTED}`)
-}

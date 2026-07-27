@@ -14,6 +14,8 @@ import { mkdtempSync, rmSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { RuntimeSessionManager, type ManagedAgent, type GoalHandles } from '../session-manager.js'
+import { createRouter } from '../index.js'
+import { buildSessionRoutes } from '../session-routes.js'
 import { GoalTracker } from '../../agent/goal-tracker.js'
 import { saveGoalState, restoreGoalTracker, loadGoalState } from '../../agent/goal-persist.js'
 import type { GoalSnapshot } from '../session-manager.js'
@@ -21,6 +23,7 @@ import type { Artifact } from '../../artifact/types.js'
 import type { AgentCallbacks } from '../../agent/loop-types.js'
 import type { OaiMessage } from '../../api/oai-types.js'
 import type { PlanDocument } from '../../plan/plan-store.js'
+import type { SessionEvent, SessionRecord } from '../protocol.js'
 
 /** Minimal fake agent that remembers the tracker it was handed (for the
  *  double-track assertion: cancelGoal must clear BOTH refs AND agent field). */
@@ -283,7 +286,7 @@ describe('Goal 计划倒计时自动批准（2026-07-24）', () => {
 
   test('goal 激活时计划提交武装倒计时；非 submit action 不武装', async () => {
     const { manager, agents } = makePlanManager({ delayMs: 5000, plans: [submittedPlan()] })
-    const s = manager.createSession({})
+    const s = manager.createSession({ planAutoApproveUi: true })
     void manager.run(s.id, 'go')
     await manager.setGoal(s.id, { goal: 'x', maxIterations: 10, contextWindow: 1000 })
 
@@ -303,7 +306,7 @@ describe('Goal 计划倒计时自动批准（2026-07-24）', () => {
 
   test('非 goal 会话不武装（纯手动审批语义不变）', async () => {
     const { manager, agents } = makePlanManager({ delayMs: 5000, plans: [submittedPlan()] })
-    const s = manager.createSession({})
+    const s = manager.createSession({ planAutoApproveUi: true })
     void manager.run(s.id, 'go')
 
     await submitPlanViaTool(agents[0]!.callbacks!)
@@ -313,7 +316,7 @@ describe('Goal 计划倒计时自动批准（2026-07-24）', () => {
 
   test('到期触发 approvePlan（同 slug）', async () => {
     const { manager, agents } = makePlanManager({ delayMs: 40, plans: [submittedPlan()] })
-    const s = manager.createSession({})
+    const s = manager.createSession({ planAutoApproveUi: true })
     void manager.run(s.id, 'go')
     await manager.setGoal(s.id, { goal: 'x', maxIterations: 10, contextWindow: 1000 })
 
@@ -328,7 +331,7 @@ describe('Goal 计划倒计时自动批准（2026-07-24）', () => {
 
   test('显式取消后到期不触发（cancelled 事件带 reason）', async () => {
     const { manager, agents } = makePlanManager({ delayMs: 40, plans: [submittedPlan()] })
-    const s = manager.createSession({})
+    const s = manager.createSession({ planAutoApproveUi: true })
     void manager.run(s.id, 'go')
     await manager.setGoal(s.id, { goal: 'x', maxIterations: 10, contextWindow: 1000 })
 
@@ -344,5 +347,115 @@ describe('Goal 计划倒计时自动批准（2026-07-24）', () => {
     const cancelled = manager.getEvents(s.id)!.events.filter((e) => e.type === 'plan_auto_approve_cancelled')
     assert.equal(cancelled.length, 1)
     assert.equal(cancelled[0]!.data.reason, 'user')
+  })
+
+  test('P1b: planAutoApproveUi=false 时不武装（fail-closed，vscode-extension 安全边界）', async () => {
+    const { manager, agents } = makePlanManager({ delayMs: 40, plans: [submittedPlan()] })
+    // 默认不传 planAutoApproveUi → fail-closed：goal 激活 + 计划提交 → 不武装
+    const s = manager.createSession({})
+    void manager.run(s.id, 'go')
+    await manager.setGoal(s.id, { goal: 'x', maxIterations: 10, contextWindow: 1000 })
+
+    await submitPlanViaTool(agents[0]!.callbacks!)
+    const pending = manager.getEvents(s.id)!.events.filter((e) => e.type === 'plan_auto_approve_pending')
+    assert.equal(pending.length, 0, 'planAutoApproveUi 未设置 → 不发射 plan_auto_approve_pending')
+  })
+
+  test('P1b: planAutoApproveUi=true 时正常武装（desktop 可见倒计时）', async () => {
+    const { manager, agents } = makePlanManager({ delayMs: 40, plans: [submittedPlan()] })
+    const s = manager.createSession({ planAutoApproveUi: true })
+    void manager.run(s.id, 'go')
+    await manager.setGoal(s.id, { goal: 'x', maxIterations: 10, contextWindow: 1000 })
+
+    await submitPlanViaTool(agents[0]!.callbacks!)
+    const pending = manager.getEvents(s.id)!.events.filter((e) => e.type === 'plan_auto_approve_pending')
+    assert.equal(pending.length, 1, 'planAutoApproveUi=true → 正常武装倒计时')
+    assert.equal(pending[0]!.data.slug, 'p-1')
+  })
+
+  // P1b 的标记此前只活在 InternalSession——sidecar 重启 rehydrate 后静默丢失，
+  // 同一客户端重启前后行为不一致。现在随 record 持久化，恢复路径读回。
+  test('P1b: planAutoApproveUi 随 record 持久化——重启 rehydrate 后仍武装', async () => {
+    type Entry = { record: SessionRecord; events: SessionEvent[] }
+    const store = new Map<string, Entry>()
+    const persistence = {
+      saveRecord: (record: SessionRecord) => {
+        store.set(record.id, { record: { ...record }, events: store.get(record.id)?.events ?? [] })
+      },
+      appendEvent: (sessionId: string, event: SessionEvent) => { store.get(sessionId)?.events.push(event) },
+      loadAll: () => [...store.values()].map(v => ({ record: v.record, events: v.events })),
+      loadRecords: () => [...store.values()].map(v => ({ ...v.record })),
+      loadEvents: (sessionId: string) => [...(store.get(sessionId)?.events ?? [])],
+    }
+
+    const m1 = new RuntimeSessionManager({
+      createAgent: () => new GoalFakeAgent() as CapturingAgent,
+      defaultCwd: '/tmp',
+      goalPlanAutoApproveMs: 5000,
+      persistence,
+    })
+    const s = m1.createSession({ planAutoApproveUi: true })
+    assert.equal(store.get(s.id)?.record.planAutoApproveUi, true, '创建时标记必须随 record 落盘')
+
+    // 第二个 manager 模拟 sidecar 重启：构造即 rehydrate，走 loadRecords 懒路径
+    const goalTrackerRef: { current: GoalTracker | null } = { current: null }
+    const agents2: CapturingAgent[] = []
+    const m2 = new RuntimeSessionManager({
+      createAgent: () => {
+        const a = new GoalFakeAgent() as CapturingAgent
+        a.run = (_p, cb) => { a.callbacks = cb; return Promise.resolve() }
+        agents2.push(a)
+        return a
+      },
+      defaultCwd: '/tmp',
+      resolveGoalHandles: () => ({ goalTrackerRef, sessionDir } as GoalHandles),
+      goalPlanAutoApproveMs: 5000,
+      listPlans: async () => [submittedPlan()],
+      persistence,
+    })
+    void m2.run(s.id, 'go')
+    await m2.setGoal(s.id, { goal: 'x', maxIterations: 10, contextWindow: 1000 })
+
+    await submitPlanViaTool(agents2[0]!.callbacks!)
+    const pending = m2.getEvents(s.id)!.events.filter((e) => e.type === 'plan_auto_approve_pending')
+    assert.equal(pending.length, 1, '重启 rehydrate 后 planAutoApproveUi 应读回并正常武装')
+  })
+
+  // 上面两个 P1b 测试直连 manager.createSession，绕过了 HTTP 路由——而 bb445ac6
+  // 落地时字段恰好丢在路由层（POST /sessions 逐字段构造入参，未透传），导致
+  // desktop 与 vscode 一并 fail-closed。以下两个测试走真实路由表，钉住这一跳。
+  const ROUTE_TOKEN = 'goal-plan-token'
+  const ROUTE_AUTH = { authorization: `Bearer ${ROUTE_TOKEN}` }
+
+  async function createSessionViaRoute(
+    manager: RuntimeSessionManager,
+    body: Record<string, unknown>,
+  ): Promise<string> {
+    const router = createRouter(buildSessionRoutes(manager, ROUTE_TOKEN))
+    const created = await router('POST', '/sessions', body, ROUTE_AUTH)
+    assert.equal(created.status, 201)
+    return (created.body as { id: string }).id
+  }
+
+  test('P1b 路由层：POST /sessions 必须透传 planAutoApproveUi（desktop 真实路径）', async () => {
+    const { manager, agents } = makePlanManager({ delayMs: 40, plans: [submittedPlan()] })
+    const id = await createSessionViaRoute(manager, { planAutoApproveUi: true })
+    void manager.run(id, 'go')
+    await manager.setGoal(id, { goal: 'x', maxIterations: 10, contextWindow: 1000 })
+
+    await submitPlanViaTool(agents[0]!.callbacks!)
+    const pending = manager.getEvents(id)!.events.filter((e) => e.type === 'plan_auto_approve_pending')
+    assert.equal(pending.length, 1, '路由层丢字段会让 desktop 一并被 fail-closed')
+  })
+
+  test('P1b 路由层：POST /sessions 不带该字段 → 仍 fail-closed（vscode 真实路径）', async () => {
+    const { manager, agents } = makePlanManager({ delayMs: 40, plans: [submittedPlan()] })
+    const id = await createSessionViaRoute(manager, {})
+    void manager.run(id, 'go')
+    await manager.setGoal(id, { goal: 'x', maxIterations: 10, contextWindow: 1000 })
+
+    await submitPlanViaTool(agents[0]!.callbacks!)
+    const pending = manager.getEvents(id)!.events.filter((e) => e.type === 'plan_auto_approve_pending')
+    assert.equal(pending.length, 0, '路由层不得把缺省值兜成 true')
   })
 })

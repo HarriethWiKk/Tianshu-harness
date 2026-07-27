@@ -44,6 +44,8 @@ import {
   setNetworkConfig,
   getMirrorConfig,
   setMirrorConfig,
+  getPrDefaultsConfig,
+  setPrDefaultsConfig,
   getPermissionDirs,
   setPermissionDirs,
   getVisionModelConfig,
@@ -469,6 +471,20 @@ export function buildConfigRoutes(apiToken?: string): Record<string, RouteHandle
     'PUT /config/mirrors': withAuth((body) => {
       try {
         return { status: 200, body: { ok: true, mirrors: setMirrorConfig(body ?? {}) } }
+      } catch (err) {
+        return { status: 400, body: { error: (err as Error).message } }
+      }
+    }, apiToken),
+
+    // GitHub PR panel defaults (merge method / auto-fix / auto-merge / CI poll
+    // cadence). Read by the desktop PR detail as the per-PR toggle initials.
+    'GET /config/pr-defaults': withAuth(() => {
+      return { status: 200, body: getPrDefaultsConfig() }
+    }, apiToken),
+
+    'PUT /config/pr-defaults': withAuth((body) => {
+      try {
+        return { status: 200, body: { ok: true, prDefaults: setPrDefaultsConfig(body ?? {}) } }
       } catch (err) {
         return { status: 400, body: { error: (err as Error).message } }
       }

@@ -3,8 +3,8 @@
  *
  * name/defaultHint/files 由 scripts/gen-env-registry.ts 生成，勿手改；
  * description 字段人工维护，重新生成时按 name 保留。
- * 最后生成：2026-07-25T08:15:53.872Z
- * 共 115 个变量。
+ * 最后生成：2026-07-27T03:39:47.159Z
+ * 共 121 个变量。
  *
  * 每个条目含：名称 / 默认值提示 / 引用文件 / 简要说明。
  * 当源码中新增 RIVET_* 引用但注册表未同步时，
@@ -38,7 +38,7 @@ export const ENV_REGISTRY: EnvRegistryEntry[] = [
   {
     name: 'RIVET_AMBIGUOUS_WIDTH',
     defaultHint: '\'\'',
-    files: ['tui/width.ts', 'tui/engine/__tests__/live-engine-ghost-render.test.ts', 'tui/__tests__/width.test.ts'],
+    files: ['tui/width.ts', 'tui/engine/__tests__/live-engine-ghost-render.test.ts', 'tui/__tests__/format-welcome.test.ts', 'tui/__tests__/width.test.ts'],
     description: '',
   },
   {
@@ -56,7 +56,7 @@ export const ENV_REGISTRY: EnvRegistryEntry[] = [
   {
     name: 'RIVET_ASCII_UI',
     defaultHint: '',
-    files: ['tui/term-caps.ts', 'tui/engine/__tests__/app-core.test.ts'],
+    files: ['tui/term-caps.ts', 'tui/engine/__tests__/app-core.test.ts', 'tui/__tests__/format-welcome.test.ts'],
     description: '',
   },
   {
@@ -331,7 +331,7 @@ export const ENV_REGISTRY: EnvRegistryEntry[] = [
   },
   {
     name: 'RIVET_HEADLESS_MAX_TURNS',
-    defaultHint: '15',
+    defaultHint: '',
     files: ['main.ts'],
     description: '非 goal 模式下 -p 一次提示的最大轮数（默认 15）；benchmark/eval 多文档任务可调高',
   },
@@ -441,12 +441,6 @@ export const ENV_REGISTRY: EnvRegistryEntry[] = [
     name: 'RIVET_NO_EMBEDDINGS',
     defaultHint: '',
     files: ['search/embedding-provider.ts'],
-    description: '',
-  },
-  {
-    name: 'RIVET_NO_SANDBOX',
-    defaultHint: '',
-    files: ['tools/sandbox-profile.ts'],
     description: '',
   },
   {
@@ -584,8 +578,8 @@ export const ENV_REGISTRY: EnvRegistryEntry[] = [
   {
     name: 'RIVET_SANDBOX',
     defaultHint: '',
-    files: ['tools/sandbox-profile.ts'],
-    description: '',
+    files: ['tools/bash.ts', 'tools/sandbox-profile.ts', 'tools/__tests__/sandbox-profile.test.ts'],
+    description: '追加可写根目录，平台分隔符分隔（POSIX 用 :，Windows 用 ;）。与工具链画像、会话授权合并。',
   },
   {
     name: 'RIVET_SANDBOX_WRITABLE',
@@ -630,6 +624,12 @@ export const ENV_REGISTRY: EnvRegistryEntry[] = [
     description: '',
   },
   {
+    name: 'RIVET_STREAM_RESULT_MAX',
+    defaultHint: '',
+    files: ['stream-json.ts', '__tests__/stream-json.test.ts'],
+    description: '',
+  },
+  {
     name: 'RIVET_TDD_GATE',
     defaultHint: '\'\'',
     files: ['agent/tdd-gate.ts', 'agent/__tests__/tdd-gate.test.ts'],
@@ -642,6 +642,12 @@ export const ENV_REGISTRY: EnvRegistryEntry[] = [
     description: '',
   },
   {
+    name: 'RIVET_TEST_GLM_KEY',
+    defaultHint: '',
+    files: ['__tests__/switch-agent-session.test.ts'],
+    description: '',
+  },
+  {
     name: 'RIVET_TEST_PRESENCE_GATE',
     defaultHint: '',
     files: ['agent/test-presence.ts', 'agent/__tests__/deliver-task.test.ts', 'agent/__tests__/test-presence.test.ts', 'agent/__tests__/wave-gate.test.ts'],
@@ -651,6 +657,18 @@ export const ENV_REGISTRY: EnvRegistryEntry[] = [
     name: 'RIVET_TOOL_PRESET',
     defaultHint: '',
     files: ['tools/tool-preset.ts', 'tools/__tests__/tool-preset.test.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_TS_LOAD_TIMEOUT',
+    defaultHint: '\'\'',
+    files: ['tools/syntax-check.ts'],
+    description: 'syntax-check 加载 esbuild 的超时（ms；0/负数回退 3s）',
+  },
+  {
+    name: 'RIVET_TSC_FALLBACK_TIMEOUT',
+    defaultHint: '\'\'',
+    files: ['tools/syntax-check.ts'],
     description: '',
   },
   {
@@ -693,6 +711,18 @@ export const ENV_REGISTRY: EnvRegistryEntry[] = [
     name: 'RIVET_WAVE_GATE',
     defaultHint: '',
     files: ['agent/wave-gate.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_WEB_CRAWL',
+    defaultHint: '',
+    files: ['tools/default-registry.ts'],
+    description: '',
+  },
+  {
+    name: 'RIVET_WEB_MAP',
+    defaultHint: '',
+    files: ['tools/default-registry.ts'],
     description: '',
   },
   {

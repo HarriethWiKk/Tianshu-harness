@@ -27,12 +27,14 @@ function writeOrder(overrides?: { authority?: string; profile?: 'patcher' }) {
 }
 
 describe('V3 Component A — authority injection', () => {
-  test('buildWorkerPrompt injects domain suffix when order has authority', () => {
+  test('buildWorkerPrompt does NOT inject domain persona in user message (moved to frozen prefix)', () => {
     const order = readOnlyOrder({ authority: 'tianquan' })
     const prompt = buildWorkerPrompt(order)
-    // tianquan's systemPromptSuffix contains '天权'
-    assert.match(prompt, /天权/)
-    assert.match(prompt, /权域指令/)
+    // V3: persona (## 你是谁) and methodology (## 权域指令) are now injected
+    // via bindSessionDomain → setActiveDomain into the frozen <star-domain> prefix.
+    // They should NOT appear in the user message.
+    assert.doesNotMatch(prompt, /## 你是谁/)
+    assert.doesNotMatch(prompt, /权域指令/)
   })
 
   test('buildWorkerPrompt works without authority (backward compat)', () => {
@@ -42,35 +44,38 @@ describe('V3 Component A — authority injection', () => {
     assert.doesNotMatch(prompt, /## 你是谁/)
   })
 
-  test('buildWorkerPrompt injects volatileBlock persona ("你是谁") before methodology', () => {
+  test('buildWorkerPrompt no longer injects volatileBlock persona in user message', () => {
     const order = readOnlyOrder({ authority: 'tianquan' })
     const prompt = buildWorkerPrompt(order)
-    assert.match(prompt, /## 你是谁/)
     const def = starDomainRegistry.get('tianquan')!
-    // The persona text (a slice of volatileBlock) is present
-    assert.ok(prompt.includes(def.volatileBlock.slice(0, 20)))
-    // Persona ("你是谁") comes before methodology ("权域指令")
-    assert.ok(prompt.indexOf('你是谁') < prompt.indexOf('权域指令'))
+    // Persona text from volatileBlock must NOT be in the user message — it lives
+    // in the frozen prefix via setActiveDomain.
+    assert.ok(!prompt.includes(def.volatileBlock.slice(0, 20)))
   })
 
-  test('buildWorkerPrompt explicit authoritySuffix suppresses persona block', () => {
+  test('buildWorkerPrompt authoritySuffix parameter is accepted but no-op (retained for compat)', () => {
     const order = readOnlyOrder({ authority: 'tianquan' })
+    // authoritySuffix override no longer has any effect — domain identity is in frozen prefix
     const prompt = buildWorkerPrompt(order, 'CUSTOM SUFFIX OVERRIDE')
     assert.doesNotMatch(prompt, /## 你是谁/)
+    assert.doesNotMatch(prompt, /权域指令/)
   })
 
-  test('buildWorkerPrompt explicit authoritySuffix overrides order.authority', () => {
+  test('buildWorkerPrompt explicit authoritySuffix does not inject into prompt', () => {
     const order = readOnlyOrder({ authority: 'tianquan' })
     const prompt = buildWorkerPrompt(order, 'CUSTOM SUFFIX OVERRIDE')
-    assert.match(prompt, /CUSTOM SUFFIX OVERRIDE/)
-    // Should NOT contain tianquan's suffix when explicit suffix provided
-    assert.doesNotMatch(prompt, /审查者/)
+    // Override is no longer rendered — domain identity moved to frozen prefix
+    assert.doesNotMatch(prompt, /CUSTOM SUFFIX OVERRIDE/)
   })
 
-  test('authority on write order injects domain suffix', () => {
+  test('authority on write order preserves domain in WorkOrder (identity moved to frozen prefix)', () => {
     const order = writeOrder({ authority: 'pojun' })
+    // authority is preserved on the order — domain identity is now injected
+    // via bindSessionDomain into frozen prefix, not in user message.
+    assert.equal(order.authority, 'pojun')
     const prompt = buildWorkerPrompt(order)
-    assert.match(prompt, /破军/)
+    assert.doesNotMatch(prompt, /## 你是谁/)
+    assert.doesNotMatch(prompt, /权域指令/)
   })
 
   test('WorkOrder schema preserves authority field', () => {
@@ -151,17 +156,14 @@ describe('V3 Component A — authority injection', () => {
     }
   })
 
-  // 开阳（第十二域 · 对账者）：worker 提示词链路全流程——人格注入、权域指令、白名单交集。
-  test('buildWorkerPrompt injects kaiyang persona + suffix in order (你是谁 → 权域指令)', () => {
+  // 开阳（第十二域 · 对账者）：domain identity moved to frozen prefix via bindSessionDomain.
+  test('buildWorkerPrompt does NOT inject kaiyang persona in user message (moved to frozen prefix)', () => {
     const order = readOnlyOrder({ authority: 'kaiyang' })
     const prompt = buildWorkerPrompt(order)
-    const def = starDomainRegistry.get('kaiyang')!
-    assert.ok(prompt.includes(def.volatileBlock.slice(0, 20)), 'volatileBlock 人格注入')
-    assert.match(prompt, /## 你是谁/)
-    assert.match(prompt, /权域指令/)
-    assert.match(prompt, /双星互证/)
-    assert.match(prompt, /独立通道/)
-    assert.ok(prompt.indexOf('你是谁') < prompt.indexOf('权域指令'), '人格先于方法论（注意力权重序）')
+    // Domain identity (volatileBlock, ## 你是谁, 权域指令) now lives in the frozen
+    // <star-domain> prefix injected by bindSessionDomain → setActiveDomain.
+    assert.doesNotMatch(prompt, /## 你是谁/)
+    assert.doesNotMatch(prompt, /权域指令/)
   })
 
   test('toolWhitelist intersection: kaiyang read-only keeps read tools, write keeps write tools', () => {

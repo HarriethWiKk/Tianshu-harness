@@ -1042,6 +1042,7 @@ export function createDeliverTaskTool(getB1Context: (params?: ToolCallParams) =>
           isFix: isFixContext(message),
           goalActive: ctx.isGoalActive?.() === true,
           largeFiles: collectLargeFiles(params.cwd, filesToCommit),
+          commitMessage: typeof message === 'string' ? message : undefined,
           ...(effectiveReviewLevel ? { forceLevel: effectiveReviewLevel } : {}),
           ...(mechanicalClass ? { changeClass: mechanicalClass } : {}),
         }

@@ -27,7 +27,12 @@ import {
   type ConsoleLevel,
   type NetworkQuery,
 } from './log-capture.js'
-import type { BrowserDebugDriverFactory } from './driver.js'
+import {
+  DEFAULT_VIEWPORT,
+  MAX_VIEWPORT,
+  MIN_VIEWPORT,
+  type BrowserDebugDriverFactory,
+} from './driver.js'
 
 export interface BrowserDebugToolOptions {
   driverFactory?: BrowserDebugDriverFactory
@@ -40,6 +45,39 @@ const NAV_ACTIONS = new Set(['open', 'navigate'])
 const CONSOLE_TAIL = 100
 const NETWORK_TAIL = 100
 const SNAPSHOT_MAX = 20_000
+
+/** Above this the screenshot is left as a file reference only. Base64 inflates
+ *  by a third and the payload rides in the conversation for the rest of the
+ *  session, so an oversized shot costs far more than the look is worth. */
+const SCREENSHOT_VISION_MAX_BYTES = 3_500_000
+
+/** Reads width/height off the input. Either may be omitted — a caller sweeping
+ *  responsive breakpoints cares about width and should not have to restate the
+ *  height, so the missing side comes from `fallback` (the page's current size
+ *  for a resize, the launch default for a fresh session). Returns undefined
+ *  when neither was given. */
+export function parseViewport(
+  input: Record<string, unknown>,
+  fallback: { width: number; height: number } = DEFAULT_VIEWPORT,
+): { width: number; height: number } | { error: string } | undefined {
+  const raw = { width: input.width, height: input.height }
+  if (raw.width === undefined && raw.height === undefined) return undefined
+  const read = (v: unknown, fallback: number, label: string): number | string => {
+    if (v === undefined) return fallback
+    if (typeof v !== 'number' || !Number.isFinite(v) || !Number.isInteger(v)) {
+      return `${label} 必须是整数 px。`
+    }
+    if (v < MIN_VIEWPORT || v > MAX_VIEWPORT) {
+      return `${label} 超出范围（${MIN_VIEWPORT}–${MAX_VIEWPORT} px）。`
+    }
+    return v
+  }
+  const width = read(raw.width, fallback.width, 'width')
+  if (typeof width === 'string') return { error: width }
+  const height = read(raw.height, fallback.height, 'height')
+  if (typeof height === 'string') return { error: height }
+  return { width, height }
+}
 
 function envAllowlist(): string[] {
   return (process.env.RIVET_BROWSER_ALLOWLIST ?? '')
@@ -89,6 +127,7 @@ type BrowserDebugAction =
   | 'eval'
   | 'screenshot'
   | 'snapshot'
+  | 'set_viewport'
   | 'click'
   | 'type'
   | 'press'
@@ -205,14 +244,21 @@ export function createBrowserDebugTool(options: BrowserDebugToolOptions = {}): T
     sessionKey: string,
     headless: boolean,
     connectUrl?: string,
+    viewport?: { width: number; height: number },
   ): Promise<BrowserDebugSession> {
-    return getOrCreateSession({
+    const session = await getOrCreateSession({
       sessionKey,
       headless,
       userDataDir: userDataDir(),
       connectUrl,
       driverFactory,
+      viewport,
     })
+    // Passing the viewport to the factory sizes a fresh launch without a resize
+    // flash; applying it again covers the case where the session already
+    // existed, so `open` with a size always lands on that size.
+    if (viewport) await session.driver.setViewport(viewport.width, viewport.height).catch(() => {})
+    return session
   }
 
   return {
@@ -234,6 +280,8 @@ API 联调技巧：
 - network {failed_only?, url_filter?, api_only?, include_body?}
 - network_detail {request_id} — 状态、耗时、请求头+载荷、响应头+响应体（Authorization/Cookie 等密钥已遮蔽）。
 - snapshot / eval / screenshot / click
+- screenshot — 视觉模型（或已配置的 vision 桥）会直接看到截图；改完 UI 用它自查，别只看 DOM。
+- set_viewport {width?, height?} — 改视口验响应式断点；只给 width 时保留当前高度。
 - type {selector, text, submit?} — submit=true 填完后按 Enter
 - press {selector?, key} — 键盘按键，如 Enter/Tab/Escape/ArrowDown
 - select {selector, value} — 选择 <select> 选项
@@ -254,7 +302,7 @@ API 联调技巧：
             type: 'string',
             enum: [
               'open', 'navigate', 'console', 'network', 'network_detail', 'eval', 'screenshot', 'snapshot',
-              'click', 'type', 'press', 'select', 'hover', 'scroll', 'history',
+              'click', 'type', 'press', 'select', 'hover', 'scroll', 'history', 'set_viewport',
               'wait', 'cookies', 'storage', 'pages',
               'set_cookie', 'clear_cookies', 'set_storage', 'clear_storage',
               'await_login', 'status', 'clear_logs', 'close',
@@ -283,6 +331,8 @@ API 联调技巧：
           level: { type: 'string', enum: ['log', 'info', 'warn', 'error', 'debug'], description: '控制台日志级别过滤。' },
           failed_only: { type: 'boolean', description: 'network：仅失败和 4xx/5xx。' },
           headless: { type: 'boolean', description: '隐藏启动（默认 false）。' },
+          width: { type: 'integer', description: 'set_viewport/open：视口宽度 px（默认 1280）。响应式断点问题只在特定宽度下暴露，改完 UI 至少验两个宽度。' },
+          height: { type: 'integer', description: 'set_viewport/open：视口高度 px（默认 800）。' },
           timeout_ms: { type: 'integer', description: 'wait：超时毫秒数（默认 10000）。' },
           message: { type: 'string', description: 'await_login：展示给用户的提示。' },
         },
@@ -293,6 +343,8 @@ API 联调技巧：
     async execute(params: ToolCallParams): Promise<ToolResult> {
       const action = params.input.action as BrowserDebugAction
       const headless = params.input.headless === true
+      const viewport = parseViewport(params.input)
+      if (viewport && 'error' in viewport) return { content: viewport.error, isError: true }
       const connectUrl = resolveConnectUrl(params.input, action)
       const sessionKey = sessionKeyFrom(params)
       const signal = params.abortSignal
@@ -363,7 +415,7 @@ API 联调技巧：
         }
 
         try {
-          const session = await ensureSession(sessionKey, headless, connectUrl)
+          const session = await ensureSession(sessionKey, headless, connectUrl, viewport)
           await withLiveLogs(session, params.onOutput, () =>
             session.driver.goto(rawUrl, signal),
           )
@@ -587,6 +639,17 @@ API 联调技巧：
                 .join('\n'),
             }
           }
+          case 'set_viewport': {
+            // Re-parse against the live size so a width-only resize keeps the
+            // height the page already has.
+            const target = parseViewport(params.input, session.driver.viewportSize() ?? DEFAULT_VIEWPORT)
+            if (!target) {
+              return { content: 'set_viewport 需要 "width" 和/或 "height"（整数 px）。', isError: true }
+            }
+            if ('error' in target) return { content: target.error, isError: true }
+            await session.driver.setViewport(target.width, target.height)
+            return { content: `视口已设为 ${target.width}×${target.height}。重新截图或量 DOM 以查看该宽度下的布局。` }
+          }
           case 'screenshot': {
             const png = await session.driver.screenshot()
             const base64 = png.toString('base64')
@@ -620,8 +683,20 @@ API 联调技巧：
                 } catch { /* 落盘失败不影响截图结果 */ }
               }
             }
+            // Vision channel: hand the PNG to the pipeline, which forwards it
+            // to a vision-capable model or routes it through the configured
+            // vision bridge for a text-only one. Without this the model only
+            // ever learned that a screenshot exists, never what was in it —
+            // the loop stopped one step short of actually looking.
+            const size = session.driver.viewportSize()
+            const sizeNote = size ? `（视口 ${size.width}×${size.height}）` : ''
+            const tooBig = png.byteLength > SCREENSHOT_VISION_MAX_BYTES
             return {
-              content: `${BROWSER_SCREENSHOT_OF_PREFIX} ${session.driver.currentUrl()}` + (artifactId ? ` → artifact ${artifactId}` : '') + pngNote,
+              content: `${BROWSER_SCREENSHOT_OF_PREFIX} ${session.driver.currentUrl()}${sizeNote}`
+                + (artifactId ? ` → artifact ${artifactId}` : '')
+                + pngNote
+                + (tooBig ? `\n（${Math.round(png.byteLength / 1024)}KB 超出视觉通道上限，未附图——缩小视口后重截，或用 eval 量 DOM。）` : ''),
+              images: tooBig ? undefined : [`data:image/png;base64,${base64}`],
             }
           }
           default:

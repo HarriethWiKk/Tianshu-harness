@@ -17,7 +17,9 @@ import { color } from '../engine/ansi.js'
 import { resolveThemeEntry, type RivetTheme } from '../theme.js'
 import { formatElapsed } from '../tool-elapsed.js'
 import { formatTokenCount } from './spinner-status.js'
-import { formatAuthorityLabel } from './profile-labels.js'
+import { formatAuthorityLabel, formatWorkerIdentity } from './profile-labels.js'
+import { DOMAIN_SWITCH_CACHE_NOTE } from '../../agent/domain-picker-entries.js'
+import type { GenesisEntry } from '../../agent/star-genesis-data.js'
 import type { TranscriptMessage } from '../scrollback-transcript.js'
 import type { ConnectView } from '../connect-flow.js'
 import type { InitView } from '../init-flow.js'
@@ -461,6 +463,8 @@ export interface TasksWorkerRow {
   unread?: boolean
   /** 终态失败分类（review-findings/review-infra/...）——completed+review-findings 渲染 ⚠️。 */
   failureReason?: string
+  /** 星域 id（身份格式化用；来自 FleetWorkerView.authority）。 */
+  authority?: string
 }
 
 export type TasksFilter = 'running' | 'completed' | 'all'
@@ -573,6 +577,10 @@ export interface DomainPickerEntry {
   meta: string
   /** 选中项的一段式 essence 预览（不转储整段 volatileBlock） */
   essence: string
+  /** 创始星短名（来自 star-genesis-data；auto / custom 域缺省） */
+  founder?: string
+  /** 一句话核心专长（来自 star-genesis-data；auto / custom 域缺省） */
+  expertise?: string
   /** 是否为当前生效项 */
   current: boolean
   uiPersona?: {
@@ -627,7 +635,7 @@ export function renderDomainPicker(data: DomainPickerData, width: number, height
   const innerWidth = width - 4 // padLine 占 2，左右各留 1 空隙
   const contentRows = Math.max(3, height - 4) // border + title + footer + bottom
   const previewRows = Math.min(4, Math.max(2, contentRows - data.entries.length - 1))
-  const listRows = Math.max(1, contentRows - previewRows - 1)
+  const listRows = Math.max(1, contentRows - previewRows - 2) // 分隔线 + 缓存备注行
 
   const sel = data.selectedIndex
   const current = data.entries[sel]
@@ -645,14 +653,10 @@ export function renderDomainPicker(data: DomainPickerData, width: number, height
     const cursor = selected ? color(CURSOR, currentAccent, { bold: true }) : ' '
     const mark = e.current ? color(eGlyph, eAccent, { bold: true }) : selected ? color(eGlyph, currentAccent) : color(eGlyph, theme.dim)
     const name = selected ? color(e.name, currentAccent, { bold: true }) : color(e.name, theme.secondary)
-    const motto = e.motto ? `  ${e.motto}` : ''
-    const head = `${cursor} ${mark} ${name}${color(motto, theme.dim)}`
-    
-    // meta 接在 motto 之后（dim），按内宽截断（用 plain 长度估算，避免 SGR 计入）
-    const plainHead = `  ${eGlyph} ${e.name}${motto}`
-    const metaRoom = Math.max(0, innerWidth - stringWidth(plainHead) - 2)
-    const metaText = e.meta && metaRoom > 6 ? `  ${e.meta}`.slice(0, metaRoom) : ''
-    lines.push(padLine(`${head}${color(metaText, theme.dim)}`, width, theme))
+    // 行内简短信息：创始星（创世碑文数据源），比 keywords meta 更可读。
+    const founder = e.founder ? `  ${e.founder}` : ''
+    const head = `${cursor} ${mark} ${name}${color(founder, theme.dim)}`
+    lines.push(padLine(head, width, theme))
   }
   for (let i = visible.length; i < listRows; i++) {
     lines.push(padLine('', width, theme))
@@ -666,18 +670,22 @@ export function renderDomainPicker(data: DomainPickerData, width: number, height
       : '─'
   lines.push(padLine(` ${color(sepChar.repeat(Math.max(0, innerWidth - 1)), currentAccent)}`, width, theme))
 
-  // 选中项 essence 预览
+  // 选中项预览：创始星 → 核心专长（小白可读）→ motto。
   const previewLines: string[] = []
   if (current) {
     const glyph = current.uiPersona?.glyph ?? '●'
-    previewLines.push(color(`  ${glyph}  ${current.motto}`, currentAccent, { bold: true }))
-    
-    const plainEssence = current.essence || ''
-    const wrappedEssence = wrapToWidth(plainEssence, innerWidth - 1, previewRows - 1)
-    for (const d of wrappedEssence) {
-      if (previewLines.length < previewRows) {
+    const founderLine = current.founder ? `  ${glyph}  创始星：${current.founder}` : `  ${glyph}  ${current.motto}`
+    previewLines.push(color(founderLine, currentAccent, { bold: true }))
+
+    const plainDesc = current.expertise || current.essence || ''
+    const wrappedDesc = wrapToWidth(plainDesc, innerWidth - 1, previewRows - 2)
+    for (const d of wrappedDesc) {
+      if (previewLines.length < previewRows - 1) {
         previewLines.push(` ${color(d, theme.muted)}`)
       }
+    }
+    if (current.founder && current.motto) {
+      previewLines.push(` ${color(`「${current.motto}」`, theme.dim)}`)
     }
   }
 
@@ -685,7 +693,99 @@ export function renderDomainPicker(data: DomainPickerData, width: number, height
     lines.push(padLine(previewLines[i] ?? '', width, theme))
   }
 
-  lines.push(formatFooter(compactHints([['←/→', '切换'], ['↑↓', '选择'], ['Enter', '应用'], ['S', '设为默认'], ['Esc', '取消']]), width, theme, 'subtle'))
+  // 常驻备注：切换星域的缓存代价（预防性提示，切换后的忠告见 slash-commands）。
+  lines.push(padLine(` ${color(DOMAIN_SWITCH_CACHE_NOTE, theme.dim)}`, width, theme))
+
+  lines.push(formatFooter(compactHints([['←/→', '切换'], ['↑↓', '选择'], ['Enter', '应用'], ['g', '碑文'], ['S', '设为默认'], ['Esc', '取消']]), width, theme, 'subtle'))
+  lines.push(formatBottomBorder(width, theme, 'subtle'))
+  return lines
+}
+
+// ── Domain Genesis Card（创世碑文 tab）─────────────────────────────
+
+export interface DomainGenesisCardData {
+  /** 当前域的创世碑文数据（star-genesis-data）。 */
+  genesis: GenesisEntry
+  /** persona 展示（glyph / accent / separator），与选择页同源。 */
+  glyph: string
+  accent: 'primary' | 'secondary' | 'success' | 'warning' | 'error' | 'dim'
+  /** 正文滚动偏移（行）。 */
+  scroll: number
+}
+
+/** 正文的最大滚动行数（供键处理器夹取）。 */
+export function genesisCardMaxScroll(data: DomainGenesisCardData, width: number, height: number): number {
+  const { total } = layoutGenesisCard(data, width, height)
+  return total.maxScroll
+}
+
+function layoutGenesisCard(data: DomainGenesisCardData, width: number, height: number): { total: { maxScroll: number; bodyRows: number } } {
+  const innerWidth = width - 4
+  const bodyRows = Math.max(3, height - 5) // border + tab + divider + footer + bottom
+  const g = data.genesis
+
+  // 头：glyph + 星名 + motto + 创始星徽章
+  const headLines = 2
+  const sigilLines = g.sigil ? 1 + (g.sigilNote?.length ?? 0) + 1 : 0
+  const paraLines: string[] = []
+  for (const face of g.faces) {
+    if (g.faces.length > 1 || face.label) paraLines.push('') // face 小标题占位
+    for (const p of face.inscription) {
+      paraLines.push(...wrapToWidth(p, innerWidth - 1, 99))
+      paraLines.push('')
+    }
+  }
+  const totalLines = headLines + sigilLines + paraLines.length
+  return { total: { maxScroll: Math.max(0, totalLines - bodyRows), bodyRows } }
+}
+
+/**
+ * 创世碑文卡（domain-picker 的第二个 tab 视图）。
+ *
+ * 头（glyph + 星名 + motto + 创始星）→ 印记 seal → 按「面」分节的碑文（可滚动）。
+ * ←/→ 换域、↑↓ 滚动、g/Esc 返回选择页（键位在 app.ts）。
+ */
+export function renderDomainGenesisCard(data: DomainGenesisCardData, width: number, height: number, theme: RivetTheme): string[] {
+  const lines: string[] = []
+  lines.push(formatBorder(width, theme, 'subtle'))
+  lines.push(renderTabBar('domain', width, theme))
+
+  const g = data.genesis
+  const accent = (theme as any)[data.accent] ?? theme.primary
+  const innerWidth = width - 4
+
+  // 组装全部正文行（先 wrap 后切片滚动）
+  const body: string[] = []
+  const head = ` ${data.glyph} ${color(`${g.name} · ${g.faces[0]!.model}`, accent, { bold: true })}`
+  body.push(head)
+  body.push(` ${color(`「${g.motto}」`, theme.dim)}`)
+  if (g.sigil) {
+    body.push(` ${color(`印记 ${g.sigil}`, accent)}`)
+    for (const note of g.sigilNote ?? []) {
+      body.push(`   ${color(note, theme.muted)}`)
+    }
+    body.push('')
+  }
+  for (const face of g.faces) {
+    if (g.faces.length > 1 || face.label) {
+      body.push(` ${color(`${face.label ?? '主星'} · ${face.model}`, theme.secondary, { bold: true })}`)
+    }
+    for (const p of face.inscription) {
+      for (const w of wrapToWidth(p, innerWidth - 1, 99)) {
+        body.push(` ${color(w, theme.secondary)}`)
+      }
+      body.push('')
+    }
+  }
+
+  const { total } = layoutGenesisCard(data, width, height)
+  const scroll = Math.min(Math.max(0, data.scroll), total.maxScroll)
+  const visible = body.slice(scroll, scroll + total.bodyRows)
+  for (const line of visible) lines.push(padLine(line, width, theme))
+  for (let i = visible.length; i < total.bodyRows; i++) lines.push(padLine('', width, theme))
+
+  const scrollHint = total.maxScroll > 0 ? ` · ${scroll + 1}/${total.maxScroll + 1}屏` : ''
+  lines.push(formatFooter(compactHints([['←/→', '换星域'], ['↑↓', `滚动${scrollHint}`], ['g/Esc', '返回']]), width, theme, 'subtle'))
   lines.push(formatBottomBorder(width, theme, 'subtle'))
   return lines
 }
@@ -753,7 +853,7 @@ export function renderTasks(
 
       // 三段式：`  ●◐ label(固定列)  activity(弹性)  stats(右对齐)`
       const labelW = Math.min(22, Math.max(12, Math.floor(inner * 0.28)))
-      const label = fitDisplay(`${w.shortLabel}·${w.profile}`, labelW)
+      const label = fitDisplay(`${w.shortLabel} ${formatWorkerIdentity({ profile: w.profile, authority: w.authority })}`, labelW)
 
       const statParts: string[] = []
       if (w.toolUseCount && w.toolUseCount > 0) statParts.push(`⚙${w.toolUseCount}`)

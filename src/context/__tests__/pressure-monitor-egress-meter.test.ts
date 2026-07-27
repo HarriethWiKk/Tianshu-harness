@@ -1,13 +1,15 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import { PressureMonitor } from '../pressure-monitor.js'
-import { BlockChargeTracker } from '../../agent/injection-meter.js'
 
 /**
  * W2-B1: egress metering — every injected request byte books under exactly
  * one source tag, and the per-source ledger sums to the existing accumulator
- * (identity check). Block sources follow appendixDelta semantics (charge on
- * change, zero at steady state); append sources charge once per commit.
+ * (identity check).
+ *
+ * The appendixDelta charge decision itself no longer lives here: it moved to
+ * the emission point inside PromptEngine, where the bytes are actually written
+ * into a <context-update>. See prompt/__tests__/appendix-ledger.test.ts.
  */
 
 describe('PressureMonitor per-source injection ledger (W2-B1)', () => {
@@ -55,38 +57,5 @@ describe('PressureMonitor per-source injection ledger (W2-B1)', () => {
     pm.resetCvmOverhead()
     assert.equal(pm.getCvmOverheadRatio(), 0)
     assert.deepEqual(pm.getCvmInjectionBySource(), {}, 'stale per-source rows would break the sum identity')
-  })
-})
-
-describe('BlockChargeTracker appendixDelta semantics (W2-B1)', () => {
-  it('charges full bytes on entry, zero at steady state, full again on change', () => {
-    const tracker = new BlockChargeTracker()
-    const block = 'A'.repeat(100)
-
-    assert.equal(tracker.charge(block), 100, 'entry pays once')
-    assert.equal(tracker.charge(block), 0, 'second render with no change must charge 0')
-    assert.equal(tracker.charge(block), 0, 'steady state stays free')
-
-    const changed = 'B'.repeat(60)
-    assert.equal(tracker.charge(changed), 60, 'changed block pays its new bytes')
-    assert.equal(tracker.charge(changed), 0)
-  })
-
-  it('empty block charges nothing and does not disturb the baseline logic', () => {
-    const tracker = new BlockChargeTracker()
-    assert.equal(tracker.charge(''), 0)
-    assert.equal(tracker.charge('X'), 1)
-    assert.equal(tracker.charge(''), 0, 'clearing the block re-sends nothing chargeable')
-    assert.equal(tracker.charge('X'), 1, 're-entry after clear pays again')
-  })
-
-  it('compact boundary reset makes the next render pay full entry cost again', () => {
-    const tracker = new BlockChargeTracker()
-    const block = 'C'.repeat(80)
-    tracker.charge(block)
-    assert.equal(tracker.charge(block), 0)
-    // Compact resets the appendix baseline → bytes re-enter the request.
-    tracker.reset()
-    assert.equal(tracker.charge(block), 80, 'unmetered re-entry would under-report overhead')
   })
 })

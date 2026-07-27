@@ -157,6 +157,11 @@ export interface SessionRecord {
    */
   askMode?: AskModeState
   /**
+   * P1b（安全）— 创建会话的客户端是否具备 plan 倒计时自动批准 UI。持久化使
+   * sidecar 重启后行为一致；缺省 = false（fail-closed：无可见性即不自动批准）。
+   */
+  planAutoApproveUi?: boolean
+  /**
    * PlusMenu — current provider model id for this session (the resolved model
    * id, not an alias). Absent → the global default. Surfaced in the model picker
    * and persisted so a reconnecting viewer sees the live model.

@@ -129,6 +129,9 @@ export function learnBashPrefix(command: string, permissions: PermissionConfig |
   if (!permissions || typeof command !== 'string') return
   const prefix = extractBashPrefix(command)
   if (!prefix) return
+  // `CI=true npm test` 的首 token 是环境赋值——学进 allowlist 是死条目
+  // （匹配前赋值已被剥离），留着只会让 allowlist 语义变含糊。
+  if (prefix.includes('=')) return
   if (!permissions.bash) permissions.bash = { allowlist: [], denylist: [] }
   if (!permissions.bash.allowlist.includes(prefix)) {
     permissions.bash.allowlist.push(prefix)
@@ -150,41 +153,104 @@ export function learnFileApproval(
   if (!exists) overlay.allow.push({ tool: toolName, params: { file_path: filePath } })
 }
 
-/** Characters that terminate a shell token or start a shell operator.
- *  Used to verify the command contains no shell metacharacters after the
- *  allowlisted prefix. */
-const SHELL_OPERATOR_RE = /[&|;<>()$\x60\\!"']/
+/** Shell constructs `splitShellSegments` does NOT model, so a command containing
+ *  them cannot be reasoned about segment-by-segment:
+ *  - `>` `<` redirection writes/reads arbitrary paths regardless of the binary,
+ *    so `echo x > ~/.zshrc` would sail through on an allowlisted `echo`;
+ *  - `\` escaping changes what the shell treats as a separator;
+ *  - `!` triggers history expansion.
+ *  Commands containing these always fall back to an explicit prompt. */
+const UNMODELLED_SHELL_CHARS = /[<>\\!]/
 
-/** Check if a bash command matches an allowlisted command safely.
- *  For single-word entries ("npx"): the entire command must consist of only
- *  the command name followed by plain arguments — no shell operators/metacharacters.
- *  For multi-word entries ("git status"): the command must start with the entry
- *  followed by a space/tab or end of string — no shell operators.
+/** Binaries that take code as an argument. Matching only the binary name would
+ *  grant everything the interpreter can be told to run, so `bash -c "rm -rf /"`
+ *  must still prompt even when `bash` is allowlisted. */
+const INTERPRETERS = new Set([
+  'sh', 'bash', 'zsh', 'ksh', 'dash', 'fish',
+  'node', 'deno', 'bun', 'python', 'python3', 'perl', 'ruby', 'php',
+  'osascript', 'powershell', 'pwsh', 'cmd',
+])
+
+/** Inline-code flags for the binaries above (`-c`, `-e`, `--eval`, …). Only
+ *  consulted for INTERPRETERS — plenty of benign commands use `-c` for
+ *  unrelated purposes (`grep -c`, `wc -c`). */
+const INLINE_CODE_FLAG = /^-{1,2}(c|e|eval|command|exec)$/i
+
+/** Short-flag clusters carrying an inline-code switch: `bash -lc`, `sh -ec`,
+ *  `node -pe`, `ruby -ne`. Single dash only — long flags like `--check` /
+ *  `--experimental-*` are benign and must not be caught here. */
+const INLINE_CODE_CLUSTER = /^-[a-z]*[ce][a-z]*$/i
+
+/** Binaries that execute whatever they are handed, with no flag needed. */
+const ALWAYS_PROMPT_BINARIES = new Set([
+  'eval', 'exec', 'source', '.', 'xargs',
+  // Wrapper binaries: they run their argument vector as a subprocess, so an
+  // allowlisted wrapper would launder any command past the prompt.
+  'timeout', 'nice', 'nohup', 'parallel', 'env', 'stdbuf',
+])
+
+/** Does one segment's leading binary match an allowlist entry?
+ *  Mirrors segmentMatchesDenyPrefix (same token boundary), plus the fail-closed
+ *  guards an ALLOW decision needs that a DENY decision does not.
  *
- *  This prevents bypass via shell chaining: "npx && rm -rf /" is rejected
- *  even when "npx" is allowlisted, because "&&" is a shell operator. */
+ *  `VAR=value` stripping differs from the deny side deliberately: an env
+ *  assignment is itself a code-execution vector (`PATH=/tmp/evil:…`,
+ *  `LD_PRELOAD=…`, `NODE_OPTIONS=--require=…`), and on the allow side
+ *  "weakening" means *granting*. Only assignments with plainly inert values
+ *  (no path separator, no expansion, no second `=`) may be stripped for
+ *  matching; anything else falls to an explicit prompt. */
+function segmentMatchesAllowEntry(segment: string, allowlist: readonly string[]): boolean {
+  let trimmed = segment.trimStart()
+  while (/^\w+=/.test(trimmed)) {
+    const m = /^\w+=(\S*)\s+/.exec(trimmed)
+    if (!m) return false // trailing assignment with no command — nothing to grant
+    const value = m[1]!
+    if (/[/:$=]/.test(value)) return false
+    trimmed = trimmed.slice(m[0].length)
+  }
+  if (!trimmed) return false
+
+  // Residual substitution delimiters mean splitShellSegments could not fully
+  // parse this segment (e.g. nested `$( … $( … ) … )`). Denylist may tolerate a
+  // parse miss — it only weakens a denial — but granting on text we never
+  // inspected is the opposite, so fail closed.
+  if (/[`()]/.test(trimmed)) return false
+
+  const tokens = trimmed.split(/\s+/)
+  const binary = tokens[0] ?? ''
+  // A binary that is itself an expansion (`$CMD args`) is unknowable statically.
+  if (binary.includes('$')) return false
+  const base = binary.slice(binary.lastIndexOf('/') + 1)
+  if (ALWAYS_PROMPT_BINARIES.has(base)) return false
+  if (INTERPRETERS.has(base) && tokens.slice(1).some(t => INLINE_CODE_FLAG.test(t) || INLINE_CODE_CLUSTER.test(t))) return false
+
+  return allowlist.some(entry => {
+    if (!entry || !trimmed.startsWith(entry)) return false
+    const nextChar = trimmed[entry.length]
+    return nextChar === undefined || nextChar === ' ' || nextChar === '\t'
+  })
+}
+
+/** Check whether a bash command is covered by the allowlist.
+ *
+ *  Every command the shell would actually run must be allowlisted — the same
+ *  segmentation used by the denylist (`splitShellSegments`), so `npx && rm -rf /`
+ *  is still rejected when only `npx` is allowlisted, because the `rm` segment is
+ *  not covered.
+ *
+ *  This replaces an earlier rule that rejected any command containing a shell
+ *  metacharacter anywhere. That rule was an unconditional wall rather than a
+ *  permission check: `npm test -- --grep "foo"` and
+ *  `git diff $(git merge-base main HEAD)` could never be approved no matter what
+ *  the user allowlisted, because the quote and the `$(` alone disqualified them.
+ *  Segment-wise coverage keeps the chaining bypass closed while letting an
+ *  approval actually stick. */
 export function isBashCommandAllowlisted(command: string, allowlist: readonly string[] | undefined): boolean {
   if (!allowlist?.length) return false
-  const trimmed = command.trimStart()
+  const trimmed = command.trim()
   if (!trimmed) return false
-  return allowlist.some(entry => {
-    if (!trimmed.startsWith(entry)) return false
-    if (entry.includes(' ')) {
-      // Multi-word: "git status" matches "git status --porcelain" but NOT "git status&&rm"
-      if (trimmed.length === entry.length) return true
-      const nextChar = trimmed[entry.length]
-      if (nextChar !== ' ' && nextChar !== '\t') return false
-      // Check remainder for shell operators — same guard as single-word path
-      const remainder = trimmed.slice(entry.length)
-      return !SHELL_OPERATOR_RE.test(remainder)
-    }
-    // Single-word: match the first token exactly AND verify the rest
-    // of the command contains no shell operators.
-    const nextChar = trimmed[entry.length]
-    if (nextChar === undefined) return true   // exact match
-    if (nextChar !== ' ' && nextChar !== '\t') return false  // "npxfoo" must not match "npx"
-    // Check that the remainder after the first token has no shell operators
-    const remainder = trimmed.slice(entry.length)
-    return !SHELL_OPERATOR_RE.test(remainder)
-  })
+  if (UNMODELLED_SHELL_CHARS.test(trimmed)) return false
+  const segments = splitShellSegments(trimmed)
+  if (!segments.length) return false
+  return segments.every(seg => segmentMatchesAllowEntry(seg, allowlist))
 }

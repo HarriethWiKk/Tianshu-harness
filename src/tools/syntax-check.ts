@@ -85,6 +85,175 @@ function getPySyntaxTimeoutMs(): number {
   return Number.isFinite(v) && v > 0 ? v : 5000
 }
 
+// ── TypeScript compiler (lazy, ground truth for esbuild false-positive filtering) ──
+//
+// esbuild's TypeScript parser is stricter than tsc: it rejects legal TS patterns
+// like fullwidth parens（／）in JSDoc, certain Unicode positions, and complex
+// generics nesting that tsc accepts. When esbuild reports a parse error we run a
+// second opinion through the TypeScript compiler API. If TS accepts the file,
+// esbuild's error is downgraded to a warning (no rollback). Only when both
+// esbuild AND TS reject the file do we treat it as a fatal syntax error.
+//
+// We use `createSourceFile()` — a pure-syntax parse, ~10-50ms — not `tsc
+// --noEmit` which requires tsconfig resolution, type-checking and project-wide
+// analysis (~2s). The TS module is kept `external` in tsup (like esbuild) and
+// loaded lazily via createRequire so the packaged sidecar without a local
+// typescript install degrades to the tsc subprocess fallback.
+//
+// Timeout: RIVET_TS_LOAD_TIMEOUT (ms); set to 0/negative to fall back to 3s.
+
+let _tsPromise: Promise<any | null> | undefined
+let _tsModule: any | undefined
+
+async function loadTsModule(): Promise<any | null> {
+  try {
+    const req = createRequire(import.meta.url)
+    return req('typescript')
+  } catch {
+    return null
+  }
+}
+
+async function getTypeScript(): Promise<any | null> {
+  if (_tsModule !== undefined) return _tsModule
+  if (_tsPromise) {
+    _tsModule = await _tsPromise
+    return _tsModule
+  }
+  _tsPromise = withTimeout(
+    loadTsModule(),
+    'TypeScript load',
+    getTsLoadTimeoutMs(),
+  ).catch(() => null)
+  _tsModule = await _tsPromise
+  return _tsModule
+}
+
+function getTsLoadTimeoutMs(): number {
+  const v = Number.parseInt(process.env.RIVET_TS_LOAD_TIMEOUT ?? '', 10)
+  return Number.isFinite(v) && v > 0 ? v : 3000
+}
+
+/** Test-only: clear the TypeScript load cache. */
+export function _resetTsCacheForTest(): void {
+  _tsPromise = undefined
+  _tsModule = undefined
+}
+
+interface TsSecondOpinionResult {
+  /** true if TS accepted the file (esbuild false positive). */
+  passed: boolean
+  /** Parse error messages when TS also rejects the file. */
+  errors?: string[]
+  /** True when TS module AND tsc subprocess are both unavailable. */
+  unavailable?: boolean
+}
+
+/** Run TypeScript compiler API as ground-truth second opinion.
+ *  Returns {passed:true} when TS parser accepts the file → esbuild false positive.
+ *  Returns {passed:false, errors} when TS also reports errors → real syntax error.
+ *  Returns {unavailable:true} when TS module is absent → caller should try tsc fallback. */
+async function tsSecondOpinion(
+  filePath: string,
+  content: string,
+  ext: string,
+): Promise<TsSecondOpinionResult> {
+  const ts = await getTypeScript()
+  if (!ts || !ts.createSourceFile) return { passed: false, unavailable: true }
+
+  try {
+    const scriptKindMap: Record<string, number> = {
+      '.ts': ts.ScriptKind?.TS ?? 3,
+      '.tsx': ts.ScriptKind?.TSX ?? 4,
+      '.js': ts.ScriptKind?.JS ?? 1,
+      '.jsx': ts.ScriptKind?.JSX ?? 2,
+      '.mjs': ts.ScriptKind?.JS ?? 1,
+      '.cjs': ts.ScriptKind?.JS ?? 1,
+    }
+    const scriptKind = scriptKindMap[ext] ?? scriptKindMap['.ts']!
+
+    const sourceFile = ts.createSourceFile(
+      filePath,
+      content,
+      ts.ScriptTarget?.Latest ?? 99, // ES2024+
+      /* setParentNodes */ true,
+      scriptKind,
+    )
+
+    // parseDiagnostics contains only syntax/parse errors, not type errors
+    const diagnostics: any[] = sourceFile.parseDiagnostics ?? []
+    const errorCategory = ts.DiagnosticCategory?.Error ?? 1
+    const syntaxErrors = diagnostics.filter((d: any) => d.category === errorCategory)
+
+    if (syntaxErrors.length === 0) {
+      return { passed: true }
+    }
+
+    const errorMessages = syntaxErrors.slice(0, 5).map((d: any) => {
+      const pos = d.file?.getLineAndCharacterOfPosition?.(d.start ?? 0) ??
+        sourceFile.getLineAndCharacterOfPosition(d.start ?? 0)
+      const msg = typeof ts.flattenDiagnosticMessageText === 'function'
+        ? ts.flattenDiagnosticMessageText(d.messageText, '\n')
+        : String(d.messageText)
+      return `  ${filePath}:${pos.line + 1}:${pos.character + 1} - ${msg}`
+    })
+
+    return { passed: false, errors: errorMessages }
+  } catch {
+    // TS API threw unexpectedly — treat as unavailable, fall through to tsc
+    return { passed: false, unavailable: true }
+  }
+}
+
+/** Timeout for tsc subprocess (used only as fallback when TS module is unavailable). */
+function getTscFallbackTimeoutMs(): number {
+  const v = Number.parseInt(process.env.RIVET_TSC_FALLBACK_TIMEOUT ?? '', 10)
+  return Number.isFinite(v) && v > 0 ? v : 8000
+}
+
+/** Run `tsc --noEmit` on the written file as a last-resort syntax check.
+ *  Only invoked when the TypeScript compiler API module is unavailable.
+ *  Returns 'pass' (tsc accepts → esbuild false positive), 'fail' (tsc rejects →
+ *  real error), or 'degraded' (tsc unavailable/timeout → defer to esbuild). */
+function tscSubprocessCheck(filePath: string): Promise<'pass' | 'fail' | 'degraded'> {
+  return new Promise((resolve) => {
+    let child: ReturnType<typeof spawn>
+    try {
+      child = spawn('npx', ['tsc', '--noEmit', '--pretty', 'false', '--skipLibCheck', filePath], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: getResolvedEnv(),
+        windowsHide: true,
+        timeout: getTscFallbackTimeoutMs(),
+      })
+    } catch {
+      resolve('degraded')
+      return
+    }
+
+    const timer = setTimeout(() => {
+      try { child.kill('SIGKILL') } catch { /* already exited */ }
+      resolve('degraded')
+    }, getTscFallbackTimeoutMs())
+
+    let stderr = ''
+    child.stderr?.on('data', (d: Buffer) => { stderr += d.toString() })
+
+    child.on('close', (code) => {
+      clearTimeout(timer)
+      if (code === 0) {
+        resolve('pass')
+      } else {
+        resolve('fail')
+      }
+    })
+
+    child.on('error', () => {
+      clearTimeout(timer)
+      resolve('degraded')
+    })
+  })
+}
+
 function withTimeout<T>(promise: Promise<T>, label: string, timeoutMs: number): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs)
@@ -160,7 +329,40 @@ export async function checkSyntax(filePath: string, content: string): Promise<Sy
         ? errorLines.join('\n')
         : lines.slice(1).join('\n')
       const cleaned = detail.replace(/<stdin>:/g, '')
-      const message = `⚠️ Syntax error detected in ${ext}:\n${cleaned}\n\nThe file was written but will fail at runtime.`
+
+      // Second opinion: TypeScript compiler (ground truth for TS/JS syntax).
+      // esbuild's parser is stricter than tsc — it rejects legal TS patterns
+      // (fullwidth parens in JSDoc, certain Unicode positions, complex generics).
+      // When esbuild and TS disagree, trust TS and downgrade to warning.
+      const second = await tsSecondOpinion(filePath, content, ext)
+
+      if (second.passed) {
+        // TS accepted the file → esbuild false positive. Warn but don't roll back.
+        const msg = `⚠️ 语法检查提示（低风险）：\n${cleaned}\n\n经二次确认，此文件语法正确，文件已保留未回滚。`
+        return { warning: msg, fatal: null }
+      }
+
+      if (second.unavailable) {
+        // TS module not available → try tsc subprocess as last resort
+        const tscResult = await tscSubprocessCheck(filePath)
+        if (tscResult === 'pass') {
+          const msg = `⚠️ 语法检查提示（低风险）：\n${cleaned}\n\n经 tsc 二次确认，此文件语法正确，文件已保留未回滚。`
+          return { warning: msg, fatal: null }
+        }
+        if (tscResult === 'degraded') {
+          // Neither TS API nor tsc available — infrastructure failure must NOT
+          // masquerade as fatal syntax error. Warn but don't roll back.
+          const msg = `⚠️ 语法检查提示：\n${cleaned}\n\n语法验证工具暂时不可用，文件已保留未回滚。建议运行 typecheck 命令手动验证。`
+          return { warning: msg, fatal: null }
+        }
+        // tsc also failed → real error, roll back
+      }
+
+      // Both esbuild AND TS/tsc agree — real syntax error. Roll back.
+      const tsErrors = second.errors?.length
+        ? `\n\n具体错误：\n${second.errors.join('\n')}`
+        : ''
+      const message = `⚠️ 语法检查发现错误：\n${cleaned}${tsErrors}\n\n文件已写入但存在语法问题，运行时将失败。`
       return { warning: message, fatal: message }
     }
   }

@@ -19,6 +19,21 @@ export const FROZEN_BLOCK_CAPS = {
 export type FrozenBlockCaps = typeof FROZEN_BLOCK_CAPS
 
 /**
+ * 子代理的 frozen 块上限覆盖。
+ *
+ * project-instructions 收到 4,000：按节选取（见 project-instructions.ts）在这个
+ * 预算下仍能装下全部硬闸门章节与代码约定，被挤掉的是目录索引、能力全景、排查
+ * 手册这类"自己找路"用的参考资料——子代理接的是自包含任务卡，不需要自己找路，
+ * 真需要时它有 read_file。
+ *
+ * 不分只读/写工两档：分层本身已经按内容适配，再加一个按档位猜"谁需要哪节"的
+ * 旋钮只增加校准负担。
+ */
+export const SUBAGENT_BLOCK_CAPS: Partial<Record<keyof FrozenBlockCaps, number>> = {
+  projectInstructions: 4_000,
+}
+
+/**
  * 前缀块策略 — 决定 frozen 前缀里挂多少「参考类」内容。
  *
  * 解析优先级（镜像 tools/tool-preset.ts）：
@@ -206,7 +221,26 @@ export function invalidatePromptBlocks(): void {
   memo.clear()
 }
 
-/** 不读配置的 standard 策略——供 worker 与不关心档位的调用方使用。 */
+/** 不读配置的 standard 策略——供不关心档位的调用方使用。 */
 export function standardPromptBlocks(): PromptBlockPolicy {
   return { profile: 'standard', ...PROFILE_BASELINE.standard, caps: { ...PROFILE_BASELINE.standard.caps }, blocks: { ...ALL_ON } }
+}
+
+/**
+ * 子代理策略：standard 叠加 {@link SUBAGENT_BLOCK_CAPS}，描述档位走 compact。
+ *
+ * compact 对内置工具是 no-op（最长描述 480 字符，够不着 800 的压缩门槛），
+ * 只在 worker 注册表含 MCP 工具时省字节。之所以仍然显式设定，是因为不设就等于
+ * 让 worker 隐式落在 full——同一份注册表在主控 lean 档下是 compact，在 worker
+ * 下是 full，无谓的不一致。
+ *
+ * 构造期（staticCtx.tools）与 `updateTools()`（loop 的 blockPolicy）必须读同一份，
+ * 否则 MCP 异步注册后描述回弹成 full → system 字节中途翻转 → 整段前缀缓存 miss。
+ */
+export function subagentPromptBlocks(): PromptBlockPolicy {
+  return {
+    ...standardPromptBlocks(),
+    toolDescriptions: 'compact',
+    caps: { ...PROFILE_BASELINE.standard.caps, ...SUBAGENT_BLOCK_CAPS },
+  }
 }

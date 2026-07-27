@@ -23,7 +23,7 @@ const ACTION_PROMISE_PATTERN =
  * 后补"重写/更新/写入"等写动作词（4df36bcd 系列：宣布"更新计划"未命中旧模式）。
  */
 const TOOL_VERB_PATTERN =
-  /(grep|ripgrep|read|edit|write|run|test|bash|cat|ls|glob|fetch|curl|查(?:看|找|阅)?|搜索|读取?|修改|编辑|运行|执行|跑(?:一?下|测试)?|改一?下|写一?下|重写|写(?:入|文件)|更新(?:文件|计划|文档)?|看(?:一?下)?(?:代码|文件))/i
+  /(grep|ripgrep|read|edit|write|run|test|(?<!Git\s)bash|cat|ls|glob|fetch|curl|查(?:看|找|阅)?|搜索|读取?|修改|编辑|运行|执行|跑(?:一?下|测试)?|改一?下|写一?下|重写|写(?:入|文件)|更新(?:文件|计划|文档)?|看(?:一?下)?(?:代码|文件))/i
 
 /**
  * 写侧动词——承诺的是写入/修改/测试类操作（区别于"查/搜/读"的只读调研）。

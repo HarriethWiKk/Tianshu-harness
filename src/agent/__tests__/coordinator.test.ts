@@ -1059,7 +1059,7 @@ describe('DelegationCoordinator', () => {
     assert.ok(state.getSummary().passed > 0)
   })
 
-  it('downgrades adversarial verifier self-reported verified result without run_tests transcript', async () => {
+  it('blocks adversarial verifier self-reported verified result without run_tests transcript', async () => {
     const coordinator = new DelegationCoordinator({
       baseToolRegistry: makeRegistry(),
       modelCards: cards,
@@ -1096,10 +1096,18 @@ describe('DelegationCoordinator', () => {
 
     assert.equal(run.status, 'completed')
     assert.equal(run.results.length, 1)
-    assert.equal(run.results[0]!.status, 'passed')
+    // 目标对账门（`883a3a22`）跑在证据门之前：派它去 verify，它既无 verification
+    // 元数据、transcript 里也没有验证痕迹 → 直接硬改判 blocked。证据门随后不再
+    // 补「自报 verified 却没跑 run_tests」那条 risk（它只在 evidenceStatus 仍是
+    // verified 时发力，而这里已经被改成 unverified 了）——两条判词说的是同一件
+    // 事，留一条即可，但断言必须跟着改：现在只有目标对账那条。
+    assert.equal(run.results[0]!.status, 'blocked')
     assert.equal(run.results[0]!.evidenceStatus, 'unverified')
-    assert.ok(run.results[0]!.risks.some(r => r.includes('without running run_tests')))
-    assert.ok(run.packet.includes('without running run_tests'))
+    assert.ok(
+      run.results[0]!.risks.some(r => r.includes('未执行受派的验证')),
+      `应留下未执行验证的判词，实际：${JSON.stringify(run.results[0]!.risks)}`,
+    )
+    assert.ok(run.packet.includes('未执行受派的验证'), '判词要进主控 packet')
   })
 
   it('keeps adversarial verifier verified when run_tests appears in transcript', async () => {

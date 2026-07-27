@@ -315,10 +315,10 @@ interface PhaseWeights {
 
 const PHASE_WEIGHTS: Record<PhaseClass, PhaseWeights> = {
   explore: { editRatio: 0.05, targetNovelty: 0.25, toolEntropy: 0.20, errorPenalty: 0.12, tokenEfficiency: 0.13, oscillationPenalty: 0.10, textRepetitionPenalty: 0.15 },
-  plan:    { editRatio: 0.10, targetNovelty: 0.18, toolEntropy: 0.15, errorPenalty: 0.18, tokenEfficiency: 0.18, oscillationPenalty: 0.10, textRepetitionPenalty: 0.11 },
+  plan:    { editRatio: 0.15, targetNovelty: 0.18, toolEntropy: 0.15, errorPenalty: 0.13, tokenEfficiency: 0.18, oscillationPenalty: 0.10, textRepetitionPenalty: 0.11 },
   execute: { editRatio: 0.40, targetNovelty: 0.08, toolEntropy: 0.08, errorPenalty: 0.18, tokenEfficiency: 0.08, oscillationPenalty: 0.06, textRepetitionPenalty: 0.12 },
   verify:  { editRatio: 0.05, targetNovelty: 0.08, toolEntropy: 0.08, errorPenalty: 0.35, tokenEfficiency: 0.18, oscillationPenalty: 0.12, textRepetitionPenalty: 0.14 },
-  deliver: { editRatio: 0.05, targetNovelty: 0.08, toolEntropy: 0.08, errorPenalty: 0.35, tokenEfficiency: 0.24, oscillationPenalty: 0.08, textRepetitionPenalty: 0.12 },
+  deliver: { editRatio: 0.15, targetNovelty: 0.08, toolEntropy: 0.08, errorPenalty: 0.25, tokenEfficiency: 0.24, oscillationPenalty: 0.08, textRepetitionPenalty: 0.12 },
 }
 
 // ─── Signal Computation ─────────────────────────────────────────────
@@ -657,6 +657,7 @@ function computeConvergenceScore(
   signalsMissingData: ReadonlySet<keyof ConvergenceSignals> = new Set(),
   producingReport = false,
   windowSize = 6,
+  activityMode?: ActivityMode,
 ): number {
   // Weight re-allocation for no-data signals: when a penalty signal lacks
   // sufficient data, its default 1.0 ("no penalty") would otherwise enter the
@@ -700,11 +701,11 @@ function computeConvergenceScore(
     w.oscillationPenalty * signals.oscillationPenalty +
     w.textRepetitionPenalty * signals.textRepetitionPenalty
 
-  // Phase expectation penalty: phases that require edits (execute, deliver)
-  // are fundamentally off-track if no edits are happening. Verify phase is
-  // deliberately excluded — its job is running tests/typechecks and reading
-  // diagnostics, NOT editing files. Penalizing verify for low editRatio is
-  // the primary false-positive source ("verify 阶段 47 轮未收敛").
+  // Phase expectation penalty: phases that require edits (execute) are
+  // fundamentally off-track if no edits are happening. Plan phase is
+  // deliberately excluded — its deliverable can be a text report or design
+  // document, not necessarily file edits. Verify phase is also excluded —
+  // its job is running tests/typechecks and reading diagnostics.
   const editExpectedPhases: PhaseClass[] = ['execute']
   let penalty = 1.0
   if (editExpectedPhases.includes(phaseClass) && signals.editRatio < 0.1) {
@@ -745,10 +746,21 @@ function computeConvergenceScore(
   // Skip the read-only penalty when the agent is producing a substantial text
   // deliverable (review/analysis report): read-heavy work with a textual output
   // is legitimate progress, not stagnation.
+  //
+  // W3 诊断态豁免：诊断会话（排查/根因分析）的正确行为就是大量读取——
+  // 把"只读无产出"当作停滞信号来惩罚在语义上是矛盾的。诊断态下惩罚
+  // 底线大幅抬高——只保留对极端长跑（turn≥20）的最轻惩罚，避免把
+  // 排查会话的正常读取节奏误判为 doom-loop。
   if (!producingReport && !withinProductiveRange && window.length >= (isGlm ? 2 : 4) && productiveRatio === 0) {
-    // 诊断探针存在时减半惩罚：agent 在主动诊断而非被动读取
     const diagProbes = hasDiagnosticProbes(window)
-    if (isGlm) {
+    const isDiagnostic = activityMode === 'diagnostic'
+    if (isDiagnostic) {
+      // 诊断态：只对极端长跑（≥20 turns）留最轻惩罚，避免彻底静音后
+      // 真停滞无法检出。no-tool 僵局和文本重复信号不受影响——那些
+      // 在诊断态下同样是有效停滞信号。
+      if (turn >= 20) penalty = Math.min(penalty, 0.5)
+      // turn < 20：完全不惩罚——诊断会话前 20 轮的读取密度是正常节奏
+    } else if (isGlm) {
       if (turn >= 15) penalty = Math.min(penalty, diagProbes ? 0.25 : 0.05)
       else if (turn >= 11) penalty = Math.min(penalty, diagProbes ? 0.5 : 0.15)
       else if (turn >= 7) penalty = Math.min(penalty, diagProbes ? 0.7 : 0.35)
@@ -1060,7 +1072,7 @@ export function evaluateConvergence(input: ConvergenceInput): ConvergenceResult 
   const producingReport = !hasUnverifiedEdits
     && isProducingReport(input.textFingerprints ?? [], signals.textRepetitionPenalty)
 
-  const score = computeConvergenceScore(signals, weights, input.phaseClass, input.noToolTurnCount ?? 0, input.turn, input.recentToolHistory, input.providerName, signalsMissingData, producingReport, windowSize)
+  const score = computeConvergenceScore(signals, weights, input.phaseClass, input.noToolTurnCount ?? 0, input.turn, input.recentToolHistory, input.providerName, signalsMissingData, producingReport, windowSize, input.activityMode)
 
   // W4 噪音洪流修复：工具错误受阻时降级收敛 score。最近窗口中 ≥40% 的
   // 工具返回 failed → agent 很可能在与坏掉的工具搏斗而非 doom-loop。
@@ -1120,6 +1132,7 @@ export function evaluateConvergence(input: ConvergenceInput): ConvergenceResult 
     && stagnationWindow.length >= Math.min(windowSize, 4)
     && productiveRatio === 0
     && !producingReport
+    && input.activityMode !== 'diagnostic'  // W3：诊断会话的正确行为就是大量读取，不是停滞
     && distanceToLastProductive >= productiveDistanceThreshold
 
   // Reasoning-aware no-tool handling. A model that keeps emitting fresh,

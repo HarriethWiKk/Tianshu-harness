@@ -23,8 +23,12 @@ import { isProFeatureEnabled } from './config/pro-license.js'
 import type { GoalTracker as GoalTrackerInstance } from './agent/goal-tracker.js'
 import { createUpdateGoalTool } from './tools/update-goal.js'
 import { presetIncludes } from './tools/tool-preset.js'
+import { applySandboxPolicyForApprovalMode } from './tools/sandbox-profile.js'
 import { TuiApp } from './tui/engine/app.js'
 import { wrapCallbacksWithTuiApp } from './tui/engine/bridge.js'
+import { tapAgentCallbacks, type EventSink } from './agent/event-tap.js'
+import { createNdjsonEventSink, type EventStreamFile } from './agent/event-stream-sink.js'
+import { formatEventForScreenReader } from './tui/screen-reader.js'
 import { getPaletteCommands, filterCommands } from './tui/command-palette.js'
 import type { PaletteCommand } from './tui/command-palette.js'
 import { buildCockpitSnapshot } from './tui/cockpit/state.js'
@@ -40,6 +44,8 @@ import { join as pathJoin } from 'node:path'
 import { formatWelcome } from './tui/format/welcome.js'
 import { color } from './tui/engine/ansi.js'
 import type { RewindMode } from './tui/format/rewind.js'
+import { explainToolRisk } from './agent/risk-explain.js'
+import { askSideQuestion } from './agent/side-question.js'
 import { collectPostBoundaryEditIds } from './agent/file-history.js'
 import { loadHistory, searchHistory } from './tui/history.js'
 import { parseScrollbackTranscript } from './tui/scrollback-transcript.js'
@@ -97,10 +103,28 @@ const wantSessionPicker = sessionCliArgs.openPicker
 const wantNewSession = sessionCliArgs.forceNew
 const skipWelcome = args.includes('--skip-welcome')
 
+// --stream-events <path> → mirror the run as NDJSON `SessionEvent`s (the same
+// records the sidecar serves to `attach`). A path is required rather than
+// optional: in TUI mode stdout is the render surface.
+const wantScreenReader = args.includes('--screen-reader')
+let screenReaderMode = false
+
+const streamEventsIdx = args.indexOf('--stream-events')
+const streamEventsArg = streamEventsIdx >= 0 ? args[streamEventsIdx + 1] : undefined
+const streamEventsPath = streamEventsArg && !streamEventsArg.startsWith('-') ? streamEventsArg : undefined
+if (streamEventsIdx >= 0 && !streamEventsPath) {
+  process.stderr.write('--stream-events requires a file path (stdout is the TUI render surface)\n')
+  process.exit(2)
+}
+
 // ── Lifecycle ──────────────────────────────────────────────────
 
 let app: TuiApp | null = null
 let ctx: BootstrapContext | null = null
+// Constructed eagerly but does no I/O until the first event lands.
+const eventStream: EventStreamFile | null = streamEventsPath
+  ? createNdjsonEventSink(streamEventsPath)
+  : null
 let heartbeatInterval: ReturnType<typeof setInterval> | null = null
 let perfSummaryFlush: Promise<void> = Promise.resolve()
 
@@ -122,6 +146,7 @@ async function shutdown(code: number = 0): Promise<void> {
         // Delegate core cleanup to bootstrap shutdown handler.
         ctx?.shutdown()
       },
+      () => eventStream?.close(),
       () => {
         // Post-teardown resume hint: printed AFTER TUI dispose so it lands on the
         // normal scrollback and survives the exit — the session id would otherwise
@@ -158,10 +183,22 @@ process.on('SIGINT', () => { void shutdown(0) })
 process.on('SIGTERM', () => { void shutdown(0) })
 
 // Last-resort sync hook: even if shutdown() threw or an uncaughtException
-// skipped it, the process-exit event still fires (unless SIGKILL). MCP child
-// processes (e.g. context7-mcp) are spawned via StdioClientTransport and would
-// otherwise orphan to PPID=1, accumulating across dev restarts.
+// skipped it, the process-exit event still fires (unless SIGKILL).
+//
+// Terminal modes come first — an uncaught throw skips shutdown()/dispose()
+// entirely, stranding the user with a hidden cursor, bracketed paste still
+// armed and the terminal in raw mode (`tput reset` territory). We deliberately
+// do NOT register an `uncaughtException` listener to do this: that would
+// suppress Node's default crash behaviour for genuine synchronous errors
+// (see platform/eperm-filter.ts). This hook fires either way.
+//
+// MCP child processes (e.g. context7-mcp) are spawned via StdioClientTransport
+// and would otherwise orphan to PPID=1, accumulating across dev restarts.
 process.on('exit', () => {
+  try { app?.restoreTerminalSync() } catch { /* best-effort */ }
+  try {
+    if (process.stdin.isTTY && process.stdin.setRawMode) process.stdin.setRawMode(false)
+  } catch { /* best-effort */ }
   try { ctx?.refs.mcpManager?.killChildrenSync?.() } catch { /* best-effort */ }
 })
 
@@ -311,6 +348,8 @@ async function main() {
       prompt: effectivePrompt,
       json: parsed.json,
       streamJson: parsed.streamJson,
+      sessionId,
+      model: model.id,
       createAgent: () => {
         const toolRegistry = createDefaultToolRegistry([], registryOptions)
 
@@ -513,6 +552,14 @@ async function main() {
   }
   if (ctx.config.ui?.reducedMotion) setReducedMotion(true)
 
+  // 读屏档是 reducedMotion 的超集：冻结字形还不够，会反复被朗读的是每 120ms
+  // 的重绘本身。CLI 开关优先于配置。
+  screenReaderMode = wantScreenReader || ctx.config.ui?.screenReader === true
+  if (screenReaderMode) {
+    setReducedMotion(true)
+    app?.setScreenReader(true)
+  }
+
   // Provider/Model/Session 已在欢迎屏头部展示，常规启动不再重复打印。
   if (process.env['RIVET_DEBUG']) {
     process.stderr.write(`[T9] Provider: ${ctx.provider.name}, Model: ${ctx.config.provider.default}\n`)
@@ -574,6 +621,22 @@ async function main() {
   // app 在此处必定非 null（前有 app = new TuiApp 赋值，无重赋 null 路径）
   const tuiApp = app!
   tuiApp.setApprovalMode(ctx!.config.agent.approval ?? 'auto-safe')
+  // 审批提示的 Ctrl+E 风险解释：侧路请求，只在按键时才发。
+  tuiApp.setRiskExplainer(async (toolName, input) => explainToolRisk({
+    client: ctx?.agent.config.client,
+    promptEngine: ctx!.agent.config.promptEngine,
+    getMessages: () => ctx?.session.getMessages() ?? [],
+    contextWindow: ctx!.agent.config.contextWindow,
+    recordUsage: (usage, model) => ctx?.agent.recordSidePathUsage('risk-explain', usage, model),
+  }, { toolName, input }))
+  // `/btw` 侧问：同一条侧路纪律，流式回填浮层。
+  tuiApp.setSideQuestionAsker(async (question, onDelta) => askSideQuestion({
+    client: ctx?.agent.config.client,
+    promptEngine: ctx!.agent.config.promptEngine,
+    getMessages: () => ctx?.session.getMessages() ?? [],
+    contextWindow: ctx!.agent.config.contextWindow,
+    recordUsage: (usage, model) => ctx?.agent.recordSidePathUsage('side-question', usage, model),
+  }, { question, onDelta }))
   // Plan submit 成功后自动弹出审批面板（替代手动 /plan-approve）。
   ctx!.agent.onPlanApprovalRequested = (info) => {
     // 工具执行期间直接推 overlay 可能与 turn 收尾渲染冲突，defer 到下一事件循环。
@@ -708,6 +771,19 @@ async function main() {
   tuiApp.registerOverlays({
     // Pager — scrollback 内容 或 当前选中 worker 的 detail（用于 /tasks Enter）
     pagerContent: () => {
+      // Job 日志（/jobs Enter）— 优先于 worker detail
+      const jobId = tuiApp.getJobDetailId()
+      if (jobId) {
+        const text = tuiApp.getJobDetailView(jobId)
+        if (text) {
+          return {
+            content: text,
+            page: 0,
+            title: `后台任务日志: ${jobId}`,
+            messages: parseScrollbackTranscript(text),
+          }
+        }
+      }
       const workerId = tuiApp.getWorkerDetailId()
       if (workerId) {
         const liveView = tuiApp.getWorkerDetailView(workerId)
@@ -792,6 +868,8 @@ async function main() {
       })
       return { entries: all.slice(-30), selectedIndex: 0 }
     },
+    // Rewind phase 2 — 摘要动作的缓存代价是否值得标注（非前缀缓存 provider 不标）
+    rewindCachePreserving: () => ctx?.agent.compaction.isCachePreservingProvider() ?? false,
     // Rewind phase 2 — 精确到选中消息的代码回滚会影响哪些文件
     rewindFilePreview: (messageIndex: number) => {
       const fh = ctx?.agent.getFileHistory()
@@ -834,6 +912,8 @@ async function main() {
     },
     // Tasks — /tasks 显示子代理（per-worker，来自舰队读模型；filter 由 overlay nav 决定）
     tasksData: () => tuiApp.getTasksData(),
+    // Jobs — /jobs 显示后台 shell 任务（来自 TUI job 读模型）
+    jobsData: () => tuiApp.getJobsData(),
     // Domain Picker — 裸 /domain 打开的 CC 风星域选择器（entries 由共享 builder 构造）
     domainPickerData: () => ({
       entries: buildDomainPickerEntries(ctx!.agent.getSessionDomain()),
@@ -890,7 +970,7 @@ async function main() {
         const entries = [
           { id: 'manual', label: 'Manual', description: '每个高风险工具都弹确认。最大控制，适合敏感项目。', current: current === 'manual' },
           { id: 'auto-safe', label: 'Auto', description: '低/无风险工具自动执行，高风险仍需确认。可配每 N 轮暂停检查点。', current: current === 'auto-safe', recommended: true },
-          { id: 'dangerously-skip-permissions', label: 'YOLO', description: '全自动执行，无刹车无打扰。回滚兜底（/rollback + git 检查点）。需二次确认。', current: current === 'dangerously-skip-permissions' },
+          { id: 'dangerously-skip-permissions', label: 'YOLO', description: '全自动执行，无审批打扰；写边界仍在（沙箱自动开启），仅工作区外写会询问。回滚兜底（/rollback + git 检查点）。需二次确认。', current: current === 'dangerously-skip-permissions' },
         ]
         return { title: '权限模式 / Permission', choices: entries, selectedIndex: Math.max(0, entries.findIndex(e => e.current)) }
       }
@@ -940,7 +1020,9 @@ async function main() {
         return { title: fullTitle, choices: entries, selectedIndex: recommendedIndex, inputSubMode: tuiApp.getChoicePanelInputState() }
       }
       if (tuiApp.choicePanelKind === 'ask-user-question') {
-        return tuiApp.buildAskChoicePanelData()
+        // ask 面板走 app.ts 的 Tab 化专用渲染器（buildAskPanelData），
+        // 不经过通用 choicePanelData 管线——这里是不可达的兜底。
+        return { title: '', choices: [], selectedIndex: 0 }
       }
       const current = ctx?.agent.getReasoningEffort() ?? ctx?.agent.config.reasoningEffort ?? 'high'
       const isAuto = ctx?.agent.config.autoReasoning && !ctx?.agent.userReasoningOverride
@@ -982,10 +1064,31 @@ async function main() {
       }
     }
   }, /* rewindExec: */ (messageIndex: number, mode: RewindMode) => {
-    // Rewind Enter 回调：按选择的粒度恢复（仅对话 / 仅代码 / 对话+代码）。
+    // Rewind Enter 回调：按选择的粒度恢复（仅对话 / 仅代码 / 对话+代码），
+    // 或对选定区段做定点摘要（/compact 压全部，这里只压用户圈定的一段）。
     const messages = ctx?.session.getMessages() ?? []
     const target = messages[messageIndex]
     const content = target && typeof target.content === 'string' ? target.content : ''
+
+    if (mode === 'summarize-from' || mode === 'summarize-to') {
+      const scope = mode === 'summarize-from' ? 'from' : 'to'
+      tuiApp.commitStatic(`⏳ 正在摘要${scope === 'from' ? '此消息之后' : '此消息之前'}的对话…`)
+      void ctx?.agent.compaction.summarizeRange({ scope, messageIndex }).then(
+        result => {
+          if (!result.ok) {
+            tuiApp.commitStatic(`摘要失败：${result.reason}`, { isError: true })
+            return
+          }
+          const saved = result.beforeTokens - result.afterTokens
+          tuiApp.commitStatic(
+            `⏪ 已把 ${result.replaced} 条消息压成摘要 — ${result.beforeTokens} → ${result.afterTokens} tokens（省 ${saved}）`,
+          )
+        },
+        err => tuiApp.commitStatic(`摘要失败：${(err as Error).message}`, { isError: true }),
+      )
+      return
+    }
+
     const doCode = mode === 'code' || mode === 'both'
     const doConvo = mode === 'convo' || mode === 'both'
 
@@ -1037,6 +1140,7 @@ async function main() {
     const res = switchAgentRuntime(ctx!, modelId)
     if (res.ok && res.modelName) {
       tuiApp.setModelInfo(res.modelName, res.contextWindow)
+      attachJobSubscription()
       tuiApp.commitStatic(`Model switched to: ${res.modelName}`)
     } else {
       tuiApp.commitStatic(`⚠️ Model switch failed: ${res.error ?? 'unknown error'}`)
@@ -1069,6 +1173,7 @@ async function main() {
     const res = switchAgentRuntime(ctx!, modelId)
     if (res.ok && res.modelName) {
       tuiApp.setModelInfo(res.modelName, res.contextWindow)
+      attachJobSubscription()
       tuiApp.commitStatic(`Model switched to: ${res.modelName}`)
     } else {
       tuiApp.commitStatic(`⚠️ Model switch failed: ${res.error ?? 'unknown error'}`)
@@ -1099,6 +1204,8 @@ async function main() {
     const applyPermission = (mode: string) => {
       ctx!.agent.setApprovalMode(mode as import('./agent/loop-types.js').ApprovalMode)
       tuiApp.setApprovalMode(mode)
+      // Switching to YOLO mid-session must also raise the write boundary.
+      applySandboxPolicyForApprovalMode(mode)
       // YOLO 联动无限轮次：真正全自动，不被 maxTurns 截断。
       // 其他模式恢复默认 200 轮预算。
       const yoloMaxTurns = mode === 'dangerously-skip-permissions' ? 0 : 200
@@ -1231,6 +1338,7 @@ async function main() {
           const res = switchAgentRuntime(ctx, modelAlias)
           if (res.ok && res.modelName) {
             tuiApp.setModelInfo(res.modelName, res.contextWindow)
+            attachJobSubscription()
             liveApplied = true
           }
         }
@@ -1270,6 +1378,31 @@ async function main() {
   // 动态读 refs.coordinator：switchModel 会重建 coordinator，闭包不能捕获旧实例。
   tuiApp.setWorkerKill(workerId => ctx?.refs.coordinator?.killWorker(workerId) ?? false)
   tuiApp.setWorkerSteer((workerId, text) => ctx?.refs.coordinator?.steerWorker(workerId, text) ?? false)
+
+  // ── 后台 Job 直达通道 ─────────────────────────────────────────
+  // agent.jobs 是 SessionJobs（EventEmitter）。/model 切换会 new AgentLoop →
+  // 新建 SessionJobs，故订阅必须可重入：每次 (re)attach 到当前 ctx.agent.jobs。
+  // subscribedJobs 去重防止对同一实例重复 on()。
+  let subscribedJobs: import('./tools/job-store.js').SessionJobs | undefined
+  let jobListener: ((ev: import('./tools/job-store.js').JobEvent) => void) | undefined
+  const attachJobSubscription = () => {
+    const jobs = ctx?.agent.jobs
+    if (!jobs || jobs === subscribedJobs) return
+    // 换实例时旧实例的 listener 必须摘除——否则旧 job 的事件继续进读模型，
+    // 而 kill 已路由到新实例，读模型与真实状态分叉。
+    if (subscribedJobs && jobListener) subscribedJobs.removeListener('event', jobListener)
+    subscribedJobs = jobs
+    jobListener = (ev: import('./tools/job-store.js').JobEvent) => { tuiApp.handleJobEvent(ev) }
+    jobs.on('event', jobListener)
+    // 回填：attach 之前已存在的 job（重启/换实例后的首轮）不能是空的——
+    // 按当前快照补一发合成事件进读模型。
+    for (const snap of jobs.list()) {
+      tuiApp.handleJobEvent({ kind: snap.status === 'running' ? 'started' : 'exit', job: snap })
+    }
+  }
+  attachJobSubscription()
+  tuiApp.setJobKill(jobId => ctx?.agent.jobs?.kill(jobId) ?? false)
+  tuiApp.setJobLogs(jobId => ctx?.agent.jobs?.logs(jobId) ?? null)
 
   // ── SlashRouter ──────────────────────────────────────────────
   registerTuiSlashCommands(app, ctx)
@@ -1428,7 +1561,24 @@ async function main() {
     // 判定空闲时触发（busy 时输入已被 TuiApp 入队 steerBuffer），故此处无需再自管
     // isStreaming 标志——正是「双门异步清除时机不同」造成 Esc 后死会话的根因。
     // run 生命周期回调（完成/错误/中止）由 bridge 桥接到 TuiApp，并带世代守卫。
-    const callbacks = wrapCallbacksWithTuiApp(app!)
+    const base = wrapCallbacksWithTuiApp(app!)
+    // The tap wraps the OUTSIDE of the bridge rather than riding its `original`
+    // parameter: bridge.ts lets `original.onApprovalRequired` *replace* the
+    // app's handler (bridge.ts:77-80), so passing an observer in there would
+    // hijack the approval UI. Decorating the finished set only observes.
+    //
+    // Both consumers share one tap — a second tap would double-count `seq`.
+    const sinks: EventSink[] = []
+    if (eventStream) sinks.push(eventStream.sink)
+    if (screenReaderMode) {
+      sinks.push((event) => {
+        const line = formatEventForScreenReader(event)
+        if (line) app!.commitStatic(line)
+      })
+    }
+    const callbacks = sinks.length > 0
+      ? tapAgentCallbacks(base, (event) => { for (const s of sinks) s(event) })
+      : base
     ctx!.agent.run(resolved.prompt, callbacks, images).catch((err) => {
       process.stderr.write(`[T9] Agent error: ${(err as Error)?.message}\n`)
     })
@@ -1594,6 +1744,9 @@ async function main() {
   const existingMsgCount = ctx.session.getMessages().length
   if (!skipWelcome) {
     const installRoot = detectInstallRoot()
+    // 首屏框与输入框的线框同源——否则 thick/dots 星域下刊头是 thin、输入框
+    // 是域个性，两个框并排时风格断裂。（提前取 id：let  narrowing 不进闭包）
+    const sessionDomainId = ctx.agent.getSessionDomain()?.id
     const welcomeLines = formatWelcome({
       modelName,
       cwd: process.cwd(),
@@ -1610,6 +1763,7 @@ async function main() {
         : (ctx.agent.config.autoReasoning && !ctx.agent.userReasoningOverride)
           ? 'auto'
           : (ctx.agent.getReasoningEffort() ?? ctx.agent.config.reasoningEffort),
+      separator: starDomainRegistry.list().find(d => d.id === sessionDomainId)?.uiPersona?.separator,
     }, theme)
     for (const line of welcomeLines) {
       stdout.write(line + '\n')

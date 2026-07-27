@@ -1,8 +1,9 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { createDelegateTaskTool, type DelegateTaskCoordinator } from '../delegate-task.js'
+import { createDelegateTaskTool, formatUiContent, type DelegateTaskCoordinator } from '../delegate-task.js'
 import type { CoordinatorRun, DelegationRequest } from '../../agent/coordinator.js'
 import { profileRegistry } from '../../agent/profile-registry.js'
+import { MAX_BUDGET_CONTINUATIONS, MAX_HANDS_EXTRA_RUNS } from '../../agent/worker-continuation.js'
 import { starDomainRegistry } from '../../agent/star-domain-registry.js'
 
 function makeRun(): CoordinatorRun {
@@ -53,7 +54,7 @@ describe('DELEGATE_TASK_TOOL', () => {
     assert.equal(calls[0]!.reviewDepth, 2)
     assert.equal(result.isError, false)
     assert.ok(result.content.includes('<worker_results>'))
-    assert.ok(result.uiContent!.includes('delegate_task 已完成'))
+    assert.ok(result.uiContent!.includes('delegate_task · 1/1 通过'))
   })
 
   it('passes authority through to the coordinator', async () => {
@@ -189,48 +190,125 @@ describe('DELEGATE_TASK_TOOL', () => {
     // P0: tool-level timeout = ladder/profile budget + 30s exit grace, so the
     // worker's internal budget timer always fires first (preserving partial output).
     const GRACE = 30_000
+    // 预算耗尽会自动续跑，每一轮都是一次带完整 budget 的 runWorker——外层必须覆盖
+    // 最坏运行次数，否则续跑撞上工具层硬 reject，连首轮 partial 都一起丢。
+    const RUNS = 1 + MAX_BUDGET_CONTINUATIONS
+    const HANDS_RUNS = 1 + MAX_HANDS_EXTRA_RUNS
 
-    it('returns 120s ladder + grace for turn 0-1 (cold open)', () => {
+    it('returns 120s ladder × runs + grace for turn 0-1 (cold open)', () => {
       const tool = createDelegateTaskTool({ delegate: async () => makeRun() })
-      assert.equal(tool.timeoutMs?.({ ...base, sessionTurnCount: 0 }), 120_000 + GRACE)
-      assert.equal(tool.timeoutMs?.({ ...base, sessionTurnCount: 1 }), 120_000 + GRACE)
+      assert.equal(tool.timeoutMs?.({ ...base, sessionTurnCount: 0 }), 120_000 * RUNS + GRACE)
+      assert.equal(tool.timeoutMs?.({ ...base, sessionTurnCount: 1 }), 120_000 * RUNS + GRACE)
     })
 
-    it('returns 240s ladder + grace for turn 2-4 (warming)', () => {
+    it('returns 240s ladder × runs + grace for turn 2-4 (warming)', () => {
       const tool = createDelegateTaskTool({ delegate: async () => makeRun() })
-      assert.equal(tool.timeoutMs?.({ ...base, sessionTurnCount: 2 }), 240_000 + GRACE)
-      assert.equal(tool.timeoutMs?.({ ...base, sessionTurnCount: 4 }), 240_000 + GRACE)
+      assert.equal(tool.timeoutMs?.({ ...base, sessionTurnCount: 2 }), 240_000 * RUNS + GRACE)
+      assert.equal(tool.timeoutMs?.({ ...base, sessionTurnCount: 4 }), 240_000 * RUNS + GRACE)
     })
 
-    it('returns 480s ladder + grace for turn 5+ (mature)', () => {
+    it('returns 480s ladder × runs + grace for turn 5+ (mature)', () => {
       const tool = createDelegateTaskTool({ delegate: async () => makeRun() })
-      assert.equal(tool.timeoutMs?.({ ...base, sessionTurnCount: 5 }), 480_000 + GRACE)
-      assert.equal(tool.timeoutMs?.({ ...base, sessionTurnCount: 30 }), 480_000 + GRACE)
+      assert.equal(tool.timeoutMs?.({ ...base, sessionTurnCount: 5 }), 480_000 * RUNS + GRACE)
+      assert.equal(tool.timeoutMs?.({ ...base, sessionTurnCount: 30 }), 480_000 * RUNS + GRACE)
     })
 
-    it('defaults to mature (480s + grace) when sessionTurnCount is undefined', () => {
+    it('defaults to mature when sessionTurnCount is undefined', () => {
       const tool = createDelegateTaskTool({ delegate: async () => makeRun() })
-      assert.equal(tool.timeoutMs?.(base), 480_000 + GRACE)
-      assert.equal(tool.timeoutMs?.(), 480_000 + GRACE)
+      assert.equal(tool.timeoutMs?.(base), 480_000 * RUNS + GRACE)
+      assert.equal(tool.timeoutMs?.(), 480_000 * RUNS + GRACE)
     })
 
-    it('profile defaultTimeoutMs dominates the ladder (reviewer = 600s + grace)', () => {
+    it('profile defaultTimeoutMs dominates the ladder (reviewer = 600s)', () => {
       const tool = createDelegateTaskTool({ delegate: async () => makeRun() })
       assert.equal(
         tool.timeoutMs?.({ ...base, input: { profile: 'reviewer' }, sessionTurnCount: 0 }),
-        600_000 + GRACE,
+        600_000 * RUNS + GRACE,
       )
       // Scouts now carry their own 480s budget (session 2c1186f5: 240s ladder
       // hard-killed scouts mid-report) — no longer a ladder example.
       assert.equal(
         tool.timeoutMs?.({ ...base, input: { profile: 'code_scout' }, sessionTurnCount: 0 }),
-        480_000 + GRACE,
+        480_000 * RUNS + GRACE,
       )
-      // Profiles without defaultTimeoutMs keep the ladder
+      // Profiles without defaultTimeoutMs keep the ladder；verifier 是写工，
+      // 它在 worktree 内的续跑与两轮修复共用 MAX_HANDS_EXTRA_RUNS 的总账。
       assert.equal(
         tool.timeoutMs?.({ ...base, input: { profile: 'verifier' }, sessionTurnCount: 0 }),
-        120_000 + GRACE,
+        120_000 * HANDS_RUNS + GRACE,
       )
     })
+
+    it('按次 timeoutMs 抬高外层天花板——否则调大的内层预算会被外层先开枪打断', () => {
+      const tool = createDelegateTaskTool({ delegate: async () => makeRun() })
+      assert.equal(
+        tool.timeoutMs?.({ ...base, input: { profile: 'architect', timeoutMs: 900_000 }, sessionTurnCount: 0 }),
+        900_000 * RUNS + GRACE,
+      )
+      // 调小不收紧外层：内层自己会先开枪，外层留富余只是天花板。
+      assert.equal(
+        tool.timeoutMs?.({ ...base, input: { profile: 'reviewer', timeoutMs: 60_000 }, sessionTurnCount: 0 }),
+        600_000 * RUNS + GRACE,
+      )
+    })
+  })
+
+  describe('按次预算（Wave 9）', () => {
+    it('maxTurns / timeoutMs 透传成 WorkOrder budget 覆盖', async () => {
+      const calls: DelegationRequest[] = []
+      const tool = createDelegateTaskTool({ delegate: async r => { calls.push(r); return makeRun() } })
+
+      await tool.execute({
+        toolUseId: 'tu',
+        cwd: '/repo',
+        input: { objective: '查一个 URL 的当前状态', maxTurns: 6, timeoutMs: 60_000 },
+      })
+
+      assert.deepEqual(calls[0]!.budget, { maxTurns: 6, timeoutMs: 60_000 })
+    })
+
+    it('不给预算就不覆盖——profile 默认值继续生效', async () => {
+      const calls: DelegationRequest[] = []
+      const tool = createDelegateTaskTool({ delegate: async r => { calls.push(r); return makeRun() } })
+      await tool.execute({ toolUseId: 'tu', cwd: '/repo', input: { objective: '扫一遍路由层' } })
+      assert.equal(calls[0]!.budget, undefined)
+    })
+
+    it('越界预算被 schema 拦下，不静默夹紧', async () => {
+      const tool = createDelegateTaskTool({ delegate: async () => makeRun() })
+      const tooManyTurns = await tool.execute({
+        toolUseId: 'tu', cwd: '/repo', input: { objective: 'x', maxTurns: 500 },
+      })
+      assert.equal(tooManyTurns.isError, true)
+      const tooShort = await tool.execute({
+        toolUseId: 'tu', cwd: '/repo', input: { objective: 'x', timeoutMs: 1000 },
+      })
+      assert.equal(tooShort.isError, true)
+    })
+
+    it('两个预算字段都出现在工具 schema 里', () => {
+      const tool = createDelegateTaskTool({ delegate: async () => makeRun() })
+      const props = tool.definition.input_schema!.properties
+      assert.equal((props.maxTurns as { type: string }).type, 'integer')
+      assert.equal((props.timeoutMs as { type: string }).type, 'integer')
+    })
+  })
+})
+
+describe('formatUiContent 多 worker digest 带身份', () => {
+  it('派发侧盖章的 profile/authority 进 digest 行——匿名摘要映射不回任务', () => {
+    const run: CoordinatorRun = {
+      status: 'completed',
+      selectedModel: 'm',
+      results: [
+        { workOrderId: 'wo_1', status: 'passed', summary: '查完了认证模块', findings: [], artifacts: [], changedFiles: [], risks: [], nextActions: [], evidenceStatus: 'verified', profile: 'code_scout', authority: 'tianxuan' },
+        { workOrderId: 'wo_2', status: 'blocked', summary: '没找到入口', findings: [], artifacts: [], changedFiles: [], risks: [], nextActions: [], evidenceStatus: 'unverified', profile: 'doc_scout' },
+      ],
+      packet: '',
+    }
+    const ui = formatUiContent(run)
+    assert.ok(ui.includes('天璇·侦察代码'), `行内应有星域+职能身份：${ui}`)
+    // 无 authority 的行退化为纯职能身份，两条结果可以区分
+    assert.ok(ui.includes('侦察文档'), `第二行应有可区分身份：${ui}`)
   })
 })

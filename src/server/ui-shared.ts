@@ -21,6 +21,14 @@ export {
   type DecisionStyle,
 } from '../agent/star-domain-data.js'
 
+// 创世碑文（Genesis Stele）——各星域主星模型与碑文记录（纯数据叶子；
+// 桌面端「星域图谱 → 创世碑文」页的数据源。单一事实源是仓库根 star.md）
+export {
+  STAR_GENESIS,
+  type GenesisEntry,
+  type GenesisFace,
+} from '../agent/star-genesis-data.js'
+
 // 工具输出的结构化文案标记（browser-mirror / walkthrough 提取用）
 export {
   BROWSER_NAVIGATED_PREFIX,

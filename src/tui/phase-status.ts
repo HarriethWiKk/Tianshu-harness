@@ -27,7 +27,7 @@ export function phaseStatusLabel(
     case 'stop-reason': return detail?.reason ?? null
     case 'convergence-warning':
       return detail?.reason
-        ? `⚠ ${detail.reason} — 已提示模型改道；持续无进展将触发熔断`
+        ? `⚠ AI 近几轮无明显进展，已建议切换策略；若再无改善将自动中断`
         : null
     default: return null
   }

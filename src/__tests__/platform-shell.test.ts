@@ -99,6 +99,53 @@ describe('resolveGitBashPath — probe order', () => {
     assert.equal(got, null)
   })
 
+  it('2.5a. `where bash` 兜底：bash.exe 在 PATH 而 git.exe 不在（Scoop shim 布局）', () => {
+    const expected = 'C:\\Users\\me\\scoop\\shims\\bash.exe'
+    const got = resolveGitBashPath(baseDeps({
+      whichGit: () => 'C:\\Users\\me\\scoop\\shims\\git.exe', // shim 目录——gitRoot 推导必失败
+      whichBash: () => expected,
+      exists: (p) => p === expected,
+    }))
+    assert.equal(got, expected)
+  })
+
+  it('2.5b. WSL 的 System32\\bash.exe 被排除——回退到后续候选', () => {
+    const expected = 'C:\\Program Files\\Git\\bin\\bash.exe'
+    const got = resolveGitBashPath(baseDeps({
+      whichBash: () => 'C:\\Windows\\System32\\bash.exe',
+      exists: (p) => p === expected || p === 'C:\\Windows\\System32\\bash.exe',
+    }))
+    assert.equal(got, expected, 'WSL bash 绝不可用（Linux 根 + /mnt/c 语义）')
+  })
+
+  it('2.5c. `where git` 推导成功时优先于 `where bash`（系统 Git 语义优先）', () => {
+    const derived = 'C:\\Program Files\\Git\\bin\\bash.exe'
+    const got = resolveGitBashPath(baseDeps({
+      whichGit: () => 'C:\\Program Files\\Git\\cmd\\git.exe',
+      whichBash: () => 'D:\\msys64\\usr\\bin\\bash.exe',
+      exists: (p) => p === derived || p === 'D:\\msys64\\usr\\bin\\bash.exe',
+    }))
+    assert.equal(got, derived)
+  })
+
+  it('3c. Scoop 候选路径（USERPROFILE\\scoop\\apps\\git\\current）', () => {
+    const expected = 'C:\\Users\\me\\scoop\\apps\\git\\current\\bin\\bash.exe'
+    const got = resolveGitBashPath(baseDeps({
+      env: { USERPROFILE: 'C:\\Users\\me' },
+      exists: (p) => p === expected,
+    }))
+    assert.equal(got, expected)
+  })
+
+  it('3d. SCOOP 环境变量自定义安装根时按其布局探测', () => {
+    const expected = 'D:\\tools\\scoop\\apps\\git\\current\\bin\\bash.exe'
+    const got = resolveGitBashPath(baseDeps({
+      env: { SCOOP: 'D:\\tools\\scoop' },
+      exists: (p) => p === expected,
+    }))
+    assert.equal(got, expected)
+  })
+
   it('4d. legacy RIVET_BUNDLED_BUSYBOX is no longer recognized (regression guard)', () => {
     const busybox = 'C:\\app\\resources\\shell-runtime\\win-x86_64\\busybox.exe'
     const got = resolveGitBashPath(baseDeps({

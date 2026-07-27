@@ -40,6 +40,9 @@ export function activityPhrase(event: WorkerActivityEvent): string {
     case 'thinking':
       _thinkIdx = (_thinkIdx + 1) % THINKING_WORDS.length
       return THINKING_WORDS[_thinkIdx]!
+    case 'lifecycle':
+      // 派发侧补发的阶段短语，本身已是给人看的中文——不进词池轮换。
+      return event.detail?.slice(0, 40) || '补偿轮'
     default:
       _writeIdx = (_writeIdx + 1) % WRITING_WORDS.length
       return WRITING_WORDS[_writeIdx]!

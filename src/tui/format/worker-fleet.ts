@@ -15,7 +15,7 @@ import { color } from '../engine/ansi.js'
 import type { RivetTheme } from '../theme.js'
 import type { FleetWorkerView } from '../fleet-registry.js'
 import { formatElapsed } from '../worker-panel-model.js'
-import { profileLabel, authorityStarName } from './profile-labels.js'
+import { formatWorkerIdentity, statusWord } from './profile-labels.js'
 import { displayWidth, truncateToDisplayWidth } from '../width.js'
 
 export interface WorkerFleetSummary {
@@ -35,17 +35,8 @@ function statusGlyph(status: FleetWorkerView['status']): string {
   }
 }
 
-/** 状态词（行尾右对齐，对齐 kimi-code 子代理块的可读状态列）。 */
-function statusWord(status: FleetWorkerView['status']): string {
-  switch (status) {
-    case 'running': return '执行中'
-    case 'passed': return '完成'
-    case 'completed': return '完成'
-    case 'failed': return '失败'
-    case 'blocked': return '受阻'
-    case 'escalated': return '升级'
-  }
-}
+/** 状态词（行尾右对齐，对齐 kimi-code 子代理块的可读状态列）。
+ *  已上移至 profile-labels.ts 共享（detail 头部同口径）。 */
 
 const WIDE = { ambiguousAsWide: true }
 
@@ -67,7 +58,10 @@ function truncate(text: string, max: number): string {
   // 压平空白：activity/summary 是自由文本，嵌入 \n 会让 live region 单行
   // 占多个显示行，破坏 LiveEngine 行数追踪（输入框重影）。渲染层兜底压平。
   const flat = text.replace(/\s+/g, ' ').trim()
-  return flat.length > max ? `${flat.slice(0, Math.max(0, max - 1))}…` : flat
+  // 宽度账按显示列数而非字符数——CJK objective 按字符放行必折行（树形崩坏、
+  // live 行高估），且 slice 可劈开代理对。与同文件 formatWorkerRow 同口径。
+  if (displayWidth(flat, WIDE) <= max) return flat
+  return `${truncateToDisplayWidth(flat, max - 1, WIDE)}…`
 }
 
 /**
@@ -81,11 +75,10 @@ function assignLabels(workers: FleetWorkerView[]): string[] {
   for (const w of workers) {
     profileCount.set(w.profile, (profileCount.get(w.profile) ?? 0) + 1)
   }
-  // 第二遍：分配标签
+  // 第二遍：分配标签。身份与续行/详情/派发卡同源（formatWorkerIdentity），
+  // 需要 #N 序号时在其返回值后追加——同屏不得出现两种拼法。
   return workers.map(w => {
-    const profile = profileLabel(w.profile)
-    const star = authorityStarName(w.authority)
-    const label = star ? `${star} · ${profile}` : profile
+    const label = formatWorkerIdentity({ profile: w.profile, authority: w.authority })
     const count = profileCount.get(w.profile) ?? 1
     if (count <= 1) return label
     const seq = (profileSeen.get(w.profile) ?? 0) + 1
@@ -142,36 +135,33 @@ function buildEntries(
   const visible = workers.slice(0, maxRows)
   const overflow = workers.length - visible.length
   const labels = assignLabels(visible)
-  // 先成型分支行，量出最长行宽，再把状态词对齐到同一列
-  const branchRows: { base: string; w: FleetWorkerView; cont: string }[] = []
+
   for (let i = 0; i < visible.length; i++) {
     const w = visible[i]!
     const isLast = i === visible.length - 1 && overflow <= 0
     const branch = isLast ? '└─' : '├─'
     const cont = isLast ? '  ' : '│ '
     const glyph = statusGlyph(w.status)
-    const label = labels[i]!
     const elapsed = formatElapsed(w.elapsedMs)
 
-    // 计数段（CC AgentProgress 对标）：工具调用数 + token 数，缺省时省略
+    // 主行：任务优先。有 objective 用 objective，否则回退身份。
+    // 预算 = 总宽 − 前缀（` ├─ ● ` 6 列）− 实际尾（elapsed），不再用偏小的
+    // 常数 8——尾部 `  12m30s` 一类最坏就到 8 列，常数预算在长尾时仍会折行。
+    const objective = w.contract?.objective
+    const prefix = ` ${branch} ${glyph} `
+    const tail = elapsed ? `  ${elapsed}` : ''
+    const mainText = truncate(objective ?? labels[i]!, rule - displayWidth(prefix, WIDE) - displayWidth(tail, WIDE))
+    lines.push({ text: `${prefix}${mainText}${tail}`, kind: 'worker', status: w.status })
+
+    // 续行：身份 · 计数 · 状态词（objective 已在主行时，身份下沉到这里）。
+    const identity = formatWorkerIdentity({ profile: w.profile, authority: w.authority })
     const stats: string[] = []
     if (w.toolUseCount > 0) stats.push(`${w.toolUseCount} 工具`)
     if (w.tokenCount > 0) stats.push(`${fmtTokens(w.tokenCount)} tok`)
-    const statsStr = stats.length > 0 ? ` · ${stats.join(' · ')}` : ''
-    const tail = elapsed ? `  ${elapsed}` : ''
-    branchRows.push({ base: ` ${branch} ${glyph} ${label}${statsStr}${tail}`, w, cont })
-  }
-  const wordCol = branchRows.reduce((n, r) => Math.max(n, displayWidth(r.base, WIDE)), 0) + 2
-  for (const { base, w, cont } of branchRows) {
-    const word = statusWord(w.status)
-    const pad = Math.max(2, wordCol - displayWidth(base, WIDE))
-    lines.push({ text: `${base}${' '.repeat(pad)}${word}`, kind: 'worker', status: w.status })
-
-    if (w.activity) {
-      const head = ` ${cont}   ⎿ `
-      const budget = Math.max(0, rule - head.length - 1)
-      lines.push({ text: `${head}${truncate(w.activity, budget)}`, kind: 'activity', status: w.status })
-    }
+    const metaParts = [identity, ...stats, statusWord(w.status)]
+    const head = ` ${cont}   `
+    const metaLine = truncate(metaParts.join(' · '), Math.max(0, rule - displayWidth(head, WIDE)))
+    lines.push({ text: `${head}${metaLine}`, kind: 'activity', status: w.status })
   }
 
   if (overflow > 0) {
@@ -299,8 +289,8 @@ export function formatWorkerRow(worker: FleetWorkerView, theme: RivetTheme, widt
   if (width <= 0) return ''
   const WIDE = { ambiguousAsWide: true }
   const glyph = statusGlyph(worker.status)
-  const star = authorityStarName(worker.authority)
-  const labelBase = star ? `${star} · ${profileLabel(worker.profile)}` : profileLabel(worker.profile)
+  // 身份与 formatWorkerIdentity 同源——主区行/侧栏/续行/详情不得两种拼法。
+  const labelBase = formatWorkerIdentity({ profile: worker.profile, authority: worker.authority })
   const elapsed = formatElapsed(worker.elapsedMs)
   const colorKey = statusColorKey(worker.status, worker.failureReason)
   // theme[colorKey] 在类型上是 string | 函数（部分主题键是 formatter），但语义色键

@@ -69,9 +69,15 @@ export interface ToolExecutionDeps {
   getSupportsVision?: () => boolean
   /** Vision channel: append a trailing multimodal user message (text + data-URL
    *  images). Append-only at the tail — prefix-cache safe (same boundary as
-   *  the steer path). Only invoked when getSupportsVision() is true. */
+   *  the steer path). An empty image list appends plain text, which is how the
+   *  bridge path below delivers its description. */
   addUserMessageWithImages?: (text: string, images: string[]) => void
-  recordToolHistory: (name: string, input: Record<string, unknown>, isError: boolean, content: string, errorClass?: ToolErrorClass) => void
+  /** Vision bridge: describe tool-carried screenshots with the separately
+   *  configured multimodal model, for primary models that cannot take images.
+   *  Absent when no vision model is configured — then screenshots are dropped
+   *  as before. Returns null when the description could not be produced. */
+  describeToolImages?: (images: string[], signal?: AbortSignal) => Promise<string | null>
+  recordToolHistory: (name: string, input: Record<string, unknown>, isError: boolean, content: string, errorClass?: ToolErrorClass, errorKind?: FailureClass) => void
   buildRuntimeSnapshot: (extra?: Partial<RuntimeHookSnapshot>) => RuntimeHookSnapshot
   requestThetaCheck: (reason: string) => void
   /** Wave 2 控制面：postTool hook 结构化事实上报出口（shadow 记账，不改 prompt）。 */
@@ -253,8 +259,8 @@ export class ToolExecutionController {
       latestRisk: state.latestRisk,
       sessionTurnCount: this.deps.getSessionTurnCount(),
       sessionId: this.deps.getSessionId(),
-      recordToolHistory: (name, input_, isError, content, errorClass) =>
-        this.deps.recordToolHistory(name, input_, isError, content, errorClass),
+      recordToolHistory: (name, input_, isError, content, errorClass, errorKind) =>
+        this.deps.recordToolHistory(name, input_, isError, content, errorClass, errorKind),
       onLeaveMark: this.deps.onLeaveMark,
       onPlanSteps: this.deps.onPlanSteps,
       onAcceptance: this.deps.onAcceptance,
@@ -604,15 +610,34 @@ export class ToolExecutionController {
     // Vision channel: forward tool-carried screenshots to the model as a
     // TRAILING user message (append-only after the tool results — same
     // prefix-cache-safe boundary as the steer path; never rewrites history).
-    // Text-only models: images are dropped, byte-identical to legacy behavior.
-    if (pendingImages.length > 0 && this.deps.getSupportsVision?.() === true && this.deps.addUserMessageWithImages) {
-      // Cap at the 2 most recent shots — a batch with several snapshots must
-      // not flood the context with megapixel base64.
+    // Cap at the 2 most recent shots — a batch with several snapshots must not
+    // flood the context with megapixel base64.
+    if (pendingImages.length > 0) {
       const images = pendingImages.slice(-2)
-      this.deps.addUserMessageWithImages(
-        '<system-reminder>Screenshot(s) from the computer_use call(s) above are attached. Use them to visually confirm UI state alongside the accessibility tree; do not describe them back to the user unless asked.</system-reminder>',
-        images,
-      )
+      if (this.deps.getSupportsVision?.() === true && this.deps.addUserMessageWithImages) {
+        this.deps.addUserMessageWithImages(
+          '<system-reminder>Screenshot(s) from the tool call(s) above are attached. Use them to visually confirm UI state alongside any accessibility tree or DOM measurements; do not describe them back to the user unless asked.</system-reminder>',
+          images,
+        )
+      } else if (this.deps.describeToolImages && !input.abortSignal.aborted) {
+        // Text-only primary model with a vision model configured: the bridge
+        // that already served user-attached images now also serves screenshots
+        // the agent took itself. Without it the agent could take a screenshot
+        // and still be blind to it, which is the loop stopping one step short.
+        // A failing side model must not take the tool batch down with it — the
+        // tool results are already valid without the description.
+        let description: string | null = null
+        try {
+          description = await this.deps.describeToolImages(images, input.abortSignal)
+        } catch { /* bridge unavailable — fall through to text-only results */ }
+        if (description) {
+          this.deps.addUserMessageWithImages?.(
+            `<system-reminder>Screenshot(s) from the tool call(s) above, described by the configured vision model:\n${description}</system-reminder>`,
+            [],
+          )
+        }
+      }
+      // No vision and no bridge: images are dropped, byte-identical to legacy.
     }
 
     const level = getInterventionLevel(this.deps.getPredictionAccumulator())

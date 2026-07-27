@@ -3,8 +3,8 @@
  *
  *  1. 委派工具终态 → scrollback 出现「完成沉淀卡」（◆ 子代理组 · N/M 通过）。
  *  2. team currentWave 推进 → scrollback 提交 wave 完成时间线行，重复推送去重。
- *  3. ask_user_question 面板：含选项自动可开、数字键快选（单选直接提交、
- *     多选切换 + Enter 确认）、无选项不弹面板。
+ *  3. ask_user_question Tab 化面板：含选项自动可开；答题后先进提交页，
+ *     显式「提交回答」才发出；←→ 可乱序切题；无选项不弹面板。
  */
 
 import { test } from 'node:test'
@@ -110,9 +110,9 @@ test('team wave 推进：提交时间线行且重复推送去重', () => {
   assert.ok(!stripAnsi(out.chunks.join('')).includes('wave 1/2 完成'), '重复推送被去重')
 })
 
-test('ask 面板：单选数字键快选直接提交答案', () => {
+test('ask 面板：单选数字键快选 → 提交页 → Enter 显式提交', () => {
   const { app, stdin } = makeApp()
-  app.registerOverlays({ choicePanelData: () => app.buildAskChoicePanelData() })
+  app.registerOverlays({ choicePanelData: () => ({ title: '', choices: [], selectedIndex: 0 }) })
   let submitted: string | undefined
   app.onSubmit(text => { submitted = text })
   app.openAskUserQuestionPanel({
@@ -120,14 +120,18 @@ test('ask 面板：单选数字键快选直接提交答案', () => {
   })
   assert.ok(app.pendingAskFlow, '面板流已建立')
 
-  stdin.dataHandler!('2') // 数字键 2 → Beta
-  assert.equal(submitted, 'Beta', '数字键直选第 2 项并提交')
+  stdin.dataHandler!('2') // 数字键 2 → 选定 Beta，推进到提交页（不直接提交）
+  assert.equal(submitted, undefined, '选定后先进提交页，不直接提交')
+  assert.ok(app.pendingAskFlow, '面板仍在（等待显式提交）')
+
+  stdin.dataHandler!('\r') // 提交页光标默认在「提交回答」
+  assert.equal(submitted, 'Beta', '提交页 Enter 发出答案')
   assert.equal(app.pendingAskFlow, undefined, '提交后流清理')
 })
 
-test('ask 面板：多选数字键切换 + Enter 确认', () => {
+test('ask 面板：多选数字键切换 + Enter 确认 + 提交页提交', () => {
   const { app, stdin } = makeApp()
-  app.registerOverlays({ choicePanelData: () => app.buildAskChoicePanelData() })
+  app.registerOverlays({ choicePanelData: () => ({ title: '', choices: [], selectedIndex: 0 }) })
   const submitted: string[] = []
   app.onSubmit(text => { submitted.push(text) })
   app.openAskUserQuestionPanel({
@@ -138,10 +142,51 @@ test('ask 面板：多选数字键切换 + Enter 确认', () => {
   assert.equal(submitted.length, 0, '多选切换不提交')
   stdin.dataHandler!('3') // 切换 Z
   assert.equal(submitted.length, 0, '多选切换不提交')
-  stdin.dataHandler!('\r') // Enter 确认
-  assert.equal(submitted.length, 1, 'Enter 后提交一次')
+  stdin.dataHandler!('\r') // Enter 确认多选 → 提交页
+  assert.equal(submitted.length, 0, '确认多选只进提交页，不直接提交')
+  stdin.dataHandler!('\r') // 提交页 Enter → 提交
+  assert.equal(submitted.length, 1, '提交页 Enter 后提交一次')
   assert.ok(submitted[0]!.includes('X') && submitted[0]!.includes('Z'), `多选答案含 X 与 Z: ${submitted[0]}`)
   assert.ok(!submitted[0]!.includes('Y'), '未选 Y')
+})
+
+test('ask 面板：←→ 切 Tab 乱序答题，提交页确认后按题组串', () => {
+  const { app, stdin } = makeApp()
+  app.registerOverlays({ choicePanelData: () => ({ title: '', choices: [], selectedIndex: 0 }) })
+  let submitted: string | undefined
+  app.onSubmit(text => { submitted = text })
+  app.openAskUserQuestionPanel({
+    questions: [
+      { id: 'q1', prompt: '第一题', options: ['A1', 'A2'], allowMultiple: false },
+      { id: 'q2', prompt: '第二题', options: ['B1', 'B2'], allowMultiple: false },
+    ],
+  })
+
+  stdin.dataHandler!('\x1B[C') // → 切到第 2 题
+  stdin.dataHandler!('1')      // 第 2 题选 B1 → 推进到提交页
+  stdin.dataHandler!('\x1B[D') // ← 回第 2 题
+  stdin.dataHandler!('\x1B[D') // ← 回第 1 题（可回退补答）
+  stdin.dataHandler!('2')      // 第 1 题选 A2 → 提交页
+  assert.equal(submitted, undefined, '答完两题仍待显式提交')
+
+  stdin.dataHandler!('\r') // 提交页 Enter
+  assert.equal(submitted, '第一题 → A2\n第二题 → B1', 'composeAnswers 按题组串')
+  assert.equal(app.pendingAskFlow, undefined)
+})
+
+test('ask 面板：提交页选「取消」不提交、仅关面板', () => {
+  const { app, stdin } = makeApp()
+  app.registerOverlays({ choicePanelData: () => ({ title: '', choices: [], selectedIndex: 0 }) })
+  let submitted: string | undefined
+  app.onSubmit(text => { submitted = text })
+  app.openAskUserQuestionPanel({
+    questions: [{ id: 'q1', prompt: 'Pick one', options: ['Alpha', 'Beta'], allowMultiple: false }],
+  })
+  stdin.dataHandler!('1')      // 选 Alpha → 提交页
+  stdin.dataHandler!('\x1B[B') // ↓ 移到「取消」
+  stdin.dataHandler!('\r')     // 确认取消
+  assert.equal(submitted, undefined, '取消不提交')
+  assert.ok(app.pendingAskFlow, '取消只关面板，不清理流（与 Esc 同语义，可输入框作答）')
 })
 
 test('ask 面板：无选项问题不弹面板', () => {

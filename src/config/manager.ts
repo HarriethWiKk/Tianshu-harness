@@ -2,7 +2,7 @@ import { readFileSync, existsSync } from 'fs'
 import { writeFileAtomicSync } from '../fs-atomic.js'
 import { resolve, join } from 'path'
 import { z } from 'zod'
-import { configSchema, reviewConfigSchema, workersSchema, councilConfigSchema, editorSchema, mirrorsSchema, envSchema, uiSchema, permissionsSchema, networkSchema, fetchSchema, searchSchema, type Config, type ProviderConfig, type ModelConfig, type ReviewConfig, type WorkersConfig, type CouncilConfig, type EditorConfig, type MirrorsConfig, type UiConfig } from './schema.js'
+import { configSchema, reviewConfigSchema, workersSchema, councilConfigSchema, editorSchema, mirrorsSchema, prDefaultsSchema, envSchema, uiSchema, permissionsSchema, networkSchema, fetchSchema, searchSchema, type Config, type ProviderConfig, type ModelConfig, type ReviewConfig, type WorkersConfig, type CouncilConfig, type EditorConfig, type MirrorsConfig, type PrDefaultsConfig, type UiConfig } from './schema.js'
 import { DEFAULT_CONFIG } from './default.js'
 import { userConfigPath } from './paths.js'
 import { cloneProviderPreset, findPresetModel, isProviderPresetKey, type ProviderPresetKey } from './provider-presets.js'
@@ -762,6 +762,31 @@ export function setMirrorConfig(input: {
   cfg.mirrors = mirrorsSchema.parse(merged)
   saveConfig(cfg)
   return cfg.mirrors
+}
+
+/** Snapshot of the GitHub PR panel defaults block (desktop CI loop). */
+export function getPrDefaultsConfig(): PrDefaultsConfig {
+  return loadConfig().prDefaults
+}
+
+/**
+ * Persist GitHub PR defaults (merge method / auto-fix / auto-merge / CI poll
+ * cadence) to the user global config. Validated through prDefaultsSchema.
+ */
+export function setPrDefaultsConfig(input: {
+  mergeMethod?: unknown
+  autoFix?: unknown
+  autoMerge?: unknown
+  ciPollSeconds?: unknown
+}): PrDefaultsConfig {
+  const cfg = loadConfig()
+  const merged: Record<string, unknown> = { ...cfg.prDefaults }
+  for (const key of ['mergeMethod', 'autoFix', 'autoMerge', 'ciPollSeconds'] as const) {
+    if (input[key] !== undefined) merged[key] = input[key]
+  }
+  cfg.prDefaults = prDefaultsSchema.parse(merged)
+  saveConfig(cfg)
+  return cfg.prDefaults
 }
 
 /** Snapshot of the UI preferences block for the TUI settings panel. */

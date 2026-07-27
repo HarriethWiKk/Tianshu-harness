@@ -136,12 +136,15 @@ the registry prompt was not loaded — escalate as blocked.`,
 // Instead of injecting project-specific knowledge, teach the worker
 // to discover it dynamically. This works on ANY project.
 
+// 「读 AGENTS.md / .rivet.md 拿项目约定」那一条已删：两种情况下都是死条文——
+// 文件存在时其内容已经在冻结块的 <project-instructions> 里（读一遍纯属浪费一次
+// 工具调用），文件不存在时条件本身就不成立。<project-instructions> 超预算略去
+// 章节时还会自带一条「需要时直接读原文」的标记，比这条静态指令更准。
 const PROJECT_DISCOVERY_PREAMBLE = `## Project Context Discovery
 
 Before diving into the objective, quickly orient yourself:
-1. If .rivet.md or AGENTS.md exists at the project root, read it — it contains project conventions.
-2. If package.json exists, read the "scripts" and "dependencies" sections to understand the stack.
-3. Use repo_map to see the top-level file structure if you need navigation context.
+1. If package.json exists, read the "scripts" and "dependencies" sections to understand the stack.
+2. Use repo_map to see the top-level file structure if you need navigation context.
 
 Do NOT spend more than 1-2 tool calls on discovery. Proceed to the objective quickly.
 If the objective is already specific enough (cites file paths), skip discovery entirely.`
@@ -203,10 +206,12 @@ export interface WorkerPromptOptions {
   ledgerCwd?: string
 }
 
-export function buildWorkerPrompt(order: WorkOrder, authoritySuffix?: string, opts?: WorkerPromptOptions): string {
-  // V3 Component A: if order has authority, derive persona + suffix from domain registry.
-  // volatileBlock = "你是谁" (frames identity, goes first); systemPromptSuffix = "你怎么做"
-  // (methodology, goes last for highest attention weight).
+export function buildWorkerPrompt(order: WorkOrder, _authoritySuffix?: string, opts?: WorkerPromptOptions): string {
+  // V3 Component A: domain identity is now injected via bindSessionDomain →
+  // setActiveDomain into the frozen <star-domain> prefix (worker-session.ts
+  // passes defaultDomain: order.authority). The persona (## 你是谁) and
+  // methodology (## 权域指令) are no longer duplicated here — they belong
+  // in the structural constant position, not the user message.
   const domainDef = order.authority ? starDomainRegistry.get(order.authority) : undefined
   if (order.authority && !domainDef) {
     const known = starDomainRegistry.getDomainIds()
@@ -215,8 +220,6 @@ export function buildWorkerPrompt(order: WorkOrder, authoritySuffix?: string, op
       `Known domains: ${known.join(', ')}. Worker will run without domain persona/methodology.`,
     )
   }
-  const effectiveSuffix = authoritySuffix ?? domainDef?.systemPromptSuffix
-  const personaBlock = authoritySuffix ? undefined : domainDef?.volatileBlock
   const hasWriteTools = order.allowedTools.some(t => WRITE_CAPABLE_TOOLS.has(t))
   const capability = hasWriteTools ? 'write-capable' : 'read-only'
   const resultShape = hasWriteTools ? buildWriteResultShape() : buildReadOnlyResultShape()
@@ -227,12 +230,6 @@ export function buildWorkerPrompt(order: WorkOrder, authoritySuffix?: string, op
     `Kind: ${order.kind}`,
     `Profile: ${order.profile}`,
   ]
-
-  // V3 Component A (persona): inject the star-domain identity up front so the
-  // worker reasons in-character before reading its methodology / task.
-  if (personaBlock) {
-    parts.push('', '## 你是谁', '', personaBlock)
-  }
 
   // Inject profile-specific expertise (prefer registry, fallback to hardcoded PROFILE_PROMPTS)
   const profileDef = profileRegistry.get(order.profile)
@@ -290,20 +287,26 @@ export function buildWorkerPrompt(order: WorkOrder, authoritySuffix?: string, op
     )
   }
 
+  // changedFiles 相关的三条对只读 worker 是死条文——它没有任何写工具，
+  // 前件不可能成立，而结果卡模板里 changedFiles 本来就写死成 []。
   parts.push(
-    'Do not call disallowed tools. Do not claim that files were changed unless you actually modified them.',
-    'If you changed files and did not run relevant verification, evidenceStatus must be "unverified".',
+    hasWriteTools
+      ? 'Do not call disallowed tools. Do not claim that files were changed unless you actually modified them.'
+      : 'Do not call disallowed tools.',
+  )
+  if (hasWriteTools) {
+    parts.push('If you changed files and did not run relevant verification, evidenceStatus must be "unverified".')
+  }
+  parts.push(
     '执行纪律（全星域共享）：绿非证明，复现即证——宣称已修/已验证前，先用工具复现结论（run_tests 或验证命令）；summary 里的每个数字要能指到一条真实验证记录，否则宣称会被证据门降级。',
-    'Use changedFiles ONLY for files you actually modified/created. Use examinedFiles for files you read/inspected.',
+    hasWriteTools
+      ? 'Use changedFiles ONLY for files you actually modified/created. Use examinedFiles for files you read/inspected.'
+      : 'Use examinedFiles for files you read/inspected.',
     'Return exactly one JSON object and no prose outside the object.',
     'The JSON object must match this shape:',
     resultShape,
     'JSON string discipline: every string value MUST be valid JSON. Escape any double-quote inside a string as \\", escape newlines as \\\\n, and escape backslashes as \\\\\\. Never put a raw unescaped " inside a string value — common offenders are summary, findings[].claim/evidence, and artifacts[].content (e.g. when quoting code, paths, or emphasizing a term). If you want to quote or emphasize something inside a string, use single quotes, backticks, or Chinese quotes 「」 instead of a bare ". A single unescaped " breaks the whole report and forces the caller to salvage individual fields.',
   )
-
-  if (effectiveSuffix) {
-    parts.push('', '## 权域指令', '', effectiveSuffix)
-  }
 
   // B3（将星点亮）：worker 出战带着上次的记忆——账本缺陷/能力族 top-3，
   // 各一行（族名 + 复发计数 + signature 摘要）。体量受控，账本缺失时零注入。
@@ -407,8 +410,56 @@ const WORKER_RESULTS_HINT = `<worker_results_hint>
 以下 worker 返回来自只读扫描或子代理摘要。除非某个 result 的 verification.status 为 "passed"，否则这些发现属于“待核验假设”，不是已验证事实。引用到具体文件前，请用 read_file/grep 独立确认。
 </worker_results_hint>`
 
-function wrapWorkerResults(body: string): string {
-  return `${WORKER_RESULTS_HINT}\n${body}`
+/** 失败原因 → 主控该怎么办。派发没完成时，光给一个 enum 值等于没说。 */
+const FAILURE_GUIDANCE: Record<string, string> = {
+  max_turns: '轮次预算耗尽（已自动续跑仍未收敛）——缩小 objective 或用 maxTurns 调大预算后重派',
+  timeout: '时间预算耗尽（已自动续跑仍未收敛）——拆小任务或用 timeoutMs 调大预算后重派',
+  caller_aborted: '被调用方中止——用户按了停或外层超时，不要自动重派',
+  circuit_open: '该 profile 连续失败已熔断——改用别的 profile 或自己内联做',
+  claim_conflict: '目标文件被另一会话锁定——等待释放或换只读 profile',
+  json_parse: 'worker 报告不成形（修复轮也没救回）——换更强的模型或把任务拆简单',
+  schema_mismatch: 'worker 报告字段不合规——同上',
+  worker_crash: 'worker 运行时崩溃——查 API/工具层错误，不要原样重派',
+  worker_blocked: 'worker 自己判定被阻塞——读它的 summary 找阻塞点',
+  unknown: '未分类失败——读 summary 判断',
+}
+
+/** 派发没完成时，在 hint 里说清楚：这不是一份交付，别当成交付用。 */
+function buildFailureNotice(results: readonly WorkerResult[]): string {
+  const failed = results.filter(r => r.status !== 'passed')
+  if (failed.length === 0) return ''
+  const lines = failed.map(r => {
+    const reason = r.failureReason
+    const guidance = reason ? (FAILURE_GUIDANCE[reason] ?? reason) : '无 failureReason，读 summary 判断'
+    return `- ${r.workOrderId}（${r.status}${reason ? `/${reason}` : ''}）：${guidance}`
+  })
+  const resumable = failed.some(r => r.nextActions?.some(a => a.startsWith(RESUME_HINT_PREFIX)))
+  return [
+    '<worker_dispatch_incomplete>',
+    `本次派发有 ${failed.length}/${results.length} 个 worker 没有完成。它们的 findings 只是半程产出，不足以当作交付依据——不要在汇报里把它们说成"已完成"。`,
+    ...lines,
+    ...(resumable ? ['带 "Resumable:" 的结果可以用 delegate_task({resume: "<workOrderId>"}) 接着干，它会带着上一轮的完整上下文继续。'] : []),
+    '</worker_dispatch_incomplete>',
+  ].join('\n')
+}
+
+function wrapWorkerResults(body: string, results: readonly WorkerResult[] = []): string {
+  const notice = buildFailureNotice(results)
+  return notice ? `${WORKER_RESULTS_HINT}\n${notice}\n${body}` : `${WORKER_RESULTS_HINT}\n${body}`
+}
+
+/** 超预算裁字段时，`nextActions` 里那条续跑指引不能跟着一起没。
+ *  它由 `captureAbortCheckpoint` 写入，是主控知道「这活能接着干」的唯一线索——
+ *  而 packet 超预算恰恰发生在派了一批 worker 的时候，正是最需要续跑的场景。 */
+const RESUME_HINT_PREFIX = 'Resumable:'
+
+function dropNextActionsKeepingResumeHints(result: Record<string, unknown>): void {
+  const actions = result.nextActions
+  const resumable = Array.isArray(actions)
+    ? actions.filter((a): a is string => typeof a === 'string' && a.startsWith(RESUME_HINT_PREFIX))
+    : []
+  if (resumable.length > 0) result.nextActions = resumable
+  else delete result.nextActions
 }
 
 /** Mark a compact result as truncated and downgrade any verified claim,
@@ -443,13 +494,36 @@ function truncateArtifactContent(artifacts: Array<Record<string, unknown>>): Arr
   })
 }
 
+/** packet 里 objective 的长度上限。目标通常一两句话，但模型偶尔写长文——
+ *  packet 有硬预算（MAX_WORKER_PACKET_CHARS），一个跑题的长目标不该把别的
+ *  worker 的结果挤出裁剪线。 */
+const MAX_PACKET_OBJECTIVE_CHARS = 300
+
+function truncateObjective(objective: string | undefined): string | undefined {
+  if (!objective) return undefined
+  const flat = objective.replace(/\s+/g, ' ').trim()
+  if (!flat) return undefined
+  return flat.length > MAX_PACKET_OBJECTIVE_CHARS ? `${flat.slice(0, MAX_PACKET_OBJECTIVE_CHARS)}…` : flat
+}
+
 /** Build the `<worker_results>` packet for the primary session.
  *  Async because large packets await artifact store persistence before returning
  *  the reference — never emits a dangling artifact reference. */
 export async function buildPrimaryWorkerPacket(results: WorkerResult[], artifactStore?: ArtifactStore): Promise<string> {
-  const compact = results.map(result => {
+  // 失败置顶：一是主控最先读到的就是"这次没干完"，二是超预算裁剪从尾部丢结果，
+  // 置顶让没完成的那几个在裁剪里活到最后——最需要被看见的恰恰是它们。
+  const ordered = [
+    ...results.filter(r => r.status !== 'passed'),
+    ...results.filter(r => r.status === 'passed'),
+  ]
+  const compact = ordered.map(result => {
     const raw = {
       workOrderId: result.workOrderId,
+      // 目标紧挨 id 排在 summary 之前：主控读到交回物时，第一眼就该看见当初派它
+      // 去做什么。此前 packet 只有 id 和 summary——批量派五个、再隔几轮，模型得
+      // 靠 `batch:3` 自己回忆目标，「对不上」于是无从判断。由 coordinator 从
+      // WorkOrder 盖章，不是 worker 自报。
+      objective: truncateObjective(result.objective),
       status: result.status,
       summary: result.summary,
       findings: result.findings,
@@ -492,7 +566,7 @@ export async function buildPrimaryWorkerPacket(results: WorkerResult[], artifact
         for (const result of compact) {
           delete result.examinedFiles
           delete result.risks
-          delete result.nextActions
+          dropNextActionsKeepingResumeHints(result)
           delete result.verification
           delete result.artifacts
           markTruncated(result)
@@ -502,7 +576,7 @@ export async function buildPrimaryWorkerPacket(results: WorkerResult[], artifact
         if (json.length > MAX_WORKER_PACKET_CHARS) {
           json = json.slice(0, MAX_WORKER_PACKET_CHARS - 100) + '…"'
         }
-        return wrapWorkerResults(`<worker_results>${json}\n[artifact:${artifactId}] — full worker results saved to artifact store, use read_section to retrieve</worker_results>`)
+        return wrapWorkerResults(`<worker_results>${json}\n[artifact:${artifactId}] — full worker results saved to artifact store, use read_section to retrieve</worker_results>`, results)
       }
       // artifact save failed → fall through to progressive field drop
     }
@@ -514,7 +588,7 @@ export async function buildPrimaryWorkerPacket(results: WorkerResult[], artifact
     for (const result of compact) {
       delete result.examinedFiles
       delete result.risks
-      delete result.nextActions
+      dropNextActionsKeepingResumeHints(result)
       delete result.verification
       markTruncated(result)
     }
@@ -552,5 +626,5 @@ export async function buildPrimaryWorkerPacket(results: WorkerResult[], artifact
     }
   }
 
-  return wrapWorkerResults(`<worker_results>${json}</worker_results>`)
+  return wrapWorkerResults(`<worker_results>${json}</worker_results>`, results)
 }

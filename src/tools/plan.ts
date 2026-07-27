@@ -9,7 +9,7 @@
 import type { Tool, ToolCallParams, ToolResult } from './types.js'
 import { writePlan, slugify, stripPlanStatusMarkers, insertPlanStatusMarker, insertPlanModelMarker, isDraftSlug, type PlanOption } from '../plan/plan-store.js'
 import { checkPlanFactAnchors, formatAnchorDrifts, extractPlanAnchors } from '../plan/plan-fact-anchors.js'
-import { detectPointerPlaceholder, POINTER_GUARD_ERROR_MARKER } from './pointer-guard.js'
+import { detectPointerPlaceholder, POINTER_GUARD_ERROR_MARKER, resolveIdempotentPointer } from './pointer-guard.js'
 import { inferModelTierFromName } from '../agent/model-tier-policy.js'
 import { readFile, stat, rm } from 'node:fs/promises'
 import { join, basename } from 'node:path'
@@ -369,6 +369,16 @@ function planExitModeExecute(params: ToolCallParams): ToolResult {
 
 // ── submit implementation ──
 
+/** 从 plan 指针首行解析出项目相对路径。格式：`[plan persisted to <path> — …]`。 */
+function parsePlanPointerPath(prefix: string, value: string): string | null {
+  const firstLine = value.trimStart().split(/\r?\n/, 1)[0] ?? ''
+  if (!firstLine.startsWith(prefix)) return null
+  const after = firstLine.slice(prefix.length).trimStart()
+  const dashIdx = after.indexOf(' — ')
+  const rel = (dashIdx >= 0 ? after.slice(0, dashIdx) : after.split(/\s/, 1)[0]!).trim()
+  return rel || null
+}
+
 async function planSubmitExecute(params: ToolCallParams): Promise<ToolResult> {
   const title = params.input.title
   let planContent: unknown = params.input.plan
@@ -420,11 +430,20 @@ async function planSubmitExecute(params: ToolCallParams): Promise<ToolResult> {
   //（write_file/edit_file/hash_edit 同款防线，pointer-guard.ts 中 PLAN_POINTER_PREFIX 已注册。）
   const matchedPointer = detectPointerPlaceholder(planContent as string)
   if (matchedPointer) {
+    // 优雅化解：指针所指计划文件确实在磁盘上 → 幂等成功。
+    // 被门禁拒绝的提交也会产生指针但未落盘 → resolve 返回 null，走原错误。
+    const relPath = parsePlanPointerPath(matchedPointer, planContent as string)
+    if (relPath) {
+      const absPath = join(params.cwd, relPath)
+      const resolved = await resolveIdempotentPointer({ mode: 'edit', filePath: absPath, value: planContent as string, matchedPrefix: matchedPointer })
+      if (resolved) return { content: resolved.content }
+    }
     return {
       content: [
-        `错误：plan 字段的内容是 ${POINTER_GUARD_ERROR_MARKER}（"${matchedPointer} …"），不是真实的计划正文。`,
-        `这类占位符只在你的历史消息中出现——提交后参数会被替换成显示指针（包括被门禁拒绝、并未落盘的提交），它们不是合法输入，也不代表计划已保存。`,
-        `修复：在 plan 字段写出完整计划正文；或省略 plan 字段同 title 重提（从活动计划文件读取）。如需旧版本，先 read_file 目标计划文件或活动计划文件。`,
+        `❌ 提交被拦截：plan 字段的内容是系统显示占位符（"${matchedPointer} …"），不是真实的计划正文。`,
+        `原因：对话历史中，提交后的参数会被替换为显示摘要（包括被门禁拒绝、未落盘的提交）。AI 有时会误把摘要当正文复用。`,
+        `修复：在 plan 字段写出完整计划正文；或省略 plan 字段同 title 重提（从活动计划文件读取）。如需旧版本，先 read_file 目标计划文件。`,
+        `[${POINTER_GUARD_ERROR_MARKER}]`,
       ].join(' '),
       isError: true,
     }

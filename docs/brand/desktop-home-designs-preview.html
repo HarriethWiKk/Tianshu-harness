@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>天枢 (Tianshu) 毛玻璃水凝质感与浅色主题对比优化预览</title>
+  <style>
+    :root {
+      --bg-app: #0e1015;
+      --bg-window: #161822;
+      --bg-sidebar: #11121a;
+      --panel-bg: rgba(30, 33, 43, 0.72);
+      --border-color: rgba(255, 255, 255, 0.08);
+      --text-main: #f3f4f6;
+      --text-muted: #9ca3af;
+      --text-faint: #6b7280;
+      --accent-color: #6366f1;
+      --font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'PingFang SC', sans-serif;
+    }
+
+    [data-theme="light"] {
+      --bg-app: #eef7f2;
+      --bg-window: #f6fbf8;
+      --bg-sidebar: #e9f3ed;
+      --panel-bg: rgba(255, 255, 255, 0.75);
+      --border-color: rgba(0, 0, 0, 0.08);
+      --text-main: #0f291e;
+      --text-muted: #2d5a47;
+      --text-faint: #648a79;
+      --accent-color: #10b981;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: var(--font-family);
+      background: var(--bg-app);
+      color: var(--text-main);
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      min-height: 100vh;
+    }
+
+    .top-controls {
+      width: 100%; max-width: 1100px; display: flex; align-items: center; justify-content: space-between;
+      margin-bottom: 16px; background: var(--bg-window); padding: 10px 18px; border-radius: 14px;
+      border: 1px solid var(--border-color);
+    }
+    .btn-toggle {
+      padding: 6px 12px; border-radius: 8px; border: 1px solid var(--border-color);
+      background: var(--bg-window); color: var(--text-main); font-size: 12px; cursor: pointer;
+    }
+
+    .mac-window {
+      width: 100%; max-width: 1100px; height: 750px; background: var(--bg-window);
+      border-radius: 14px; border: 1px solid var(--border-color);
+      box-shadow: 0 24px 60px rgba(0, 0, 0, 0.15); display: flex; overflow: hidden;
+    }
+
+    /* 侧边栏 */
+    .sidebar {
+      width: 230px; background: var(--bg-sidebar); border-right: 1px solid var(--border-color);
+      display: flex; flex-direction: column; padding: 14px 12px;
+    }
+    .mac-dots { display: flex; gap: 7px; margin-bottom: 20px; padding-left: 6px; }
+    .dot { width: 11px; height: 11px; border-radius: 50%; }
+    .dot-close { background: #ff5f56; }
+    .dot-min { background: #ffbd2e; }
+    .dot-max { background: #27c93f; }
+
+    .nav-item {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 8px 12px; border-radius: 8px; font-size: 13px; color: var(--text-muted); cursor: pointer;
+    }
+    .nav-item.active { background: rgba(16, 185, 129, 0.12); color: var(--text-main); font-weight: 500; }
+    .history-item {
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 7px 8px; font-size: 12px; color: var(--text-muted); border-radius: 6px; margin-top: 4px;
+    }
+
+    /* 主画布 */
+    .main-workspace {
+      flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: flex-end;
+      padding-bottom: 72px; position: relative; overflow: hidden; width: 100%;
+    }
+
+    .zcode-center {
+      width: 100%; max-width: 680px; margin: 0 auto; display: flex; flex-direction: column; align-items: center;
+      gap: 18px; position: relative; z-index: 1;
+    }
+
+    .greeting-title {
+      font-size: 26px; font-weight: 500; color: var(--text-main); letter-spacing: 0.02em; text-align: center;
+    }
+
+    /* 居中毛玻璃 Composer Card (Backdrop Blur saturate) */
+    .zcode-composer {
+      width: 100%; background: var(--panel-bg);
+      backdrop-filter: blur(24px) saturate(180%);
+      -webkit-backdrop-filter: blur(24px) saturate(180%);
+      border: 1px solid var(--border-color);
+      border-radius: 18px; padding: 16px 20px;
+      box-shadow: 0 20px 48px rgba(0, 0, 0, 0.08), 0 1px 0 inset rgba(255, 255, 255, 0.3);
+      display: flex; flex-direction: column; gap: 12px; position: relative;
+    }
+    .composer-pills-row { display: flex; align-items: center; gap: 8px; font-size: 13px; flex-wrap: wrap; }
+    .composer-pill {
+      display: inline-flex; align-items: center; gap: 5px; padding: 4px 10px; border-radius: 8px;
+      background: rgba(255, 255, 255, 0.6); backdrop-filter: blur(10px);
+      border: 1px solid var(--border-color); font-size: 12px; color: var(--text-main); font-weight: 500;
+      cursor: pointer; position: relative; user-select: none; transition: all 0.2s ease;
+      box-shadow: 0 2px 6px rgba(0,0,0,0.03);
+    }
+    [data-theme="dark"] .composer-pill {
+      background: rgba(255, 255, 255, 0.06);
+    }
+    .composer-pill:hover { background: rgba(255, 255, 255, 0.85); color: var(--text-main); transform: translateY(-1px); }
+    .composer-pill.active { background: rgba(16, 185, 129, 0.18); color: var(--text-main); border-color: var(--accent-color); }
+    
+    .zcode-input {
+      width: 100%; background: transparent; border: none; outline: none;
+      color: var(--text-main); font-size: 14px; resize: none; font-family: inherit; line-height: 1.6; min-height: 54px;
+    }
+    .zcode-input::placeholder { color: var(--text-muted); opacity: 0.8; }
+
+    .composer-bottom-bar { display: flex; align-items: center; justify-content: space-between; margin-top: 4px; }
+    .left-actions, .right-actions { display: flex; align-items: center; gap: 10px; }
+    .action-circle-btn {
+      width: 28px; height: 28px; border-radius: 50%; background: transparent;
+      border: 1px solid var(--border-color); color: var(--text-muted); display: flex; align-items: center; justify-content: center; cursor: pointer;
+    }
+    .send-arrow-btn {
+      width: 32px; height: 32px; border-radius: 50%; background: var(--accent-color); color: #fff;
+      border: none; display: flex; align-items: center; justify-content: center; cursor: pointer; font-weight: 700;
+      box-shadow: 0 4px 12px rgba(16, 185, 129, 0.3);
+    }
+
+    /* 快捷 4 大星域毛玻璃 Chips */
+    .chips-row {
+      display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; max-width: 660px;
+    }
+    .chip-item {
+      padding: 7px 16px; border-radius: 20px; background: rgba(255, 255, 255, 0.55);
+      backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+      border: 1px solid var(--border-color); font-size: 12px; color: var(--text-main); cursor: pointer;
+      display: flex; align-items: center; gap: 6px; transition: all 0.2s ease;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.04); font-weight: 500;
+    }
+    [data-theme="dark"] .chip-item { background: rgba(255,255,255,0.04); }
+    .chip-item:hover, .chip-item.active {
+      background: rgba(16, 185, 129, 0.16); color: var(--text-main); border-color: var(--accent-color);
+      transform: translateY(-2px); box-shadow: 0 6px 20px rgba(16, 185, 129, 0.2);
+    }
+
+    .hints-footer {
+      font-size: 11px; color: var(--text-faint); display: flex; gap: 16px; margin-top: 4px;
+    }
+    kbd { background: var(--bg-sidebar); border: 1px solid var(--border-color); padding: 1px 5px; border-radius: 4px; }
+  </style>
+</head>
+<body data-theme="light">
+
+  <div class="top-controls">
+    <span style="font-weight:600; font-size:14px;">浅色/薄荷绿等自定义主题下高对比毛玻璃效果预览</span>
+    <button class="btn-toggle" onclick="toggleTheme()">☀️ / 🌙 切换深浅模式</button>
+  </div>
+
+  <div class="mac-window">
+    <div class="sidebar">
+      <div class="mac-dots">
+        <div class="dot dot-close"></div>
+        <div class="dot dot-min"></div>
+        <div class="dot dot-max"></div>
+      </div>
+      <div class="nav-item active"><span>➕ 新建任务</span><span>⌘N</span></div>
+      <div class="nav-item"><span>🔍 搜索</span><span>⌘K</span></div>
+      <div class="nav-item"><span>⏱️ 定时任务</span></div>
+      <div class="nav-item"><span>🪄 技能</span></div>
+
+      <div style="margin-top:20px; font-size:11px; color:var(--text-faint);">项目 · opencode-tui</div>
+      <div class="history-item"><span>了解TUI项目并更新...</span><span>10小时</span></div>
+      <div class="history-item"><span>桌面端菜单设计与...</span><span>22小时</span></div>
+    </div>
+
+    <!-- 主画布 (薄荷绿/浅色主题毛玻璃效果) -->
+    <div class="main-workspace">
+      <div class="zcode-center">
+        <!-- 动态人文问候语 -->
+        <h1 class="greeting-title" id="greeting-txt">中午好呀，要不要先休息一下</h1>
+
+        <!-- 居中毛玻璃 Composer -->
+        <div class="zcode-composer">
+          <div class="composer-pills-row">
+            <div class="composer-pill">📂 opencode-tui ▾</div>
+            <div class="composer-pill">🌿 main ▾</div>
+            <div class="composer-pill active" id="domain-pill">⚔️ 星域: 瑶光 (复现即证 · 缺陷归族) ▾</div>
+            <div class="composer-pill">🤖 Adaptive Router: DeepSeek-V4 ▾</div>
+          </div>
+
+          <textarea id="composer-text" class="zcode-input" rows="2">请分析代码库中的异常缺陷，通过严谨对账与复现定位根因：</textarea>
+
+          <div class="composer-bottom-bar">
+            <div class="left-actions">
+              <button class="action-circle-btn">+</button>
+              <div class="composer-pill">🛡️ 完全访问 (CVM 就绪) ▾</div>
+            </div>
+
+            <div class="right-actions">
+              <span style="font-size:11px; color:var(--text-faint);">按 Enter 发送</span>
+              <button class="send-arrow-btn">↑</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- 4 大星域 Chips (浅色模式清澈高对比毛玻璃) -->
+        <div class="chips-row">
+          <div class="chip-item" onclick="selectStarDomain('tianquan', '⚖️ 星域: 天权 (称量归位 · 严谨门禁)', '请评估当前代码的重构方案，进行严格的架构审查与风险判断')">⚖️ 天权 · 架构评估与代码审查</div>
+          <div class="chip-item active" onclick="selectStarDomain('yaoguang', '⚔️ 星域: 瑶光 (复现即证 · 缺陷归族)', '请分析代码库中的异常缺陷，通过严谨对账与复现定位根因')">⚔️ 瑶光 · 疑难 Bug 归因与复现</div>
+          <div class="chip-item" onclick="selectStarDomain('tianliang', '🛡️ 天梁 (精准交付 · 分波节奏)', '请按照设定的修改目标，分步骤精准编写代码并完成测试验证')">🛡️ 天梁 · 按计划分波代码交付</div>
+          <div class="chip-item" onclick="selectStarDomain('qiming', '🌟 启明 (破夜指引 · 洞察全景)', '请探索当前项目的全景依赖，帮我梳理业务逻辑并开启开发')">🌟 启明 · 通用全栈开发引导</div>
+        </div>
+
+        <div class="hints-footer">
+          <span><kbd>⌘K</kbd> 命令面板</span>
+          <span><kbd>⌘N</kbd> 新建任务</span>
+          <span><kbd>/</kbd> 斜杠命令</span>
+          <span><kbd>@</kbd> 关联文件</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    function toggleTheme() {
+      const body = document.body;
+      const isDark = body.getAttribute('data-theme') === 'dark';
+      body.setAttribute('data-theme', isDark ? 'light' : 'dark');
+    }
+
+    function selectStarDomain(domain, pillText, promptText) {
+      const ta = document.getElementById('composer-text');
+      ta.value = promptText;
+      ta.focus();
+      ta.setSelectionRange(promptText.length, promptText.length);
+
+      const dp = document.getElementById('domain-pill');
+      dp.textContent = pillText;
+      dp.classList.add('active');
+    }
+  </script>
+</body>
+</html>

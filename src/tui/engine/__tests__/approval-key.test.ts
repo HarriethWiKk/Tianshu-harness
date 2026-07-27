@@ -4,7 +4,8 @@
  * Bug：审批模式下 Enter 既经 onAnyKey 落入 inputLine 触发 submit，
  * 又经 mode-bound approval:return 触发 approve —— 双触发，且会把输入框里的文本误提交。
  *
- * 契约：审批模式下按键只解析审批动作（y/return=approve、n/escape=deny、e=edit-approve），
+ * 契约：审批模式下按键只解析审批动作——↑↓ 移动光标、Enter 按光标行分发
+ * （批准/拒绝/编辑/解释风险），y/n/e/^E 直达键与光标确认等价，
  * 绝不落入 inputLine（不提交、不污染输入框）。
  */
 
@@ -37,7 +38,7 @@ test('审批模式 Enter → 仅 approve 一次，不提交输入框（无双触
   let resolved: unknown = Symbol('unset')
   void app.callbacks.onApprovalRequired!('1', 'Bash', { command: 'ls' }).then(r => { resolved = r })
 
-  stdin.dataHandler!('\r') // approval 模式下回车
+  stdin.dataHandler!('\r') // approval 模式下回车（光标默认在「批准」）
   await tick()
 
   assert.deepEqual(resolved, { approved: true }, '应 approve 一次')
@@ -70,4 +71,61 @@ test('审批模式 e → 不是 approve（假 edit 已移除，按键被吞）',
   await tick()
   // 旧实现 e===approve 是误导性假动作；现在 e 被吞，审批仍 pending（resolved 保持哨兵 symbol）
   assert.ok(typeof resolved === 'symbol', 'e 不应 resolve 审批（仍 pending）')
+})
+
+test('审批模式 ↓ + Enter → 光标分发到「拒绝」', async () => {
+  const { app, stdin } = makeApp()
+  let resolved: unknown = Symbol('unset')
+  void app.callbacks.onApprovalRequired!('1', 'Bash', { command: 'ls' }).then(r => { resolved = r })
+  stdin.dataHandler!('\x1B[B') // ↓ → 拒绝
+  stdin.dataHandler!('\r')
+  await tick()
+  assert.equal(resolved, false, '光标第 2 行 Enter 应 deny')
+})
+
+test('审批模式 ↓↑ + Enter → 光标回到「批准」', async () => {
+  const { app, stdin } = makeApp()
+  let resolved: unknown = Symbol('unset')
+  void app.callbacks.onApprovalRequired!('1', 'Bash', { command: 'ls' }).then(r => { resolved = r })
+  stdin.dataHandler!('\x1B[B') // ↓ → 拒绝
+  stdin.dataHandler!('\x1B[A') // ↑ → 批准
+  stdin.dataHandler!('\r')
+  await tick()
+  assert.deepEqual(resolved, { approved: true }, '光标回到第 1 行 Enter 应 approve')
+})
+
+test('审批模式 ↓↓ + Enter → 进入编辑模式（仍 pending，输入行装入 JSON）', async () => {
+  const { app, stdin } = makeApp()
+  let resolved: unknown = Symbol('unset')
+  void app.callbacks.onApprovalRequired!('1', 'Bash', { command: 'ls' }).then(r => { resolved = r })
+  stdin.dataHandler!('\x1B[B') // ↓ → 拒绝
+  stdin.dataHandler!('\x1B[B') // ↓ → 编辑 JSON
+  stdin.dataHandler!('\r')
+  await tick()
+  assert.ok(typeof resolved === 'symbol', '进入编辑模式不 resolve 审批')
+})
+
+test('审批模式光标环绕：↑ 从「批准」绕到末行「解释风险」', async () => {
+  const { app, stdin } = makeApp()
+  let resolved: unknown = Symbol('unset')
+  void app.callbacks.onApprovalRequired!('1', 'Bash', { command: 'ls' }).then(r => { resolved = r })
+  stdin.dataHandler!('\x1B[A') // ↑ 环绕 → 末行「解释风险」（请求风险解释，不 resolve）
+  stdin.dataHandler!('\r')
+  await tick()
+  assert.ok(typeof resolved === 'symbol', '解释风险只拉取解释，不 resolve 审批')
+})
+
+test('审批模式请求风险解释后光标收敛——不越界成死键', async () => {
+  const { app, stdin } = makeApp()
+  // 永不返回的解释器：pending 态持续，选项收缩为 3 行的窗口被钉住
+  app.setRiskExplainer(() => new Promise(() => {}))
+  void app.callbacks.onApprovalRequired!('1', 'Bash', { command: 'ls' })
+  stdin.dataHandler!('\x1B[A') // ↑ 环绕 → 末行「解释风险」(index 3)
+  stdin.dataHandler!('\r')       // Enter 请求解释 → 选项 4 → 3
+  await tick()
+  const ctrl = (app as unknown as {
+    approvalIntentController: { approvalOptionIndex: number; riskExplainPending: boolean }
+  }).approvalIntentController
+  assert.equal(ctrl.riskExplainPending, true, '解释请求应在途')
+  assert.ok(ctrl.approvalOptionIndex <= 2, `光标越界：index=${ctrl.approvalOptionIndex}（3 行选项应为 0-2）`)
 })

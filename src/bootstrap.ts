@@ -36,6 +36,8 @@ import { runResumePreflightOai } from './context/resume-preflight.js'
 import { createWriteEvidenceProbe } from './context/write-evidence-probe.js'
 import { FileHistory } from './agent/file-history.js'
 import { PromptEngine } from './prompt/engine.js'
+import { subagentPromptBlocks } from './prompt/block-policy.js'
+import { applyDescriptionMode } from './tools/description-compact.js'
 import { createDefaultToolRegistry } from './tools/default-registry.js'
 import { presetIncludes, resolveToolPreset } from './tools/tool-preset.js'
 import { BROWSER_DEBUG_TOOL } from './tools/browser-debug/tool.js'
@@ -43,7 +45,7 @@ import { defaultStore as defaultTodoStore } from './tools/todo.js'
 import { TodoStore } from './tools/todo-store.js'
 import { createDelegateTaskTool } from './tools/delegate-task.js'
 import { createUndoTool } from './tools/undo.js'
-import { maybeWarnNoSandbox } from './tools/sandbox-profile.js'
+import { maybeWarnNoSandbox, applySandboxPolicyForApprovalMode } from './tools/sandbox-profile.js'
 import { applyConfiguredPathGrants, loadPersistedGrants } from './tools/path-grants.js'
 import { createDelegateBatchTool } from './tools/delegate-batch.js'
 import { createTeamOrchestrateTool } from './tools/team-orchestrate.js'
@@ -818,6 +820,10 @@ export function createAgentRuntime(deps: {
   const runtimeFactory: WorkerRuntimeFactory = (_order, card, workerRegistry) => {
     const writeProfiles = profileRegistry.listWriteProfiles()
     const isWrite = writeProfiles.includes(_order.profile)
+    // 子代理块策略：收紧 project-instructions 预算 + compact 描述档。三条分支
+    // （modelOverride / review-override / 常规）共用同一份——分头构造迟早跑偏。
+    const blocks = subagentPromptBlocks()
+    const subagentTools = () => applyDescriptionMode(workerRegistry.getDefinitions(), blocks.toolDescriptions)
 
     // Per-order modelOverride: highest precedence (above review override and
     // workers routing). Builds a dedicated client for the seat's provider/model
@@ -848,8 +854,8 @@ export function createAgentRuntime(deps: {
           const ovSpec = ovProvider.models.find(m => m.id === ovModel || m.alias === ovModel)
           const ovContextWindow = ovSpec?.contextWindow ?? card.contextWindow
           const ovMaxTokens = isWrite
-            ? Math.min(8192, ovSpec?.maxTokens ?? ovContextWindow)
-            : Math.min(4096, ovSpec?.maxTokens ?? ovContextWindow)
+            ? Math.min(16384, ovSpec?.maxTokens ?? ovContextWindow)
+            : Math.min(16384, ovSpec?.maxTokens ?? ovContextWindow)
           const ovCapabilities = resolveCapabilities(ovProvider.name, ovProvider.capabilities)
           debugLog(`[worker-model] modelOverride active: profile=${_order.profile} authority=${_order.authority} → ${ovProvider.name}/${ovModel} isWrite=${isWrite}`)
           return {
@@ -866,10 +872,11 @@ export function createAgentRuntime(deps: {
             promptEngine: new PromptEngine({
               model: ovModel,
               maxTokens: ovMaxTokens,
-              staticCtx: { tools: workerRegistry.getDefinitions() },
-              volatileCtx: { cwd, sessionMemoryBlock: persist.buildMemoryBlock() },
+              staticCtx: { tools: subagentTools(), audience: 'subagent' },
+              volatileCtx: { cwd, sessionMemoryBlock: persist.buildMemoryBlock(), blockCaps: blocks.caps },
             }),
             toolRegistry: workerRegistry,
+            blockPolicy: blocks,
             cwd,
             maxTurns: 40,
             contextWindow: ovContextWindow,
@@ -891,8 +898,8 @@ export function createAgentRuntime(deps: {
     // workers must NOT touch the session primary's server-side cache (GLM
     // cache-killer mechanism). StreamClient is built lazily here (not at
     // bootstrap) so maxTokens/thinkingBudget reflect this call's isWrite —
-    // write profiles (e.g. 'patcher') get 8192, read-only profiles get 4096,
-    // matching the non-override worker path.
+    // 读写同档 16384（实测只读大报告在 4096 顶格截断触发整轮续跑，一次截断
+    // 的代价远超档位放宽的成本），matching the non-override worker path.
     const overrideResolved = reviewOverrides.get(_order.profile)
     if (overrideResolved) {
       const overrideApiKey = reviewOverrideApiKeys.get(_order.profile)
@@ -904,8 +911,8 @@ export function createAgentRuntime(deps: {
         )
         const overrideContextWindow = overrideSpec?.contextWindow ?? card.contextWindow
         const overrideMaxTokens = isWrite
-          ? Math.min(8192, overrideSpec?.maxTokens ?? overrideContextWindow)
-          : Math.min(4096, overrideSpec?.maxTokens ?? overrideContextWindow)
+          ? Math.min(16384, overrideSpec?.maxTokens ?? overrideContextWindow)
+          : Math.min(16384, overrideSpec?.maxTokens ?? overrideContextWindow)
         debugLog(`[worker-model] review-override active: profile=${_order.profile} model=${overrideResolved.modelId} isWrite=${isWrite}`)
         const overrideCapabilities = resolveCapabilities(overrideResolved.providerName, overrideResolved.providerConfig.capabilities)
         return {
@@ -925,10 +932,11 @@ export function createAgentRuntime(deps: {
           promptEngine: new PromptEngine({
             model: overrideResolved.modelId,
             maxTokens: overrideMaxTokens,
-            staticCtx: { tools: workerRegistry.getDefinitions() },
-            volatileCtx: { cwd, sessionMemoryBlock: persist.buildMemoryBlock() },
+            staticCtx: { tools: subagentTools(), audience: 'subagent' },
+            volatileCtx: { cwd, sessionMemoryBlock: persist.buildMemoryBlock(), blockCaps: blocks.caps },
           }),
           toolRegistry: workerRegistry,
+          blockPolicy: blocks,
           cwd,
           maxTurns: 40,
           contextWindow: overrideContextWindow,
@@ -991,8 +999,8 @@ export function createAgentRuntime(deps: {
     const workerModelSpec = workerProvider.models.find(m => m.id === workerModel || m.alias === workerModel)
     const workerContextWindow = workerModelSpec?.contextWindow ?? card.contextWindow
     const workerMaxTokens = isWrite
-      ? Math.min(8192, workerModelSpec?.maxTokens ?? workerContextWindow)
-      : Math.min(4096, workerModelSpec?.maxTokens ?? workerContextWindow)
+      ? Math.min(16384, workerModelSpec?.maxTokens ?? workerContextWindow)
+      : Math.min(16384, workerModelSpec?.maxTokens ?? workerContextWindow)
 
     debugLog(`[worker-model] runtimeFactory: kind=${_order.kind} profile=${_order.profile} model=${workerModel} provider=${workerProvider.name} contextWindow=${workerContextWindow}`)
 
@@ -1011,10 +1019,13 @@ export function createAgentRuntime(deps: {
       promptEngine: new PromptEngine({
         model: workerModel,
         maxTokens: workerMaxTokens,
-        staticCtx: { tools: workerRegistry.getDefinitions() },
-        volatileCtx: { cwd, sessionMemoryBlock: persist.buildMemoryBlock() },
+        // audience:'subagent' — 分档精简的 system 段：删主控专属循环/契约，
+        // 工具耦合段按 worker 实际工具集门控。主控路径不传该字段，字节不变。
+        staticCtx: { tools: subagentTools(), audience: 'subagent' },
+        volatileCtx: { cwd, sessionMemoryBlock: persist.buildMemoryBlock(), blockCaps: blocks.caps },
       }),
       toolRegistry: workerRegistry,
+      blockPolicy: blocks,
       cwd,
       maxTurns: 40,
       contextWindow: workerContextWindow,
@@ -1437,6 +1448,13 @@ export function switchAgentRuntime(ctx: BootstrapContext, modelId: string): Swit
       session: ctx.session,
     })
 
+    // 搬运后台 job 注册表到新 agent：不搬则新 AgentLoop 自建空 SessionJobs，
+    // 旧 agent 上在跑的后台 job 被孤立（仍在跑但无人管理/无事件）。setJobs 会
+    // 复用旧实例（其 EventEmitter 监听器保持有效，TUI 订阅在 main 侧按 attach
+    // 幂等重挂）。
+    const carriedJobs = ctx.agent.jobs
+    if (carriedJobs) { try { agent.setJobs(carriedJobs) } catch { /* best-effort */ } }
+
     ctx.agent = agent
     ctx.refs.promptEngine = agent.config.promptEngine
     ctx.refs.getTaskContract = () => agent.getTaskContract()
@@ -1835,10 +1853,15 @@ export async function bootstrapInteractiveSession(opts: BootstrapOptions = {}): 
   setTargetConventions(config.editor.platform, config.editor.eol)
   applyConfiguredGitBashPath(config.env.gitBashPath)
 
+  // YOLO removes the approval boundary, so the kernel write boundary becomes
+  // the only one. Turn the sandbox on before the startup notice is computed.
+  applySandboxPolicyForApprovalMode(config.agent.approval)
+
   // Announce the command sandbox's protection level up-front. Stays silent when
-  // a real kernel boundary is active; warns loudly (esp. on native Windows or
-  // RIVET_NO_SANDBOX) when writes are unbounded and rollback is the only — and
-  // only after-the-fact, file-only — safety net.
+  // a real kernel boundary is active; warns loudly (esp. on native Windows, or
+  // when RIVET_SANDBOX was requested but no backend exists) — in that case
+  // writes are unbounded and rollback is the only, after-the-fact, file-only
+  // safety net.
   maybeWarnNoSandbox({ cwd })
 
   // Re-activate out-of-workspace path grants the user chose to "remember" for

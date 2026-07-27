@@ -28,6 +28,8 @@ export interface OpenSessionOptions {
   userDataDir: string
   connectUrl?: string
   driverFactory?: BrowserDebugDriverFactory
+  /** Initial page size. Omitted = the driver's default. */
+  viewport?: { width: number; height: number }
 }
 
 export type OutputSink = (chunk: string) => void
@@ -99,6 +101,7 @@ export class BrowserDebugSession {
       headless: opts.headless,
       userDataDir: opts.userDataDir,
       connectUrl: opts.connectUrl,
+      viewport: opts.viewport,
       events,
     })
     self = new BrowserDebugSession(opts.sessionKey, driver, opts.headless, mode, {
@@ -147,6 +150,7 @@ export async function getOrCreateSession(opts: {
   userDataDir: string
   connectUrl?: string
   driverFactory?: BrowserDebugDriverFactory
+  viewport?: { width: number; height: number }
 }): Promise<BrowserDebugSession> {
   const key = opts.sessionKey
   const existing = sessions.get(key)
@@ -162,6 +166,7 @@ export async function getOrCreateSession(opts: {
     userDataDir: opts.userDataDir,
     connectUrl: opts.connectUrl,
     driverFactory: opts.driverFactory,
+    viewport: opts.viewport,
   })
     .then((s) => {
       sessions.set(key, s)

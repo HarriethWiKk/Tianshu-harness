@@ -6,6 +6,13 @@ import type { ClaimProposal } from '../context/claims.js'
 import { DEFAULT_DELEGATE_PROFILE, profileRegistry, delegationToolTimeoutMs } from '../agent/profile-registry.js'
 import { starDomainRegistry } from '../agent/star-domain-registry.js'
 import { validatePathSafe } from './path-validate.js'
+import {
+  MAX_TURNS_TOOL_DESCRIPTION,
+  TIMEOUT_MS_TOOL_DESCRIPTION,
+  delegateMaxTurnsSchema,
+  delegateTimeoutMsSchema,
+  toBudgetOverride,
+} from './delegate-budget.js'
 import type { Tool, ToolCallParams, ToolResult } from './types.js'
 import { createActivityStreamer, createDelegationActivityMapper, progressSnippet } from './worker-activity-stream.js'
 import type { WorkerActivityEvent } from '../agent/coordinator.js'
@@ -23,13 +30,13 @@ export interface DelegateBatchCoordinator {
 /** Dynamic profile validation — accepts built-in + user-loaded profiles */
 const profileStringSchema = z.string().refine(
   (val) => profileRegistry.getProfileNames().includes(val),
-  (val) => ({ message: `Unknown profile "${val}". Available: ${profileRegistry.getProfileNames().join(', ')}` }),
+  (val) => ({ message: `未知 profile "${val}"。可用：${profileRegistry.getProfileNames().join(', ')}` }),
 )
 
 /** Dynamic star-domain (authority) validation — see delegate-task.ts. */
 const authorityStringSchema = z.string().refine(
   (val) => starDomainRegistry.getDomainIds().includes(val),
-  (val) => ({ message: `Unknown authority "${val}". Available: ${starDomainRegistry.getDomainIds().join(', ')}` }),
+  (val) => ({ message: `未知星域 "${val}"。可用：${starDomainRegistry.getDomainIds().join(', ')}` }),
 )
 
 const taskSchema = z.object({
@@ -47,6 +54,8 @@ const taskSchema = z.object({
    *  context instead of starting fresh. Use the workOrderId from a previous
    *  delegate_task/delegate_batch result. */
   resume: z.string().optional(),
+  maxTurns: delegateMaxTurnsSchema,
+  timeoutMs: delegateTimeoutMsSchema,
 })
 
 const inputSchema = z.object({
@@ -133,6 +142,8 @@ export function createDelegateBatchTool(
                 symbols: { type: 'array', items: { type: 'string' } },
                 dependsOn: { type: 'array', items: { type: 'integer' }, description: '本批次中必须先完成的任务下标（被引用的任务会先运行）。例如测试任务依赖它所覆盖的源码任务。' },
                 resume: { type: 'string', description: '要恢复的 worker ID。worker 从之前的会话上下文继续，而不是从零开始。' },
+                maxTurns: { type: 'integer', description: MAX_TURNS_TOOL_DESCRIPTION },
+                timeoutMs: { type: 'integer', description: TIMEOUT_MS_TOOL_DESCRIPTION },
               },
               required: ['objective'],
             },
@@ -236,6 +247,7 @@ export function createDelegateBatchTool(
         sessionTurn: params.sessionTurnCount,
         onActivity: streamActivity,
         resumeWorkOrderId: t.resume,
+        budget: toBudgetOverride(t),
         }
       })
 
@@ -355,11 +367,11 @@ export function createDelegateBatchTool(
     // full 5-task batch is not killed by a single-wave budget before its later
     // wave can finish (and salvage partial output) — see delegationToolTimeoutMs.
     timeoutMs: (params) => {
-      const tasks = (params?.input?.tasks as Array<{ profile?: string }> | undefined) ?? []
+      const tasks = (params?.input?.tasks as Array<{ profile?: string; timeoutMs?: number }> | undefined) ?? []
       return delegationToolTimeoutMs(
         params?.sessionTurnCount,
         tasks.map(t => t.profile),
-        { taskCount: tasks.length },
+        { taskCount: tasks.length, requestedTimeoutMs: tasks.map(t => t.timeoutMs) },
       )
     },
   }

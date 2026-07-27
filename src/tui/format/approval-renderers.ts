@@ -12,9 +12,7 @@
 import { color } from '../engine/ansi.js'
 import type { RivetTheme } from '../theme.js'
 import { displayWidth, truncateToDisplayWidth } from '../width.js'
-
-/** 宽度口径：与 LiveEngine 一致，ambiguous 符号按宽处理。 */
-const WIDE = { ambiguousAsWide: true }
+import type { RiskExplanation, RiskLevel } from '../../agent/risk-explain.js'
 
 export interface ApprovalRenderer {
   /** 渲染审批预览行（每行已做列宽控制，调用方直接显示） */
@@ -217,13 +215,26 @@ export interface FormatApprovalPromptInput {
   toolName: string
   input: Record<string, unknown>
   columns: number
+  /** 光标选项列表的选中行（0 批准 / 1 拒绝 / 2 编辑 JSON / 3 解释风险）。 */
+  selectedIndex: number
+  /** Ctrl+E 拉取的风险解释状态（未请求时三者皆空）。 */
+  risk?: RiskExplanation | null
+  riskPending?: boolean
+  riskError?: string
+}
+
+const RISK_LABEL: Record<RiskLevel, string> = { low: '低风险', medium: '中风险', high: '高风险' }
+
+function riskColor(level: RiskLevel, theme: RivetTheme): string {
+  return level === 'high' ? theme.error : level === 'medium' ? theme.warning : theme.success
 }
 
 /**
  * 渲染 approval 行内提示。
  *
  * 精简风格：去掉 AI 感的模态框边框，采用类似 git 编辑器的行内展示。
- * 工具名 + 预览内容用 dim 色，操作提示紧凑排列。
+ * 工具名 + 预览内容用 dim 色；底部是光标选项列表（↑↓ 移动、Enter 确认），
+ * 行内保留快捷键字母——y/n/e/^E 直达键与光标确认等价，兼容肌肉记忆。
  */
 export function formatApprovalPrompt(input: FormatApprovalPromptInput, theme: RivetTheme): string[] {
   const lines: string[] = []
@@ -237,13 +248,33 @@ export function formatApprovalPrompt(input: FormatApprovalPromptInput, theme: Ri
     lines.push(`    ${pv}`)
   }
 
-  // 紧凑操作提示行（类似 git commit 编辑器的底部提示）
-  const hints = [
-    `${color('Enter/y', theme.success)}  ${color('approve', theme.muted)}`,
-    `${color('Esc/n', theme.error)}   ${color('deny', theme.muted)}`,
-    `${color('e', theme.secondary)}     ${color('edit JSON', theme.muted)}`,
-  ]
-  lines.push(color('  ' + hints.join('    '), theme.dim))
+  // 风险解释（Ctrl+E 按需拉取）。只在用户真的问了之后才占屏。
+  if (input.riskPending) {
+    lines.push(`  ${color('· 正在分析这条操作的风险…', theme.dim)}`)
+  } else if (input.riskError) {
+    lines.push(`  ${color(`· 风险分析不可用：${input.riskError}`, theme.dim)}`)
+  } else if (input.risk) {
+    const c = riskColor(input.risk.level, theme)
+    lines.push(`  ${color(`[${RISK_LABEL[input.risk.level]}]`, c, { bold: true })}`)
+    for (const line of input.risk.lines) {
+      lines.push(`    ${color(line, theme.secondary)}`)
+    }
+  }
+
+  // 光标选项列表。已经给过解释就不再出现「解释风险」行——重复入口只是噪音。
+  const options = ['批准 (Enter/y)', '拒绝 (Esc/n)', '编辑 JSON (e)']
+  if (!input.risk && !input.riskPending) {
+    options.push('解释风险 (^E)')
+  }
+  lines.push('')
+  options.forEach((label, i) => {
+    const cursor = i === input.selectedIndex
+    const glyph = cursor ? color('>', theme.primary, { bold: true }) : ' '
+    const text = cursor
+      ? color(`${i + 1}. ${label}`, theme.primary, { bold: true })
+      : color(`${i + 1}. ${label}`, theme.muted)
+    lines.push(`  ${glyph} ${text}`)
+  })
 
   return lines
 }

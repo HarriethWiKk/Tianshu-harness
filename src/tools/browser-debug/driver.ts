@@ -57,6 +57,12 @@ export interface BrowserDebugDriver {
   clearCookies(): Promise<void>
   setStorage(kind: StorageKind, key: string, value: string): Promise<void>
   clearStorage(kind: StorageKind): Promise<void>
+  /** Resize the active page. Responsive breakpoints are a first-class part of
+   *  a UI change, so verification has to be able to move the window — a bug
+   *  that only shows at one width is invisible from a single fixed size. */
+  setViewport(width: number, height: number): Promise<void>
+  /** Current page size, so a screenshot can say what it is a screenshot of. */
+  viewportSize(): { width: number; height: number } | null
   currentUrl(): string
   /** URLs of all open pages/tabs in the context (active page last). */
   pageUrls(): string[]
@@ -64,11 +70,20 @@ export interface BrowserDebugDriver {
   close(): Promise<void>
 }
 
+/** Viewport bounds. The lower bound keeps a resize from producing a degenerate
+ *  page that no real device would show; the upper bound keeps a screenshot from
+ *  turning into a megapixel payload on the vision channel. */
+export const MIN_VIEWPORT = 240
+export const MAX_VIEWPORT = 3840
+export const DEFAULT_VIEWPORT = { width: 1280, height: 800 } as const
+
 export interface DriverLaunchOptions {
   headless: boolean
   userDataDir: string
   events: DriverEvents
   connectUrl?: string
+  /** Initial page size; defaults to DEFAULT_VIEWPORT. */
+  viewport?: { width: number; height: number }
 }
 
 export type BrowserDebugDriverFactory = (opts: DriverLaunchOptions) => Promise<BrowserDebugDriver>
@@ -109,6 +124,8 @@ interface PwPage {
   reload(opts: Record<string, unknown>): Promise<unknown>
   goBack(opts: Record<string, unknown>): Promise<unknown>
   goForward(opts: Record<string, unknown>): Promise<unknown>
+  setViewportSize(size: { width: number; height: number }): Promise<void>
+  viewportSize(): { width: number; height: number } | null
   keyboard: PwKeyboard
   url(): string
   bringToFront(): Promise<void>
@@ -397,6 +414,10 @@ function buildDriver(
       const varName = kind === 'session' ? 'sessionStorage' : 'localStorage'
       await getPage().evaluate(`${varName}.clear()`)
     },
+    setViewport: async (width, height) => {
+      await getPage().setViewportSize({ width, height })
+    },
+    viewportSize: () => getPage().viewportSize(),
     currentUrl: () => getPage().url(),
     pageUrls,
     bringToFront: () => getPage().bringToFront(),
@@ -408,7 +429,7 @@ export const playwrightDriverFactory: BrowserDebugDriverFactory = async (opts) =
   const mod = await loadPlaywright()
   const context = await mod.chromium.launchPersistentContext(opts.userDataDir, {
     headless: opts.headless,
-    viewport: { width: 1280, height: 800 },
+    viewport: opts.viewport ?? DEFAULT_VIEWPORT,
   })
   const existing = context.pages()
   const page = existing.length > 0 ? existing[0]! : await context.newPage()
@@ -429,6 +450,9 @@ export const playwrightConnectFactory: BrowserDebugDriverFactory = async (opts) 
   }
   const existing = context.pages()
   const page = existing.length > 0 ? existing[0]! : await context.newPage()
+  // Only resize when asked: an adopted browser is the user's own window, and
+  // silently reshaping it would be a surprising side effect of connecting.
+  if (opts.viewport) await page.setViewportSize(opts.viewport)
   const tracker = attachPageTracker(context, opts.events, page)
   return buildDriver(tracker.getActivePage, context, tracker.pageUrls, () => browser.close())
 }

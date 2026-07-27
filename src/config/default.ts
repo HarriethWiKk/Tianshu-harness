@@ -254,6 +254,12 @@ export const DEFAULT_CONFIG: Config = {
     fallbackMemoryMinutes: 10,
     fallbackTimeoutSec: 60,
   },
+  prDefaults: {
+    mergeMethod: 'squash',
+    autoFix: false,
+    autoMerge: false,
+    ciPollSeconds: 10,
+  },
   env: {
     resolve: true,
     extraPath: [],

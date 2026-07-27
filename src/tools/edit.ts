@@ -27,7 +27,7 @@ async function writeEditLanding(
 }
 import { detectEol, chooseEol, toLf, applyEol, type Eol } from './line-endings.js'
 import { getTargetEol } from '../platform.js'
-import { detectPointerPlaceholder, pointerPlaceholderError } from './pointer-guard.js'
+import { detectPointerPlaceholder, pointerPlaceholderError, resolveIdempotentPointer } from './pointer-guard.js'
 import { trackFileChange, restoreLatestBackup } from '../agent/recovery-stack.js'
 import { formatActivePlanDraftReceipt } from '../agent/plan-mode.js'
 
@@ -115,6 +115,8 @@ export const EDIT_FILE_TOOL: Tool = {
       if (typeof value !== 'string') continue
       const matchedPointer = detectPointerPlaceholder(value)
       if (matchedPointer) {
+        const resolved = await resolveIdempotentPointer({ mode: 'edit', filePath, value, matchedPrefix: matchedPointer })
+        if (resolved) return resolved
         return {
           content: pointerPlaceholderError({ toolName: 'edit_file', field, matchedPrefix: matchedPointer, filePath }),
           isError: true,
@@ -485,6 +487,15 @@ async function finalizeEdit(
   if (check.fatal) {
     const relPath = relative(cwd, filePath)
     const restored = restoreLatestBackup(cwd, relPath)
+    // 回滚后 mtime 会变（copyFileSync 不保留原始时间戳），但内容已恢复。
+    // 刷新读文件 mtime 追踪器——否则后续 hash_edit 的仅位置锚点检查会误报
+    // "文件已变化，请重新 read_file"，主控白费一轮重读。
+    if (restored) {
+      try {
+        const s = await stat(filePath)
+        noteFileObserved(filePath, s.mtimeMs, s.size, sessionId)
+      } catch { /* stat 失败不影响主流程 */ }
+    }
     const fails = incrementEditFailCount(filePath)
     const gatePrefix = fails >= 3 ? `此文件已连续编辑失败 ${fails} 次，再次编辑前必须先重新 read_file。\n\n` : ''
     const rollbackMsg = restored ? '更改已自动回滚。' : '自动回滚失败。'

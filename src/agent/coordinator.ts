@@ -31,9 +31,18 @@ import {
   deriveWorkerSessionId,
 } from './work-order.js'
 import { buildContractProjection, type ContractProjection } from './contract-projection.js'
+import { reconcileWithObjective } from './worker-objective-gate.js'
 import { buildPrimaryWorkerPacket } from './worker-prompts.js'
 import { runWorkerSession, type WorkerActivityKind, type WorkerCheckpoint, type WorkerSessionConfig, type WorkerSessionRun } from './worker-session.js'
 import { saveWorkerSession, loadWorkerSession } from './worker-session-persist.js'
+import { buildContinuationObjective, decideContinuation, markContinued, mergeUsage, MAX_BUDGET_CONTINUATIONS } from './worker-continuation.js'
+import {
+  buildRevisionObjective,
+  decideRevision,
+  detectEvidenceShortfall,
+  markRevised,
+  type EvidenceShortfall,
+} from './worker-revision.js'
 import { WorkerLiveness, EXPLORE_STALL_MS, deriveWorkerStallMs } from './worker-liveness.js'
 import { runHandsSession, type HandsSessionConfig, type HandsSessionRun } from './hands-session.js'
 import { buildWorkerEpisode } from './worker-episode.js'
@@ -97,8 +106,30 @@ export interface WorkerActivityEvent {
   /** Why this authority was chosen (from WorkOrder.authorityReason). */
   authorityReason?: string
   kind: WorkerActivityKind
-  /** Tool name for tool events; text delta for text/thinking; 累计 token 总数 for turn. */
+  /** Tool name for tool events; text delta for text/thinking; 累计 token 总数 for turn;
+   *  中文阶段短语 for lifecycle. */
   detail?: string
+}
+
+const CONTINUATION_REASON_LABEL: Record<'max_turns' | 'timeout', string> = {
+  max_turns: '轮次预算耗尽',
+  timeout: '时间预算耗尽',
+}
+
+const SHORTFALL_LABEL: Record<EvidenceShortfall, string> = {
+  claimed_verified_downgraded: '宣称已验证但证据不成立',
+  unproven_claim_in_summary: '摘要含未经验证的宣称',
+}
+
+/**
+ * 补偿轮的阶段事件。走 worker 自己那条 onActivity 通道（已由 delegateOrder 包成
+ * liveness + 请求侧上行的扇出），因此不需要额外的传输管线——但补偿轮**不是** worker
+ * 发起的，worker 不知道自己在第几次续跑，只有派发侧知道，所以由这里补发。
+ */
+function emitLifecycle(workerConfig: WorkerSessionConfig, detail: string): void {
+  try {
+    workerConfig.onActivity?.('lifecycle', detail)
+  } catch { /* UI upstream must never break dispatch */ }
 }
 
 /**
@@ -153,8 +184,9 @@ export interface DelegationRequest {
   /** Logical group identifier for related tasks (e.g. team wave). */
   groupId?: string
   /** Star domain authority for cognitive injection (V3 Component A).
-   *  When set, the domain's systemPromptSuffix and volatileBlock are injected
-   *  into the worker prompt (see buildWorkerPrompt). Tool access becomes the
+   *  When set, the worker's frozen <star-domain> prefix is pinned to this domain
+   *  (worker-session.ts defaultDomain: order.authority； volatileBlock + 共享纪律
+   *  在该结构常量位注入，user 消息不再重复）。Tool access becomes the
    *  intersection profile.allowedTools ∩ domain.toolWhitelist (work-order.ts
    *  toolsForAuthority) — fail-closed: an unknown/unloaded authority yields []
    *  (deny-all). Built-in domains currently ship full-set whitelists, so the
@@ -436,13 +468,30 @@ export function evictOldSubagentResults(dir: string, limit = MAX_SUBAGENT_RESULT
   return toEvict
 }
 
-/** Persist worker result to ~/.rivet/subagents/<orderId>.json for future resume/inspection. */
-function persistWorkerResult(result: WorkerResult, fingerprint?: string): void {
+/**
+ * Persist worker result to ~/.rivet/subagents/ for future resume/inspection.
+ *
+ * 落三类文件：
+ * - `<orderId>.json` —— 最新一轮副本（loadPersistedResult 读它，行为不变）。
+ * - `<orderId>.<nonce>.json` —— 按派发 nonce 的逐轮归档（有 nonce 时）。稳定
+ *   order id（batch:0 / team:T1）跨委派复用，没有 nonce 时第二次派发会把第一轮
+ *   的 findings/usage 物理覆盖（L1）。nonce 与 worker 会话 JSONL 同源
+ *   （deriveWorkerSessionId 那颗）。
+ * - `<fingerprint>.json` —— T5 resume 指纹副本。
+ *
+ * LRU 说明：归档让每次派发多占一个文件，MAX_SUBAGENT_RESULTS 会比「复用免费」
+ * 时代更早触顶；淘汰仍按最旧 mtime 优先，语义不变——最旧的轮次先死。
+ * homeDir 仅供测试注入（与 loadPersistedResult 同例）。
+ */
+export function persistWorkerResult(result: WorkerResult, fingerprint?: string, dispatchNonce?: string, homeDir?: string): void {
   try {
-    const dir = subagentsDir()
+    const dir = coordinatorSubagentsDir(homeDir)
     mkdirSync(dir, { recursive: true })
     const json = JSON.stringify(result, null, 2)
     writeFileSync(join(dir, `${result.workOrderId}.json`), json, 'utf-8')
+    if (dispatchNonce) {
+      writeFileSync(join(dir, `${result.workOrderId}.${dispatchNonce}.json`), json, 'utf-8')
+    }
     // T5: also write a fingerprint-indexed copy for resume lookup
     if (fingerprint) {
       writeFileSync(join(dir, `${fingerprint}.json`), json, 'utf-8')
@@ -472,6 +521,65 @@ export function loadPersistedResult(orderId: string, homeDir?: string): WorkerRe
   } catch {
     return null
   }
+}
+
+/** nonce 必须是不含路径语义的裸标识符——它会拼进文件名，拒绝分隔符与父目录逃逸。 */
+function isSafeRoundNonce(nonce: string): boolean {
+  return /^[A-Za-z0-9_-]+$/.test(nonce)
+}
+
+/** 一轮派发的归档元数据（L1）。 */
+export interface PersistedResultRound {
+  /** 派发 nonce，与 worker 会话 JSONL（worker-<id>-<nonce>.jsonl）后缀同源。 */
+  nonce: string
+  /** 文件 mtime——派发完成时间，兼作轮次排序键。 */
+  savedAt: number
+}
+
+/**
+ * 列出某个 order id 的全部归档轮次，按时间升序（第 0 条是首轮）。
+ * 只数 `<orderId>.<nonce>.json`：`<orderId>.json` 最新副本（nonce 为空被排除）
+ * 与指纹文件（不带 order id 前缀）都不算轮次。
+ */
+export function listPersistedResultRounds(orderId: string, homeDir?: string): PersistedResultRound[] {
+  try {
+    const dir = coordinatorSubagentsDir(homeDir)
+    const prefix = `${orderId}.`
+    const rounds: PersistedResultRound[] = []
+    for (const f of readdirSync(dir)) {
+      if (!f.startsWith(prefix) || !f.endsWith('.json')) continue
+      const nonce = f.slice(prefix.length, -'.json'.length)
+      if (!isSafeRoundNonce(nonce)) continue
+      let savedAt = 0
+      try { savedAt = statSync(join(dir, f)).mtimeMs } catch { /* ignore */ }
+      rounds.push({ nonce, savedAt })
+    }
+    rounds.sort((a, b) => a.savedAt - b.savedAt)
+    return rounds
+  } catch {
+    return []
+  }
+}
+
+/** 读取指定轮次的归档结果；未知轮次、非法 nonce 或无法解析一律返回 null。 */
+export function loadPersistedResultRound(orderId: string, nonce: string, homeDir?: string): WorkerResult | null {
+  if (!isSafeRoundNonce(nonce)) return null
+  try {
+    const path = join(coordinatorSubagentsDir(homeDir), `${orderId}.${nonce}.json`)
+    if (!existsSync(path)) return null
+    return parseWorkerResult(readFileSync(path, 'utf-8'), orderId)
+  } catch {
+    return null
+  }
+}
+
+/** delegateOrder 内部流转的单次派发状态（首轮 / 重试 / 升级 / 续跑共用同一形状）。 */
+interface DelegateRunState {
+  result: WorkerResult
+  transcript?: WorkerSessionRun['transcript']
+  sessionMessages?: readonly OaiMessage[]
+  usage?: Usage | Partial<Usage>
+  providerName?: string
 }
 
 /** T5: fingerprint a delegation request for result reuse. */
@@ -581,17 +689,17 @@ export class DelegationCoordinator {
   /** W3: stash an aborted worker's checkpoint (bounded FIFO) and annotate the
    *  blocked result with an explicit re-dispatch entry, so the primary KNOWS
    *  the partial work is resumable instead of writing the worker off. */
-  private captureAbortCheckpoint(orderId: string, workerRun: WorkerSessionRun): void {
-    if (!workerRun.checkpoint?.partialResult) return
+  private captureAbortCheckpoint(orderId: string, checkpoint: WorkerCheckpoint | undefined, result: WorkerResult): void {
+    if (!checkpoint?.partialResult) return
     if (this.abortCheckpoints.size >= DelegationCoordinator.MAX_ABORT_CHECKPOINTS && !this.abortCheckpoints.has(orderId)) {
       const oldest = this.abortCheckpoints.keys().next().value
       if (oldest !== undefined) this.abortCheckpoints.delete(oldest)
     }
-    this.abortCheckpoints.set(orderId, workerRun.checkpoint)
-    if (workerRun.result.status === 'blocked') {
-      workerRun.result.nextActions = [
-        ...workerRun.result.nextActions,
-        `Resumable: re-dispatch with delegate_task/delegate_batch resume:'${orderId}' — the worker's partial progress (${workerRun.checkpoint.completedTools.length} tool calls, ${workerRun.checkpoint.partialResult.length} chars) is checkpointed and will be injected as context.`,
+    this.abortCheckpoints.set(orderId, checkpoint)
+    if (result.status === 'blocked') {
+      result.nextActions = [
+        ...result.nextActions,
+        `Resumable: re-dispatch with delegate_task/delegate_batch resume:'${orderId}' — the worker's partial progress (${checkpoint.completedTools.length} tool calls, ${checkpoint.partialResult.length} chars) is checkpointed and will be injected as context.`,
       ]
     }
   }
@@ -1170,14 +1278,18 @@ export class DelegationCoordinator {
         ? tryResumeWorkerResult(request.objective, request.scope.files, request.profile, Date.now())
         : null
       if (resumeHit) {
+        // resume 命中是主控最可能已经丢掉目标的场景（结果来自更早的轮次甚至上一
+        // 个会话），所以这里也要盖章。但**不覆盖**已有的 objective：那是当初真正
+        // 产出这份结果的目标，用「这次请求的目标」盖掉它，会把两者的不一致藏起来。
+        const resumed: WorkerResult = { ...resumeHit, objective: resumeHit.objective ?? request.objective }
         return {
           status: 'completed',
           selectedModel: '[resumed]',
           modelTierShadows: [],
           modelTierGatedDecisions: [],
           gatedInfluenceAudits: [],
-          results: [resumeHit],
-          packet: await buildPrimaryWorkerPacket([resumeHit], this.config.artifactStore),
+          results: [resumed],
+          packet: await buildPrimaryWorkerPacket([resumed], this.config.artifactStore),
         }
       }
 
@@ -1291,6 +1403,155 @@ export class DelegationCoordinator {
     }
 
     return { result, sessionMessages: messages }
+  }
+
+  /**
+   * 预算耗尽后的自动续跑。worker 被 max-turns / 墙钟超时切断时会**正常返回**一个
+   * blocked 结果，走不到下面那套 `catch` 里的重试阶梯——续跑链路（priorMessages +
+   * checkpoint）早就通了，缺的只是扳机。这里把它接上：带着上一轮完整对话再跑，
+   * 字节是热前缀缓存，续一轮几乎不花钱。
+   *
+   * 只覆盖只读工，写工的边界见 `decideContinuation` 的注释。
+   */
+  private async maybeContinueExhausted(
+    order: WorkOrder,
+    workerConfig: WorkerSessionConfig,
+    mergedSignal: AbortSignal,
+    isWrite: boolean,
+    current: DelegateRunState,
+  ): Promise<DelegateRunState> {
+    let run = current
+    let attempt = 0
+
+    while (true) {
+      const decision = decideContinuation({
+        result: run.result,
+        attempt,
+        aborted: mergedSignal.aborted,
+        isWrite,
+        sharedWorktree: this.config.sharedWorktree === true,
+        hasSessionMessages: (run.sessionMessages?.length ?? 0) > 0,
+      })
+      if (!decision.proceed) {
+        if (attempt > 0) debugLog(`[worker-continuation] ${order.id} 停在第 ${attempt} 次续跑：${decision.skipReason}`)
+        break
+      }
+      attempt++
+
+      const continuationOrder: WorkOrder = {
+        ...order,
+        objective: buildContinuationObjective(order.objective, decision.reason, attempt),
+      }
+      const checkpoint = this.abortCheckpoints.get(order.id)
+      const continuationConfig: WorkerSessionConfig = {
+        ...workerConfig,
+        order: continuationOrder,
+        priorMessages: run.sessionMessages,
+        ...(checkpoint ? { checkpoint } : {}),
+      }
+
+      // 续跑重新占用 liveness 槽位——首轮的 finally 已经把它清掉了，不重注册的话
+      // stall sweep 看不到这一轮，静默卡死没人收。跑完必须再清，否则槽位泄漏。
+      this.liveness.register(order.id, this.config.workerStallMs ?? deriveWorkerStallMs({ providerName: workerConfig.providerName, isWrite }))
+      this.ensureStallSweep()
+      debugLog(`[worker-continuation] ${order.id} 第 ${attempt} 次续跑（${decision.reason}）`)
+      // 补偿轮对用户是不可见的额外时间：不发事件的话，面板上只看到一个 worker
+      // 卡在那儿"还在跑"，看不出它已经进入第二次续跑。
+      emitLifecycle(workerConfig, `续跑 ${attempt}/${MAX_BUDGET_CONTINUATIONS} · ${CONTINUATION_REASON_LABEL[decision.reason]}`)
+
+      let continued: WorkerSessionRun
+      try {
+        continued = await this.runWorker(continuationConfig)
+      } catch (error) {
+        // 续跑失败不覆盖首轮成果——保留原结果，让主控看到原始 failureReason。
+        debugLog(`[worker-continuation] ${order.id} 第 ${attempt} 次续跑抛错：${error instanceof Error ? error.message : String(error)}`)
+        break
+      } finally {
+        this.liveness.unregister(order.id)
+        if (this.liveness.size() === 0) this.stopStallSweep()
+      }
+
+      this.captureAbortCheckpoint(order.id, continued.checkpoint, continued.result)
+      const messages = typeof continued.session?.getMessages === 'function'
+        ? continued.session.getMessages()
+        : run.sessionMessages
+      run = {
+        ...run,
+        result: markContinued(continued.result, attempt, decision.reason),
+        transcript: continued.transcript ?? run.transcript,
+        sessionMessages: messages,
+        usage: mergeUsage(run.usage, continued.usage),
+      }
+    }
+
+    return run
+  }
+
+  /**
+   * 证据不达标 → 有界复核（Wave 8）。只读工没有写工那样的闸门修复，宣称与证据对
+   * 不上时此前只是被静默降级。这里给它一轮打回：要么真的复现，要么诚实撤回宣称。
+   *
+   * 三条边界：只覆盖只读工（写工走写闸门的有界修复）；上限一轮；**不阻断交付**
+   * ——复核后仍不达标就照常降级交回，门禁始终在主控收口。
+   */
+  private async maybeReviseEvidence(
+    order: WorkOrder,
+    workerConfig: WorkerSessionConfig,
+    mergedSignal: AbortSignal,
+    isWrite: boolean,
+    current: DelegateRunState,
+  ): Promise<DelegateRunState> {
+    const shortfall = detectEvidenceShortfall(current.result, order.profile, current.transcript)
+    const decision = decideRevision({
+      result: current.result,
+      shortfall,
+      attempt: 0,
+      aborted: mergedSignal.aborted,
+      isWrite,
+      hasSessionMessages: (current.sessionMessages?.length ?? 0) > 0,
+    })
+    if (!decision.proceed) return current
+
+    const revisionOrder: WorkOrder = {
+      ...order,
+      objective: buildRevisionObjective(order.objective, decision.shortfall, current.result.summary),
+    }
+    this.liveness.register(order.id, this.config.workerStallMs ?? deriveWorkerStallMs({ providerName: workerConfig.providerName, isWrite }))
+    this.ensureStallSweep()
+    debugLog(`[worker-revision] ${order.id} 证据不达标（${decision.shortfall}），打回复核一轮`)
+    emitLifecycle(workerConfig, `证据复核 · ${SHORTFALL_LABEL[decision.shortfall]}`)
+
+    let revised: WorkerSessionRun
+    try {
+      revised = await this.runWorker({
+        ...workerConfig,
+        order: revisionOrder,
+        priorMessages: current.sessionMessages,
+      })
+    } catch (error) {
+      debugLog(`[worker-revision] ${order.id} 复核抛错：${error instanceof Error ? error.message : String(error)}`)
+      return current
+    } finally {
+      this.liveness.unregister(order.id)
+      if (this.liveness.size() === 0) this.stopStallSweep()
+    }
+
+    // 复核不该以丢失既有发现为代价——收窄了就不要这一轮，照常降级交回原结果。
+    if (revised.result.findings.length < current.result.findings.length) {
+      debugLog(`[worker-revision] ${order.id} 复核产出的 findings 变少，弃用复核结果`)
+      return current
+    }
+
+    const messages = typeof revised.session?.getMessages === 'function'
+      ? revised.session.getMessages()
+      : current.sessionMessages
+    return {
+      ...current,
+      result: markRevised(revised.result, decision.shortfall),
+      transcript: revised.transcript ?? current.transcript,
+      sessionMessages: messages,
+      usage: mergeUsage(current.usage, revised.usage),
+    }
   }
 
   private async delegateOrder(order: WorkOrder): Promise<CoordinatorRun> {
@@ -1482,7 +1743,7 @@ export class DelegationCoordinator {
 
     this.state.recordEvent({ type: 'running', workOrderId: order.id, timestamp: Date.now() })
 
-    let run: { result: WorkerResult; transcript?: WorkerSessionRun['transcript']; sessionMessages?: readonly OaiMessage[]; usage?: Usage | Partial<Usage>; providerName?: string } | undefined
+    let run: DelegateRunState | undefined
 
     // T3: escalation shadow events collected during retry
     const escalationShadows: ModelTierShadowEvent[] = []
@@ -1633,6 +1894,10 @@ export class DelegationCoordinator {
           const cwd = this.config.cwd ?? workerConfig.cwd
           // Capture session messages from the hands worker for resume persistence.
           let handsSessionMessages: readonly OaiMessage[] | undefined
+          // 写工的断点此前整个丢掉——runHands 只透传 result/usage，内层
+          // WorkerSessionRun.checkpoint 无人接。结果是最容易耗尽预算的一档
+          // worker（32 轮的实现+验证）连「可续跑」这句提示都拿不到。
+          let handsCheckpoint: WorkerCheckpoint | undefined
           // Write workers (patcher/verifier) execute in an isolated git worktree.
           // Worktree lifecycle is managed by runHands → runHandsSession: create
           // before agent runs, collect diff after, cleanup on exit.
@@ -1656,21 +1921,30 @@ export class DelegationCoordinator {
             activeClaims,
             domainKnowledgeStore: this.config.domainKnowledgeStore,
             artifactStore: workerStore,
-            runAgent: async (prompt, callbacks, workerCwd) => {
+            onLifecycle: (detail) => emitLifecycle(workerConfig, detail),
+            runAgent: async (_prompt, callbacks, workerCwd, options) => {
+              // worker prompt 由 order 重建，所以额外轮次的意图走结构化字段而非
+              // prompt 文本：objective 覆盖本轮目标，continueSession 让这一轮接上
+              // 前一轮的完整对话（Wave 7 的 worktree 内续跑靠这两个）。
               const sessionRun = await this.runWorker({
                 ...workerConfig,
-                order,
+                order: options?.objective ? { ...order, objective: options.objective } : order,
                 cwd: workerCwd,
                 activeClaims,
                 domainKnowledgeStore: this.config.domainKnowledgeStore,
+                ...(options?.continueSession && handsSessionMessages && handsSessionMessages.length > 0
+                  ? { priorMessages: handsSessionMessages }
+                  : {}),
               })
               if (typeof sessionRun.session?.getMessages === 'function') {
                 handsSessionMessages = sessionRun.session.getMessages()
               }
+              handsCheckpoint = sessionRun.checkpoint
               callbacks.onTurnComplete(sessionRun.usage, 1, true)
               return JSON.stringify(sessionRun.result)
             },
           }))
+          this.captureAbortCheckpoint(order.id, handsCheckpoint, handsRun.result)
           run = { result: handsRun.result, sessionMessages: handsSessionMessages, usage: handsRun.usage, providerName: workerConfig.providerName }
           this.recordWorkerEpisode(order, handsRun, selected.model)
         } finally {
@@ -1682,7 +1956,7 @@ export class DelegationCoordinator {
         }
       } else {
         const workerRun = await wrapAbort(this.runWorker(workerConfig))
-        this.captureAbortCheckpoint(order.id, workerRun)
+        this.captureAbortCheckpoint(order.id, workerRun.checkpoint, workerRun.result)
         const sessionMessages = typeof workerRun.session?.getMessages === 'function'
           ? workerRun.session.getMessages()
           : undefined
@@ -1750,13 +2024,17 @@ export class DelegationCoordinator {
                   activeClaims: this.config.activeClaims?.() ?? workerConfig.activeClaims ?? [],
                   domainKnowledgeStore: this.config.domainKnowledgeStore,
                   artifactStore: retryWorkerStore,
-                  runAgent: async (prompt, callbacks, workerCwd) => {
+                  onLifecycle: (detail) => emitLifecycle(workerConfig, detail),
+                  runAgent: async (_prompt, callbacks, workerCwd, options) => {
                     const sessionRun = await this.runWorker({
                       ...workerConfig,
-                      order,
+                      order: options?.objective ? { ...order, objective: options.objective } : order,
                       cwd: workerCwd,
                       activeClaims: workerConfig.activeClaims ?? [],
                       domainKnowledgeStore: this.config.domainKnowledgeStore,
+                      ...(options?.continueSession && retryHandsMessages && retryHandsMessages.length > 0
+                        ? { priorMessages: retryHandsMessages }
+                        : {}),
                     })
                     if (typeof sessionRun.session?.getMessages === 'function') {
                       retryHandsMessages = sessionRun.session.getMessages()
@@ -1774,7 +2052,7 @@ export class DelegationCoordinator {
               }
             } else {
               const workerRun = await wrapAbort(this.runWorker(workerConfig))
-              this.captureAbortCheckpoint(order.id, workerRun)
+              this.captureAbortCheckpoint(order.id, workerRun.checkpoint, workerRun.result)
               const sessionMessages = typeof workerRun.session?.getMessages === 'function'
                 ? workerRun.session.getMessages()
                 : undefined
@@ -1887,8 +2165,18 @@ export class DelegationCoordinator {
                   activeClaims: upgradedConfig.activeClaims ?? [],
                   domainKnowledgeStore: this.config.domainKnowledgeStore,
                   artifactStore: escalateWorkerStore,
-                  runAgent: async (prompt, callbacks, workerCwd) => {
-                    const sessionRun = await this.runWorker({ ...upgradedConfig, order, cwd: workerCwd, activeClaims: upgradedConfig.activeClaims ?? [], domainKnowledgeStore: this.config.domainKnowledgeStore })
+                  onLifecycle: (detail) => emitLifecycle(workerConfig, detail),
+                  runAgent: async (_prompt, callbacks, workerCwd, options) => {
+                    const sessionRun = await this.runWorker({
+                      ...upgradedConfig,
+                      order: options?.objective ? { ...order, objective: options.objective } : order,
+                      cwd: workerCwd,
+                      activeClaims: upgradedConfig.activeClaims ?? [],
+                      domainKnowledgeStore: this.config.domainKnowledgeStore,
+                      ...(options?.continueSession && retryHandsMessages && retryHandsMessages.length > 0
+                        ? { priorMessages: retryHandsMessages }
+                        : {}),
+                    })
                     if (typeof sessionRun.session?.getMessages === 'function') {
                       retryHandsMessages = sessionRun.session.getMessages()
                     }
@@ -1992,6 +2280,14 @@ export class DelegationCoordinator {
       }
     }
 
+    // 预算耗尽 → 自动续跑。必须在 enrichResult / 熔断记账 / 升级判定之前：否则
+    // 首轮的 blocked 先污染连败计数，而续跑产出的结果又拿不到模型元数据。
+    run = await this.maybeContinueExhausted(order, workerConfig, mergedSignal, isWrite, run)
+
+    // 证据不达标 → 打回复核一轮。同样必须在 enrichResult / 熔断记账之前：复核
+    // 产出的才是最终结果，让它拿到模型元数据、也让熔断记的是最终判定。
+    run = await this.maybeReviseEvidence(order, workerConfig, mergedSignal, isWrite, run)
+
     // Run completed — regardless of task verdict, the provider's API delivered.
     run.result = this.enrichResult(run.result, selected.model, run.providerName ?? workerConfig.providerName, run.usage)
     this.recordProviderOutcome(selected.model, true)
@@ -2040,6 +2336,15 @@ export class DelegationCoordinator {
       run = { ...run, result: expanded.result, sessionMessages: expanded.sessionMessages }
     }
 
+    // 目标对账：盖上派发侧的 objective，并核一次交回物是否回答了受派的问题。
+    // 位置在摘要扩写**之后**——扩写有机会把偏短的 summary 补起来，先判空壳会把
+    // 本可救回的误判成空。也在 aggregateResults 之前：evidence 门只会把 status
+    // 往严处改，不会把这里判出的 blocked 翻回 passed。
+    //
+    // 批量派发每个 order 也走这条路（delegateBatch → delegateOrder），所以对账
+    // 对 batch worker 同样生效，无须在批聚合处再来一遍。
+    run = { ...run, result: reconcileWithObjective(order, run.result, run.transcript) }
+
     const results = aggregateResults([run.result], 'primary_decides', profileMap, transcriptMap)
     // Wave 3 aggregation path: consume ONLY the verifyWorkerEvidence-gated
     // output — the adapter maps, never re-derives evidence policy.
@@ -2054,10 +2359,11 @@ export class DelegationCoordinator {
       })
     }
 
-    // D1: persist worker result to ~/.rivet/subagents/ for future resume/inspection
+    // D1: persist worker result to ~/.rivet/subagents/ for future resume/inspection.
+    // 带上本次派发 nonce——稳定 order id 复用时逐轮归档，前轮结果不再被覆盖（L1）。
     const fp = fingerprintRequest(order.objective, order.scope.files, order.profile)
     for (const r of results) {
-      persistWorkerResult(r, fp)
+      persistWorkerResult(r, fp, dispatchNonce)
     }
 
     // Save worker session history for resume support. Best-effort: never blocks.
@@ -2244,9 +2550,11 @@ export class DelegationCoordinator {
     const aggregated = [...aggregateResults(allResults, policy, profileMap), ...depthCapped]
     // Wave 3 aggregation path: post-verifyWorkerEvidence facts only.
     this.emitWorkerResultSignals(aggregated)
-    // D1: persist worker results to ~/.rivet/subagents/
+    // D1: persist worker results to ~/.rivet/subagents/。每个 order 此前已走
+    // delegateOrder（那里有 nonce 归档）；这里按各自 nonce 再落一次终态，
+    // 合成结果（深度封顶 / 依赖清扫）没有 nonce，只更新最新副本。
     for (const r of aggregated) {
-      persistWorkerResult(r)
+      persistWorkerResult(r, undefined, this.dispatchNonces.get(r.workOrderId))
     }
 
     const baseRun: CoordinatorRun = {

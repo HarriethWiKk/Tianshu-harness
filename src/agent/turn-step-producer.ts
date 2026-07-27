@@ -36,7 +36,6 @@ import { buildCognitiveProjectionParts, createCognitiveLedger, getCognitivePhase
 import { formatImmuneContext } from './immune-context.js'
 import { VITALS_LITE_KIND } from './telemetry-writer.js'
 import { getCapsuleByStar } from './seed-capsule-store.js'
-import { BlockChargeTracker } from './injection-meter.js'
 import { signalFromLedgerDelta, signalsFromDelivered, signalsFromObligations } from './control-plane-adapters.js'
 import { renderControlPlaneAppendix } from './control-plane.js'
 import { palMode } from './hooks/problem-attack-hook.js'
@@ -164,26 +163,8 @@ export const PHASE_CLASS_MAP: Record<string, string> = {
 export class TurnStepProducer {
   constructor(private readonly self: AgentLoop) {}
 
-  // ── W6 CVM 增量记账基线（appendixDelta 对齐：只有变化字节才计费）──
-  /** 上次计费时的 projection stable 快照 */
-  private lastChargedProjectionStable = ''
-  /** 上次计费时的 toolContext 快照 */
-  private lastChargedToolCtx = ''
-  /** 本轮实际渲染的 toolContext（runPerception 写入，runCognitivePrep 消费） */
-  private lastRenderedToolCtx = ''
   /** 本轮 TurnMode（initializeRun 写入，runPerception 消费） */
   private lastTurnMode: TurnMode = 'chat'
-  /** 计费基线对应的 compact 轮 — compact 重置 appendix baseline 后块全量
-   *  重新入场，计费基线必须同步作废（否则重发字节被漏计）。 */
-  private chargeBaselineCompactTurn: number | null = null
-  /** W2-B1: advisory appendix block 的增量计费基线（appendixDelta 对齐） */
-  private readonly advisoryBlockCharge = new BlockChargeTracker()
-  /** advisory 计费基线对应的 compact 轮（与 chargeBaselineCompactTurn 同语义） */
-  private advisoryChargeBaselineCompactTurn: number | null = null
-  /** Wave 4: control-plane appendix 独立计费 tracker——同一字节绝不同时记在
-   *  advisory-appendix 与 control-appendix（两个 block 互斥，各自持有 tracker）。 */
-  private readonly controlBlockCharge = new BlockChargeTracker()
-  private controlChargeBaselineCompactTurn: number | null = null
 
   /**
    * Step 6a: Per-run initialization — warmup, heartbeat, state resets,
@@ -669,17 +650,6 @@ export class TurnStepProducer {
     const activeStarName = this.self.sessionDomain?.name
     const advisoryBlock = this.self.advisoryBus.render(activeStarName, turn)
     this.self.config.promptEngine.setHarnessAdvisoryBlock(advisoryBlock)
-    // W2-B1 egress metering: advisory appendix block, appendixDelta semantics —
-    // pays full bytes on change, zero at steady state. Compact resets the
-    // appendix baseline → tracker baseline must reset too (bytes re-enter).
-    if (this.self.lastCompactTurn !== this.advisoryChargeBaselineCompactTurn) {
-      this.advisoryChargeBaselineCompactTurn = this.self.lastCompactTurn
-      this.advisoryBlockCharge.reset()
-    }
-    const advisoryChargedChars = this.advisoryBlockCharge.charge(advisoryBlock ?? '')
-    if (advisoryChargedChars > 0) {
-      this.self.pressureMonitor.recordCvmInjection(Math.ceil(advisoryChargedChars / 4), 'advisory-appendix')
-    }
 
     // Phase 2 通道分级：system-reminder 通道条目走消息流细断点（必读通道,
     // 缓存安全:只追加尾部）。目前仅 git-clear 等 immediate 守护使用。
@@ -755,14 +725,6 @@ export class TurnStepProducer {
       if (this.self.controlPlane.mode === 'active') {
         const controlBlock = renderControlPlaneAppendix(frame)
         this.self.config.promptEngine.setControlPlaneAppendix(controlBlock)
-        if (this.self.lastCompactTurn !== this.controlChargeBaselineCompactTurn) {
-          this.controlChargeBaselineCompactTurn = this.self.lastCompactTurn
-          this.controlBlockCharge.reset()
-        }
-        const controlChargedChars = this.controlBlockCharge.charge(controlBlock ?? '')
-        if (controlChargedChars > 0) {
-          this.self.pressureMonitor.recordCvmInjection(Math.ceil(controlChargedChars / 4), 'control-appendix')
-        }
       }
     }
 
@@ -873,6 +835,15 @@ export class TurnStepProducer {
         writeProbe: createWriteEvidenceProbe(this.self.cwd),
       },
     )
+
+    // ── CVM egress metering ──
+    // 盘古呼吸：CVM 保护的资源（context）也是它消耗的资源。账记在字节真正写进
+    // <context-update> 的地方——buildOaiRequest 内部。工具轮复用 cachedAppendix、
+    // 稳态 delta 静默、Top-K 淘汰的块都不进账本，这里自然拿到空数组。
+    // chars / 4 ≈ tokens（够用的粗估，只用于 overhead 比例）
+    for (const { source, chars } of this.self.config.promptEngine.drainAppendixLedger()) {
+      this.self.pressureMonitor.recordCvmInjection(Math.ceil(chars / 4), source)
+    }
 
     return { action: 'proceed', request }
   }
@@ -997,38 +968,9 @@ export class TurnStepProducer {
       ? buildCognitiveProjectionParts(cognitiveLedger, { sycophancyHint, immuneHint, yaoguangHint })
       : { stable: '', ephemeral: '' }
     this.self.config.promptEngine.setCognitiveProjection(projectionStable, projectionEphemeral)
-
-    // ── CVM overhead tracking ──
-    // 盘古呼吸：CVM 保护的资源（context）也是它消耗的资源。
-    // W6 增量计费（incident 20b9714e）：appendixDelta 语义下字节恒定块
-    // 入场付一次、稳态零重发——真实边际成本只有变化字节。旧口径每轮全额
-    // 计费高估 ~10x，137 轮会话的名义开销必然越过 5%/8% 阈值，长会话
-    // 后段镜面被误熄。ephemeral（一次性提示）每轮都是新字节，全额计入。
-    // chars / 4 ≈ tokens (crude but fast estimate for overhead ratio)
-    if (eligibility.projectionMode !== 'none') {
-      // compact 后 appendix baseline 重置 → 块全量重发，计费基线同步作废
-      if (this.self.lastCompactTurn !== this.chargeBaselineCompactTurn) {
-        this.chargeBaselineCompactTurn = this.self.lastCompactTurn
-        this.lastChargedProjectionStable = ''
-        this.lastChargedToolCtx = ''
-      }
-      // W2-B1: per-source tagging — same charge decisions as before, but each
-      // egress books under its own enum tag so telemetry can split
-      // projection/ephemeral/tool-context (sum semantics unchanged).
-      const stableChanged = projectionStable !== this.lastChargedProjectionStable
-      const toolCtxChanged = this.lastRenderedToolCtx !== this.lastChargedToolCtx
-      if (stableChanged && projectionStable.length > 0) {
-        this.self.pressureMonitor.recordCvmInjection(Math.ceil(projectionStable.length / 4), 'projection')
-      }
-      if (projectionEphemeral.length > 0) {
-        this.self.pressureMonitor.recordCvmInjection(Math.ceil(projectionEphemeral.length / 4), 'ephemeral')
-      }
-      if (toolCtxChanged && this.lastRenderedToolCtx.length > 0) {
-        this.self.pressureMonitor.recordCvmInjection(Math.ceil(this.lastRenderedToolCtx.length / 4), 'tool-context')
-      }
-      this.lastChargedProjectionStable = projectionStable
-      this.lastChargedToolCtx = this.lastRenderedToolCtx
-    }
+    // CVM 计量不在这里发生：setter 只是备好内容，字节是否真的上线由
+    // buildAppendixBody 的 delta 判定说了算。计费点见 buildRequest 的
+    // drainAppendixLedger（设计：docs/design/2026-07-26-cvm-overhead-metering-fix.md）。
   }
 
   async runPerception(
@@ -1129,12 +1071,9 @@ export class TurnStepProducer {
     // W6 节流次序反转：toolContext（通道 A 中较贵的块）只在 8% 硬顶才熄，
     // 5% 阈值改为降级通道 B（advisory-bus 隔渲染周期送达，见下）。
     if (this.self.pressureMonitor.isCvmThrottlingCeiling()) {
-      this.lastRenderedToolCtx = ''
       this.self.config.promptEngine.setToolContext(null)
     } else {
-      const renderedToolCtx = renderToolContext(affordanceState, policies, efe) || ''
-      this.lastRenderedToolCtx = renderedToolCtx
-      this.self.config.promptEngine.setToolContext(renderedToolCtx || null)
+      this.self.config.promptEngine.setToolContext(renderToolContext(affordanceState, policies, efe) || null)
     }
     this.self.advisoryBus.setOverheadThrottled(pressureResult.shouldThrottleCvm)
     this.self.recordModelRoutingShadow(currentSensorium, efe)

@@ -6,9 +6,11 @@ import { CACHE_ANCHOR_MESSAGES } from '../compact/constants.js'
 import { estimateOaiTokens } from '../compact/micro.js'
 import { buildSystemPrompt, type StaticPromptContext } from './static.js'
 import type { ToolDefinition } from '../api/types.js'
-import { buildStableVolatileBlock, buildLatestTurnVolatileBlock, buildDynamicAppendixParts, buildConsolidatedBlock, renderTaskDepthAdvisory, renderPlanMethodologyAdvisory, FROZEN_BLOCK_CAPS, type VolatileContext, type ToolHistoryEntry } from './volatile.js'
+import { buildStableVolatileBlock, buildLatestTurnVolatileBlock, buildDynamicAppendixParts, buildConsolidatedBlock, renderTaskDepthAdvisory, renderPlanMethodologyAdvisory, FROZEN_BLOCK_CAPS, type AppendixPart, type VolatileContext, type ToolHistoryEntry } from './volatile.js'
+import type { CvmInjectionSource } from '../context/pressure-monitor.js'
 import type { BudgetInput } from './prefix-budget.js'
 import { analyzeVolatilePayload, LARGE_VOLATILE_PAYLOAD_CHARS, type VolatilePayloadReport } from '../context/payload-diagnostic.js'
+import { selectProjectInstructions } from './project-instructions.js'
 import type { TaskState } from '../agent/task-state.js'
 import type { ContextClaim } from '../context/claims.js'
 import type { PlaybookBullet } from '../agent/playbook.js'
@@ -243,6 +245,18 @@ export class PromptEngine {
   private appendixSeq = 0
   /** Whether a full baseline context-update was sent since last reset. */
   private appendixBaselineSent = false
+  /**
+   * CVM egress ledger: chars of metered appendix sub-blocks ACTUALLY written
+   * into a <context-update> since the last drain. Booked at the emission point
+   * so a block that is byte-stable (delta suppresses it), dropped by Top-K, or
+   * simply not rebuilt on a tool turn costs nothing.
+   *
+   * Invariant: only main-path boundary builds write here — see
+   * buildAppendixBody's chargeLedger parameter.
+   */
+  private appendixLedger: Map<CvmInjectionSource, number> = new Map()
+  /** Fired by resetAppendixBaseline so CVM accounting tracks history rewrites. */
+  private onResetAppendixBaselineCb?: () => void
 
   constructor(config: PromptEngineConfig) {
     this.config = config
@@ -525,14 +539,14 @@ export class PromptEngine {
               const habituated = this.tracker.getHabituated()
               if (habituated.has('playbookLessons')) activeCtx.playbookLessons = undefined
 
-              const activeAppendix = this.actionableTurn ? this.buildAppendixBody(activeCtx, appendixMaxChars) : ''
+              const activeAppendix = this.actionableTurn ? this.buildAppendixBody(activeCtx, appendixMaxChars, !sidePath) : ''
               this.cachedConsolidated = this.consolidatedBlock
-              this.cachedAppendix = this.withEphemeralProjection(activeAppendix)
+              this.cachedAppendix = this.withEphemeralProjection(activeAppendix, !sidePath)
             } else {
               if (this.actionableTurn) {
-                const appendix = this.buildAppendixBody(dynamicCtx, appendixMaxChars)
+                const appendix = this.buildAppendixBody(dynamicCtx, appendixMaxChars, !sidePath)
                 this.cachedConsolidated = this.consolidatedBlock
-                this.cachedAppendix = this.withEphemeralProjection(appendix)
+                this.cachedAppendix = this.withEphemeralProjection(appendix, !sidePath)
               } else {
                 this.cachedConsolidated = ''
                 this.cachedAppendix = ''
@@ -871,7 +885,9 @@ export class PromptEngine {
       { name: 'static.ts BASE_PROMPT', category: 'brake', content: this.systemPrompt },
       { name: 'star-domain volatileBlock', category: 'brake', content: ctx.activeDomain?.volatileBlock },
       { name: '工具 schema (JSON)', category: 'tools', content: JSON.stringify(this.config.staticCtx.tools) },
-      { name: 'project-instructions', category: 'reference', content: ctx.rivetMd?.slice(0, caps.projectInstructions), cap: caps.projectInstructions, rawChars: ctx.rivetMd?.length },
+      // 与渲染层同一套按节选取——`slice(0, cap)` 会把报告写成「按前 N 字符收录」，
+      // 而实际收录的是另一组章节，归因数字对不上真实前缀。
+      { name: 'project-instructions', category: 'reference', content: ctx.rivetMd ? selectProjectInstructions(ctx.rivetMd, caps.projectInstructions).text : undefined, cap: caps.projectInstructions, rawChars: ctx.rivetMd?.length },
       { name: 'project-memory', category: 'reference', content: ctx.projectMemoryBlock?.slice(0, caps.projectMemory), cap: caps.projectMemory, rawChars: ctx.projectMemoryBlock?.length },
       { name: 'knowledge-manifest', category: 'reference', content: ctx.knowledgeManifestBlock?.slice(0, caps.knowledgeManifest), cap: caps.knowledgeManifest, rawChars: ctx.knowledgeManifestBlock?.length },
       { name: 'codebase-index', category: 'reference', content: ctx.projectIndexBlock?.slice(0, caps.codebaseIndex), cap: caps.codebaseIndex, rawChars: ctx.projectIndexBlock?.length },
@@ -1162,9 +1178,11 @@ export class PromptEngine {
 
   /** Prepend per-turn ephemeral cognitive hints OUTSIDE the delta context-update.
    *  cachedAppendix is frozen across a user message's tool turns, so this stays
-   *  stable within a turn sequence and only refreshes at the next user boundary. */
-  private withEphemeralProjection(appendix: string): string {
+   *  stable within a turn sequence and only refreshes at the next user boundary.
+   *  These bytes ship in full every boundary (no delta), so they book in full. */
+  private withEphemeralProjection(appendix: string, chargeLedger: boolean): string {
     if (!this.cognitiveEphemeral) return appendix
+    if (chargeLedger) this.chargeAppendixLedger('ephemeral', this.cognitiveEphemeral.length)
     return appendix ? `${this.cognitiveEphemeral}\n${appendix}` : this.cognitiveEphemeral
   }
 
@@ -1200,29 +1218,64 @@ export class PromptEngine {
    * boundary, emit full baseline (seq=1). Subsequent boundaries emit only
    * changed sub-blocks (mode="delta"), or self-closing tag if nothing changed.
    * Tool-call turns reuse cachedAppendix (never calling this method).
+   *
+   * `chargeLedger` must be false for hermetic side-path builds: their appendix
+   * bytes never reach the main history, so booking them would re-introduce the
+   * overcounting this metering exists to avoid.
    */
-  private buildAppendixBody(ctx: VolatileContext, maxChars?: number): string {
+  private buildAppendixBody(ctx: VolatileContext, maxChars: number | undefined, chargeLedger: boolean): string {
     const parts = buildDynamicAppendixParts(ctx, maxChars)
     if (!this.config.appendixDelta) {
       if (parts.length === 0) return ''
+      this.chargeAppendixParts(parts, chargeLedger)
       return `<context-update>\n${parts.map(p => p.content).join('\n\n')}\n</context-update>`
     }
     this.appendixSeq++
     const current = new Map<string, string>()
-    const changed: string[] = []
+    const changed: AppendixPart[] = []
     for (const p of parts) {
       current.set(p.name, p.content)
-      if (this.lastEmittedAppendixParts.get(p.name) !== p.content) changed.push(p.content)
+      if (this.lastEmittedAppendixParts.get(p.name) !== p.content) changed.push(p)
     }
     const sendFull = !this.appendixBaselineSent
     this.lastEmittedAppendixParts = current
     this.appendixBaselineSent = true
     if (sendFull) {
       if (parts.length === 0) return ''
+      this.chargeAppendixParts(parts, chargeLedger)
       return `<context-update seq="${this.appendixSeq}">\n${parts.map(p => p.content).join('\n\n')}\n</context-update>`
     }
     if (changed.length === 0) return `<context-update seq="${this.appendixSeq}"/>`
-    return `<context-update seq="${this.appendixSeq}" mode="delta">\n${changed.join('\n\n')}\n</context-update>`
+    this.chargeAppendixParts(changed, chargeLedger)
+    return `<context-update seq="${this.appendixSeq}" mode="delta">\n${changed.map(p => p.content).join('\n\n')}\n</context-update>`
+  }
+
+  /** Book the chars of appendix sub-blocks that carry a CVM source tag. */
+  private chargeAppendixLedger(source: CvmInjectionSource, chars: number): void {
+    if (chars <= 0) return
+    this.appendixLedger.set(source, (this.appendixLedger.get(source) ?? 0) + chars)
+  }
+
+  private chargeAppendixParts(emitted: AppendixPart[], chargeLedger: boolean): void {
+    if (!chargeLedger) return
+    for (const p of emitted) {
+      if (p.source) this.chargeAppendixLedger(p.source, p.content.length)
+    }
+  }
+
+  /**
+   * Hand over the CVM egress booked since the last call and clear it.
+   *
+   * Consume-once on purpose. The alternative — hanging the ledger off the
+   * OaiChatRequest — would leak through `{...request}` spreads (llm-speculation)
+   * and be replayed verbatim by FallbackStreamClient failover, double-charging
+   * every retried turn. Same class of bug as the prefixProbe poisoning of 2026-07-06.
+   */
+  drainAppendixLedger(): Array<{ source: CvmInjectionSource; chars: number }> {
+    if (this.appendixLedger.size === 0) return []
+    const rows = [...this.appendixLedger].map(([source, chars]) => ({ source, chars }))
+    this.appendixLedger.clear()
+    return rows
   }
 
   /**
@@ -1239,10 +1292,22 @@ export class PromptEngine {
    * rewrite/compaction drops messages carrying prior context-update blocks —
    * the model needs a fresh full snapshot because delta's "absent = unchanged"
    * semantics rely on the history still being present.
+   *
+   * The same event invalidates CVM accounting: the appendix bytes booked so far
+   * just left the context. Registered listeners (the pressure monitor) are
+   * notified here rather than at each of the ten call sites, so the two cannot
+   * drift apart.
    */
   resetAppendixBaseline(): void {
     this.lastEmittedAppendixParts = new Map()
     this.appendixBaselineSent = false
+    this.appendixLedger.clear()
+    this.onResetAppendixBaselineCb?.()
+  }
+
+  /** Register the CVM accounting reset that must accompany a baseline reset. */
+  setOnResetAppendixBaseline(fn: () => void): void {
+    this.onResetAppendixBaselineCb = fn
   }
 
   /**

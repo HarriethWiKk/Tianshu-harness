@@ -179,6 +179,34 @@ describe('read history invalidation after edits', () => {
     const r = await READ_SECTION_TOOL.execute(params({ file_path: fp, section: 'L1-L2' }, 'sessA'))
     assert.ok(r.content.includes('已变更'), `staleness note must appear: ${r.content.slice(0, 120)}`)
   })
+
+  it('edit_file rollback → hash_edit position-only does NOT false-report staleness', async () => {
+    // Regression: edit_file 失败回滚后 copyFileSync 改变 mtime，但内容已恢复。
+    // 此前 hash_edit 的仅位置锚点检查会看到 mtime 不匹配，报告"文件已变化"，
+    // 主控被要求重读——浪费一轮。修复后回滚路径会刷新 mtime 追踪器。
+    const fp = join(dir, 'src/rollback.ts')
+    writeFileSync(fp, `const x: number = 1\nconst y: string = "hello"\n`, 'utf-8')
+    await READ_FILE_TOOL.execute(params({ file_path: fp }, 'sessA'))
+
+    // 故意引入 TypeScript 语法错误触发回滚
+    const bad = await EDIT_FILE_TOOL.execute(params({
+      file_path: fp,
+      old_string: 'const x: number = 1',
+      new_string: 'const x: number = ;', // 语法错
+    }, 'sessA'))
+    assert.ok(bad.isError, 'must fail with syntax error')
+    assert.ok(bad.content.includes('回滚'), `must mention rollback: ${bad.content.slice(0, 120)}`)
+
+    // 回滚后，仅位置锚点的 hash_edit 不应再报告 mtime 漂移
+    const h = await HASH_EDIT_TOOL.execute(params({
+      file_path: fp,
+      anchors: ['L1'],
+      new_string: 'const x: number = 42',
+    }, 'sessA'))
+    assert.ok(!h.isError, `hash_edit should succeed after rollback: ${h.content.slice(0, 160)}`)
+    assert.ok(!h.content.includes('已修改'), `must not report file modification after rollback: ${h.content.slice(0, 200)}`)
+    assert.ok(!h.content.includes('仅位置锚点'), `must not warn about position drift after rollback: ${h.content.slice(0, 200)}`)
+  })
 })
 
 describe('in-process concurrent session isolation', () => {

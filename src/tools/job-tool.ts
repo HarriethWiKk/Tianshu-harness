@@ -94,7 +94,7 @@ Actions:
       case 'kill': {
         if (!id) return { content: 'kill 需要 id 参数。', isError: true }
         const ok = jobs.kill(id)
-        return { content: ok ? `已发送终止信号给任务 ${id}。` : `未找到任务 ${id}。`, uiContent: `kill ${id}`, isError: !ok }
+        return { content: ok ? `已发送终止信号给任务 ${id}。` : `任务 ${id} 不存在或已结束。`, uiContent: `kill ${id}`, isError: !ok }
       }
 
       default:

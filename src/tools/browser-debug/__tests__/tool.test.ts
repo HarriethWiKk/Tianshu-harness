@@ -96,6 +96,12 @@ class FakeDriver implements BrowserDebugDriver {
     this.calls.push(`setStorage:${kind}:${key}:${value}`)
   }
   async clearStorage(kind: 'local' | 'session') { this.calls.push(`clearStorage:${kind}`) }
+  size: { width: number; height: number } | null = { width: 1280, height: 800 }
+  async setViewport(width: number, height: number) {
+    this.calls.push(`viewport:${width}x${height}`)
+    this.size = { width, height }
+  }
+  viewportSize() { return this.size }
   currentUrl() {
     return this.url
   }
@@ -156,6 +162,66 @@ test('localhost navigation uses sessionId bucket', async () => {
   const status = await tool.execute(params({ action: 'status' }, { sessionId: 'worker-1' }))
   assert.match(status.content, /会话：worker-1/)
   await tool.execute(params({ action: 'close' }, { sessionId: 'worker-1' }))
+})
+
+test('open honours width/height and set_viewport resizes the live page', async () => {
+  __resetSessionForTest()
+  const tool = makeTool()
+  await tool.execute(params({ action: 'open', url: 'http://localhost:3000/', width: 390, height: 844 }))
+  assert.deepEqual(FakeDriver.lastLaunchOpts?.viewport, { width: 390, height: 844 })
+  assert.deepEqual(FakeDriver.last?.size, { width: 390, height: 844 })
+
+  const res = await tool.execute(params({ action: 'set_viewport', width: 1440, height: 900 }))
+  assert.equal(res.isError, undefined)
+  assert.match(res.content, /1440×900/)
+  assert.deepEqual(FakeDriver.last?.size, { width: 1440, height: 900 })
+  await tool.execute(params({ action: 'close' }))
+})
+
+test('width-only resize keeps the height the page already has', async () => {
+  __resetSessionForTest()
+  const tool = makeTool()
+  await tool.execute(params({ action: 'open', url: 'http://localhost:3000/', width: 1440, height: 900 }))
+  await tool.execute(params({ action: 'set_viewport', width: 768 }))
+  assert.deepEqual(FakeDriver.last?.size, { width: 768, height: 900 })
+  await tool.execute(params({ action: 'close' }))
+})
+
+test('set_viewport rejects out-of-range and non-integer sizes', async () => {
+  __resetSessionForTest()
+  const tool = makeTool()
+  await tool.execute(params({ action: 'open', url: 'http://localhost:3000/' }))
+  const tooWide = await tool.execute(params({ action: 'set_viewport', width: 99_999 }))
+  assert.equal(tooWide.isError, true)
+  assert.match(tooWide.content, /超出范围/)
+  const fractional = await tool.execute(params({ action: 'set_viewport', width: 800.5 }))
+  assert.equal(fractional.isError, true)
+  assert.match(fractional.content, /整数/)
+  const missing = await tool.execute(params({ action: 'set_viewport' }))
+  assert.equal(missing.isError, true)
+  await tool.execute(params({ action: 'close' }))
+})
+
+test('screenshot attaches the PNG on the vision channel and reports the viewport', async () => {
+  __resetSessionForTest()
+  const tool = makeTool()
+  await tool.execute(params({ action: 'open', url: 'http://localhost:3000/', width: 1440, height: 900 }))
+  const res = await tool.execute(params({ action: 'screenshot' }))
+  assert.equal(res.isError, undefined)
+  assert.match(res.content, /视口 1440×900/)
+  assert.deepEqual(res.images, [`data:image/png;base64,${Buffer.from('PNGDATA').toString('base64')}`])
+  await tool.execute(params({ action: 'close' }))
+})
+
+test('oversized screenshot keeps the file reference but skips the vision channel', async () => {
+  __resetSessionForTest()
+  const tool = makeTool()
+  await tool.execute(params({ action: 'open', url: 'http://localhost:3000/' }))
+  FakeDriver.last!.screenshot = async () => Buffer.alloc(4_000_000)
+  const res = await tool.execute(params({ action: 'screenshot' }))
+  assert.equal(res.images, undefined)
+  assert.match(res.content, /超出视觉通道上限/)
+  await tool.execute(params({ action: 'close' }))
 })
 
 test('network url_filter and include_body', async () => {

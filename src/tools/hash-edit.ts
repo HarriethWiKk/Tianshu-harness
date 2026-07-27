@@ -4,7 +4,7 @@ import { relative } from 'node:path'
 import type { Tool, ToolCallParams } from './types.js'
 import { validatePath } from './path-validate.js'
 import { syntaxCheck, checkSyntax } from './syntax-check.js'
-import { detectPointerPlaceholder, pointerPlaceholderError } from './pointer-guard.js'
+import { detectPointerPlaceholder, pointerPlaceholderError, resolveIdempotentPointer } from './pointer-guard.js'
 import { getFileReadMtime, noteFileObserved, recordSuccessfulEdit, wasFileEditedBySession, incrementEditFailCount, resetEditFailCount } from './read-file.js'
 import { landingWriteFile, delegatedToToolResult, isDelegateRejected } from './client-delegate.js'
 import { trackFileChange, restoreLatestBackup } from '../agent/recovery-stack.js'
@@ -76,6 +76,15 @@ async function finalizeHashEdit(
   if (check.fatal) {
     const relPath = relative(cwd, filePath)
     const restored = restoreLatestBackup(cwd, relPath)
+    // 回滚后 mtime 会变（copyFileSync 不保留原始时间戳），但内容已恢复。
+    // 刷新读文件 mtime 追踪器——否则后续 hash_edit 的仅位置锚点检查会误报
+    // "文件已变化，请重新 read_file"。
+    if (restored) {
+      try {
+        const s = await stat(filePath)
+        noteFileObserved(filePath, s.mtimeMs, s.size, sessionId)
+      } catch { /* stat 失败不影响主流程 */ }
+    }
     const fails = incrementEditFailCount(filePath)
     const gatePrefix = fails >= 3 ? `此文件已连续 hash_edit 失败 ${fails} 次，再次编辑前必须先重新 read_file。\n\n` : ''
     const rollbackMsg = restored ? '更改已自动回滚。' : '自动回滚失败。'
@@ -329,6 +338,8 @@ apply_patch 加 unified diff。
     if (typeof newStringInput === 'string') {
       const matchedPointer = detectPointerPlaceholder(newStringInput)
       if (matchedPointer) {
+        const resolved = await resolveIdempotentPointer({ mode: 'edit', filePath, value: newStringInput, matchedPrefix: matchedPointer })
+        if (resolved) return resolved
         return {
           content: pointerPlaceholderError({ toolName: 'hash_edit', field: 'new_string', matchedPrefix: matchedPointer, filePath }),
           isError: true,

@@ -19,6 +19,9 @@ import { WRITE_FILE_POINTER_PREFIX } from './write-file-arg-processor.js'
 import { EDIT_FILE_POINTER_PREFIX } from './edit-file-arg-processor.js'
 import { HASH_EDIT_POINTER_PREFIX } from './hash-edit-arg-processor.js'
 import { POINTER_INTERNAL_TAG } from './pointer-tag.js'
+import { readFile } from 'node:fs/promises'
+import { toPosixPath } from '../path-format.js'
+import { canonicalizePathForCompare } from '../agent/plan-mode.js'
 
 /** edit_file's new_string collapse marker (see edit-file-arg-processor render). */
 export const EDIT_NEW_BLOCK_POINTER_PREFIX = '[new block'
@@ -95,9 +98,10 @@ function detectPointerPlaceholderInLine(line: string): string | null {
 }
 
 /**
- * Model-facing rejection message. Explains the placeholder mechanism (the model
- * cannot know its own history was rewritten) and gives the concrete recovery
- * path, so a single rejection is enough to break the imitation loop.
+ * Rejection message visible to both the model (as tool result) and the user
+ * (on the TUI).  Explains *what happened* in plain terms first, then gives
+ * the model a concrete recovery path.  Avoids internal jargon that a human
+ * reader cannot decode.  A machine-only marker is appended for hook detection.
  */
 export function pointerPlaceholderError(opts: {
   toolName: string
@@ -106,9 +110,79 @@ export function pointerPlaceholderError(opts: {
   filePath: string
 }): string {
   return (
-    `错误：${opts.field} 的内容是 ${POINTER_GUARD_ERROR_MARKER}（"${opts.matchedPrefix} …"），不是真实的文件内容。 `
-    + `这类占位符只在你的历史消息中出现——大内容写入成功后参数会被替换成显示指针，它们从来不是合法输入。 `
-    + `不要模仿历史里的占位符格式。修复：在 ${opts.field} 参数中写出完整的真实内容（可以是完整代码）；`
-    + `如果需要此文件的旧版本，请先 read_file ${opts.filePath}。`
+    `❌ 写入被拦截：${opts.field} 的内容是系统显示占位符（"${opts.matchedPrefix} …"），不是真实的文件内容。\n\n`
+    + `原因：大内容写入成功后，历史消息中的参数会被替换为显示占位符（节省上下文 token）。AI 有时会误把占位符当正文写入。\n\n`
+    + `修复：用真实的完整内容重新调用 ${opts.toolName}。若需查看文件的当前内容，先 read_file ${opts.filePath}。\n\n`
+    + `[${POINTER_GUARD_ERROR_MARKER}]`
   )
+}
+
+// ── Idempotent pointer resolution (shared across write_file / edit_file / hash_edit / plan) ──
+
+/** 从任意工具的回吐指针首行解析出路径。
+ *  各工具指针格式统一为 `<prefix> <path> — …` 或 `<prefix> <path>: …`。
+ *  — 分隔符见于 write_file / hash_edit / plan；
+ *  : 分隔符见于 edit_file 的 old_string 指针（`[edit on <path>: replaced …]`）。 */
+function parsePointerPath(value: string, prefix: string): string | null {
+  const firstLine = value.trimStart().split(/\r?\n/, 1)[0] ?? ''
+  if (!firstLine.startsWith(prefix)) return null
+  const after = firstLine.slice(prefix.length).trimStart()
+  // Find the earliest separator — both " — " and ": " can appear in
+  // descriptive text; the one closest to the prefix is the path delimiter.
+  let bestIdx = Infinity
+  for (const sep of [' — ', ': ']) {
+    const idx = after.indexOf(sep)
+    if (idx >= 0 && idx < bestIdx) bestIdx = idx
+  }
+  if (bestIdx < Infinity) return after.slice(0, bestIdx).trim()
+  const path = after.split(/\s/, 1)[0]?.trim()
+  return path && path.length > 0 ? path : null
+}
+
+export interface IdempotentResolveInput {
+  mode: 'full' | 'edit'
+  filePath: string
+  value: string
+  matchedPrefix: string
+}
+
+/**
+ * 通用幂等化解：模型把历史里的显示指针当内容回吐时，若指针路径与本次目标一致
+ * 且磁盘状态自洽，则按幂等成功返回（正向断模仿循环）；否则返回 null 让调用方
+ * 走原 pointer-guard 硬错误。绝不把真实错误吞成成功。
+ *
+ * - mode='full'（write_file）：磁盘行数须与指针记录精确一致，chars 容 CRLF 偏差。
+ * - mode='edit'（edit_file/hash_edit/plan）：指针记录的是块大小非整文件——只校验
+ *   路径一致 + 目标文件存在，视为「该编辑上一轮已应用」的 no-op。
+ */
+export async function resolveIdempotentPointer(
+  input: IdempotentResolveInput,
+): Promise<{ content: string; isError?: false } | null> {
+  const ptrPath = parsePointerPath(input.value, input.matchedPrefix)
+  if (!ptrPath) return null
+  if (canonicalizePathForCompare(ptrPath) !== canonicalizePathForCompare(toPosixPath(input.filePath))) return null
+
+  let onDisk: string
+  try {
+    onDisk = (await readFile(input.filePath, 'utf-8')).replace(/\r\n/g, '\n')
+  } catch {
+    return null
+  }
+
+  if (input.mode === 'full') {
+    const m = /(\d+) lines?, (\d+) chars/.exec(input.value)
+    if (!m) return null
+    const wantLines = Number(m[1]); const wantChars = Number(m[2])
+    const lines = onDisk.split('\n').length
+    if (lines !== wantLines || Math.abs(onDisk.length - wantChars) > wantLines) return null
+    return {
+      content: `该文件已是指针所指向的内容（磁盘为凭：${lines} lines，路径一致），本次按幂等成功处理、未做写入。`
+        + `那是消息历史里的显示指针被当作内容回传的自动化解——以后如需修改请先 read_file 再编辑；如需整文件重写，请写出完整真实内容。`,
+    }
+  }
+
+  return {
+    content: `该编辑已应用到磁盘（路径一致，文件存在），本次按幂等无需重复应用。`
+      + `你回传的是消息历史里的 "${input.matchedPrefix} …" 显示指针（不是真实内容）——如需继续修改请先 read_file ${toPosixPath(input.filePath)} 看当前内容。`,
+  }
 }

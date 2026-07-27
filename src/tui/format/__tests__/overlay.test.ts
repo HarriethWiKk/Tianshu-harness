@@ -122,7 +122,7 @@ describe('renderTasks: per-worker 舰队', () => {
     assert.ok(text.includes('运行中'), '标题栏 filter tab 高亮运行中')
     assert.ok(text.includes('任务组'), '单组用「任务组」标题')
     assert.ok(text.includes('1/3 完成'))
-    assert.ok(text.includes('T1·code_scout'))
+    assert.ok(text.includes('T1 侦察代码'), '行内展示中文身份（shortLabel + 紧凑职能）')
     assert.ok(text.includes('grep seams'))
     assert.ok(text.includes('Enter:详情'))
     assert.ok(text.includes('Tab:筛选'))
@@ -187,7 +187,7 @@ describe('renderTasks: per-worker 舰队', () => {
     const lines = renderTasks(data, 60, 12, theme, 1)
     const text = stripAnsi(lines.join('\n'))
     // 第二个 worker 行应以 > 开头（去 ANSI 后仍是 >）
-    const workerLines = text.split('\n').filter(l => l.includes('A·') || l.includes('B·'))
+    const workerLines = text.split('\n').filter(l => /[AB] worker/.test(l))
     assert.equal(workerLines.length, 2)
     assert.ok(!workerLines[0]!.includes('>'), 'first worker not selected')
     assert.ok(workerLines[1]!.includes('>'), 'second worker selected')
@@ -239,7 +239,7 @@ describe('renderTasks: objective 子行', () => {
   it('有 objective 时在主行下渲染缩进子行', () => {
     const text = stripAnsi(renderTasks(dataWith(1, '定位舰队行渲染函数与列宽计算'), 70, 14, theme).join('\n'))
     const lines = text.split('\n')
-    const mainIdx = lines.findIndex(l => l.includes('T1·code_scout'))
+    const mainIdx = lines.findIndex(l => l.includes('T1 侦察代码'))
     assert.ok(mainIdx >= 0, '主行存在')
     assert.ok(lines[mainIdx + 1]!.includes('定位舰队行渲染函数'), 'objective 紧跟在主行之后')
   })
@@ -247,7 +247,7 @@ describe('renderTasks: objective 子行', () => {
   it('无 objective 时不产生空子行', () => {
     const text = stripAnsi(renderTasks(dataWith(1), 70, 14, theme).join('\n'))
     const lines = text.split('\n')
-    const mainIdx = lines.findIndex(l => l.includes('T1·code_scout'))
+    const mainIdx = lines.findIndex(l => l.includes('T1 侦察代码'))
     // 帧内空行仍带左右边框，比较时先剥掉。
     const innerText = lines[mainIdx + 1]!.replace(/[│┃]/g, '').trim()
     assert.equal(innerText, '', '主行之后应是空白填充行，不是缩进子行')
@@ -257,7 +257,7 @@ describe('renderTasks: objective 子行', () => {
     // 1 组 + 3 worker × 2 行 = 7 行需求；height 12 → maxEntries 6，装不下。
     const text = stripAnsi(renderTasks(dataWith(3, '这是一个目标'), 70, 12, theme).join('\n'))
     assert.ok(!text.includes('这是一个目标'), 'objective 子行被整体省略')
-    for (const label of ['T1·', 'T2·', 'T3·']) {
+    for (const label of ['T1 侦', 'T2 侦', 'T3 侦']) {
       assert.ok(text.includes(label), `${label} 仍在列表内`)
     }
   })
@@ -271,7 +271,7 @@ describe('renderTasks: objective 子行', () => {
     const lines = renderTasks(dataWith(2, '目标文本'), 70, 16, theme, 1)
     const text = stripAnsi(lines.join('\n'))
     const rows = text.split('\n')
-    const secondMain = rows.findIndex(l => l.includes('T2·code_scout'))
+    const secondMain = rows.findIndex(l => l.includes('T2 侦察代码'))
     assert.ok(rows[secondMain]!.includes('>'), '光标在第二个 worker 主行')
     assert.ok(!rows[secondMain + 1]!.includes('>'), '子行不带光标')
   })

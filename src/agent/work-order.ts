@@ -214,6 +214,19 @@ export const workerResultSchema = z.object({
   evidenceStatus: z.enum(['verified', 'failed', 'blocked', 'unverified', 'skipped']).default('unverified'),
   /** Why the worker failed — enables recovery-strategy differentiation. */
   failureReason: z.enum(['caller_aborted', 'circuit_open', 'claim_conflict', 'timeout', 'max_turns', 'json_parse', 'schema_mismatch', 'worker_crash', 'worker_blocked', 'unknown']).optional(),
+  /** Runtime metadata: 派发时的 objective，由 coordinator 盖章。
+   *
+   *  刻意**不进** `workerResultIngestSchema`——那份是 worker 自报的入口，zod 会
+   *  把它写的 objective 剥掉。对账的两边必须有一边来自派发侧，否则 worker 可以
+   *  把目标和交付写成自洽的一对。主控 packet 靠它把「派它去做什么」与「它交回
+   *  什么」并排放在一起。 */
+  objective: z.string().optional(),
+  /** Runtime metadata: 派发侧 profile，由 coordinator 与 objective 同点盖章。
+   *  刻意不进 ingest schema（同 objective 纪律）——digest/展示拿它标识身份时
+   *  不能信 worker 自报。 */
+  profile: z.string().optional(),
+  /** Runtime metadata: 派发侧 authority（星域 id），与 profile 同点盖章。 */
+  authority: z.string().optional(),
   /** Runtime metadata: actual model used by the worker. */
   model: z.string().optional(),
   /** Runtime metadata: provider used by the worker. */
@@ -260,6 +273,11 @@ const workerResultIngestSchema = z.object({
     z.undefined().transform(() => [] as (Record<string, unknown> | string)[]),
   ]).default([]),
   evidenceStatus: z.enum(['verified', 'failed', 'blocked', 'unverified', 'skipped']).default('unverified'),
+  /** 运行时字段，不指望模型自己写。但 hands 路径会把上游构造好的结果
+   *  `JSON.stringify` 后交给 `parseWorkerResult` 再解一次——不收这个键的话，
+   *  写工的失败原因（含续跑判据依赖的 max_turns / timeout）会在这道内部序列化
+   *  边界上被静默剥掉，主控只看到一个没有原因的 blocked。 */
+  failureReason: z.enum(['caller_aborted', 'circuit_open', 'claim_conflict', 'timeout', 'max_turns', 'json_parse', 'schema_mismatch', 'worker_crash', 'worker_blocked', 'unknown']).optional(),
 })
 
 export type WorkerResult = z.infer<typeof workerResultSchema>

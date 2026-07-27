@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import { bashGitBypassesScope, isDestructiveGitAction } from '../approval-risk.js'
-import { assessToolRisk, DANGEROUS_BASH_PATTERNS, BASH_WRITE_PATTERNS, bashCommandMayWrite, requiresBashWriteApproval, CONFIDENCE_THRESHOLDS } from '../approval-risk.js'
+import { assessToolRisk, DANGEROUS_BASH_PATTERNS, BASH_WRITE_PATTERNS, bashCommandMayWrite, requiresBashWriteApproval, requiresUnconditionalApproval, CONFIDENCE_THRESHOLDS } from '../approval-risk.js'
 import type { ContextClaim } from '../../context/claims.js'
 import type { Sensorium } from '../sensorium.js'
 
@@ -593,5 +593,23 @@ describe('SED_BYPASS_PATTERNS', () => {
   it('does not flag sed on regular project files', () => {
     const result = assessToolRisk('bash', { command: "sed -i 's/foo/bar/' src/main.ts" }, 'none', [], undefined)
     assert.ok(!result.reasons.some(r => r.includes('sed bypass')))
+  })
+})
+
+describe('requiresUnconditionalApproval — sandbox boundary', () => {
+  it('always gates request_path_access, whatever the input', () => {
+    assert.equal(requiresUnconditionalApproval('request_path_access', { path: '/etc' }), true)
+    assert.equal(requiresUnconditionalApproval('request_path_access', {}), true)
+  })
+
+  it('still gates the computer_use arbitrary-JS surface', () => {
+    assert.equal(requiresUnconditionalApproval('computer_use', { action: 'js_eval' }), true)
+    assert.equal(requiresUnconditionalApproval('computer_use', { action: 'browser_adopt' }), true)
+  })
+
+  it('leaves ordinary tools ungated', () => {
+    assert.equal(requiresUnconditionalApproval('bash', { command: 'rm -rf /' }), false)
+    assert.equal(requiresUnconditionalApproval('write_file', { file_path: '/etc/hosts' }), false)
+    assert.equal(requiresUnconditionalApproval('computer_use', { action: 'screenshot' }), false)
   })
 })

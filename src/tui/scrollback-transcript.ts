@@ -5,12 +5,14 @@
  * 解析策略（保守启发式）：
  * - 按行扫描，识别消息起始标记。
  * - 用户消息：行首（去 ANSI 后）为 `▌` 或 `❯`。
- * - 工具结果：行首（去 ANSI 后）为 `●`。
+ * - 工具结果：行首（去 ANSI 后）为工具卡 bullet 之一（`›` 成功 / `✗` 失败 /
+ *   `⠋` 进行中 / `?` 待答 / `●` live 卡）。
  * - 其余连续行归为一个 assistant/system 块。
- * - 截断检测：消息内含 `… +N lines [Ctrl+O]` 或 `… [Ctrl+O]` 时标记为 truncated。
+ * - 截断检测：交给 truncation-marker.ts 的共享正则（同时认中文与历史英文标记）。
  */
 
 import { displayWidth } from './width.js'
+import { TRUNCATION_MARKER_RE } from './truncation-marker.js'
 
 const ANSI_RE = /\x1B\[[0-9;]*[a-zA-Z]/g
 
@@ -36,24 +38,23 @@ export interface TranscriptMessage {
   rawContent: string
 }
 
+const TOOL_BULLETS = ['\u25CF', '\u203A', '\u2717', '\u280B', '? '] as const
+
 function detectRole(strippedFirstLine: string): TranscriptRole | null {
   const trimmed = strippedFirstLine.trimStart()
   // U+258C left half block (user marker) / U+276F heavy right-pointing angle bracket
   if (trimmed.startsWith('\u258C') || trimmed.startsWith('\u276F')) return 'user'
-  // U+25CF black circle (tool marker)
-  if (trimmed.startsWith('\u25CF')) return 'tool'
+  // 工具卡 bullet 全集：U+25CF ● (live) / U+203A › (成功) / U+2717 ✗ (失败) /
+  // U+280B ⠋ (进行中) / '?' (待答)。ASCII 降级轨的 '>' 'x' '-' 不在此列——
+  // 它们与普通正文首字符撞车，误判代价高于漏判。
+  if (TOOL_BULLETS.some(b => trimmed.startsWith(b))) return 'tool'
   // box-drawing corners for system blocks
   if (trimmed.startsWith('┌─') || trimmed.startsWith('╭─')) return 'system'
   return null
 }
 
 function isTruncatedMessage(lines: string[]): boolean {
-  for (const line of lines) {
-    const stripped = stripAnsi(line)
-    if (/…\s*\+\d+\s+lines\s*\[Ctrl\+O\]/i.test(stripped)) return true
-    if (/…\s*\[Ctrl\+O\]/i.test(stripped)) return true
-  }
-  return false
+  return lines.some(line => TRUNCATION_MARKER_RE.test(stripAnsi(line)))
 }
 
 function makeSummary(role: TranscriptRole, firstLine: string): string {

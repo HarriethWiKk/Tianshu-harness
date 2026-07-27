@@ -1,4 +1,5 @@
 import type { ToolDefinition } from '../api/types.js'
+import { buildSubagentSystemPrompt } from './static-subagent.js'
 
 const BASE_PROMPT = `<identity>
 你在「天枢」北斗星域运行时中——一个认知增强的代码开发环境。你拥有完整的开发工具集：文件读写、代码搜索、终端执行、测试运行、项目导航、任务委派。你的任务是在理解用户意图、项目上下文与工程约束的基础上，主动设计更合理的架构、发现隐藏风险、修复根因问题，并输出清晰、稳定、可维护、可扩展的实现方案。
@@ -86,6 +87,10 @@ const BASE_PROMPT = `<identity>
   2. 将注意力和后续操作锁定在被指代的具体任务语义上，编号只是临时引用标签
   3. 禁止把 P1/T2 当作字面字符串去搜索文件或代码——它指向的是你上一次输出中的某条计划项
   意图路由系统（<intent-retrieval-route> 块）已为这类消息完成分类，你的职责是在执行阶段遵守编号→任务的关联，不要脱锚。
+  </rule>
+
+  <rule name="case-sensitivity">
+  标识符和文件路径的大小写必须与实际一致——macOS 默认不区分大小写会掩盖错误直到 Linux/CI 崩溃。写 import 前用 glob 核实磁盘上的真实文件名；引用第三方 API/DOM 方法前查文档确认拼写（\`I18n\` ≠ \`I18N\`）。用户报告「页面空白」时优先排查级联初始化失败：打开 console 看第一条报错，后续报错往往是初始化中断后的连锁反应。
   </rule>
 
 </rules>
@@ -240,13 +245,25 @@ const MODEL_CALIBRATIONS: Partial<Record<ModelFamily, string>> = {
 export interface StaticPromptContext {
   tools: ToolDefinition[]
   modelFamily?: ModelFamily
+  /**
+   * Emit the lean sub-agent prompt instead of the full main-controller one.
+   * Main-controller callers must leave this undefined: that path returns
+   * BASE_PROMPT byte-for-byte, which the prefix cache depends on.
+   */
+  audience?: 'subagent'
 }
 
 export function buildSystemPrompt(ctx: StaticPromptContext): string {
+  const base = ctx.audience === 'subagent'
+    ? buildSubagentSystemPrompt(BASE_PROMPT, ctx.tools)
+    : BASE_PROMPT
   const calibration = ctx.modelFamily ? MODEL_CALIBRATIONS[ctx.modelFamily] : undefined
-  if (calibration) return BASE_PROMPT + '\n\n' + calibration
-  return BASE_PROMPT
+  if (calibration) return base + '\n\n' + calibration
+  return base
 }
+
+/** Exposed for the golden byte-equality test that pins the main-controller prompt. */
+export const MAIN_BASE_PROMPT = BASE_PROMPT
 
 export function detectModelFamily(modelName: string): ModelFamily {
   const lower = modelName.toLowerCase()

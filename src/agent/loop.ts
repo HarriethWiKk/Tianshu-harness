@@ -13,6 +13,7 @@ import { resolvePromptBlocks } from '../prompt/block-policy.js'
 import { buildBudgetReport } from '../prompt/prefix-budget.js'
 import type { CompactCircuitBreakerState, ContextAnchor } from '../context/types.js'
 import type { ToolErrorClass } from '../tools/types.js'
+import type { FailureClass } from './failure-classifier.js'
 import { EvidenceTracker } from './evidence.js'
 import { ObligationTracker } from './obligation-tracker.js'
 import { decideAcceptanceOutcome } from './evidence-obligation.js'
@@ -725,6 +726,12 @@ export class AgentLoop {
       this.failureJournal,
     )
     this.pressureMonitor = new PressureMonitor(this.config.contextWindow)
+    // 累加器语义是「当前历史里驻留的 CVM 字节」。任何丢弃历史消息的操作都会
+    // 重置 appendix baseline，同一时刻这些字节也离开了上下文——挂在 engine 内部
+    // 而非逐个调用点，两者结构上无法漂移。
+    this.config.promptEngine.setOnResetAppendixBaseline(() => {
+      this.pressureMonitor.resetCvmOverhead()
+    })
     this.resourceSensor = new ResourceSensor(this.config.resourceSensorOptions)
     this.fsWatcher = this.config.fsWatcherEnabled === false ? null : createFsWatcher({ cwd: this.cwd })
     this.telemetryWriter = createTelemetryWriter(this.cwd, this.config.sessionId)
@@ -1047,8 +1054,8 @@ export class AgentLoop {
     return this.planTraceCoordinator.buildStepResultFromTurn(turn)
   }
 
-  recordToolHistory(name: string, input: Record<string, unknown>, isError: boolean, result: string, errorClass?: ToolErrorClass): void {
-      recordToolHistory(this, name, input, isError, result, errorClass);
+  recordToolHistory(name: string, input: Record<string, unknown>, isError: boolean, result: string, errorClass?: ToolErrorClass, errorKind?: FailureClass): void {
+      recordToolHistory(this, name, input, isError, result, errorClass, errorKind);
       // Reset convergence cooldown when the agent produces a productive tool
       // (edit/bash/test/commit/deliver). This means past convergence nudges
       // were either effective (prompted action) or irrelevant (direction was
@@ -1894,6 +1901,14 @@ export class AgentLoop {
 
   getFileHistory() { return this.config.fileHistory }
 
+  /** Book a side-path request's usage into session totals + the cache-log.
+   *  Side paths are billed like any other call, and silently discarding their
+   *  usage was a real cost blind spot (2026-07-06). `kind` keeps the sources
+   *  distinguishable in `cache-log.jsonl`. */
+  recordSidePathUsage(kind: string, usage: Partial<import('../api/types.js').Usage>, model?: string): void {
+    createSidePathUsageRecorder(this)(kind, usage, model)
+  }
+
   /** 本会话 frozen 前缀的分块归因（`/prefix-budget`）。档位来自会话启动时
    *  解析的策略——中途改配置不会反映在这里，正如它也不会反映在前缀里。 */
   getPrefixBudget(): { profile: string; toolDescriptions: string; report: import('../prompt/prefix-budget.js').PrefixBudgetReport } {
@@ -2348,10 +2363,18 @@ export class AgentLoop {
 
     // W4 噪音洪流修复：计算最近工具调用中 status='failed' 的占比。
     // 高错误率时收敛检测器降级——agent 在绕工具 bug 不是 doom-loop。
+    // transient 失败（pointer-guard 等格式瞬错）被排除：模型下轮即可修正。
     const toolErrorWindow = this.recentToolHistory.slice(-10)
     const recentToolErrorRatio = toolErrorWindow.length > 0
-      ? toolErrorWindow.filter(h => h.status === 'failed').length / toolErrorWindow.length
+      ? toolErrorWindow.filter(h => h.status === 'failed' && !h.transient).length / toolErrorWindow.length
       : 0
+
+    // Sanitize history for convergence detector: transient guard failures
+    // (pointer-guard rejections, etc.) are format-level mistakes the model fixes
+    // next turn — not competence failures. Reclassify them as 'success' so they
+    // don't drag down computeErrorPenalty and trigger false stagnation signals.
+    const sanitizedHistory = this.recentToolHistory.map(h =>
+      h.status === 'failed' && h.transient ? { ...h, status: 'success' as const } : h)
 
     const convergenceCheck = evaluateConvergence({
       turn,
@@ -2359,7 +2382,7 @@ export class AgentLoop {
       phaseRelativeTurn,
       scoreHistory: this.convergenceScoreHistory,
       contextWindow: this.config.contextWindow,
-      recentToolHistory: this.recentToolHistory,
+      recentToolHistory: sanitizedHistory,
       evidenceState: this.evidence.getState(),
       toolFingerprints: this.traceStore.toolFingerprints,
       noToolTurnCount: this.consecutiveNoToolTurns,
@@ -2469,7 +2492,14 @@ export class AgentLoop {
               severity: convergenceCheck.level >= 2 ? 'warn' : 'info',
             })
           }
-          this.advisoryBus.submit({
+          // W4 advisory 密度感知（2026-07-28 session 0087edf0）：当会话已渲染
+          // 大量 advisory（平均 >15 条/轮）时，收敛 detection 不再向 advisory
+          // bus 提交——agent 已在噪音中迷失，再投喂 advisory 只会加剧正反馈回路。
+          // 仍保留 onPhaseChange 事件供 TUI 观测，但不再增加 advisory 负荷。
+          const avgAdvisoriesPerTurn = (turn + 1) > 0 ? this.guardianActivity.advisoriesRendered / (turn + 1) : 0
+          const advisoryFlood = avgAdvisoriesPerTurn > 15
+          if (!advisoryFlood) {
+            this.advisoryBus.submit({
             key: 'convergence',
             priority: 0.65,
             tier: 'operational',
@@ -2489,6 +2519,7 @@ export class AgentLoop {
                 ? { kind: 'tool_appears', tools: ['read_file', 'grep', 'glob', 'list_dir', 'bash'], withinTurns: 2 }
                 : { kind: 'course_changed', withinTurns: 2 },
           })
+          }
 
           // When convergence is detected, append the delivery gate hint so the
           // agent sees the gate state alongside the convergence message.

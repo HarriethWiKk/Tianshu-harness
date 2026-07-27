@@ -41,7 +41,7 @@ describe('buildFileDiff', async () => {
     const diff = await buildFileDiff('big.txt', before, after, { maxLines: 50 })
     const lines = diff.split('\n')
     assert.equal(lines.length, 51, '50 diff lines + 1 hint line')
-    assert.match(lines[lines.length - 1]!, /more diff lines, Ctrl\+O/)
+    assert.match(lines[lines.length - 1]!, /… \+\d+ 行 diff · ctrl\+o 展开/)
   })
 })
 

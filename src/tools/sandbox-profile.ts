@@ -17,6 +17,17 @@
  *     rollback safety net. AppContainer/Job-Object wrapping is a future native
  *     helper.
  *
+ * Failure handling (four layers, see
+ * docs/superpowers/plans/2026-07-26-sandbox-build-compat.md):
+ *   1. attribution  → sandbox-diagnose.ts turns a bare "Operation not permitted"
+ *                     into a named path + a request_path_access route
+ *   2. escalation   → the model calls request_path_access; grantPath feeds back
+ *                     into defaultWritableRoots on the very next wrap
+ *   3. pre-flight   → sandbox-toolchain.ts widens the write set from marker
+ *                     files (Xcode DerivedData, pnpm store, CocoaPods…)
+ *   4. bypass       → sandbox-incompatible.ts lets brew/docker/codesign run
+ *                     unwrapped but keeps them fail-closed for approval
+ *
  * The pure functions here (profile/command builders, backend selection given
  * injected detectors) are unit-testable on any OS; the actual kernel
  * enforcement is exercised only on the matching platform.
@@ -26,6 +37,8 @@ import { existsSync, readFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { writeGrantedRoots } from './path-grants.js'
+import { toolchainWritableRoots, currentToolchainCtx } from './sandbox-toolchain.js'
+import { sandboxIncompatibleCommand } from './sandbox-incompatible.js'
 
 export type SandboxBackendKind =
   | 'seatbelt'
@@ -54,6 +67,10 @@ export interface SandboxDecision {
   backend: SandboxBackendKind
   /** Human-readable explanation (shown in diagnostics / UI). */
   note?: string
+  /** The write roots that were in effect for this wrap. Consumed by
+   *  classifySandboxDenial to tell "boundary refused it" from "already
+   *  writable, so the refusal is something else". Absent when unsandboxed. */
+  writableRoots?: readonly string[]
 }
 
 /** Escape a string for embedding inside POSIX single quotes. */
@@ -109,6 +126,15 @@ export function defaultWritableRoots(ctx: { cwd: string; env?: NodeJS.ProcessEnv
       const trimmed = p.trim()
       if (trimmed) roots.add(trimmed)
     }
+  }
+
+  // Toolchain-implied roots (Xcode DerivedData, pnpm store, CocoaPods…).
+  // Marker-file driven and cwd-cached; missing dirs are already filtered out
+  // by the probe so bwrap's --bind never sees a non-existent path.
+  for (const root of toolchainWritableRoots(
+    currentToolchainCtx(ctx.cwd, env, ctx.platform ?? process.platform),
+  )) {
+    roots.add(root)
   }
 
   // User-approved out-of-workspace write grants (session or persisted). Recomputed
@@ -241,18 +267,74 @@ export function selectSandboxBackend(ctx: SandboxContext): SandboxBackendKind {
 let _cachedActiveBackend: SandboxBackendKind | null = null
 
 /**
+ * Single source of truth for "did the user ask for the sandbox?".
+ *
+ * Both gates MUST consult this. History: 9a51debd flipped the default from
+ * opt-out (RIVET_NO_SANDBOX=1) to opt-in (RIVET_SANDBOX=1) but only updated
+ * wrapSandboxCommand + getSandboxStartupNotice — isSandboxActive kept reading
+ * the retired RIVET_NO_SANDBOX and therefore reported "boundary in effect" on
+ * every macOS box while no boundary was applied. The approval cascade
+ * (tool-pipeline.ts) trusted that report and relaxed bash-write approval.
+ *
+ * 'learn' is the self-healing data-collection mode (see wrapSandboxCommand):
+ * it applies a real boundary, so it counts as requested.
+ */
+export function sandboxRequested(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.RIVET_SANDBOX === '1' || env.RIVET_SANDBOX === 'learn'
+}
+
+/**
  * Whether a real kernel write-boundary is in effect for the current process.
- * Cached because the backend cannot change mid-run. Used by the approval
- * cascade: when true, in-workspace bash writes are safe-by-construction
- * (boundary + rollback) and need not interrupt the user; when false we stay
- * fail-closed and keep requiring approval for write commands.
+ * Backend probe is cached (it cannot change mid-run); the env gate is not.
+ * Used by the approval cascade: when true, in-workspace bash writes are
+ * safe-by-construction (boundary + rollback) and need not interrupt the user;
+ * when false we stay fail-closed and keep requiring approval for write commands.
  */
 export function isSandboxActive(env: NodeJS.ProcessEnv = process.env): boolean {
-  if (env.RIVET_NO_SANDBOX === '1') return false
+  if (!sandboxRequested(env)) return false
   if (_cachedActiveBackend === null) {
     _cachedActiveBackend = selectSandboxBackend({ cwd: process.cwd() })
   }
   return _cachedActiveBackend !== 'none'
+}
+
+/**
+ * Couple the sandbox to the approval mode.
+ *
+ * The two are orthogonal axes — "who gets asked" vs "what can be written" —
+ * but their defaults are not independent: YOLO removes the approval boundary,
+ * which makes the kernel write boundary the only one left. So YOLO turns the
+ * sandbox ON rather than off (mirrors Codex, where --full-auto means
+ * no-approvals + workspace-write sandbox, and going truly unbounded requires a
+ * separate, deliberately longer flag).
+ *
+ * An explicit RIVET_SANDBOX always wins — RIVET_SANDBOX=0 is the escape hatch
+ * for users who genuinely want no boundary.
+ *
+ * Idempotent; safe to call again on a mid-session mode switch.
+ *
+ * ⚠️  MUTATES process.env: relies on in-process env mutation being immediately
+ * visible to subsequent sandboxRequested() calls within the same event loop.
+ * This is the established Node.js contract (process.env writes are synchronous
+ * and visible) and is the same pattern used by bootstrap / applyPermission.
+ */
+export function applySandboxPolicyForApprovalMode(
+  approvalMode: string | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): void {
+  if (env.RIVET_SANDBOX !== undefined) return // explicit setting wins
+  if (approvalMode === 'dangerously-skip-permissions') env.RIVET_SANDBOX = '1'
+}
+
+/**
+ * Whether a real write boundary covers THIS command. The approval cascade must
+ * use this rather than isSandboxActive(): the sandbox is process-level but the
+ * incompatible-command bypass is per-command, and a bypassed command must not
+ * inherit the boundary's approval exemption.
+ */
+export function sandboxCoversCommand(command: string, env: NodeJS.ProcessEnv = process.env): boolean {
+  if (!isSandboxActive(env)) return false
+  return sandboxIncompatibleCommand(command) === null
 }
 
 /** Test-only: reset the cached backend probe. */
@@ -333,8 +415,21 @@ export function wrapSandboxCommand(command: string, ctx: SandboxContext): Sandbo
   const env = ctx.env ?? process.env
   const platform = ctx.platform ?? process.platform
 
-  if (env.RIVET_SANDBOX !== '1') {
+  if (!sandboxRequested(env)) {
     return { command, sandboxed: false, backend: 'none' }
+  }
+
+  const incompatible = sandboxIncompatibleCommand(command)
+  if (incompatible) {
+    // Bypass the FS wrap but report sandboxed:false so the approval cascade
+    // stays fail-closed for this command (tool-pipeline consults
+    // sandboxCoversCommand, not the process-level isSandboxActive).
+    return {
+      command,
+      sandboxed: false,
+      backend: 'none',
+      note: `沙箱旁路（${incompatible.id}）：${incompatible.reason} — 该命令不受写边界保护，需人工审批`,
+    }
   }
 
   const backend = selectSandboxBackend(ctx)
@@ -347,6 +442,7 @@ export function wrapSandboxCommand(command: string, ctx: SandboxContext): Sandbo
         sandboxed: true,
         backend,
         note: 'macOS Seatbelt (writes confined to workspace + caches, network on)',
+        writableRoots,
       }
     case 'bwrap':
       return {
@@ -354,6 +450,7 @@ export function wrapSandboxCommand(command: string, ctx: SandboxContext): Sandbo
         sandboxed: true,
         backend,
         note: 'bwrap (read-only root, writable workspace + caches, network on)',
+        writableRoots,
       }
     case 'firejail':
       return {
@@ -361,6 +458,7 @@ export function wrapSandboxCommand(command: string, ctx: SandboxContext): Sandbo
         sandboxed: true,
         backend,
         note: 'firejail (read-only root, writable workspace + caches, network on)',
+        writableRoots,
       }
     case 'none':
     default: {

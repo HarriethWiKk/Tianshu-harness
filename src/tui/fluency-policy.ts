@@ -39,7 +39,13 @@ const PHASE_STALE_TIERS: Record<ActivityPhase, [number, number, number]> = {
   preflight:  [15_000,  60_000, 120_000],
 }
 
-function getPhaseStaleMessage(phase: ActivityPhase, silentMs: number): { message: string; level: 'info' | 'warn' | 'action' } | null {
+/** 按阶段分档的等待提示。到 action 档会明确告诉用户可以 Ctrl+C——长等待里
+ *  「还活着吗 / 我能做什么」是唯一真正要回答的两个问题。
+ *
+ *  由 TuiApp.renderLive 的 spinner 区直接消费。此前这套策略随 Ink 栈退役
+ *  （`25bcc523` 删除 src/tui/app.tsx）失去消费方，ANSI 侧只剩「10s 无 token
+ *  整行转琥珀」这一档粗粒度提示。 */
+export function getPhaseStaleMessage(phase: ActivityPhase, silentMs: number): { message: string; level: 'info' | 'warn' | 'action' } | null {
   const tiers = PHASE_STALE_TIERS[phase] ?? PHASE_STALE_TIERS.streaming
   const [info, warn, action] = tiers
   const sec = Math.round(silentMs / 1000)

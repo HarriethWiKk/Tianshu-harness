@@ -62,11 +62,11 @@ describe('formatToolCard (Claude Code ●/⎿ style)', () => {
     assert.ok(stripAnsi(lines[0]!).startsWith('    '))
   })
 
-  it('truncates with `… +N lines (ctrl+o to expand)` marker', () => {
+  it('truncates with `… +N 行 · ctrl+o 展开` marker', () => {
     const long = Array.from({ length: 50 }, (_, i) => `line ${i}`).join('\n')
     const lines = formatToolCard({ toolName: 'bash', content: long, maxLines: 4 }, theme)
     const plain = lines.map(stripAnsi)
-    assert.ok(plain.some(l => l.includes('… +46 lines [Ctrl+O]')), plain.join('|'))
+    assert.ok(plain.some(l => l.includes('… +46 行 · ctrl+o 展开')), plain.join('|'))
     // 头 4 行保留
     assert.ok(plain.some(l => l.includes('line 0')))
     assert.ok(plain.some(l => l.includes('line 3')))
@@ -79,7 +79,7 @@ describe('formatToolCard (Claude Code ●/⎿ style)', () => {
     const plain = lines.map(stripAnsi)
     assert.ok(plain.some(l => l.includes('row 0')), 'head shown')
     assert.ok(plain.some(l => l.includes('row 59')), 'tail shown')
-    assert.ok(plain.some(l => l.includes('[Ctrl+O]')), 'mid marker')
+    assert.ok(plain.some(l => l.includes('ctrl+o 展开')), 'mid marker')
   })
 
   it('expanded renders all lines without marker', () => {
@@ -87,7 +87,7 @@ describe('formatToolCard (Claude Code ●/⎿ style)', () => {
     const lines = formatToolCard({ toolName: 'bash', content: long, expanded: true }, theme)
     const plain = lines.map(stripAnsi)
     assert.ok(plain.some(l => l.includes('line 29')))
-    assert.ok(!plain.some(l => l.includes('Ctrl+O')))
+    assert.ok(!plain.some(l => l.includes('ctrl+o')))
   })
 
   it('edit/write diff content renders via formatDiff (red/green)', () => {
@@ -113,9 +113,9 @@ describe('formatToolCard (Claude Code ●/⎿ style)', () => {
     assert.ok(lines.some(l => stripAnsi(l).includes('foo.ts')))
   })
 
-  it('empty content shows (no output)', () => {
+  it('empty content shows (无输出)', () => {
     const lines = formatToolCard({ toolName: 'bash', content: '' }, theme)
-    assert.ok(stripAnsi(lines[1]!).includes('(no output)'))
+    assert.ok(stripAnsi(lines[1]!).includes('(无输出)'))
   })
 
   it('ask_user_question renders fully without truncation', () => {
@@ -128,7 +128,7 @@ describe('formatToolCard (Claude Code ●/⎿ style)', () => {
     // All 5 options are visible, no truncation marker
     assert.ok(plain.some(l => l.includes('1. OpenAI')))
     assert.ok(plain.some(l => l.includes('5. Local')))
-    assert.ok(!plain.some(l => l.includes('[Ctrl+O]')), 'must not be truncated')
+    assert.ok(!plain.some(l => l.includes('ctrl+o 展开')), 'must not be truncated')
   })
 
   it('uses family-specific default maxLines', () => {
@@ -136,22 +136,22 @@ describe('formatToolCard (Claude Code ●/⎿ style)', () => {
     // run family (bash) defaults to 8 lines
     const bashLines = formatToolCard({ toolName: 'bash', content: long }, theme)
     const bashPlain = bashLines.map(stripAnsi)
-    assert.ok(bashPlain.some(l => l.includes('… +4 lines [Ctrl+O]')), 'bash shows 8 lines')
+    assert.ok(bashPlain.some(l => l.includes('… +4 行 · ctrl+o 展开')), 'bash shows 8 lines')
     // find family (grep) defaults to 6 lines
     const grepLines = formatToolCard({ toolName: 'grep', content: long }, theme)
     const grepPlain = grepLines.map(stripAnsi)
-    assert.ok(grepPlain.some(l => l.includes('… +6 lines [Ctrl+O]')), 'grep shows 6 lines')
+    assert.ok(grepPlain.some(l => l.includes('… +6 行 · ctrl+o 展开')), 'grep shows 6 lines')
     // other family defaults to 4 lines
     const todoLines = formatToolCard({ toolName: 'todo', content: long }, theme)
     const todoPlain = todoLines.map(stripAnsi)
-    assert.ok(todoPlain.some(l => l.includes('… +8 lines [Ctrl+O]')), 'todo shows 4 lines')
+    assert.ok(todoPlain.some(l => l.includes('… +8 行 · ctrl+o 展开')), 'todo shows 4 lines')
   })
 
   it('explicit maxLines overrides family default', () => {
     const long = Array.from({ length: 12 }, (_, i) => `line ${i}`).join('\n')
     const lines = formatToolCard({ toolName: 'bash', content: long, maxLines: 3 }, theme)
     const plain = lines.map(stripAnsi)
-    assert.ok(plain.some(l => l.includes('… +9 lines [Ctrl+O]')), 'explicit maxLines wins')
+    assert.ok(plain.some(l => l.includes('… +9 行 · ctrl+o 展开')), 'explicit maxLines wins')
   })
 })
 
@@ -350,7 +350,7 @@ describe('formatThinking', () => {
     }, theme)
     const plain = lines.map(stripAnsi)
     assert.ok(plain[0]!.includes('凝思中…'), 'has header')
-    assert.ok(plain[0]!.includes('3 lines'), 'line count in header')
+    assert.ok(plain[0]!.includes('3 行'), 'line count in header')
     assert.ok(plain.some(l => l.includes('reasoning')))
     assert.ok(plain.some(l => l.includes('analysis')))
     assert.ok(plain.some(l => l.includes('conclusion')))

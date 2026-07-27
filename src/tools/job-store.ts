@@ -261,8 +261,9 @@ class BackgroundJob {
     })
   }
 
-  kill(): void {
-    if (this.status !== 'running' || !this.child) return
+  /** 返回是否真发了信号——终态 job 返回 false，调用方不得据 true 覆盖其真实结局。 */
+  kill(): boolean {
+    if (this.status !== 'running' || !this.child) return false
     if (this.lifetimeTimer) { clearTimeout(this.lifetimeTimer); this.lifetimeTimer = null }
     this.status = 'killed'
     killProcessTree(this.child, 'SIGTERM')
@@ -272,6 +273,7 @@ class BackgroundJob {
       killProcessTree(child, 'SIGKILL')
     }, 3000)
     if (typeof this.killTimer.unref === 'function') this.killTimer.unref()
+    return true
   }
 
   logs(): string {
@@ -307,6 +309,9 @@ export interface JobRegistry {
 
 /** Per-session collection of background jobs; also an event source for the server. */
 export class SessionJobs extends EventEmitter implements JobRegistry {
+  /** 终态条目内存上限：超出时淘汰最旧的终态 job（ring buffer/child 引用随之
+   *  释放；磁盘日志保留，淘汰只影响内存态）。running 永不淘汰。 */
+  static readonly MAX_TERMINAL_JOBS = 50
   private jobs = new Map<string, BackgroundJob>()
 
   constructor(private readonly logDir: string) {
@@ -314,7 +319,10 @@ export class SessionJobs extends EventEmitter implements JobRegistry {
   }
 
   spawn(opts: JobSpawnOptions): JobSnapshot {
-    const job = new BackgroundJob(opts, (ev) => this.emit('event', ev))
+    const job = new BackgroundJob(opts, (ev) => {
+      this.emit('event', ev)
+      if (ev.kind === 'exit') this.evictTerminals()
+    })
     this.jobs.set(job.id, job)
     let logPath = ''
     try {
@@ -342,13 +350,22 @@ export class SessionJobs extends EventEmitter implements JobRegistry {
   kill(id: string): boolean {
     const job = this.jobs.get(id)
     if (!job) return false
-    job.kill()
-    return true
+    // 透传真实语义：终态 job 返回 false（kill() 不会发信号）。
+    return job.kill()
   }
 
   /** Terminate every running job — call on session close to avoid orphans. */
   killAll(): void {
     for (const job of this.jobs.values()) job.kill()
+  }
+
+  /** 淘汰最旧的终态条目，把终态保有量压回上限（见 MAX_TERMINAL_JOBS）。 */
+  private evictTerminals(): void {
+    const terminals = [...this.jobs.values()]
+      .filter(j => j.status !== 'running')
+      .sort((a, b) => a.startedAt - b.startedAt)
+    const excess = terminals.length - SessionJobs.MAX_TERMINAL_JOBS
+    for (let i = 0; i < excess; i++) this.jobs.delete(terminals[i]!.id)
   }
 
   hasRunning(): boolean {

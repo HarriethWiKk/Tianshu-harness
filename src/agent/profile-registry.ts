@@ -6,6 +6,7 @@
  */
 
 import { progressiveTimeout, WORKER_EXIT_GRACE_MS } from './timeout-ladder.js'
+import { MAX_BUDGET_CONTINUATIONS, MAX_HANDS_EXTRA_RUNS } from './worker-continuation.js'
 import { normalizeFrontmatterSource } from '../utils/frontmatter.js'
 
 export type AgentRole = 'brain' | 'hands' | 'readonly' | 'readonly_plus_test'
@@ -387,7 +388,7 @@ recall_capsule(设计审美) when the task needs it. Do not restate it from memo
   {
     name: 'test_scaffolder',
     role: 'hands',
-    allowedTools: ['read_file', 'edit_file', 'write_file', 'grep', 'glob'],
+    allowedTools: ['read_file', 'edit_file', 'write_file', 'grep', 'glob', 'bash', 'run_tests'],
     expertisePrompt: `You are a test scaffolder. Generate test file boilerplate from source interfaces and types.
 
 ### Process
@@ -665,12 +666,17 @@ export const DEFAULT_DELEGATE_CONCURRENCY = 3
 export function delegationToolTimeoutMs(
   sessionTurnCount: number | undefined,
   profiles: ReadonlyArray<string | undefined>,
-  opts?: { taskCount?: number; maxWorkers?: number },
+  opts?: { taskCount?: number; maxWorkers?: number; requestedTimeoutMs?: ReadonlyArray<number | undefined> },
 ): number {
   let budget = progressiveTimeout(sessionTurnCount)
   for (const name of profiles) {
     const profileBudget = name ? profileRegistry.get(name)?.defaultTimeoutMs : undefined
     if (profileBudget && profileBudget > budget) budget = profileBudget
+  }
+  // 按次预算（delegate_task/batch 的 timeoutMs）直接进 WorkOrder.budget.timeoutMs，
+  // 外层不跟着放宽的话，主控调大的内层预算会被外层先开枪打断——按次预算就成了摆设。
+  for (const requested of opts?.requestedTimeoutMs ?? []) {
+    if (requested && requested > budget) budget = requested
   }
   // P0: a bounded worker pool runs a batch in sequential waves. A 5-task batch
   // on a 3-worker pool needs ceil(5/3)=2 waves, so the outer tool timeout must
@@ -681,5 +687,21 @@ export function delegationToolTimeoutMs(
   const taskCount = Math.max(1, Math.floor(opts?.taskCount ?? profiles.length ?? 1))
   const maxWorkers = Math.max(1, Math.floor(opts?.maxWorkers ?? DEFAULT_DELEGATE_CONCURRENCY))
   const waves = Math.max(1, Math.ceil(taskCount / maxWorkers))
-  return budget * waves + WORKER_EXIT_GRACE_MS
+  // 预算耗尽会触发自动续跑（worker-continuation），每次续跑是一次全新的
+  // runWorker，各自带一份完整 budget.timeoutMs。外层不按最坏运行次数放宽的话，
+  // 续跑必然撞上工具层硬 reject，连首轮的 partial 都一起丢——正是本函数上方
+  // 那段注释警告过的失败形状。
+  //
+  // 判据取「只有确定全是写工才按写工算」而不是反过来：profile 在 delegate 工具层
+  // 是可选的，模型省略时这里收到 undefined，而实际 worker 会落到默认的只读
+  // code_scout——按「有已知只读工才放宽」写，恰好在最常见的默认场景下不放宽。
+  // 放宽过头只是把天花板抬高（真正的卡死判定归静默探测），收紧过头会丢 partial。
+  //
+  // 写工的额外轮次比只读工还多：Wave 7 起 runHandsSession 会在同一个工作树里续跑，
+  // 与 JSON 解析修复、写闸门修复共用 MAX_HANDS_EXTRA_RUNS 的总账，每一轮都是一次
+  // 带完整 timeoutMs 的 runWorker。
+  const allHands = profiles.length > 0
+    && profiles.every(name => name !== undefined && profileRegistry.get(name)?.role === 'hands')
+  const runs = allHands ? 1 + MAX_HANDS_EXTRA_RUNS : 1 + MAX_BUDGET_CONTINUATIONS
+  return budget * waves * runs + WORKER_EXIT_GRACE_MS
 }

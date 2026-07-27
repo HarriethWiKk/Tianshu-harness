@@ -81,6 +81,7 @@ const HELP_TEXT = `Available commands:
 /exit — Exit Rivet
 /quit — Exit
 /update — Check and install the latest Rivet release
+/btw <问题> — 侧问：就当前会话问一句，回答显示在浮层，不进对话历史
 /compact [status|llm] — Micro-compact context (/compact status for stats)
 /model [name|list] — Show or switch model
 /domain [list|<name>|auto|off] — Show or switch star domain personality
@@ -204,6 +205,9 @@ export interface SlashHandlerContext {
   setCockpitPanel: (v: Panel | ((prev: Panel) => Panel)) => void
   activeOverlay?: string | null
   surfacePush?: (id: string) => void
+  /** `/btw` 侧问：开浮层并流式作答。问答只活在浮层里，不进对话历史。
+   *  未注入（headless / 测试）时 `/btw` 打印提示而非静默失败。 */
+  askSideQuestion?: (question: string) => void
   /** 设置 choice-panel 类型（effort / permission），供选择面板渲染器读取。 */
   setChoicePanelKind?: (kind: 'effort' | 'permission') => void
   surfacePop?: () => void
@@ -677,6 +681,28 @@ const TUI_SLASH_COMMANDS: readonly TuiSlashCommandDef[] = [
       process.emit('SIGINT')
       return true
 
+    },
+  },
+  {
+    // 侧问：subagent 的逆命题——看得见完整对话但没有工具。问答只活在浮层里，
+    // 一个字节都不进历史，所以主对话的前缀缓存分毫未动。
+    name: '/btw',
+    immediate: true,
+    handler(ctx) {
+      const { parts, pushStatic, setIsStreaming } = ctx
+      const question = parts.slice(1).join(' ').trim()
+      if (!question) {
+        pushStatic(createLogEntry({
+          type: 'system',
+          content: '用法：/btw <问题>\n就当前会话上下文问一个侧问。回答显示在浮层里，不进入对话历史，也不打断正在进行的工作。',
+        }))
+      } else if (!ctx.askSideQuestion) {
+        pushStatic(createLogEntry({ type: 'system', content: '侧问在当前环境不可用。' }))
+      } else {
+        ctx.askSideQuestion(question)
+      }
+      setIsStreaming(false)
+      return true
     },
   },
   {
@@ -3561,6 +3587,7 @@ export function registerTuiSlashCommands(app: TuiApp, ctx: BootstrapContext): vo
       goalTrackerRef: ctx.refs.goalTrackerRef,
       reviewGateRef: ctx.refs.reviewGateRef,
       surfacePush: (id: string) => { app.activateOverlay(id) },
+      askSideQuestion: (question: string) => { app.askSideQuestion(question) },
       setChoicePanelKind: (kind) => { app.choicePanelKind = kind },
       surfacePop: () => { app.deactivateOverlay() },
       setReasoningEffort: (effort) => { ctx.agent.setReasoningEffort(effort) },
@@ -3750,6 +3777,13 @@ export function registerTuiSlashCommands(app: TuiApp, ctx: BootstrapContext): vo
     description: "Open tasks overlay",
     immediate: true,
     overlay: "tasks",
+    handler: () => true,
+  })
+
+  register("/jobs", {
+    description: "后台任务列表",
+    immediate: true,
+    overlay: "jobs",
     handler: () => true,
   })
 

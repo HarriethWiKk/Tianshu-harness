@@ -53,13 +53,37 @@ describe('precision ceiling', () => {
   it('forces compaction on a large window even with a hot exact-prefix cache', () => {
     // 1M window, exact-prefix persistent, cache fully hot (recentHitRate 0.95).
     // Without the ceiling the cache-preserving ratios (compact 0.86) would let
-    // context grow to 860K before compacting; the ceiling forces it at 500K.
+    // context grow to 860K before compacting; the ceiling forces it at 700K.
     const largeWindow = 1_000_000
     const providerProfile = { cacheType: 'exact-prefix' as const, persistent: true }
-    // At 0.48 (480K) — below ceiling, below cache-preserving compact → tier 0/1.
-    assert.ok(tierForRatio(0.48, providerProfile, 0.95, precisionCeilingRatio(largeWindow)) < 2)
-    // At 0.51 (510K) — past the 0.5 ceiling → forced to tier >= 2 despite hot cache.
-    assert.ok(tierForRatio(0.51, providerProfile, 0.95, precisionCeilingRatio(largeWindow)) >= 2)
+    // At 0.69 (690K) — below ceiling, below cache-preserving compact → tier 0/1.
+    assert.ok(tierForRatio(0.69, providerProfile, 0.95, precisionCeilingRatio(largeWindow)) < 2)
+    // At 0.71 (710K) — past the 0.7 ceiling → forced to tier >= 2 despite hot cache.
+    assert.ok(tierForRatio(0.71, providerProfile, 0.95, precisionCeilingRatio(largeWindow)) >= 2)
+  })
+
+  it('the ceiling is a floor, not a fallback — the ladder never inverts', () => {
+    // The ceiling (0.70) sits just below the cache-preserving watch threshold
+    // (0.72). When it was a trailing `return 2` branch, the watch check
+    // shadowed it: 0.71 compacted while the *higher* 0.75 only watched.
+    const providerProfile = { cacheType: 'exact-prefix' as const, persistent: true }
+    const ceiling = precisionCeilingRatio(1_000_000)
+    const tiers = [0.69, 0.71, 0.75, 0.87, 0.93, 0.96]
+      .map(r => tierForRatio(r, providerProfile, null, ceiling))
+
+    for (let i = 1; i < tiers.length; i++) {
+      assert.ok(
+        tiers[i]! >= tiers[i - 1]!,
+        `tier must not drop as usage rises: ${JSON.stringify(tiers)}`,
+      )
+    }
+    assert.deepEqual(tiers, [0, 2, 2, 2, 3, 4])
+  })
+
+  it('keeps the watch tier reachable when the ceiling sits above it', () => {
+    // Balanced strategy (watch 0.60) with no ceiling: the floor must not
+    // swallow tier 1 for providers the ceiling does not apply to.
+    assert.equal(tierForRatio(0.65, undefined, null, precisionCeilingRatio(1_000)), 1)
   })
 
   it('does not impose a ceiling on small windows (cache strategy rules)', () => {
@@ -71,20 +95,22 @@ describe('precision ceiling', () => {
   })
 
   it('scales the ceiling down for larger windows', () => {
-    assert.equal(precisionCeilingRatio(1_000_000), 0.5)
+    // 0.7 keeps the ceiling just under the cache-preserving watch threshold
+    // (0.72) instead of halving it, which is what 0.5 did.
+    assert.equal(precisionCeilingRatio(1_000_000), 0.7)
     assert.equal(precisionCeilingRatio(300_000), 0.55)
     assert.equal(precisionCeilingRatio(1_000), 1)
   })
 
   it('honours an explicit override over the window-derived value', () => {
-    assert.equal(precisionCeilingRatio(1_000_000, 0.7), 0.7)
+    assert.equal(precisionCeilingRatio(1_000_000, 0.55), 0.55)
     assert.equal(precisionCeilingRatio(1_000, 0.4), 0.4)
   })
 
-  it('decideCompactAction: 1M/510k DeepSeek hot cache flags precision-risk without forcing an LLM rewrite', () => {
-    // Plan task 4 self-check: precisionRisk=true, action none/stale-round —
-    // NEVER a direct full-llm. The deterministic candidate still has to clear
-    // the reclaim gate downstream.
+  it('decideCompactAction: 1M/510k DeepSeek hot cache now sits below the ceiling and does nothing', () => {
+    // Was the precision-risk fixture back when the ceiling was 0.5. At 0.7 a
+    // half-full 1M window is simply not a concern — this is the point of the
+    // change: stop reclaiming at 51% of a window the provider caches well.
     const d = decideCompactAction({
       estimatedTokens: 510_000,
       maxTokens: 1_000_000,
@@ -94,8 +120,28 @@ describe('precision ceiling', () => {
       recentHitRate: 0.95,
       profile: deriveCompactionProfile({ contextWindow: 1_000_000, billing: 'per-token', cache: 'exact-prefix' }),
     })
+    assert.equal(d.precisionRisk, false)
+    assert.equal(d.action, 'none')
+    assert.equal(d.force, false)
+  })
+
+  it('decideCompactAction: precision-risk still yields a gated deterministic reclaim, never a forced LLM rewrite', () => {
+    // With the default 0.7 ceiling this band is empty on the 1M path — the LLM
+    // ladder (partial at 0.60) claims everything above it first. The branch
+    // stays reachable through precisionCeilingOverride, which is the only way
+    // a user can ask for accuracy-first reclaim below the ladder.
+    const d = decideCompactAction({
+      estimatedTokens: 510_000,
+      maxTokens: 1_000_000,
+      turn: 1,
+      failures: { consecutiveFailures: 0 },
+      providerProfile: { cacheType: 'exact-prefix', persistent: true },
+      recentHitRate: 0.95,
+      precisionCeilingOverride: 0.5,
+      profile: deriveCompactionProfile({ contextWindow: 1_000_000, billing: 'per-token', cache: 'exact-prefix' }),
+    })
     assert.equal(d.precisionRisk, true)
-    assert.ok(d.action === 'none' || d.action === 'stale-round', `got ${d.action}`)
+    assert.equal(d.action, 'stale-round')
     assert.notEqual(d.action, 'full-llm')
     assert.equal(d.force, false)
     assert.match(d.reason, /precision-risk/)
@@ -184,9 +230,10 @@ describe('precision ceiling', () => {
   })
 
   it('decideCompactTier threads the ceiling through end-to-end', () => {
-    // 1M window, exact-prefix, hot cache: 510K tokens should recommend compaction.
+    // 1M window, exact-prefix, hot cache: 710K tokens is past the 0.7 ceiling
+    // and should recommend compaction even though the cache is hot.
     const d = decideCompactTier({
-      estimatedTokens: 510_000,
+      estimatedTokens: 710_000,
       maxTokens: 1_000_000,
       turn: 1,
       failures: { consecutiveFailures: 0 },
@@ -195,5 +242,16 @@ describe('precision ceiling', () => {
     })
     assert.ok(d.tier >= 2)
     assert.equal(d.shouldCompact, true)
+
+    // 690K, just under it, stays hands-off.
+    const below = decideCompactTier({
+      estimatedTokens: 690_000,
+      maxTokens: 1_000_000,
+      turn: 1,
+      failures: { consecutiveFailures: 0 },
+      providerProfile: { cacheType: 'exact-prefix', persistent: true },
+      recentHitRate: 0.95,
+    })
+    assert.equal(below.shouldCompact, false)
   })
 })

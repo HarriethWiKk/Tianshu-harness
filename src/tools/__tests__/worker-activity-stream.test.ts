@@ -93,6 +93,16 @@ describe('createActivityStreamer', () => {
     stream(ev({ kind: 'turn', detail: '1200' }))
     assert.equal(lines.length, 0)
   })
+
+  it('lifecycle: 每一轮补偿都出行，不像 retry 那样只报一次', () => {
+    const lines: string[] = []
+    const stream = createActivityStreamer(l => lines.push(l))
+    stream(ev({ kind: 'lifecycle', detail: '续跑 1/2 · 轮次预算耗尽' }))
+    stream(ev({ kind: 'lifecycle', detail: '续跑 2/2 · 轮次预算耗尽' }))
+    assert.equal(lines.length, 2, '第二次续跑必须也可见——用户最想知道的就是它跑到第几次了')
+    assert.match(lines[0]!, /续跑 1\/2/)
+    assert.match(lines[1]!, /续跑 2\/2/)
+  })
 })
 
 describe('createDelegationActivityMapper', () => {
@@ -207,5 +217,16 @@ describe('createDelegationActivityMapper', () => {
     assert.equal(acts[0]!.contract, undefined)
     assert.deepEqual(acts[1]!.contract, contract, '晚到的 contract 补发，不因 objective 已记账而被吞')
     assert.equal(acts[2]!.contract, undefined)
+  })
+
+  it('lifecycle 事件带阶段文案上行，且不污染工具/token 计数', () => {
+    const acts: DelegationActivity[] = []
+    const map = createDelegationActivityMapper('p', a => acts.push(a))
+    map(ev({ kind: 'tool_use', detail: 'grep' }))
+    map(ev({ kind: 'lifecycle', detail: '续跑 1/2 · 轮次预算耗尽' }))
+    assert.equal(acts[1]!.eventKind, 'lifecycle')
+    assert.match(acts[1]!.progressLine!, /续跑 1\/2/)
+    assert.equal(acts[1]!.toolUseCount, 1, '补偿轮播报不是一次工具调用')
+    assert.equal(acts[1]!.tokenCount, undefined)
   })
 })

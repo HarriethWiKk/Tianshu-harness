@@ -40,9 +40,28 @@
   - `~/.bun`、`~/.deno`
   - `~/.gradle`、`~/.m2`
   - `~/Library/Caches`（macOS）
+- **按工具链画像自动追加**的目录（见 1.3）
 - 用户通过审批流程**显式授予**的目录（见第 2 节）
 
-### 1.3 扩展可写目录
+### 1.3 工具链画像（自动预扩）
+
+纯 npm/cargo 项目用上面的静态列表就够了，但真实的构建打包会碰到各生态自己的状态目录。天枢按项目里的标记文件识别工具链，**在命令执行前**就把对应目录加进可写集，避免构建跑到一半才被拦。
+
+| 工具链 | 标记文件 | 追加的可写目录 |
+|--------|---------|---------------|
+| rust | `Cargo.toml`、`src-tauri/Cargo.toml` | `~/.cargo`、`~/.rustup` |
+| xcode | `src-tauri/tauri.conf.json`、`tauri.conf.json`、`Package.swift` | `~/Library/Developer/Xcode/DerivedData`、`~/Library/Developer/CoreSimulator`、`~/Library/MobileDevice/Provisioning Profiles`（仅 macOS） |
+| pnpm | `pnpm-lock.yaml`、`pnpm-workspace.yaml` | `~/Library/pnpm`（macOS）、`~/.local/share/pnpm` |
+| cocoapods | `Podfile`、`ios/Podfile` | `~/.cocoapods`（仅 macOS） |
+| android | `build.gradle`(`.kts`)、`settings.gradle` | `~/.android`、`~/Library/Android/sdk`（macOS） |
+| flutter | `pubspec.yaml` | `~/.pub-cache` |
+| ruby | `Gemfile` | `~/.gem`、`~/.bundle` |
+| php | `composer.json` | `~/.composer`、`~/.config/composer` |
+| python | `pyproject.toml`、`requirements.txt`、`setup.py` | `~/.local/lib`、`~/.local/bin` |
+
+不存在的目录会被自动跳过。标记文件按当前工作目录查找，所以在 monorepo 里从仓库根启动、构建子目录里的 Tauri 工程时可能识别不到 —— 那种情况会退化到 2.2 的授权流程，不会硬失败。
+
+### 1.4 扩展可写目录
 
 如果某些命令必须写到工作区外（例如自定义构建目录、全局依赖位置），可以通过环境变量追加：
 
@@ -51,15 +70,27 @@ export RIVET_SANDBOX_WRITABLE="/opt/my-build:/var/log/my-project"
 rivet
 ```
 
-多个路径用 `:` 分隔（POSIX）。
+多个路径用 `:` 分隔（POSIX），Windows 用 `;`。这是临时的（只影响当前进程）；要持久化请用配置里的 `permissions.additionalWriteDirs`（见 2.3）。
 
-### 1.4 关闭沙箱
+### 1.5 开启与关闭沙箱
+
+沙箱**默认关闭**，显式开启：
 
 ```bash
-RIVET_NO_SANDBOX=1 rivet
+RIVET_SANDBOX=1 rivet
 ```
 
-关闭后启动会明确警告：无写边界，回滚是唯一安全网。**不建议在陌生仓库或不可信输入下关闭**。
+YOLO（`dangerously-skip-permissions`）模式会**自动开启**沙箱 —— 免审批不等于免边界，详见 2.4。
+
+要在任何模式下都强制关闭：
+
+```bash
+RIVET_SANDBOX=0 rivet
+```
+
+关闭后无写边界，回滚是唯一安全网。**不建议在陌生仓库或不可信输入下关闭**。
+
+> **历史**：默认值于 2026-07-11 由提交 `9a51debd` 从 opt-out 翻转为 opt-in。旧变量 `RIVET_NO_SANDBOX` 自那时起**已无任何作用**，请改用 `RIVET_SANDBOX=0`。
 
 ---
 
@@ -112,9 +143,47 @@ RIVET_NO_SANDBOX=1 rivet
 - 授权是会话级内存态，配置文件本身就是持久来源——改配置即改授权
 - CLI 与桌面端（sidecar）都会在会话创建时加载
 
-### 2.4 在 dangerously-skip-permissions 下
+### 2.4 YOLO 与沙箱 —— 免审批不等于免边界
 
-如果你启用了 `dangerously-skip-permissions`（见第 3.1 节），天枢会**自动记录**外出路径授权，不再弹窗。这等价于你一次性授权了所有当前需要的目录，但路径校验本身仍在执行。
+> **语义变更（2026-07-26）**：此前 `dangerously-skip-permissions` 会自动批准外出路径授权、且不开沙箱。现在**反过来**：YOLO 自动**开启**沙箱，而扩大写边界是唯一幸存的审批。
+
+审批和沙箱是两条独立的轴：**「谁被问」** 和 **「能写到哪」**。把它们混在一起会得到错误的耦合方向：
+
+- **非 YOLO 下**：审批本身就是边界，沙箱只是双保险 —— 边际收益低，而破坏构建的摩擦成本要全额付。所以沙箱默认关。
+- **YOLO 下**：没人盯着，沙箱是**唯一**的边界。所以 YOLO 必须打开沙箱，而不是关掉。
+
+这与 Codex 的做法一致：`--full-auto` = 不问 + workspace-write 沙箱，真正无边界需要另一个刻意更长的 flag。
+
+**YOLO 下仍会询问的，只有 `request_path_access`**（以及 `computer_use` 的 js_eval / browser_adopt）。理由：YOLO 的意思是「别再为普通工具调用打扰我」，不是「在没人看着的时候悄悄溶解唯一的边界」。
+
+摩擦量级是**每个工作区外路径每工作区一次**，不是每条命令一次：
+
+- 1.3 的工具链画像已经预先覆盖常见构建路径
+- 2.5 的不兼容命令（brew / docker / codesign）走旁路，不会因为写边界失败
+- 授权时勾 `remember: true` 会持久化到该工作区，之后不再问
+
+稳态目标：新项目头两次构建至多 1–2 次提示，之后归零；**工作区内的写全程零提示**。
+
+**无人值守场景**（headless / CI）：没有人能回答提示，所以外出授权会 fail-closed。请预先在配置里声明 `permissions.additionalWriteDirs`（见 2.3），不要指望运行时授权。
+
+**真的想裸奔**：`RIVET_SANDBOX=0` 在任何模式下都优先，包括 YOLO。此时无写边界、无审批，回滚是唯一安全网。
+
+### 2.5 哪些命令不受沙箱保护
+
+有些命令天生就要越界 —— 给它们的路径全部加白等于对所有其它命令取消边界。天枢的做法是：这类命令**跳过文件系统包裹，但强制走审批**，保留「越界要问人」的语义。
+
+| 规则 | 匹配示例 | 原因 |
+|------|---------|------|
+| `sudo` | `sudo …` | 提权本身即越界 |
+| `brew` | `brew install/uninstall/upgrade/link/tap/reinstall` | 写 `/opt/homebrew` 或 `/usr/local` |
+| `docker` | `docker`/`podman` + `build/run/compose/push/pull/buildx` | 需写 docker socket，Seatbelt 的 `deny file-write*` 会挡住 |
+| `npm-global` | `npm/pnpm/yarn/bun install … -g`（或 `--global`） | 写 node 全局 prefix |
+| `codesign` | `codesign`、`security`、`productsign` | 需访问 keychain 与系统信任库 |
+| `notarize` | `xcrun notarytool/altool` | 写 Xcode 私有状态目录 |
+| `system-update` | `softwareupdate`、`xcode-select`、`xcodebuild -license` | 系统级配置变更 |
+| `version-manager` | `nvm/asdf/rbenv/pyenv/sdk` + `install/use/global` | 写自身 HOME 目录树 |
+
+只读调用不受影响（`docker --version` 不匹配，`npm install` 不带 `-g` 也不匹配）。
 
 ---
 
@@ -182,11 +251,13 @@ rivet config set-approval auto-safe
 
 当真实内核沙箱**已激活**时，工作区内的 bash 写操作被视为“沙箱 + 回滚”安全，通常不需要再弹审批。只有当：
 
-- 沙箱未激活（原生 Windows、未装 bwrap 的 Linux/WSL、或 `RIVET_NO_SANDBOX=1`）
+- 该命令不受沙箱覆盖 —— 原生 Windows、未装 bwrap 的 Linux/WSL、未设 `RIVET_SANDBOX`，**或该命令走了 2.5 的不兼容旁路**
 - 命令不在 allowlist
 - 且命令具有写副作用
 
 才会触发 bash 写审批。
+
+注意判定是**逐命令**的，不是逐进程：即使沙箱已开，`brew install` 这类旁路命令仍然按「无沙箱」处理并要求审批。
 
 ---
 
@@ -286,15 +357,53 @@ rivet config set bash.allowlist "your-safe-prefix"
 
 ### 沙箱看起来没生效
 
-1. 检查启动日志是否有 `[sandbox]` 警告
-2. Linux/WSL 用户检查是否安装了 `bubblewrap`：
+1. 确认已设 `RIVET_SANDBOX=1` —— 沙箱默认关闭，且 `RIVET_NO_SANDBOX` 已退役无效
+2. 检查启动日志是否有 `[sandbox]` 警告
+3. Linux/WSL 用户检查是否安装了 `bubblewrap`：
    ```bash
    which bwrap
    ```
-3. macOS 用户检查 `sandbox-exec` 是否存在：
+4. macOS 用户检查 `sandbox-exec` 是否存在：
    ```bash
    which sandbox-exec
    ```
+
+### 构建/打包在沙箱下跑不起来
+
+沙箱拒绝写入时，工具结果里会出现明确的归因，而不是一句裸的 `Operation not permitted`：
+
+```
+沙箱写边界拦截（backend=seatbelt）：命令试图写入工作区之外的路径。
+被拒路径：
+  - /Users/you/Library/Developer/Xcode/DerivedData
+继续的唯一正确做法：调用 request_path_access({ path: "...", mode: "write", remember: true })
+取得用户授权，批准后原命令直接重跑即可（授权对下一条 bash 立即生效）。
+这不是文件权限位问题，也不是代码缺陷 —— 不要用 sudo、chmod、chown 重试…
+```
+
+处理顺序：
+
+1. **让 agent 走授权**：它会自己调 `request_path_access`，你批准即可。勾「记住」则该工作区之后不再问。
+2. **反复出现同一路径** → 写进配置 `permissions.additionalWriteDirs`（2.3），一劳永逸且能用于无人值守。
+3. **不确定要授权哪些路径** → 用 learn 模式摸底（见下）。
+
+授权对**下一条** bash 命令立即生效，不需要重启会话。
+
+### 用 learn 模式摸清一个项目要写哪些路径
+
+```bash
+RIVET_SANDBOX=learn rivet
+```
+
+learn 模式下，写边界拒绝**不会让命令失败**：天枢记录被拒路径 → 临时授权 → 自动重跑一次，并把观测追加到 `~/.rivet/sandbox-learn.jsonl`。跑完一次完整构建后：
+
+```bash
+jq -r '.deniedPaths[]' ~/.rivet/sandbox-learn.jsonl | sort -u
+```
+
+把结果写进 `permissions.additionalWriteDirs`，然后切回 `RIVET_SANDBOX=1`。
+
+> ⚠️ **learn 不是生产模式**。命令在被拒之前已产生的副作用（已写的文件、已发出的网络请求）会在重跑时**再来一遍**。虽然限定了最多重试一次、且结果里会显式声明，但涉及非幂等操作（数据库迁移、发布、POST 请求）时不要用。临时授权仅存在于当前会话，不写盘。
 
 ### 命令报 “Path outside project directory”
 
@@ -316,9 +425,9 @@ rivet config set bash.allowlist "your-safe-prefix"
 > **默认最小权限，显式动态授权，deny 规则永远优先。**
 
 - 写文件：默认只能写项目目录
-- 执行命令：默认受内核沙箱约束写范围
+- 执行命令：开启沙箱后受内核约束写范围；被拒时给出被拒路径与授权路线，而非裸报错
 - 危险命令：无论模式如何，deny 规则和硬编码风险模式都会拦截
-- 外出访问：必须经用户授权或显式配置
+- 外出访问：必须经用户授权或显式配置 —— **YOLO 也不例外**
 - 网络：通常放行（build/test/git 需要）
 
-如果你需要更激进的无人值守执行，请逐步提高权限（`auto-safe` → `auto-accept` → `dangerously-skip-permissions`），而不是直接关闭沙箱。
+审批和沙箱是两条轴：**「谁被问」和「能写到哪」**。提高审批自动化程度（`auto-safe` → `auto-accept` → `dangerously-skip-permissions`）不等于放弃写边界 —— 恰恰相反，越自动越需要边界，所以 YOLO 会自动开启沙箱。要减少摩擦，正确的顺序是补 `permissions.additionalWriteDirs` 和 `bash.allowlist`，而不是关沙箱。

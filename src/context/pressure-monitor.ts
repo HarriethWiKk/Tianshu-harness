@@ -36,16 +36,15 @@ function p90(values: number[]): number {
 /**
  * W2-B1: egress metering source tags. Every injected request byte is charged
  * at exactly ONE egress (no double counting):
- *   - projection / ephemeral / tool-context — cognitive prep (appendixDelta
- *     block semantics: charged only on byte change)
- *   - advisory-appendix — AdvisoryBus rendered block (same block semantics)
+ *   - projection / ephemeral / tool-context / advisory-appendix /
+ *     control-appendix — dynamic appendix blocks. Booked by PromptEngine at
+ *     the point the bytes are written into a <context-update>, so a block only
+ *     costs when it actually ships: unchanged blocks, tool turns reusing the
+ *     cached appendix, and Top-K evictions are all free.
  *   - system-reminder — bus-drained SR appended to the session tail (K1
  *     append-only: charged once per append)
  *   - runtime-payload — runtime hook injectUserMessage payloads (K1
  *     append-only: charged once per append)
- *   - control-appendix — control-plane dynamic appendix (Wave 4, active mode
- *     only; own BlockChargeTracker — the same byte is NEVER also charged to
- *     advisory-appendix)
  */
 export type CvmInjectionSource =
   | 'projection'
@@ -114,13 +113,13 @@ export class PressureMonitor {
   /**
    * Record CVM-injected tokens for overhead tracking.
    *
-   * W6（2026-07-11）计费口径 = 增量字节：appendixDelta 下字节恒定块入场
-   * 付一次、稳态零重发，调用方（turn-step-producer）只在块内容变化时计费。
-   * 旧口径每轮全额计费高估 ~10x，长会话必然越过阈值、误熄镜面。
+   * 计费口径 = 真实上线字节。appendix 类注入由 PromptEngine 在写进
+   * <context-update> 的那一刻记账（drainAppendixLedger），调用方只负责转交；
+   * SR / runtime-payload 类在各自的 append 点记一次。
    *
-   * Overhead accumulates until compact — history rewrite drops the injected
-   * blocks from context, so compaction-controller calls resetCvmOverhead().
-   * If the ratio exceeds thresholds, the next check() signals shouldThrottleCvm.
+   * 累加器语义是「当前历史里驻留的 CVM 字节」，由 resetAppendixBaseline 的
+   * 回调在历史重写时归零——不要在别处再加独立的复位调用，两套复位会漂移。
+   * 比例越过阈值后，下一次 check() 置 shouldThrottleCvm。
    */
   recordCvmInjection(estimatedTokens: number, source: CvmInjectionSource = 'projection'): void {
     this.cvmTokenAccumulator += estimatedTokens

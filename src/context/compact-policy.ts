@@ -32,12 +32,17 @@ export function tierForRatio(
   if (ratio >= ratios.ceiling) return 4
   if (ratio >= ratios.reactive) return 3
   if (ratio >= ratios.compact) return 2
-  if (ratio >= ratios.watch) return 1
   // Precision ceiling: once context usage exceeds it, model-accuracy
   // degradation outweighs any cache savings, so force at least a compact tier
   // even if the cache-economic ratios (possibly nudged up by a hot cache) said
   // otherwise. This is the guard the cache-only strategy was missing.
+  //
+  // It must be a floor, not a fallback branch. When the ceiling sits below the
+  // watch threshold (cache-preserving: 0.70 vs 0.72), an earlier `return 1`
+  // shadowed it and made the ladder non-monotonic — ratio 0.71 compacted while
+  // 0.75 only watched.
   if (precisionCeiling !== undefined && ratio >= precisionCeiling) return 2
+  if (ratio >= ratios.watch) return 1
   return 0
 }
 
@@ -98,10 +103,12 @@ export interface CompactActionDecision {
  *   - open breaker: no discretionary action.
  *   - 1M LLM ladder: full-llm ≥ 0.75, partial-llm ≥ 0.60 (unchanged ratios,
  *     now shared constants).
- *   - 1M precision band (≥ 0.5): no longer silently ignored — surfaces as a
- *     deterministic `stale-round` reclaim, which still has to clear the
- *     downstream reclaim gate and cache-advisor delay. Never a forced LLM
- *     rewrite (plan §1.4).
+ *   - precision band: past the accuracy ceiling but below the LLM ladder —
+ *     surfaces as a deterministic `stale-round` reclaim, which still has to
+ *     clear the downstream reclaim gate and cache-advisor delay. Never a forced
+ *     LLM rewrite (plan §1.4). Since the ceiling moved to 0.7 (2026-07-26) this
+ *     band is empty on the 1M path — partial-llm at 0.60 claims everything
+ *     above it — so the branch only fires under a precisionCeilingOverride.
  *   - everything else: the tier policy decides a deterministic `micro`.
  */
 export function decideCompactAction(input: CompactActionInput): CompactActionDecision {

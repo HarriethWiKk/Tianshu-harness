@@ -17,7 +17,9 @@ import { runTypeCheck } from '../../client.js'
  * fast path.
  */
 test('runTypeCheck: require(typescript) loads and returns ranOk=true', async () => {
-  const res = await runTypeCheck(process.cwd(), '*')
+  // 240s：全量套件并发时全仓 tsc 会超过 120s 默认上限（空闲实测 ~35-50s）。
+  // 上限存在的意义是「卡死要被发现」，不是「正常但慢要被误杀」。
+  const res = await runTypeCheck(process.cwd(), '*', 240_000)
   assert.equal(res.ranOk, true, 'tsc must run to completion — if ranOk is false, require(typescript) failed to load')
   // A clean repo has 0 errors, but the key assertion is ranOk, not the count.
   assert.ok(Array.isArray(res.diagnostics), 'diagnostics must be an array')

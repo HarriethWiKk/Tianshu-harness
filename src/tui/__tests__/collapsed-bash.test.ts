@@ -195,8 +195,8 @@ describe('formatCollapsedBashGroup', () => {
       { id: '4', command: 'whoami', completed: true },
     ])
     const lines = formatCollapsedBashGroup({ group, theme })
-    assert.ok(lines.some(l => l.includes('[Ctrl+O]')))
-    assert.ok(lines.some(l => l.includes('… +1 more command')))
+    assert.ok(lines.some(l => l.includes('ctrl+o 展开')))
+    assert.ok(lines.some(l => l.includes('… +1 条命令')))
   })
 
   it('marks failed entries', () => {

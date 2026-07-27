@@ -18,6 +18,14 @@ import {
   type EvaluateWorkerWriteGateInput,
   type WorkerWriteGateReport,
 } from './worker-write-gate.js'
+import {
+  buildContinuationObjective,
+  decideHandsContinuation,
+  markContinued,
+  mergeUsage,
+  MAX_HANDS_EXTRA_RUNS,
+  MAX_BUDGET_CONTINUATIONS,
+} from './worker-continuation.js'
 import { provisionSnapshotDeps } from './snapshot-deps.js'
 import { buildWorkerKnowledgeBlock } from './worker-knowledge.js'
 import { buildDomainKnowledgeBlock } from './domain-knowledge-block.js'
@@ -40,6 +48,19 @@ function buildHandsPrompt(config: HandsSessionConfig): string {
       : '',
   ].filter(Boolean)
   return [...knowledgeBlocks, buildWorkerPrompt(config.order, undefined, { ledgerCwd: config.cwd })].join('\n\n')
+}
+
+/**
+ * 额外轮次的运行意图。调用方（coordinator）用它决定这一轮是「重开一个 worker
+ * 会话」还是「让同一个 worker 接着上一轮的对话往下走」——`prompt` 参数在
+ * coordinator 那侧是走不通的，它按 order 重建 worker prompt，所以续跑的目标
+ * 必须以结构化字段递过去。
+ */
+export interface HandsRunAgentOptions {
+  /** 覆盖本轮的 objective（续跑用）。 */
+  objective?: string
+  /** 承接上一轮的会话消息，而不是从零重来。 */
+  continueSession?: boolean
 }
 
 export interface HandsSessionConfig {
@@ -73,7 +94,15 @@ export interface HandsSessionConfig {
    * Receives the worker prompt and AgentCallbacks; returns the full text output
    * which must contain a schema-valid WorkerResult JSON.
    */
-  runAgent: (prompt: string, callbacks: AgentCallbacks, workerCwd: string) => Promise<string>
+  runAgent: (
+    prompt: string,
+    callbacks: AgentCallbacks,
+    workerCwd: string,
+    options?: HandsRunAgentOptions,
+  ) => Promise<string>
+  /** 工作树内补偿轮的阶段播报（续跑）。派发侧把它接到 worker 的活动上行通道，
+   *  面板才能显示「续跑 1/2」，否则写工续跑期间外面只看到一段沉默。 */
+  onLifecycle?: (detail: string) => void
   /** W4-D1: injectable write-gate evaluator (tests). Defaults to the real wave-gate wrapper. */
   evaluateWriteGate?: (input: EvaluateWorkerWriteGateInput) => Promise<WorkerWriteGateReport>
   /** W4-D1: override gate enablement (tests). Defaults to the env kill switch. */
@@ -136,6 +165,8 @@ export async function runHandsSession(config: HandsSessionConfig): Promise<Hands
     let text = ''
     let apiError: string | undefined
     let turnUsage: Partial<Usage> = {}
+    // 首轮之外的 agent 轮次总账——续跑 / 解析修复 / 闸门修复共用，避免叠乘。
+    let extraRuns = 0
 
     text = await config.runAgent(buildHandsPrompt(config), {
       onTextDelta: (delta) => { text += delta },
@@ -166,6 +197,9 @@ export async function runHandsSession(config: HandsSessionConfig): Promise<Hands
       result = salvageWorkerResult(text, config.order.id)
         ?? buildBlockedWorkerResult(config.order, message, 'json_parse') // default — overwritten on success
       for (let attempt = 0; attempt < config.maxTurns && attempt < 2; attempt++) {
+        // 总账留一格给写闸门修复，解析修复不许吃光。
+        if (extraRuns >= MAX_HANDS_EXTRA_RUNS - 1) break
+        extraRuns++
         try {
           const repairPrompt = buildWorkerRepairPrompt(config.order, text, message)
           text = await config.runAgent(repairPrompt, {
@@ -190,6 +224,61 @@ export async function runHandsSession(config: HandsSessionConfig): Promise<Hands
      }
    }
 
+    // ── Wave 7: 预算耗尽时在工作树内续跑 ─────────────────────────────────
+    // 写工撞 max-turns / 墙钟超时会**正常返回**一个 blocked 结果，而下面写闸门的
+    // 触发条件含 `status !== 'blocked'`——不续跑的话写工一旦撞预算连闸门都不过，
+    // 改动躺在工作树里没人验就随 finally 一起销毁。
+    //
+    // 落点必须在这里（解析之后、闸门之前）：worktree 还活着，上一轮的改动还在，
+    // 续跑是真的「接着干」。coordinator 层对写工一律 skip，避免双重续跑。
+    let continuationRounds = 0
+    let continuationReason: 'max_turns' | 'timeout' | undefined
+    while (true) {
+      const decision = decideHandsContinuation({
+        result,
+        attempt: continuationRounds,
+        extraRunsUsed: extraRuns,
+        aborted: apiError !== undefined,
+      })
+      if (!decision.proceed) break
+      continuationRounds++
+      extraRuns++
+      continuationReason = decision.reason
+      try {
+        config.onLifecycle?.(`续跑 ${continuationRounds}/${MAX_BUDGET_CONTINUATIONS} · ${decision.reason === 'timeout' ? '时间预算耗尽' : '轮次预算耗尽'} · 工作树内`)
+      } catch { /* 播报失败不影响续跑 */ }
+      const objective = buildContinuationObjective(config.order.objective, decision.reason, continuationRounds)
+      let continuedText = ''
+      try {
+        continuedText = await config.runAgent(objective, {
+          onTextDelta: (delta) => { continuedText += delta },
+          onThinkingDelta: () => {},
+          onToolUse: () => {},
+          onToolResult: () => {},
+          onTurnComplete: (usage) => { turnUsage = mergeUsage(turnUsage, usage) ?? turnUsage },
+          onError: (err) => { apiError = err.message },
+          onAbort: () => { apiError = 'aborted' },
+          onApprovalRequired: async () => false,
+        }, wt.path, { objective, continueSession: true })
+      } catch {
+        // 续跑本身抛错——保留上一轮的部分成果，不把它换成一份更差的报告。
+        break
+      }
+      // 父信号断开 / API 报错：不再续，也不拿这一轮半截输出覆盖上一轮结果。
+      if (apiError) break
+      let continued: WorkerResult | undefined
+      try {
+        continued = parseWorkerResult(continuedText, config.order.id)
+      } catch {
+        continued = salvageWorkerResult(continuedText, config.order.id) ?? undefined
+      }
+      if (!continued) break
+      result = continued
+    }
+    if (continuationRounds > 0 && continuationReason) {
+      result = markContinued(result, continuationRounds, continuationReason)
+    }
+
     // ── W4-D1: main-side write gate ──────────────────────────────────────
     // Workers self-report verification, but the main controller re-runs it
     // against the worker's actual tree (reusing wave-gate: scoped typecheck +
@@ -207,8 +296,9 @@ export async function runHandsSession(config: HandsSessionConfig): Promise<Hands
       }
       let report = await evaluate({ cwd: wt.path, result })
       let repairCount = 0
-      if (report.outcome === 'failed') {
+      if (report.outcome === 'failed' && extraRuns < MAX_HANDS_EXTRA_RUNS) {
         repairCount = 1
+        extraRuns++
         try {
           const repairText = await config.runAgent(buildWorkerVerifyRepairPrompt(config.order, report), {
             onTextDelta: () => {},

@@ -22,6 +22,10 @@ export interface OverlayNavState {
   chronicleIndex: number
   tasksIndex: number
   tasksFilter: import('../format/overlay.js').TasksFilter
+  jobsIndex: number
+  /** jobs overlay 的稳定选中——行按 running 优先/startedAt 倒序重排，index 会
+   *  漂移（job 退出时换组），按 id 选中才能把 x/Enter 作用到正确的 job。 */
+  jobsSelectedId?: string
   domainPickerIndex: number
   modelPickerIndex: number
   themePickerIndex: number
@@ -56,7 +60,7 @@ export interface OverlayDataProviders {
  * TuiApp; this class only manages nav state / data providers / exec callbacks.
  */
 export class OverlayController {
-  private overlayNav: OverlayNavState = { pagerPage: 0, pagerMode: 'page', pagerSearchQuery: '', pagerSearchCurrent: 0, pagerSelectedMessage: 0, pagerVerbose: false, paletteIndex: 0, rewindIndex: 0, rewindPhase: 'list', rewindActionIndex: 0, historySearchIndex: 0, chronicleIndex: 0, tasksIndex: 0, tasksFilter: 'running', domainPickerIndex: 0, modelPickerIndex: 0, themePickerIndex: 0, choicePanelIndex: 0, planPickerIndex: 0, connectIndex: 0, initIndex: 0, query: '' }
+  private overlayNav: OverlayNavState = { pagerPage: 0, pagerMode: 'page', pagerSearchQuery: '', pagerSearchCurrent: 0, pagerSelectedMessage: 0, pagerVerbose: false, paletteIndex: 0, rewindIndex: 0, rewindPhase: 'list', rewindActionIndex: 0, historySearchIndex: 0, chronicleIndex: 0, tasksIndex: 0, tasksFilter: 'running', jobsIndex: 0, domainPickerIndex: 0, modelPickerIndex: 0, themePickerIndex: 0, choicePanelIndex: 0, planPickerIndex: 0, connectIndex: 0, initIndex: 0, query: '' }
   private overlayData?: OverlayDataProviders
   private paletteExec?: (index: number) => void
   private rewindExec?: (messageIndex: number, mode: RewindMode) => void
@@ -77,7 +81,7 @@ export class OverlayController {
   /** Direct mutable access to nav state object */
   nav(): OverlayNavState { return this.overlayNav }
   resetNav(): void {
-    this.overlayNav = { pagerPage: 0, pagerMode: 'page' as const, pagerSearchQuery: '', pagerSearchCurrent: 0, pagerSelectedMessage: 0, pagerVerbose: false, paletteIndex: 0, rewindIndex: 0, rewindPhase: 'list' as const, rewindActionIndex: 0, historySearchIndex: 0, chronicleIndex: 0, tasksIndex: 0, tasksFilter: 'running' as const, domainPickerIndex: 0, modelPickerIndex: 0, themePickerIndex: 0, choicePanelIndex: 0, planPickerIndex: 0, connectIndex: 0, initIndex: 0, query: '' }
+    this.overlayNav = { pagerPage: 0, pagerMode: 'page' as const, pagerSearchQuery: '', pagerSearchCurrent: 0, pagerSelectedMessage: 0, pagerVerbose: false, paletteIndex: 0, rewindIndex: 0, rewindPhase: 'list' as const, rewindActionIndex: 0, historySearchIndex: 0, chronicleIndex: 0, tasksIndex: 0, tasksFilter: 'running' as const, jobsIndex: 0, domainPickerIndex: 0, modelPickerIndex: 0, themePickerIndex: 0, choicePanelIndex: 0, planPickerIndex: 0, connectIndex: 0, initIndex: 0, query: '' }
   }
 
   get pagerPage(): number { return this.overlayNav.pagerPage }

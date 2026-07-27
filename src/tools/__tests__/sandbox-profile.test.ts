@@ -12,7 +12,12 @@ import {
   shSingleQuote,
   getSandboxStartupNotice,
   maybeWarnNoSandbox,
+  isSandboxActive,
+  sandboxRequested,
+  sandboxCoversCommand,
+  applySandboxPolicyForApprovalMode,
   _resetSandboxWarningLatch,
+  _resetSandboxBackendCache,
 } from '../sandbox-profile.js'
 import { grantPath, _resetGrantsForTest } from '../path-grants.js'
 import { mkdtempSync, rmSync, realpathSync } from 'node:fs'
@@ -240,5 +245,113 @@ describe('sandbox-profile: maybeWarnNoSandbox (one-shot)', () => {
     maybeWarnNoSandbox({ cwd: '/w', platform: 'win32', which: () => false, env: { ...env, RIVET_SANDBOX: '1' } }, log)
     assert.equal(logs.length, 1)
     _resetSandboxWarningLatch()
+  })
+})
+
+describe('gate parity (isSandboxActive ↔ wrapSandboxCommand)', () => {
+  it('reports inactive when the sandbox was never requested', () => {
+    _resetSandboxBackendCache()
+    const env = {} as NodeJS.ProcessEnv
+    assert.equal(isSandboxActive(env), false)
+    assert.equal(
+      wrapSandboxCommand('echo hi', { cwd: process.cwd(), env }).sandboxed,
+      false,
+    )
+  })
+
+  it('retired RIVET_NO_SANDBOX no longer grants activity', () => {
+    _resetSandboxBackendCache()
+    // The retired opt-out must not be the thing that decides activity —
+    // absence of RIVET_SANDBOX already means inactive.
+    assert.equal(isSandboxActive({ RIVET_NO_SANDBOX: '0' } as NodeJS.ProcessEnv), false)
+  })
+
+  it('learn mode counts as requested (a real boundary is applied)', () => {
+    _resetSandboxBackendCache()
+    assert.equal(sandboxRequested({ RIVET_SANDBOX: 'learn' } as NodeJS.ProcessEnv), true)
+  })
+})
+
+describe('SandboxDecision.writableRoots', () => {
+  it('carries the roots that were in effect when sandboxed', () => {
+    _resetSandboxBackendCache()
+    const env = { RIVET_SANDBOX: '1', HOME: '/home/u', TMPDIR: '/tmp' } as NodeJS.ProcessEnv
+    const d = wrapSandboxCommand('echo hi', {
+      cwd: '/work',
+      env,
+      platform: 'darwin',
+      which: (b: string) => b === 'sandbox-exec',
+    })
+    assert.equal(d.sandboxed, true)
+    assert.ok(d.writableRoots)
+    assert.ok(d.writableRoots.includes('/work'))
+  })
+})
+
+describe('incompatible-command bypass', () => {
+  const on = (cmd: string) => wrapSandboxCommand(cmd, {
+    cwd: '/work',
+    env: { RIVET_SANDBOX: '1', HOME: '/h' } as NodeJS.ProcessEnv,
+    platform: 'darwin',
+    which: (b: string) => b === 'sandbox-exec',
+  })
+
+  it('bypasses the wrap for brew but reports unsandboxed', () => {
+    _resetSandboxBackendCache()
+    const d = on('brew install jq')
+    assert.equal(d.command, 'brew install jq', 'command must not be wrapped')
+    assert.equal(d.sandboxed, false, 'must stay fail-closed for approval')
+    assert.ok(d.note?.includes('沙箱旁路'))
+  })
+
+  it('still wraps an ordinary build command', () => {
+    _resetSandboxBackendCache()
+    const d = on('npm run build')
+    assert.equal(d.sandboxed, true)
+    assert.ok(d.command.startsWith('sandbox-exec'))
+  })
+})
+
+describe('sandboxCoversCommand', () => {
+  it('is false for a bypassed command even when the sandbox is on', () => {
+    _resetSandboxBackendCache()
+    const env = { RIVET_SANDBOX: '1' } as NodeJS.ProcessEnv
+    // Only meaningful where a backend exists; on a backend-less host both are
+    // false, which is still the fail-closed answer.
+    assert.equal(sandboxCoversCommand('brew install jq', env), false)
+  })
+})
+
+describe('applySandboxPolicyForApprovalMode', () => {
+  it('turns the sandbox on for YOLO when nothing was set', () => {
+    const env = {} as NodeJS.ProcessEnv
+    applySandboxPolicyForApprovalMode('dangerously-skip-permissions', env)
+    assert.equal(env.RIVET_SANDBOX, '1')
+  })
+
+  it('leaves non-YOLO modes alone', () => {
+    for (const mode of ['manual', 'auto-safe', undefined]) {
+      const env = {} as NodeJS.ProcessEnv
+      applySandboxPolicyForApprovalMode(mode, env)
+      assert.equal(env.RIVET_SANDBOX, undefined)
+    }
+  })
+
+  it('never overrides an explicit setting — RIVET_SANDBOX=0 is the escape hatch', () => {
+    const off = { RIVET_SANDBOX: '0' } as NodeJS.ProcessEnv
+    applySandboxPolicyForApprovalMode('dangerously-skip-permissions', off)
+    assert.equal(off.RIVET_SANDBOX, '0')
+    assert.equal(sandboxRequested(off), false)
+
+    const learn = { RIVET_SANDBOX: 'learn' } as NodeJS.ProcessEnv
+    applySandboxPolicyForApprovalMode('dangerously-skip-permissions', learn)
+    assert.equal(learn.RIVET_SANDBOX, 'learn')
+  })
+
+  it('is idempotent across repeated mode switches', () => {
+    const env = {} as NodeJS.ProcessEnv
+    applySandboxPolicyForApprovalMode('dangerously-skip-permissions', env)
+    applySandboxPolicyForApprovalMode('dangerously-skip-permissions', env)
+    assert.equal(env.RIVET_SANDBOX, '1')
   })
 })

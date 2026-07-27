@@ -1,5 +1,6 @@
 import type { AgentLoop } from './loop.js'
 import { TurnStreamController } from './turn-stream.js'
+import { describeImages } from './vision-service.js'
 import { TurnCompletionController } from './turn-completion.js'
 import { ToolExecutionController } from './tool-execution.js'
 import type { RuntimeHookSnapshot } from './runtime-hooks.js'
@@ -341,7 +342,17 @@ export function createToolExecutionController(self: AgentLoop): ToolExecutionCon
       // parts) — the same append-only boundary the steer path uses.
       getSupportsVision: () => self.config.supportsVision ?? false,
       addUserMessageWithImages: (text, images) => { self.session.addUserMessage(text, images) },
-      recordToolHistory: (name, input, isError, content, errorClass) => self.recordToolHistory(name, input, isError, content, errorClass),
+      // Bridge for text-only primaries: the same vision model that describes
+      // user-attached images also describes screenshots the agent took itself,
+      // so `browser_debug screenshot` is worth calling on any model.
+      describeToolImages: self.config.visionClient
+        ? (images, signal) => describeImages(self.config.visionClient!, images, {
+            prompt: self.config.visionModelPrompt,
+            maxTokens: self.config.visionModelMaxTokens,
+            signal,
+          })
+        : undefined,
+      recordToolHistory: (name, input, isError, content, errorClass, errorKind) => self.recordToolHistory(name, input, isError, content, errorClass, errorKind),
       onLeaveMark: mark => self.captureLeaveMark(mark),
       onPlanSteps: steps => self.capturePlanSteps(steps),
       onAcceptance: items => self.captureAcceptance(items),
@@ -1027,7 +1038,7 @@ export function createTurnOrchestrator(self: AgentLoop): TurnOrchestrator {
     // === Session ===
     removeLastMessage: () => { self.session.removeLastMessage() },
     addUserMessage: (content) => { self.session.addUserMessage(content) },
-    appendSystemReminder: (content) => { self.session.appendSystemReminder(content) },
+    appendSystemReminder: (content, cls) => { self.session.appendSystemReminder(content, cls) },
     appendSystemReminderAndReport: (content) => self.session.appendSystemReminderAndReport(content),
     resetSrCount: () => { self.session.resetSrCount() },
     addAssistantBlocks: (blocks) => { self.session.addAssistantBlocks(blocks) },
@@ -1190,7 +1201,7 @@ export function createTurnOrchestrator(self: AgentLoop): TurnOrchestrator {
       getEstimatedTokens: () => self.session.getEstimatedTokens(),
       getSessionId: () => self.config.sessionId,
       getCwd: () => self.cwd,
-      appendSystemReminder: (content) => { self.session.appendSystemReminder(content) },
+      appendSystemReminder: (content, cls) => { self.session.appendSystemReminder(content, cls) },
       appendSystemReminderAndReport: (content) => self.session.appendSystemReminderAndReport(content),
       resetSrCount: () => { self.session.resetSrCount() },
       completeTurn: (params) => self.turnCompletion.complete(params),
@@ -1207,7 +1218,7 @@ export function createTurnOrchestrator(self: AgentLoop): TurnOrchestrator {
         set lastThinkingContent(v) { self.lastThinkingContent = v },
       },
       getDoomLoopLevel: () => self.getDoomLoopLevel(),
-      appendSystemReminder: (content) => { self.session.appendSystemReminder(content) },
+      appendSystemReminder: (content, cls) => { self.session.appendSystemReminder(content, cls) },
       appendSystemReminderAndReport: (content) => self.session.appendSystemReminderAndReport(content),
       completeTurn: (params) => self.turnCompletion.complete(params),
       getTotalUsage: () => self.session.getTotalUsage(),

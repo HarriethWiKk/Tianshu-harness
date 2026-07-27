@@ -42,7 +42,9 @@ export function formatThinking(input: FormatThinkingInput, theme: RivetTheme): s
   const domainId = input.domainId ?? 'tianshu'
   const domain = starDomainRegistry.get(domainId) ?? starDomainRegistry.get('tianshu')
   
-  const rawGlyph = domain?.uiPersona?.glyph ?? '✦'
+  // 兜底用 ◇（「未定/自定义域」的中性符，与 glance-bar 的自定义域展示同口径），
+  // 不用 ✦——那是品牌星，星域缺失时打一颗品牌星是语义污染。
+  const rawGlyph = domain?.uiPersona?.glyph ?? '◇'
   const accentKey = domain?.uiPersona?.accent ?? 'primary'
   const accentColor = (theme as Record<string, any>)[accentKey] ?? theme.primary
   const domainName = domain?.name ?? '天枢'
@@ -60,7 +62,7 @@ export function formatThinking(input: FormatThinkingInput, theme: RivetTheme): s
       lines.push(`${headSymbol} ${headLabel}${headMeta}`)
     } else {
       const statusLabel = getThinkingStatus(input.elapsedMs)
-      const lineInfo = textLines.length > 0 ? ` (${textLines.length} lines)` : ''
+      const lineInfo = textLines.length > 0 ? ` · ${textLines.length} 行` : ''
       const glyphStr = useAscii ? '~' : rawGlyph
       
       const headSymbol = color(glyphStr, accentColor, { bold: true })

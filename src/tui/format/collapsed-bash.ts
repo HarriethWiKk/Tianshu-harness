@@ -11,6 +11,7 @@
 import { color } from '../engine/ansi.js'
 import type { RivetTheme } from '../theme.js'
 import { displayWidth, truncateToDisplayWidth } from '../width.js'
+import { truncationHint } from '../truncation-marker.js'
 
 // ── Types ──────────────────────────────────────────────────────
 
@@ -171,7 +172,7 @@ export function formatCollapsedBashGroup(input: FormatCollapsedBashGroupInput): 
     const maxWidth = Math.max(10, (input.columns ?? 80) - 9)
     const preview = displayWidth(commands) > maxWidth ? truncateToDisplayWidth(commands, maxWidth - 2) + '…' : commands
     lines.push(`│  ╰─ ${color(preview, theme.muted)}`)
-    lines.push(color(`│     … +${completed.length - 3} more commands [Ctrl+O]`, theme.secondary))
+    lines.push(color(`│     ${truncationHint(completed.length - 3, '条命令')}`, theme.secondary))
   }
 
   return lines

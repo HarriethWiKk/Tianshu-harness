@@ -2321,6 +2321,30 @@ describe('phase-aware prediction recording', () => {
     assert.equal(captured, 'environment', 'recordToolHistory must receive errorClass for immune neutralisation')
   })
 
+  it('threads errorKind through to recordToolHistory (transient 判定走结构化管道)', async () => {
+    let captured: string | undefined = 'unset'
+    const deps = makeDeps({
+      phaseHint: 'execute',
+      recordToolHistory: (...args: unknown[]) => { captured = args[5] as string | undefined },
+      config: {
+        ...makeDeps().config,
+        toolRegistry: {
+          execute: async () => ({ content: '语法检查失败，已自动回滚', isError: true, errorKind: 'syntax_error' }),
+          get: () => ({ definition: { input_schema: {} }, isConcurrencySafe: () => false }),
+          needsApproval: () => false,
+          resolveName: (n: string) => n,
+        },
+      } as any,
+    })
+
+    await executeToolUse(
+      { id: 'tu-kind-hist', name: 'edit_file', input: { file_path: 'a.ts' } },
+      deps, noopCallbacks as any, 1, false,
+    )
+
+    assert.equal(captured, 'syntax_error', 'recordToolHistory 必须收到 errorKind——transient 不再按结果子串匹配')
+  })
+
   it('DOES record prediction for run_tests success in verify phase (TDD GREEN)', async () => {
     let recorded: boolean | undefined = undefined
     const deps = makeDeps({

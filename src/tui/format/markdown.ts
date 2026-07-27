@@ -395,6 +395,8 @@ function formatInlineToAnsi(segments: Segment[], theme: RivetTheme): string {
  * 示例: "95454cd0  — 5 files, +70/-4。"
  */
 export function tryFormatGitCommitLine(line: string, theme: RivetTheme): string | null {
+  // 代码块内缩进的提交行要保住前导空白——trim 后不补回，缩进层级被顶格抹平。
+  const indent = /^\s*/.exec(line)![0]
   const trimmed = line.trim()
   const gitLineRe = /^(?:commit\s+)?([0-9a-f]{7,40})\s+(—|-|:)\s+(.*)$/i
   const match = gitLineRe.exec(trimmed)
@@ -411,7 +413,7 @@ export function tryFormatGitCommitLine(line: string, theme: RivetTheme): string 
     .replace(/\-(\d+)/g, color('-$1', theme.error, { bold: true }))
     .replace(/(\d+)(\s+files?)/g, color('$1$2', theme.assistantColor))
 
-  return `${hashPart}${sepPart}${formattedRest}`
+  return `${indent}${hashPart}${sepPart}${formattedRest}`
 }
 
 /**
@@ -603,19 +605,18 @@ export function formatMarkdown(input: FormatMarkdownInput, theme: RivetTheme): s
     }
   }
 
-  // 末尾句检查：若最后一句话包含提问探询（如 "是否执行？"），进行醒目 Alert 高亮
+  // 末尾句检查：若最后一句话以问号收尾（提问探询），前缀 ⚡ 醒目高亮。
+  // 只认问号结尾——「需要/确认/是否…」开头的陈述句（"确认无误。"）不是提问，
+  // 不能以这些词开头就染。原行保持不动：整行去色重染会把行内既有格式
+  // （代码高亮、引用条）一并剥掉，所以只在前面加 ⚡。
   for (let i = result.length - 1; i >= 0; i--) {
     const lineStr = result[i]
     if (!lineStr) continue
     const plainLine = lineStr.replace(/\u001b\[[0-9;]*m/g, '').trim()
     if (!plainLine) continue
 
-    if (/[？\?]\s*$/.test(plainLine) || /^(是否|请问|需要|确认|要不要).*[\?？]?$/.test(plainLine)) {
-      if (!plainLine.includes('⚡')) {
-        result[i] = color(`⚡ ${plainLine}`, theme.warning, { bold: true })
-      } else {
-        result[i] = color(plainLine, theme.warning, { bold: true })
-      }
+    if (/[？\?]\s*$/.test(plainLine) && !plainLine.includes('⚡')) {
+      result[i] = `${color('⚡', theme.warning, { bold: true })} ${lineStr}`
     }
     break
   }

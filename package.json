@@ -1,6 +1,6 @@
 {
   "name": "tianshu-tui",
-  "version": "2.23.0",
+  "version": "2.24.1",
   "description": "Terminal coding agent optimized for DeepSeek V4 prefix cache",
   "license": "Apache-2.0",
   "type": "module",
@@ -25,8 +25,9 @@
   },
   "files": [
     "dist/",
-    "!dist/node_modules",
     "!dist/native",
+    "!dist/node_modules/**",
+    "dist/node_modules/better-sqlite3/",
     "scripts/fetch-native-sqlite.js",
     "README.md",
     "LICENSE",
@@ -37,7 +38,7 @@
   },
   "scripts": {
     "postinstall": "patch-package || node -e 1 && node scripts/install-git-hooks.mjs || node -e 1 && node scripts/fetch-native-sqlite.js || node -e 1",
-    "prepublishOnly": "npm run build",
+    "prepack": "npm run build && node scripts/stage-cli-sqlite-wrapper.js",
     "dev": "tsup --watch",
     "build": "tsup",
     "start": "node --expose-gc --max-old-space-size=4096 dist/main.js",
@@ -62,6 +63,7 @@
     "@modelcontextprotocol/sdk": "^1.29.0",
     "chalk": "^5.6.2",
     "diff": "^9.0.0",
+    "esbuild": "^0.28.1",
     "get-east-asian-width": "^1.6.0",
     "parquet-wasm": "^0.7.2",
     "parquetjs": "^0.11.2",

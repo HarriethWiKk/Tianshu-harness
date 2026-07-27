@@ -68,6 +68,12 @@ describe('hasActionIntent', () => {
   it('已完成任务的总结（不含行动承诺标记）', () => {
     assert.ok(!hasActionIntent('我已经完成了修改，以下是涉及的文件'))
   })
+  it('"Git Bash" 含 Bash 但不触发工具动词误配', () => {
+    // 回归：Git Bash 是产品名，不是 bash 工具调用
+    assert.ok(!hasActionIntent('让我看看 Git Bash 的探测逻辑'))
+    // 但真正的 bash 工具调用仍然触发
+    assert.ok(hasActionIntent('让我用 bash 跑一下测试'))
+  })
   it('"我来自"不触发（出处陈述，非行动宣言）', () => {
     // 回归：10ecffa5 的误报——"我来自天枢星域" + "运行在 opencode-tui"
     assert.ok(!hasActionIntent('我来自天枢星域，是运行在 opencode-tui 终端编程代理中的 AI 助手'))

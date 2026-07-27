@@ -24,8 +24,22 @@ import {
 } from '../control-plane.js'
 import { signalsFromVerifiedResults } from '../control-plane-adapters.js'
 import { verifyWorkerEvidence } from '../worker-evidence.js'
-import { BlockChargeTracker } from '../injection-meter.js'
 import type { WorkerResult } from '../work-order.js'
+
+/**
+ * Models appendixDelta billing for this fixture: a block pays its bytes when
+ * its content changes and nothing while it is byte-stable. Production books
+ * this inside PromptEngine at the emission point; here it only needs to price
+ * the control-plane lane against the naive per-signal baseline.
+ */
+function deltaCharger(): (content: string) => number {
+  let last = ''
+  return content => {
+    if (content === last) return 0
+    last = content
+    return content.length
+  }
+}
 
 function info(key: string, summary: string): ControlSignal {
   return {
@@ -55,7 +69,7 @@ function fixtureTurn(turn: number): ControlSignal[] {
 describe('control-plane flow metrics (Wave 5 fixture/replay)', () => {
   it('ordinary signals cost fewer provider-visible bytes than per-signal injection', () => {
     let frame = emptyControlPlaneFrame()
-    const tracker = new BlockChargeTracker()
+    const charge = deltaCharger()
     let controlPlaneBytes = 0
     let naiveBytes = 0
 
@@ -68,7 +82,7 @@ describe('control-plane flow metrics (Wave 5 fixture/replay)', () => {
       frame = reduceControlSignals({ ...frame, signals: tickControlSignals(frame.signals) }, incoming)
       // control plane: only the appendix lane reaches the provider, with
       // appendixDelta semantics (steady state = zero bytes).
-      controlPlaneBytes += tracker.charge(renderControlPlaneAppendix(frame) ?? '')
+      controlPlaneBytes += charge(renderControlPlaneAppendix(frame) ?? '')
     }
 
     assert.ok(naiveBytes > 0)

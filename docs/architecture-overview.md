@@ -1,6 +1,9 @@
 # 天枢 Architecture Overview
 
-> v2.19.3 · Node.js 24+ / TypeScript strict / 纯 ANSI TUI（`src/tui/engine/`）+ Tauri 桌面端 / node:test / ESM
+> v2.23.0 · Node.js 24+ / TypeScript strict / 纯 ANSI TUI（`src/tui/engine/`）+ Tauri 桌面端 / node:test / ESM
+>
+> 规模：CLI 源码 931 文件 / 20.8 万行，测试 1,134 文件 / 19.8 万行（13,125 用例 / 2,251 suites 实测），68 个 hook 模块。
+> 逐期数据与迭代里程碑见 [`engineering-metrics.md`](./engineering-metrics.md)（数据截至 2026-07-26）。
 >
 > 开发代号曾用 **Rivet**；CLI 命令仍为 `rivet`。Agent 导航索引见根目录 [`AGENTS.md`](../AGENTS.md)。
 
@@ -139,16 +142,18 @@ WorkerProfile + WorkOrder → 独立无头会话；按任务类型自适应路�
 
 ## 目录速查
 
-完整表见 [`AGENTS.md`](../AGENTS.md)。规模最大的模块：
+完整表见 [`AGENTS.md`](../AGENTS.md)。规模最大的模块（`.ts`/`.tsx` 文件数，2026-07-26）：
 
-| 目录 | 约 `.ts` 文件数 | 角色 |
-|------|-----------------|------|
-| `src/agent/` | ~800 | 心脏 |
-| `src/tools/` | ~260 | 动作面 |
-| `src/tui/` | ~240 | 终端表面 |
-| `src/server/` | ~80 | 桌面 sidecar |
-| `src/context/` | ~70 | 认知状态 |
-| `desktop/` | ~150 源文件 | GUI 表面 |
+| 目录 | 含测试 | 纯源码 | 角色 |
+|------|-------|-------|------|
+| `src/agent/` | 893 | 407 | 心脏 |
+| `src/tools/` | 312 | 154 | 动作面 |
+| `src/tui/` | 278 | 115 | 终端表面 |
+| `src/server/` | 91 | 36 | 桌面 sidecar |
+| `src/context/` | 69 | 30 | 认知状态 |
+| `src/api/` | 51 | 22 | 模型接入 |
+| `src/prompt/` | 49 | 18 | 提示词与缓存锚 |
+| `desktop/` | — | 204 | GUI 表面 |
 
 ## 相关文档
 

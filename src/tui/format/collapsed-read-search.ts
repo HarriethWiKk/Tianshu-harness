@@ -13,6 +13,7 @@
 import { color } from '../engine/ansi.js'
 import type { RivetTheme } from '../theme.js'
 import { displayWidth, truncateToDisplayWidth } from '../width.js'
+import { EXPAND_HINT } from '../truncation-marker.js'
 
 // ── Types ──────────────────────────────────────────────────────
 
@@ -301,7 +302,7 @@ export function formatCollapsedGroup(input: FormatCollapsedGroupInput): string[]
         }
         const limit = expanded ? 30 : 3
         if (lineCount > limit) {
-          lines.push(`  ${childPrefix} ${color(`… +${lineCount - limit} more lines`, theme.dim)}`)
+          lines.push(`  ${childPrefix} ${color(`… +${lineCount - limit} 行`, theme.dim)}`)
         }
       }
     }
@@ -311,7 +312,7 @@ export function formatCollapsedGroup(input: FormatCollapsedGroupInput): string[]
     const maxWidth = Math.max(10, (input.columns ?? 80) - 9)
     const preview = displayWidth(files) > maxWidth ? truncateToDisplayWidth(files, maxWidth - 2) + '…' : files
     lines.push(`  └─ ${color(preview, theme.secondary)}`)
-    lines.push(`     ${color(`… +${completed.length - 3} more files`, theme.dim)} ${color('[Ctrl+O]', theme.warning)}`)
+    lines.push(`     ${color(`… +${completed.length - 3} 个文件`, theme.dim)} ${color(EXPAND_HINT, theme.warning)}`)
   }
 
   return lines

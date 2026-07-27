@@ -39,6 +39,8 @@ class FakeDriver implements BrowserDebugDriver {
   async clearCookies() {}
   async setStorage() {}
   async clearStorage() {}
+  async setViewport() {}
+  viewportSize() { return { width: 1280, height: 800 } }
   currentUrl() { return 'about:blank' }
   pageUrls() { return ['about:blank'] }
   async bringToFront() {}

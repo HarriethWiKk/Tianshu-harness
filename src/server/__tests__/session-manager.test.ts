@@ -12,6 +12,16 @@ const settle = async () => {
   await new Promise((r) => setImmediate(r))
   await new Promise((r) => setTimeout(r, 10))
 }
+
+/** 轮询到条件成立。比固定 sleep 抗负载：机器繁忙时定时器晚触发不该判失败。 */
+const waitUntil = async (cond: () => boolean, timeoutMs = 3000): Promise<void> => {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (cond()) return
+    await new Promise((r) => setTimeout(r, 5))
+  }
+  throw new Error(`条件在 ${timeoutMs}ms 内未成立`)
+}
 import { RuntimeSessionManager, extractObjective, type ManagedAgent, type ModelOption, type DelegateActivityUpdate } from '../session-manager.js'
 import type { AgentCallbacks } from '../../agent/loop-types.js'
 import type { Artifact } from '../../artifact/types.js'
@@ -1178,45 +1188,51 @@ test('watchdog stall 后、setImmediate 执行前用户 abort → 不续跑（�
 
 // ── C2 刹车：watchdog 续跑倒计时可取消 ────────────────────────────────────
 
+// 倒计时统一取 200ms 而非 30ms：settle() 自身就要约 15ms，30ms 窗口只有一倍
+// 余量，全量并行下定时器会抢在断言之前跑完，"倒计时内不得续跑"因此偶发假失败。
+// 200ms 给到十余倍余量，同时"确实续跑了"改用轮询，空载时并不会因此变慢。
+const CONTINUE_DELAY_MS = 200
+
 test('C2: 续跑先发 pendingAutoContinue 事件，倒计时结束才真正 continue', async () => {
-  const { manager, agents } = makeManager({ watchdogContinueDelayMs: 30 })
+  const { manager, agents } = makeManager({ watchdogContinueDelayMs: CONTINUE_DELAY_MS })
   const s = manager.createSession({ prompt: 'go' })
   agents[0]!.watchdogAbort('watchdog:goal')
-  await settle() // setImmediate 已跑：事件已追加，但倒计时(30ms)未到
+  await settle() // setImmediate 已跑：事件已追加，但倒计时未到
 
   const ev = manager.getEvents(s.id, 0)!.events.find((e) => e.type === 'watchdog_recovery')
   assert.ok(ev, '决策后立即追加 watchdog_recovery 事件')
   assert.equal(ev!.data.pendingAutoContinue, true)
-  assert.equal(ev!.data.delayMs, 30)
+  assert.equal(ev!.data.delayMs, CONTINUE_DELAY_MS)
   assert.deepEqual(agents[0]!.prompts, ['go'], '倒计时内不得续跑')
 
-  await new Promise((r) => setTimeout(r, 50))
+  await waitUntil(() => agents[0]!.prompts.length > 1)
   assert.deepEqual(agents[0]!.prompts, ['go', 'continue'], '倒计时结束后续跑')
   assert.equal(manager.getSession(s.id)!.status, 'running')
 })
 
 test('C2: 倒计时窗口内用户 abort → 取消续跑并追加 cancelled 事件', async () => {
-  const { manager, agents } = makeManager({ watchdogContinueDelayMs: 30 })
+  const { manager, agents } = makeManager({ watchdogContinueDelayMs: CONTINUE_DELAY_MS })
   const s = manager.createSession({ prompt: 'go' })
   agents[0]!.watchdogAbort('watchdog:goal')
   await settle() // 倒计时已挂起
 
   manager.abort(s.id)
-  await new Promise((r) => setTimeout(r, 50))
+  // 必须睡过倒计时截止点，否则"没续跑"只是因为还没到点，证明不了取消生效。
+  await new Promise((r) => setTimeout(r, CONTINUE_DELAY_MS + 100))
   assert.deepEqual(agents[0]!.prompts, ['go'], '取消后不得续跑')
   const evs = manager.getEvents(s.id, 0)!.events.filter((e) => e.type === 'watchdog_recovery')
   assert.ok(evs.some((e) => e.data.cancelled === true), '必须追加 cancelled 事件供 UI 收卡片')
 })
 
 test('C2: 倒计时窗口内用户发新 prompt → 定时器清除，continue 不追发', async () => {
-  const { manager, agents } = makeManager({ watchdogContinueDelayMs: 30 })
+  const { manager, agents } = makeManager({ watchdogContinueDelayMs: CONTINUE_DELAY_MS })
   const s = manager.createSession({ prompt: 'go' })
   const a = agents[0]!
   a.watchdogAbort('watchdog:goal')
   await settle()
 
   assert.equal(manager.run(s.id, '用户新指令'), true)
-  await new Promise((r) => setTimeout(r, 50))
+  await new Promise((r) => setTimeout(r, CONTINUE_DELAY_MS + 100))
   assert.deepEqual(a.prompts, ['go', '用户新指令'], '用户 prompt 抢占，自动 continue 不得追发')
 })
 

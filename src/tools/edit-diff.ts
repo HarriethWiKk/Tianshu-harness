@@ -101,7 +101,7 @@ export async function buildFileDiff(
   const maxLines = opts?.maxLines ?? DEFAULT_MAX_DIFF_LINES
   if (body.length > maxLines) {
     const hidden = body.length - maxLines
-    body = [...body.slice(0, maxLines), `… (${hidden} more diff lines, Ctrl+O)`]
+    body = [...body.slice(0, maxLines), `… +${hidden} 行 diff · ctrl+o 展开`]
   }
 
   return body.join('\n')

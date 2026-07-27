@@ -48,6 +48,8 @@ npm install -g tianshu-tui
 rivet
 ```
 
+> **Windows 提示**：装完提示 `rivet 无法识别` 时——先**新开一个终端**（装 Node 时开着的窗口拿的是旧 PATH）；仍不行，把 `npm prefix -g` 输出的目录加进用户 PATH 再开新终端。官方安装器装的 Node 默认无此问题，nvm/fnm/scoop 安装的需手动加一次。
+
 **方式 C：从源码构建**：
 
 ```bash
@@ -204,13 +206,13 @@ graph TD
 
 | 指标 | 数值 |
 |------|------|
-| TUI 源码（TypeScript，不含测试） | 825 文件 / 约 17.3 万行 |
-| 测试代码 | 995 文件 / 约 16.6 万行 |
-| 测试用例（node:test） | **10,000+**，测试 : 源码 ≈ **1 : 1** |
+| CLI 源码（TypeScript，不含测试） | 931 文件 / 约 20.8 万行 |
+| 测试代码 | 1,134 文件 / 约 19.8 万行 |
+| 测试用例（node:test） | **13,000+**，测试 : 源码 ≈ **1 : 1** |
 | 类型检查 | `tsc` strict + `noUncheckedIndexedAccess` |
 | 前缀缓存命中率 | 长会话稳态实测 95–99% |
 
-编码 agent 的核心逻辑（多轮循环、工具流水线、上下文压缩）以难测著称，开源 agent 项目普遍测试覆盖很薄——本项目坚持测试与源码等量、事故修复必带回归测试。完整统计口径与复现命令见 [工程质量指标](docs/engineering-metrics.md)。
+编码 agent 的核心逻辑（多轮循环、工具流水线、上下文压缩）以难测著称，开源 agent 项目普遍测试覆盖很薄——本项目坚持测试与源码等量、事故修复必带回归测试。过去 54 天代码量增长约 3.6 倍，测试:源码比值始终保持在 0.93–0.99 之间，没有被规模稀释。完整统计口径、迭代里程碑与复现命令见 [工程质量指标](docs/engineering-metrics.md)。
 
 ## ✨ 核心特性
 
@@ -355,6 +357,23 @@ rivet config mcp list                                              # 列出 + �
 
 会话内：`/mcp`（状态）、`/debug mcp`（诊断）。MCP 工具与内置工具遵循同一审批模式。
 
+### 终端 UI（TUI）
+
+天枢的命令行界面跑在自研的 **T9 渲染引擎**上——纯 ANSI、零 React/Ink 依赖、纯 TypeScript 实现（`src/tui/engine/`）。除了一般的对话与工具调用展示，TUI 还内置一组面向编码场景的交互能力：
+
+| 能力 | 说明 · 快捷键 |
+|------|--------------|
+| **GlanceBar 状态栏** | 输入框上方单行实时显示：星域 glyph · git 分支 · 模型 · 推理强度 · 缓存命中率 · 上下文占比 · 本轮 cost · 耗时 · turn 计数 · todo 徽章。一屏掌握会话健康度。 |
+| **流式中打断（Steer）** | agent 还在跑时直接打字，回车即可注入。输入按 `now / next / later` 三档优先级排队，在工具结果或回合边界 drain 给 AgentLoop——不必等它说完。`halt` 类意图自动升到 `now`。 |
+| **@mention 补全** | 输入 `@file:` / `@folder:` / `@symbol:` 触发路径补全（走 `git ls-files`，支持带空格的 `@file:"a b.ts"` 引用形）。直接粘贴图片自动转 base64 内联（macOS/Linux/Windows 三级降级）。 |
+| **倒带 Rewind** | 双击 `ESC`（间隔 <400ms）打开消息历史，选任一过往用户消息倒带到该点；可选「仅对话 / 仅代码改动 / 两者」三种恢复粒度，代码动作附带精确的文件影响预览。详见 [倒带](#倒带rewind)。 |
+| **命令面板** | `Ctrl+Esc` 打开，模糊搜索所有 slash 命令与 surface 动作（开关侧栏、切主题、进 Cockpit 等），↑/↓ 选中、Enter 执行。 |
+| **Cockpit 驾驶舱** | `Ctrl+Esc` → 选 Cockpit，或 `/cockpit <panel>` 进入。8 面板全屏视图：summary / trace / verify / context / safety / model / mcp / advisory，←/→/Tab 切换聚焦，实时展示 doom-loop 等级、验证交付状态、缓存与投机预读统计、MCP 连接、advisory 提醒等。 |
+| **多智能体面板** | `/tasks` 打开全屏 worker 详情（融合 live 视图 + JSONL 转录，含 Contract/Activity/Result/Transcript 分段与诚实标签）；宽终端（≥100 列）下 `Ctrl+]` 切出右侧抽屉，实时展示舰队树、团队波次 DAG、todo、token 仪表。 |
+| **主题与无障碍** | `/theme [name|list]` 切换色彩主题；`auto` 主题用 OSC 11 探测终端背景色自动适配明暗。truecolor / 256 色 / 16 色三轨自动降级。`/vim` 切换 vim 键绑定；`ui.reducedMotion: true` 把 spinner 与徽章动画静态化（无障碍）。读屏用户用 `--screen-reader`（或 `ui.screenReader: true`）：动态段整体不渲染、周期重绘停转，活动的开始与等待批准改为静态行播报——`reducedMotion` 只冻结字形，救不了每 120ms 被复读一遍。 |
+
+TUI 是 CLI 的默认表面。桌面端（Tauri）与 VS Code/Cursor 插件共享同一 agent 内核，只是在 TUI 之上叠加了可视化交互层——见下节与 [VS Code 插件文档](docs/VSCODE-EXTENSION-RELEASE.md)。
+
 ### 桌面端（Tauri）
 
 桌面端在 TUI 的全部能力之上，提供了可视化交互层：
@@ -411,7 +430,7 @@ Node.js 22 · TypeScript strict（`noUncheckedIndexedAccess`）· T9 ANSI 渲染
 
 ```bash
 npx tsc --noEmit                                    # 类型检查
-npm test                                             # 所有测试（10,000+ 用例）
+npm test                                             # 所有测试（13,000+ 用例）
 npm run build                                        # tsup 打包
 node dist/main.js                                    # 启动 TUI
 node dist/main.js -p "fix the typo"                  # 无界面模式

@@ -1,0 +1,99 @@
+name: VS Code Extension
+
+on:
+  push:
+    branches: [main]
+    paths: ['vscode-extension/**']
+  pull_request:
+    paths: ['vscode-extension/**']
+  release:
+    types: [published]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: vscode-extension
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+      - run: npx @vscode/vsce package --no-dependencies
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vsix
+          path: 'vscode-extension/*.vsix'
+
+  # 端到端冒烟：对仓内构建的内核 dist/main.js 跑真实 sidecar 契约
+  # （启动→建会话→SSE→E4 协议头/能力注册→归档），零模型调用成本。
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: npm ci
+      - run: npm run build
+      - run: npm ci
+        working-directory: vscode-extension
+      - run: node tests/smoke.e2e.ts
+        working-directory: vscode-extension
+
+  # Release 时按平台矩阵出自包含运行时包（E2 ②级自举），挂到同一 Release。
+  # darwin-arm64 / darwin-x64 / linux-x64 / win32-x64。
+  runtime-bundle:
+    if: github.event_name == 'release'
+    strategy:
+      matrix:
+        include:
+          - os: macos-14
+          - os: macos-13
+          - os: ubuntu-latest
+          - os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: npm ci
+      - run: bash scripts/build-runtime-bundle.sh
+        shell: bash
+      - name: Upload to release
+        run: gh release upload "${{ github.event.release.tag_name }}" out/tianshu-runtime-*.tar.gz out/tianshu-runtime-*.tar.gz.sha256 --clobber
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-vsce:
+    if: github.event_name == 'release'
+    needs: [build, smoke]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: vsix
+          path: .
+      - run: npx @vscode/vsce publish --packagePath $(ls *.vsix)
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+
+  publish-ovsx:
+    if: github.event_name == 'release'
+    needs: [build, smoke]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: vsix
+          path: .
+      - run: npx ovsx publish $(ls *.vsix)
+        env:
+          OVSX_PAT: ${{ secrets.OVSX_PAT }}

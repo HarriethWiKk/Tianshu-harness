@@ -36,7 +36,7 @@ export interface DelegationActivity {
   /** 该 worker 累计 token 总数（input+output，来自 turn 事件的累计快照）。 */
   tokenCount?: number
   /** 原始活动事件种类（worker 消息镜像 store 重建消息流用；terminal 事件缺省）。 */
-  eventKind?: 'text' | 'thinking' | 'tool_use' | 'tool_result' | 'turn' | 'retry'
+  eventKind?: 'text' | 'thinking' | 'tool_use' | 'tool_result' | 'turn' | 'retry' | 'lifecycle'
   /** 原始事件内容：text/thinking 为 delta，tool_use/tool_result 为工具名。 */
   eventDetail?: string
   /** Terminal failure classification (WorkerFailureReason in agent/work-order.ts;
@@ -72,6 +72,10 @@ export interface DelegationActivity {
   verificationBrief?: { status: string; passed: number; failed: number }
   /** 终态 evidenceStatus。 */
   evidenceStatus?: string
+  /** 谁派发的该 worker：'user' = 用户侧派发（sidecar delegateWorker 直达），'agent' = 主模型
+   *  派发。桌面舰队面板据此标记用户工人。coordinator 事件流不带此字段（缺省即 agent 派发），
+   *  sidecar 在用户派发路径上显式补 'user'（session-manager emitDelegationActivity 同款）。 */
+  origin?: 'user' | 'agent'
 }
 
 /**

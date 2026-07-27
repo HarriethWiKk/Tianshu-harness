@@ -201,13 +201,13 @@ graph TD
 
 | Metric | Value |
 |--------|-------|
-| TUI source (TypeScript, excl. tests) | 825 files / ~173k lines |
-| Test code | 995 files / ~166k lines |
-| Test cases (node:test) | **10,000+**, test : source ≈ **1 : 1** |
+| CLI source (TypeScript, excl. tests) | 931 files / ~208k lines |
+| Test code | 1,134 files / ~198k lines |
+| Test cases (node:test) | **13,000+**, test : source ≈ **1 : 1** |
 | Type checking | `tsc` strict + `noUncheckedIndexedAccess` |
 | Prefix-cache hit rate | 95–99% steady state, measured on long sessions |
 
-Agent core logic (multi-turn loops, tool pipelines, context compaction) is notoriously hard to test, and most open-source agents ship with thin coverage. This project maintains a near 1:1 test-to-source ratio, and every incident fix ships with a regression test. Full methodology and reproduction commands: [Engineering Metrics](docs/engineering-metrics.md).
+Agent core logic (multi-turn loops, tool pipelines, context compaction) is notoriously hard to test, and most open-source agents ship with thin coverage. This project maintains a near 1:1 test-to-source ratio, and every incident fix ships with a regression test. The codebase grew ~3.6x over the past 54 days while the ratio held between 0.93:1 and 0.99:1. Full methodology, growth milestones, and reproduction commands: [Engineering Metrics](docs/engineering-metrics.md).
 
 ### Tianshu vs. MiMo-Code vs. Claude Code
 
@@ -255,11 +255,34 @@ Delegate sub-tasks to independent headless worker sessions:
 /cancel-goal   # stop early
 ```
 
-GoalTracker integrates with the turn loop, doom-loop detection, and delivery gates.
+GoalTracker integrates with the turn loop, doom-loop detection, and delivery gates; in goal mode the doom-loop threshold is loosened to allow deeper exploration.
+
+### Plan Mode
+
+Design-first workflow — produce a plan before touching code, avoiding the "just start editing" impulse-trap.
+
+```
+/plan Implement a user login module with JWT + refresh token
+```
+
+Once in Plan Mode, the agent does **not** modify code immediately. Instead it:
+1. **Investigates** — reads relevant code, understands existing architecture and constraints.
+2. **Produces a plan** — a structured plan document (technical research, architecture diagram, task breakdown, verification plan), written to `.rivet/plans/<slug>.md`.
+3. **Submits for approval** — lists key points and alternative paths, then waits for your confirmation.
+4. **Executes in waves** — after approval, auto-executes in parallel waves, each passing a review gate.
+
+```
+/plan                      # list all generated plans
+/plan close <file>         # close a completed plan (marks task status)
+/plan close <file> --preview  # preview the close impact without writing
+/plan-template             # manage reusable plan templates
+```
+
+Plan Mode has built-in star-domain delegation — complex plans automatically call `delegate_task` to probe from multiple architecture perspectives (Tianquan / Yaoguang / Tianji / Tianfu / Tianxuan) in parallel; findings are tagged "to-be-verified" to prevent blind trust. The desktop app shows real-time checklist progress during plan execution.
 
 ### Rewind
 
-Double-tap **ESC** to open message history. Select any past user message to rewind the conversation to that point — agent state, tool history, and session metadata roll back cleanly. Available in both TUI and desktop.
+Double-tap **ESC** (within 400ms) to open message history. Select any past user message to rewind the conversation to that point — agent state, tool history, and session metadata roll back cleanly. Choose from three restore granularities: **conversation only / code changes only / both**; code-related actions come with a precise preview of which files will be affected. Available in both TUI and desktop.
 
 ### Council (Multi-Perspective Review)
 
@@ -341,6 +364,38 @@ rivet config mcp list                                               # list + sta
 
 Inside a session: `/mcp` (status) and `/debug mcp` (diagnostics). MCP tools respect the same approval mode as built-in tools.
 
+### Terminal UI (TUI)
+
+Tianshu's command-line interface runs on a purpose-built **T9 rendering engine** — pure ANSI, zero React/Ink dependency, pure TypeScript (`src/tui/engine/`). Beyond ordinary conversation and tool-call display, the TUI ships a set of interactions designed for coding workflows:
+
+| Capability | Notes · Shortcuts |
+|------------|-------------------|
+| **GlanceBar status line** | A single line above the input box shows, in real time: star-domain glyph · git branch · model · reasoning effort · cache hit rate · context usage · this-turn cost · elapsed · turn count · todo badge. Session health at a glance. |
+| **Mid-stream interrupt (Steer)** | Type while the agent is still running and press Enter to inject. Inputs queue at `now / next / later` priority and drain to the AgentLoop at tool-result or turn boundaries — no need to wait for it to finish. `halt`-style intents auto-promote to `now`. |
+| **@mention completion** | Type `@file:` / `@folder:` / `@symbol:` to trigger path completion (via `git ls-files`; supports the quoted form `@file:"a b.ts"` for paths with spaces). Pasting an image auto-converts to inline base64 (3-tier fallback across macOS/Linux/Windows). |
+| **Rewind** | Double-tap `ESC` (within 400ms) to open message history; pick any past user message to rewind to, with three restore granularities (conversation only / code only / both) and a precise file-impact preview for code actions. See [Rewind](#rewind). |
+| **Command palette** | `Ctrl+Esc` opens a fuzzy-searchable list of all slash commands and surface actions (toggle side panel, switch theme, enter Cockpit, etc.) — ↑/↓ to select, Enter to run. |
+| **Cockpit** | Open via the palette or `/cockpit <panel>`. An 8-panel fullscreen view — summary / trace / verify / context / safety / model / mcp / advisory — switch focus with ←/→/Tab. Real-time view of doom-loop level, delivery/verification status, cache + speculative pre-read stats, MCP connections, advisory lifts, etc. |
+| **Multi-agent panels** | `/tasks` opens a fullscreen worker detail view (fusing the live view + JSONL transcript, with Contract/Activity/Result/Transcript sections and honesty labels); on wide terminals (≥100 columns), `Ctrl+]` toggles a right-side drawer showing the fleet tree, team-wave DAG, todos, and token gauge in real time. |
+| **Themes & accessibility** | `/theme [name\|list]` switches palettes; the `auto` theme probes the terminal background via OSC 11 to adapt light/dark. Truecolor / 256-color / 16-color auto-downgrade. `/vim` toggles vim keybindings; `ui.reducedMotion: true` staticizes spinner and badge animation (accessibility). |
+
+The TUI is the CLI's default surface. The desktop app (Tauri) and the VS Code/Cursor extension share the same agent kernel, only layering visual interactions on top of the TUI — see the next section and the [VS Code extension docs](docs/VSCODE-EXTENSION-RELEASE.md).
+
+### Desktop (Tauri)
+
+The desktop app builds a visual interaction layer on top of the TUI's full capabilities:
+
+- **+ menu** — one-click access to Council ♟, Team ⬡, dispatch sub-agents, switch model, and pick a star domain (no need to type slash commands).
+- **Reasoning-effort picker** — `/effort` (no args) pops an interactive panel; choose a tier (Auto/Max/High/Medium/Low/Off) with ↑/↓ and confirm with Enter.
+- **Thinking timer** — shows real-time elapsed while the agent runs (e.g. "thinking · explore · 1m 23s"); turns red after 10 minutes to flag a possible stall.
+- **@file preview** — files mentioned in messages are clickable; a right-side drawer shows the content with syntax highlighting and line numbers.
+- **DeepSeek balance query** — the Insights panel shows the account balance and arrears status at the top (via the official API).
+- **Custom Provider** — Settings → Connect model service → + Custom Provider, supporting any OpenAI-compatible endpoint (Ollama/vLLM/direct OpenAI); API key optional.
+- **Watchdog auto-recovery** — auto-continues on boundary stalls; the desktop timeline shows recovery events (⟳ auto-recover / ⏹ quota exhausted).
+- **Multi-session concurrency** — a tab bar manages multiple sessions, each with its own cwd + model + approval mode.
+
+> The desktop app also has Cockpit, SideChat (⌘;), Rewind time-travel, themes/Glass/wallpaper, Mirror acceleration, and other exclusive features — see the [Desktop User Guide](docs/desktop-guide.md).
+
 ## Slash Commands
 
 | Command | Description |
@@ -351,6 +406,7 @@ Inside a session: `/mcp` (status) and `/debug mcp` (diagnostics). MCP tools resp
 | `/cancel-goal` | Stop goal execution |
 | `/plan` | Enter plan mode (design-first, approval-gated) |
 | `/council <text>` | Convene multi-expert review |
+| `/team <plan.md>` | Team mode: multiple agents execute a plan in parallel |
 | `/compact` | Compact context now |
 | `/context` | Show context ledger: health, tokens, rounds, claims |
 | `/evidence` | Show evidence summary (files read/modified, tests) |
@@ -358,7 +414,9 @@ Inside a session: `/mcp` (status) and `/debug mcp` (diagnostics). MCP tools resp
 | `/undo` | Undo last file change (preview, `confirm` to restore) |
 | `/rewind` | Double-ESC: rewind to a past user message |
 | `/sessions` `/resume <n>` | List/restore saved sessions (restores side panel, todos, active plan) |
-| `/effort [off\|low\|medium\|high\|max]` | Control reasoning depth |
+| `/effort [off\|low\|medium\|high\|max\|auto]` | Control reasoning depth (no args opens a picker) |
+| `/init` | Initialize project scaffolding (`.rivet/` structure, templates) |
+| `/doctor` | Diagnose environment and configuration health |
 | `/theme [name\|list]` | Switch color theme |
 | `/permission [status\|mode\|allow\|deny\|bash\|remove\|reset\|test]` | Manage permission mode and tool/bash allow-deny rules |
 | `/skill <name>` | Load and immediately invoke a skill |
@@ -379,7 +437,7 @@ Node.js 22 · TypeScript strict (`noUncheckedIndexedAccess`) · T9 ANSI renderin
 
 ```bash
 npx tsc --noEmit                                    # typecheck
-npm test                                             # all tests (10,000+ cases)
+npm test                                             # all tests (13,000+ cases)
 npm run build                                        # tsup bundle
 node dist/main.js                                    # launch TUI
 node dist/main.js -p "fix the typo"                  # headless mode
@@ -432,6 +490,55 @@ run in parallel without interference.
 - **Checkpoint + rollback** — Git checkpoint before first file modification each turn
 - **File-level undo** — Versioned backups before every write/edit
 - **Worker safety** — Timeout budget via AbortController, tool allowlist enforcement
+
+## ⚡ Key Config Cheatsheet
+
+### Environment Variables
+
+| Variable | Effect |
+|----------|--------|
+| `DEEPSEEK_API_KEY` | DeepSeek API key |
+| `RIVET_NO_UPDATE_CHECK=1` | Disable startup auto-update check |
+| `RIVET_NO_CROSS_SESSION=1` | Disable cross-session knowledge sharing |
+| `RIVET_SESSION_DIR` | Override session-log storage path |
+| `RIVET_DEBUG_TELEMETRY` | Enable telemetry snapshot dumps (for debugging) |
+| `PORTABLE_GIT_MIRROR` | Override the PortableGit download mirror |
+
+### Key `~/.rivet/config.json` Fields
+
+```json
+{
+  "agent": {
+    "maxTurns": 200,              // max turns per session
+    "approval": "auto-safe",      // manual | auto-safe | dangerously-skip-permissions
+    "crossSessionEnabled": true,  // cross-session knowledge sharing
+    "checkpointEveryTurns": 0     // Auto-mode checkpoint interval (0 = off)
+  },
+  "compact": {
+    "enabled": true,
+    "autoThreshold": 800000       // token threshold that triggers auto-compaction
+  },
+  "workers": {
+    "routing": {
+      "code_edit": "capable",     // route task types to different models
+      "repo_summarization": "cheap"
+    }
+  }
+}
+```
+
+See `src/config/default.ts` for the full set of config options and defaults.
+
+## 📚 Documentation
+
+| Doc | Description |
+|-----|-------------|
+| [`docs/user-guide.md`](docs/user-guide.md) | Install, configure, and usage guide |
+| [`docs/desktop-guide.md`](docs/desktop-guide.md) | Desktop user guide (Cockpit/SideChat/Rewind/themes/Mirror exclusives) |
+| [`docs/user-guide-provider-config.md`](docs/user-guide-provider-config.md) | Model provider configuration guide |
+| [`docs/user-guide-sandbox-permissions.md`](docs/user-guide-sandbox-permissions.md) | Full sandbox & permission model guide |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | Contributing guide |
+| [`config.example.json`](config.example.json) | Example config (with sub-agent / review model routing) |
 
 ## 🤝 Community & Support
 
