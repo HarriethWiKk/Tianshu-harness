@@ -18,6 +18,7 @@
  * symlinked child. `write` implies `read`.
  */
 import { existsSync, mkdirSync, readFileSync, realpathSync } from 'node:fs'
+import { homedir } from 'node:os'
 import { join, resolve, sep } from 'node:path'
 import { writeFileAtomicSync } from '../fs-atomic.js'
 import { rivetHome } from '../config/paths.js'
@@ -205,6 +206,49 @@ export function applyConfiguredPathGrants(
   }
   apply(permissions.additionalReadDirs, 'read')
   apply(permissions.additionalWriteDirs, 'write')
+}
+
+/**
+ * Common third-party dependency / toolchain read-only cache directories
+ * (relative to $HOME). Read-side counterpart of the writable roots enumerated
+ * in `sandbox-profile.ts::defaultWritableRoots` and `sandbox-toolchain.ts` —
+ * the same directories the bash sandbox already lets commands write to.
+ *
+ * Reading a project's dependency source (a HarmonyOS fork in `.pub-cache`, a
+ * git-sourced package, a version-mismatched transitive dep) is a routine
+ * diagnostic step. Without these read grants, `read_file` / `grep` on any path
+ * under $HOME trips `validatePathSafe` → an approval `await` that has no
+ * timeout, and the batch-time watchdog is disarmed (turn-orchestrator.ts:892),
+ * so the session hangs until the user hits Ctrl+C — exactly the failure seen
+ * in the kaiyang session reading `~/.pub-cache/git/.../*.dart`.
+ *
+ * Grants are READ-ONLY, session-scoped, never persisted: write still goes
+ * through the normal approval/sandbox path, and nothing leaks across projects
+ * or sessions. Non-existent entries are skipped fail-closed.
+ */
+const DEFAULT_DEPENDENCY_READ_DIRS = [
+  '.npm', '.npm-cache', '.cache',
+  '.cargo', '.rustup',
+  '.gradle', '.m2',
+  '.pub-cache',
+  '.pnpm-store', '.yarn',
+  '.bun', '.deno',
+  '.cocoapods',
+  '.gem', '.bundle',
+  '.composer', '.config/composer',
+  '.android',
+  'go',
+  // In-project node_modules / vendor / Pods already live under cwd and need no
+  // grant; this list only covers $HOME-level global caches.
+]
+
+export function applyDefaultDependencyReadGrants(): void {
+  const home = homedir()
+  for (const rel of DEFAULT_DEPENDENCY_READ_DIRS) {
+    const root = resolve(join(home, rel))
+    if (!existsSync(root)) continue
+    grantPath(root, 'read', { persist: false })
+  }
 }
 
 /** Test-only: clear the in-memory grant store. */

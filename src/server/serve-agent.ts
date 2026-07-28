@@ -21,7 +21,7 @@ import { createOwnershipLedger } from '../agent/ownership-ledger.js'
 import { createWorktreeBaseline } from '../agent/worktree-baseline.js'
 import { captureGitBaseline, createInteractiveToolRegistry, createAgentRuntime, type RuntimeRefs } from '../bootstrap.js'
 import { TodoStore } from '../tools/todo-store.js'
-import { applyConfiguredPathGrants, loadPersistedGrants } from '../tools/path-grants.js'
+import { applyConfiguredPathGrants, applyDefaultDependencyReadGrants, loadPersistedGrants } from '../tools/path-grants.js'
 import { loadProjectSkills } from '../skills/skill-loader.js'
 import { createMemoryTool } from '../tools/memory.js'
 import { DomainKnowledgeStore } from '../agent/domain-knowledge-store.js'
@@ -273,6 +273,7 @@ function buildSessionStores(
   // project lives outside the opened folder).
   loadPersistedGrants(cwd)
   applyConfiguredPathGrants(ctx.config.agent.permissions)
+  applyDefaultDependencyReadGrants()
   // Load skills into the shared registry (same as CLI bootstrap). Without this,
   // skillRegistry.list() returns empty and the desktop PlusMenu shows no skills.
   loadProjectSkills(cwd, { importFromClaude: ctx.config.skills?.importFromClaude })

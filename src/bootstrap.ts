@@ -46,7 +46,7 @@ import { TodoStore } from './tools/todo-store.js'
 import { createDelegateTaskTool } from './tools/delegate-task.js'
 import { createUndoTool } from './tools/undo.js'
 import { maybeWarnNoSandbox, applySandboxPolicyForApprovalMode } from './tools/sandbox-profile.js'
-import { applyConfiguredPathGrants, loadPersistedGrants } from './tools/path-grants.js'
+import { applyConfiguredPathGrants, applyDefaultDependencyReadGrants, loadPersistedGrants } from './tools/path-grants.js'
 import { createDelegateBatchTool } from './tools/delegate-batch.js'
 import { createTeamOrchestrateTool } from './tools/team-orchestrate.js'
 import type { PlanExecutorDeps } from './agent/plan-executor.js'
@@ -1934,6 +1934,11 @@ export async function bootstrapInteractiveSession(opts: BootstrapOptions = {}): 
   // Standing config-declared grants (permissions.additionalReadDirs/WriteDirs):
   // Codex-style folder authorization without an approval round-trip.
   applyConfiguredPathGrants(config.agent.permissions)
+  // Default read-only grants for common dependency/toolchain caches under $HOME
+  // (.pub-cache, .cargo, .gradle, node package stores…). Lets read_file/grep
+  // inspect third-party dependency source without hitting a hang-prone approval
+  // gate — see path-grants.ts::applyDefaultDependencyReadGrants.
+  applyDefaultDependencyReadGrants()
 
   // 3. Provider + Auth
   const { provider, apiKey, auth } = resolveProviderAndAuth(config, opts.providerName)

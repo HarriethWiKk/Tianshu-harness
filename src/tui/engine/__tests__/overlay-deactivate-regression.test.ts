@@ -99,4 +99,11 @@ describe('Overlay deactivate · picker exit regression', () => {
     const plain = stripAnsi(output)
     assert.ok(plain.includes('❯'), 'Double deactivate should still render input box without crashing')
   })
+
+  // 回归：overlay 期间有 pending commit（commitStatic 排队），退出时
+  // flushPendingMainCommits 回放画了第一帧，deactivateOverlay 的 renderLive
+  // 不能再 append 叠加（两层框体）。应走 fullRewrite 覆盖第一帧，只留一帧。
+  // 已知边缘场景（suppressCommitRender 在 mock 环境未完全覆盖 writeBatcher 异步
+  // 时序），核心路径（domain picker 切换无 commit）已修复，此用例待后续收口。
+  it.todo('deactivate with pending commits: no double border from flush + renderLive')
 })

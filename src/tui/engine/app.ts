@@ -619,6 +619,8 @@ export class TuiApp {
   private inputController = new InputController()
   /** 输入框最近一次获得焦点的时间戳，用于 Ctrl+V 剪贴板图片防抖 */
   private lastInputFocusAt = 0
+  /** 批量回放 pending commit 时抑制每次 commitAbove 的 renderLive，最后统一画一帧。 */
+  private suppressCommitRender = false
   /** 原始 stdout（用于直接写 DEC 私有模式如 bracketed paste 开关） */
   private stdout: WriteStream
   private terminalRestored = false
@@ -1568,14 +1570,16 @@ export class TuiApp {
   /** 停用 overlay */
   deactivateOverlay(): void {
     this.input.setEscapeImmediate(false)
+    const wasActive = this.overlay.isActive()
+    // suppressCommitRender 必须在 overlay.deactivate() 之前置位：deactivate 触发
+    // onExitAltScreen → flushPendingMainCommits，回放的 commitAbove 会调 renderLive
+    // 画第一帧；suppress 让回放只 write 到 scrollback，最后由本方法统一 renderLive
+    // 画唯一帧，避免两层框体叠影。
+    if (wasActive) this.suppressCommitRender = true
     this.overlay.deactivate()
+    if (wasActive) this.suppressCommitRender = false
     // 记录焦点回归时间：Ctrl+V 剪贴板图片防抖窗口起点
     this.lastInputFocusAt = Date.now()
-    // Alt screen exit restores cursor to where it was before overlay activate.
-    // activateOverlay called live.clear() which: (1) moved cursor to live region
-    // top and erased it, (2) set lastDisplayRows=0. After alt screen exit,
-    // cursor is at that same cleared position (end of scrollback).
-    // Erase any residual chars on this line, reset render state, append fresh.
     this.workerDetailWorkerId = null
     this.jobDetailId = null
     this.stdout.write('\r\x1B[0J')
@@ -3067,7 +3071,7 @@ export class TuiApp {
     try {
       this.live.clearForCommit()
       write()
-      this.writeBatcher.flushNow()
+      if (!this.suppressCommitRender) this.writeBatcher.flushNow()
     } finally {
       if (canCork) s.uncork!()
     }
