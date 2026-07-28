@@ -1087,9 +1087,20 @@ export function renderChoicePanel(data: ChoicePanelData, width: number, height: 
   const lines: string[] = []
   lines.push(formatBorder(width, theme, 'subtle'))
   // Multi-line titles (ask pager): first line as title, rest as muted captions.
+  // 附加行（计划审批 excerpt / 倒计时行等）钳制在 height-10 行以内：不钳制时
+  // titleExtra 过大 → contentRows 被压到 1，总行数超 height 被引擎定长网格
+  // 静默截掉选项与 footer（矮终端下审批卡看不到选项）。
   const titleLines = data.title.split('\n')
+  const shownExtras = titleLines.slice(1, 1 + Math.max(0, height - 10))
+  if (titleLines.length - 1 > shownExtras.length) {
+    if (shownExtras.length > 0) {
+      shownExtras[shownExtras.length - 1] = `${shownExtras[shownExtras.length - 1]!} …`
+    } else {
+      shownExtras.push('…')
+    }
+  }
   lines.push(formatTitleLeft(titleLines[0] ?? '', width, theme))
-  for (const extra of titleLines.slice(1)) {
+  for (const extra of shownExtras) {
     lines.push(padLine(`  ${color(truncateToDisplayWidth(extra, Math.max(1, width - 8)), theme.secondary)}`, width, theme))
   }
   lines.push(frameDivider(width, theme))
@@ -1097,7 +1108,7 @@ export function renderChoicePanel(data: ChoicePanelData, width: number, height: 
   const innerWidth = width - 6 // padLine border(2) + left indent(2) + right gap(2)
   const inputSubMode = data.inputSubMode?.active ? data.inputSubMode : undefined
   const inputRows = inputSubMode ? 2 : 0 // label line + input line
-  const titleExtra = Math.max(0, titleLines.length - 1)
+  const titleExtra = shownExtras.length
   const contentRows = Math.max(1, height - 5 - inputRows - titleExtra) // border + title + separator + footer + bottom = 5
 
   if (data.choices.length === 0) {

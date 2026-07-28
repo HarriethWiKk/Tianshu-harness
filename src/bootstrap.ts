@@ -692,6 +692,17 @@ export function createInteractiveToolRegistry(
 
 // ── Agent Runtime ──────────────────────────────────────────────
 
+/**
+ * resume 缓存继承的写侧接线：引擎每个 user 边界固化冻结快照后，
+ * 把它落到 `<id>.frozen.json`（best-effort——盘存写失败不影响会话，
+ * 顶多下次 resume 退化为全量重建）。startup / /resume 切换 / /cd 三处统一挂。
+ */
+function wireFrozenSnapshotPersist(persist: SessionPersist, engine: import('./prompt/engine.js').PromptEngine): void {
+  engine.setOnFrozenSnapshotCommit(() => {
+    try { persist.writeFrozenSnapshot(engine.exportFrozenSnapshot()) } catch { /* best-effort */ }
+  })
+}
+
 export function createAgentRuntime(deps: {
   provider: ProviderConfig
   apiKey: string
@@ -717,8 +728,9 @@ export function createAgentRuntime(deps: {
   /** I4: optional callback to surface user hook results to the desktop event stream. */
   emitHookResult?: import('./agent/loop-types.js').AgentConfig['emitHookResult']
   /** /cd: previous PromptEngine whose frozen snapshots the new engine inherits
-   *  (keeps the historical prefix byte-stable across the cwd switch). */
-  inheritFrozenFrom?: import('./prompt/engine.js').PromptEngine
+   *  (keeps the historical prefix byte-stable across the cwd switch).
+   *  resume 场景传盘存 FrozenSnapshotData（<id>.frozen.json），同语义。 */
+  inheritFrozenFrom?: import('./prompt/engine.js').PromptEngine | import('./prompt/frozen-snapshot.js').FrozenSnapshotData
 }): { agent: AgentLoop } {
   const {
     provider, apiKey, auth, config, sessionId, cwd,
@@ -1323,6 +1335,9 @@ export function createShutdownHandler(ctx: BootstrapContext): () => void {
       // Mark a clean exit. Next startup mints a fresh session by default;
       // returning here requires explicit --continue / --resume <id> (R1).
       try { ctx.persist.updateMetadata({ cleanExit: true }) } catch { /* best-effort */ }
+      // resume 缓存继承的 shutdown flush：覆盖 collapse watermark 等不经
+      // commit 钩子的漂移（边界写由 wireFrozenSnapshotPersist 已覆盖）。
+      try { ctx.persist.writeFrozenSnapshot(ctx.agent.config.promptEngine.exportFrozenSnapshot()) } catch { /* best-effort */ }
       ctx.persist.compactOai(ctx.session.getMessages())
       if (ctx.fileHistory) {
         persistFileHistory(
@@ -1375,7 +1390,7 @@ export interface ResolvedModelTarget {
   alias?: string
   contextWindow?: number
 }
-export function resolveProviderForModel(ctx: BootstrapContext, modelId: string): ResolvedModelTarget | { error: string } | null {
+export function resolveProviderForModel(ctx: Pick<BootstrapContext, 'config' | 'provider' | 'apiKey' | 'auth'>, modelId: string): ResolvedModelTarget | { error: string } | null {
   for (const [provName, prov] of Object.entries(ctx.config.provider.providers)) {
     const found = prov.models.find(m => m.id === modelId || m.alias === modelId)
     if (!found) continue
@@ -1457,6 +1472,8 @@ export function switchAgentRuntime(ctx: BootstrapContext, modelId: string): Swit
 
     ctx.agent = agent
     ctx.refs.promptEngine = agent.config.promptEngine
+    // /model 切换后新引擎重新积累冻结快照——不接线则盘存文件停留在旧引擎状态。
+    wireFrozenSnapshotPersist(ctx.persist, agent.config.promptEngine)
     ctx.refs.getTaskContract = () => agent.getTaskContract()
     ctx.refs.getImpactedTests = () => [...agent.getEvidenceState().impactedTests]
     ctx.refs.getSessionVitals = () => agent.getSessionVitals()
@@ -1500,6 +1517,49 @@ export interface SwitchSessionResult {
  * targetId 必须是已解析的完整 id(调用方用 SessionPersist.resolveSessionId 解析短前缀)。
  * resume 全量 replay 目标历史(显式代价、会重建前缀缓存),不跨会话吃当前上下文。
  */
+export interface StartupResumeModelDecision {
+  target: ResolvedModelTarget | null
+  originalModel?: string
+  fallbackUsed: boolean
+  degradedWarning?: string
+}
+
+/**
+ * 启动 resume 模型亲和决策（纯函数，可测）：前缀缓存是 per-model 命名空间，
+ * resume 不换回原模型，继承的冻结快照也落不进缓存。显式 --model/--provider
+ * 优先（用户意图 > 缓存亲和）；原模型不可用走 resumeFallbackModel 兜底；
+ * 兜底也没有 → 警告降级（不 fail-closed——startup 是进程入口，拒跑等于
+ * 会话打不开，用户连开新会话都要绕路 --new；与 switchAgentSession 的
+ * fail-closed 语义差异是刻意的）。
+ */
+export function decideStartupResumeModel(input: {
+  resumed: boolean
+  explicitModel?: string
+  explicitProvider?: string
+  originalModel?: string
+  fallbackModelId?: string
+  resolve: (modelId: string) => ResolvedModelTarget | { error: string } | null
+}): StartupResumeModelDecision {
+  if (!input.resumed || input.explicitModel || input.explicitProvider) {
+    return { target: null, fallbackUsed: false }
+  }
+  if (!input.originalModel) return { target: null, fallbackUsed: false }
+  const hit = input.resolve(input.originalModel)
+  if (hit && !('error' in hit)) {
+    return { target: hit, originalModel: input.originalModel, fallbackUsed: false }
+  }
+  const fb = input.fallbackModelId ? input.resolve(input.fallbackModelId) : null
+  if (fb && !('error' in fb)) {
+    return { target: fb, originalModel: input.originalModel, fallbackUsed: true }
+  }
+  return {
+    target: null,
+    originalModel: input.originalModel,
+    fallbackUsed: false,
+    degradedWarning: `⚠ 原模型 ${input.originalModel} 当前不可用，且未配置续跑兜底模型（agent.resumeFallbackModel）——按默认模型续跑，前缀缓存将全量重建。`,
+  }
+}
+
 export function switchAgentSession(ctx: BootstrapContext, targetId: string): SwitchSessionResult {
   if (targetId === ctx.sessionId) {
     return { ok: false, error: '已经在该会话中。' }
@@ -1564,6 +1624,7 @@ export function switchAgentSession(ctx: BootstrapContext, targetId: string): Swi
   const oldCoordinator = ctx.refs.coordinator
 
   // 整体重建 AgentLoop —— 构造函数内部按 targetId 重建子系统并重挂持久化监听。
+  // 冻结快照随目标会话落盘读回（无文件/坏文件 → undefined → 旧的 byte-0 重建）。
   const { agent } = createAgentRuntime({
     provider: resumeTarget?.provider ?? ctx.provider,
     apiKey: resumeTarget?.apiKey ?? ctx.apiKey,
@@ -1579,6 +1640,7 @@ export function switchAgentSession(ctx: BootstrapContext, targetId: string): Swi
     domainKnowledgeStore: ctx.domainKnowledgeStore,
     modelId: resumeTarget?.modelId ?? currentModelId,
     session: ctx.session,
+    inheritFrozenFrom: targetPersist.readFrozenSnapshot(),
   })
 
   // 原地更新 ctx —— 持有 ctx 引用的闭包(onSubmit/onAbort/handlerCtx)即时一致。
@@ -1587,6 +1649,7 @@ export function switchAgentSession(ctx: BootstrapContext, targetId: string): Swi
   ctx.sessionId = targetId
   ctx.refs.sessionId = targetId
   ctx.refs.promptEngine = agent.config.promptEngine
+  wireFrozenSnapshotPersist(targetPersist, agent.config.promptEngine)
   ctx.refs.getTaskContract = () => agent.getTaskContract()
   ctx.refs.getImpactedTests = () => [...agent.getEvidenceState().impactedTests]
   ctx.refs.getSessionVitals = () => agent.getSessionVitals()
@@ -1769,6 +1832,7 @@ export async function switchAgentCwd(ctx: BootstrapContext, target: string): Pro
   ctx.persist = newPersist
   ctx.cwd = newCwd
   ctx.refs.promptEngine = agent.config.promptEngine
+  wireFrozenSnapshotPersist(newPersist, agent.config.promptEngine)
   ctx.refs.getTaskContract = () => agent.getTaskContract()
   ctx.refs.getImpactedTests = () => [...agent.getEvidenceState().impactedTests]
   ctx.refs.getSessionVitals = () => agent.getSessionVitals()
@@ -1924,10 +1988,17 @@ export async function bootstrapInteractiveSession(opts: BootstrapOptions = {}): 
   // Load prior messages. When the session id was explicitly resumed
   // (--continue / --resume <id>), this rehydrates that session's history.
   const existingMessages = persist.loadOai()
+  // resume 缓存继承的读侧：冻结前缀快照随会话落盘（<id>.frozen.json），
+  // 有则经 inheritFrozenFrom 喂给新引擎——历史 user 消息恢复原始字节，
+  // 服务商缓存 TTL 内不再 byte-0 全 miss；无快照/坏文件降级为旧行为。
+  const resumedFrozen = wasSessionResumed() ? persist.readFrozenSnapshot() : undefined
   if (existingMessages.length > 0) {
     session.replaceMessages(existingMessages)
     if (wasSessionResumed()) {
-      console.error(`🔄 已恢复会话 ${sessionId.slice(0, 8)}: ${existingMessages.length} 条消息(将重建前缀缓存)。默认启动为全新会话；指定会话用 rivet --resume <id>,查看列表用 rivet --list。`)
+      const anchorNote = resumedFrozen
+        ? `继承 ${resumedFrozen.frozenUserMerged.reduce((n, [, arr]) => n + arr.length, 0)} 个前缀锚点`
+        : '无冻结快照，将重建前缀缓存'
+      console.error(`🔄 已恢复会话 ${sessionId.slice(0, 8)}: ${existingMessages.length} 条消息（${anchorNote}）。默认启动为全新会话；指定会话用 rivet --resume <id>,查看列表用 rivet --list。`)
     }
   }
 
@@ -2026,13 +2097,35 @@ export async function bootstrapInteractiveSession(opts: BootstrapOptions = {}): 
   }))
 
   // 12. Agent runtime
+  // 启动 resume 模型亲和（决策见 decideStartupResumeModel 注释）。
+  const startupResume = decideStartupResumeModel({
+    resumed: wasSessionResumed(),
+    explicitModel: opts.modelId,
+    explicitProvider: opts.providerName,
+    originalModel: wasSessionResumed() ? persist.loadMetadata()?.model : undefined,
+    fallbackModelId: config.agent?.resumeFallbackModel,
+    resolve: modelId => resolveProviderForModel({ config, provider, apiKey, auth }, modelId),
+  })
+  if (startupResume.degradedWarning) console.error(startupResume.degradedWarning)
   const { agent } = createAgentRuntime({
-    provider, apiKey, auth, config, sessionId, cwd,
+    provider: startupResume.target?.provider ?? provider,
+    apiKey: startupResume.target?.apiKey ?? apiKey,
+    auth: startupResume.target ? startupResume.target.auth : auth,
+    config, sessionId, cwd,
     toolRegistry, persist, claimStore, fileHistory, refs,
-    domainKnowledgeStore, modelId: opts.modelId,
+    domainKnowledgeStore, modelId: startupResume.target?.modelId ?? opts.modelId,
     session,
+    inheritFrozenFrom: resumedFrozen,
   })
   refs.promptEngine = agent.config.promptEngine
+  wireFrozenSnapshotPersist(persist, agent.config.promptEngine)
+  // 兜底模型续跑：meta + JSONL 审计，对齐 switchAgentSession/桌面 resume-fallback 语义。
+  if (startupResume.fallbackUsed && startupResume.target) {
+    try {
+      persist.updateMetadata({ model: startupResume.target.modelId, provider: startupResume.target.providerName })
+      persist.appendModelSwitch({ from: startupResume.originalModel, to: startupResume.target.modelId, provider: startupResume.target.providerName })
+    } catch { /* best-effort */ }
+  }
   refs.getTaskContract = () => agent.getTaskContract()
   refs.getImpactedTests = () => [...agent.getEvidenceState().impactedTests]
   refs.getSessionVitals = () => agent.getSessionVitals()

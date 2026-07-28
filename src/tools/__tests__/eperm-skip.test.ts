@@ -68,7 +68,7 @@ describe('EPERM silent-skip integration', { skip: shouldSkip && 'skipped: Window
     return restricted
   }
 
-  it('collectFiles silently skips restricted subdir (.Spotlight-V100 + chmod 000)', () => {
+  it('collectFiles silently skips restricted subdir (.Spotlight-V100 + chmod 000)', async () => {
     // Layout: <tmp>/src/hit.ts, <tmp>/.Spotlight-V100/ (chmod 000)
     mkdirSync(join(tmpRoot, 'src'), { recursive: true })
     writeFileSync(join(tmpRoot, 'src', 'hit.ts'), 'const x = 1\n')
@@ -76,36 +76,36 @@ describe('EPERM silent-skip integration', { skip: shouldSkip && 'skipped: Window
     writeFileSync(join(tmpRoot, '.Spotlight-V100', 'index.ts'), 'dummy\n')
     chmodSync(join(tmpRoot, '.Spotlight-V100'), 0o000)
 
-    const files = collectFiles(tmpRoot)
+    const files = await collectFiles(tmpRoot)
     assert.ok(files.some(f => f.includes('hit.ts')), 'should find src/hit.ts')
     assert.ok(!files.some(f => f.includes('.Spotlight-V100')), 'should not include restricted dir files')
   })
 
-  it('collectFiles surfaces error on root path that is restricted', () => {
-    // Root dir itself is restricted (depth === 0) → must throw, not return empty
+  it('collectFiles surfaces error on root path that is restricted', async () => {
+    // Root dir itself is restricted (depth === 0) → must reject, not return empty
     const restricted = join(tmpRoot, '.Spotlight-V100')
     mkdirSync(restricted)
     chmodSync(restricted, 0o000)
 
-    assert.throws(
-      () => collectFiles(restricted),
+    await assert.rejects(
+      collectFiles(restricted),
       (err: NodeJS.ErrnoException) => err.code === 'EACCES' || err.code === 'EPERM',
-      'collectFiles on restricted root must throw EACCES/EPERM',
+      'collectFiles on restricted root must reject with EACCES/EPERM',
     )
   })
 
-  it('collectFiles surfaces error on non-restricted permission-denied subdir', () => {
-    // user-denied/ is chmod 000 but NOT in the restricted patterns → must throw
+  it('collectFiles surfaces error on non-restricted permission-denied subdir', async () => {
+    // user-denied/ is chmod 000 but NOT in the restricted patterns → must reject
     mkdirSync(join(tmpRoot, 'src'), { recursive: true })
     writeFileSync(join(tmpRoot, 'src', 'real.ts'), 'const x = 1\n')
     mkdirSync(join(tmpRoot, 'user-denied'))
     writeFileSync(join(tmpRoot, 'user-denied', 'secret.ts'), 'secret\n')
     chmodSync(join(tmpRoot, 'user-denied'), 0o000)
 
-    assert.throws(
-      () => collectFiles(tmpRoot),
+    await assert.rejects(
+      collectFiles(tmpRoot),
       (err: NodeJS.ErrnoException) => err.code === 'EACCES' || err.code === 'EPERM',
-      'collectFiles with non-restricted denied subdir must throw',
+      'collectFiles with non-restricted denied subdir must reject',
     )
   })
 

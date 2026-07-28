@@ -103,6 +103,10 @@ export type SessionEventType =
   // data: { model: string|null, domain: string } — 续跑必须沿用原模型/星域
   // （前缀缓存亲和）；模型不可用时由 POST /resume fail-closed。
   | 'resume_offer'
+  // /handoff 归档完成 — 交接 run 收尾时项目内 .rivet/HANDOFF.md 已拷贝归档到
+  // 会话目录 <id>.handoff.md（loadPrevHandoff 注入管线认的位置）。
+  // data: { text: string, src: string, dest: string }。旧版 UI 忽略即可。
+  | 'handoff_archived'
   // Goal mode — autonomous cross-turn goal tracker state change (created /
   // paused / resumed / cancelled / criteria-extracted / verdict-updated).
   // data: GoalSnapshot (see session-manager). The desktop GoalBar polls or

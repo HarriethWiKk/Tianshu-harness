@@ -53,6 +53,7 @@ describe('migrateSessionFiles (/cd 会话迁移)', () => {
     writeFileSync(join(oldDir, `${sid}.memory.json`), '{}')
     writeFileSync(join(oldDir, `${sid}.handoff.md`), '# handoff')
     writeFileSync(join(oldDir, `${sid}.goal.json`), '{"state":"paused"}')
+    writeFileSync(join(oldDir, `${sid}.frozen.json`), '{"v":1}')
     writeFileSync(join(oldDir, `${sid}.claims.jsonl`), '{"type":"claim_proposed"}\n')
     writeFileSync(join(oldDir, sid, 'cache-log.jsonl'), '{}\n')
     writeFileSync(join(oldDir, sid, 'backups', 'b1.jsonl'), '{}\n')
@@ -64,6 +65,7 @@ describe('migrateSessionFiles (/cd 会话迁移)', () => {
     const res = migrateSessionFiles(sid, oldCwd, newCwd)
 
     assert.deepEqual([...res.moved].sort(), [
+      `${sid}.frozen.json`,
       `${sid}.goal.json`,
       `${sid}.handoff.md`,
       `${sid}.jsonl`,
@@ -72,7 +74,7 @@ describe('migrateSessionFiles (/cd 会话迁移)', () => {
       `${sid}/`,
     ].sort())
 
-    for (const name of [`${sid}.jsonl`, `${sid}.meta.json`, `${sid}.memory.json`, `${sid}.handoff.md`, `${sid}.goal.json`]) {
+    for (const name of [`${sid}.jsonl`, `${sid}.meta.json`, `${sid}.memory.json`, `${sid}.handoff.md`, `${sid}.goal.json`, `${sid}.frozen.json`]) {
       assert.ok(!existsSync(join(oldDir, name)), `${name} must leave the old dir`)
       assert.ok(existsSync(join(newDir, name)), `${name} must land in the new dir`)
     }

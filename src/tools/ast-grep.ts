@@ -46,6 +46,10 @@ function formatMatch(m: AstGrepMatch, includeMeta: boolean): string {
 /** 空结果首行前缀——search-pod-hook 靠 startsWith 识别；改文案必须与 hook 同步。 */
 export const AST_GREP_EMPTY_PREFIX = '0 处匹配'
 
+/** 文件循环让出间隔：readFileSync + tree-sitter 同步解析全仓文件是一个长同步
+ *  段，同进程 worker 执行时会冻结 TUI 输入——每处理 20 个文件让出一次事件循环。 */
+const YIELD_EVERY_FILES = 20
+
 /** 格式化匹配计数摘要行（空结果时以 AST_GREP_EMPTY_PREFIX 开头）。 */
 export function formatAstGrepSummary(matchCount: number, filesScanned: number, errorCount: number): string {
   const errPart = errorCount > 0 ? `，${errorCount} 个错误` : ''
@@ -114,7 +118,7 @@ export const AST_GREP_TOOL: Tool = {
     for (const p of paths) {
       const resolved = resolve(params.cwd ?? process.cwd(), p)
       try {
-        allFiles.push(...collectFiles(resolved))
+        allFiles.push(...await collectFiles(resolved))
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err)
         return { content: `错误：${message}`, isError: true }
@@ -131,7 +135,14 @@ export const AST_GREP_TOOL: Tool = {
     // single-shot, degrades gracefully if the lang-* package is missing.
     await ensureDynamicLangsRegistered(napi)
 
+    let filesProcessed = 0
     for (const filePath of allFiles) {
+      // Slice the scan into event-loop-yieldable chunks (see YIELD_EVERY_FILES).
+      if (filesProcessed > 0 && filesProcessed % YIELD_EVERY_FILES === 0) {
+        await new Promise<void>(r => setImmediate(r))
+      }
+      filesProcessed++
+
       const langStr = resolveLang(explicitLang, filePath)
       if (!langStr) {
         errors.push(`${filePath}: 不支持的语言（该扩展名无语法）`)

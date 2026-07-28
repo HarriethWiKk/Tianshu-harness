@@ -57,8 +57,8 @@ describe('runHandsSession × worker write gate (W4-D1)', () => {
     wtCoordinator = new WorktreeCoordinator(baseDir)
   })
 
-  after(() => {
-    wtCoordinator.cleanupAll()
+  after(async () => {
+    await wtCoordinator.cleanupAll()
     rmSync(baseDir, { recursive: true, force: true })
   })
 

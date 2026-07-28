@@ -2,7 +2,7 @@ import type { ToolHistoryEntry } from '../prompt/volatile.js'
 import type { KnowledgeCandidate } from '../memory/essence-gate.js'
 import { ControlPlaneController } from './control-plane-adapters.js'
 import { SessionContext } from './context.js'
-import { SessionPersist, getSessionDir } from './session-persist.js'
+import { SessionPersist, getSessionDir, shouldAutoWriteHandoff } from './session-persist.js'
 import { attachSessionPersistListener } from './session-persist-listener.js'
 import { PrewarmCache } from './prewarm.js'
 import { invalidateSessionReadDedup } from '../tools/read-file.js'
@@ -112,7 +112,7 @@ import type { Pheromone } from '../context/stigmergy.js'
 import type { PrefixFingerprint } from '../prompt/fingerprint.js'
 import type { SensoriumEntry } from './retrospect.js'
 import { join, dirname } from 'node:path'
-import { writeFileSync, mkdirSync, existsSync, readFileSync, rmSync } from 'node:fs'
+import { writeFileSync, mkdirSync, existsSync, readFileSync, rmSync, statSync } from 'node:fs'
 import { extractRegressionInventory } from './regression-inventory.js'
 import type { ApprovalMode, AgentConfig, AgentCallbacks } from './loop-types.js'
 import type { PermissionAllowRule, PermissionOverlay } from './permissions.js'
@@ -163,6 +163,9 @@ const IDLE_COMPACTION_DELAY_MS = 60_000
 export class AgentLoop {
     session!: SessionContext;
     config!: AgentConfig;
+  /** Agent 创建时间——shutdown 自动 handoff 据此判断会话内是否已手动交接
+   *  （/handoff 或人工编辑的文档 mtime 晚于它 → 结构化摘要不覆盖）。 */
+  readonly createdAtMs = Date.now()
   abortController: AbortController | null = null
   /** Turn heartbeat watchdog reference (set in initializeRun, cleared on stop). */
   _turnHeartbeat: import('./turn-heartbeat.js').TurnHeartbeat | null = null
@@ -1973,10 +1976,15 @@ export class AgentLoop {
       }
     } catch { /* non-critical */ }
     try {
-      const handoffText = this.compaction.buildSessionHandoff()
+      // 会话内 /handoff（或人工编辑）已产出更新的交接文档时，结构化摘要不覆盖——
+      // 自动 handoff 只是「会话内没做手动交接」的兜底（shouldAutoWriteHandoff）。
       const sp = this.persist
-      if (sp) {
+      const handoffMtime = sp && existsSync(sp.getHandoffPath()) ? statSync(sp.getHandoffPath()).mtimeMs : null
+      if (sp && shouldAutoWriteHandoff(handoffMtime, this.createdAtMs)) {
+        const handoffText = this.compaction.buildSessionHandoff()
         sp.writeHandoff(handoffText)
+      }
+      if (sp) {
         const domainId = this.sessionDomain?.id
         if (domainId) sp.updateMetadata({ domain: domainId })
       }

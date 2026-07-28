@@ -51,6 +51,8 @@ import { SteerBuffer } from '../tui/steer-buffer.js'
 import { TEAM_PANEL_UI_PREFIX } from '../tui/team-panel-model.js'
 import { COUNCIL_PANEL_UI_PREFIX } from '../tui/council-panel-model.js'
 import { containsRegisteredFrame } from '../tui/frame-codec.js'
+import { buildHandoffPrompt } from '../tui/handoff.js'
+import { getSessionDir } from '../agent/session-persist.js'
 import { WatchdogRecoveryPolicy } from '../agent/watchdog-recovery-policy.js'
 import { buildDomainPickerEntries, type DomainPickerEntry } from '../agent/domain-picker-entries.js'
 import { starDomainRegistry } from '../agent/star-domain-registry.js'
@@ -58,8 +60,9 @@ import type { ActiveStarDomain } from '../agent/star-domain.js'
 import type { StarDomainId } from '../agent/star-domain.js'
 import { skillRegistry, loadProjectSkills, listInstallableSkills, importSkillsIntoRivet, countInstalledSkills, type InstallableSkill } from '../skills/skill-loader.js'
 import type { MissionStore } from './mission-store.js'
-import { join, resolve } from 'node:path'
+import { join, resolve, dirname } from 'node:path'
 import { readFile } from 'node:fs/promises'
+import { existsSync, copyFileSync, statSync, mkdirSync } from 'node:fs'
 import { createWorktree, removeWorktree, listWorktrees, hasUnlandedWork, commitAll, revParseHead, squashMergeBranch, pushBranch, type WorktreeEntry } from '../agent/worktree.js'
 import { createPr } from './gh-cli.js'
 import { getGitGraph, getWorkingTreeFiles, getFileDiff, getFileAtBase } from '../tools/git.js'
@@ -731,6 +734,12 @@ interface InternalSession {
   knownArtifacts: Set<string>
   /** T3 — mid-run user guidance, drained into the agent at the next tool boundary. */
   steer: SteerBuffer
+  /**
+   * /handoff 登记的归档任务（桌面端 POST /sessions/:id/handoff）：交接 run 收尾时
+   * 把项目内 .rivet/HANDOFF.md 拷贝归档到会话目录 <id>.handoff.md——
+   * loadPrevHandoff 注入管线认的位置（与 TUI pendingHandoffCopy 同语义）。
+   */
+  pendingHandoff?: { src: string; dest: string; sinceMs: number }
   /**
    * Background job registry (bash run_in_background + `job` tool). Server-owned so
    * it survives agent rebuilds (switchModel) and its lifecycle events can be
@@ -1966,6 +1975,7 @@ export class RuntimeSessionManager {
             this.rejectAllPending(session, session.record.status === 'aborted' ? 'aborted' : 'stale')
             this.touch(session)
             this.scanArtifacts(session)
+            this.settleHandoffArchive(session)
             this.append(session, 'done', { status: session.record.status })
             this.persistRecord(session)
             this.maybeWatchdogAutoContinue(session)
@@ -2008,6 +2018,50 @@ export class RuntimeSessionManager {
       failEnsure(err)
     }
     return true
+  }
+
+  /**
+   * /handoff（桌面端入口）：登记归档任务后发起交接 run——agent 把交接文档写到
+   * 项目内 .rivet/HANDOFF.md（工作区内免审批），run 收尾时 settleHandoffArchive
+   * 拷贝归档到会话目录 <id>.handoff.md（loadPrevHandoff 注入管线认的位置，
+   * 与 TUI pendingHandoffCopy 同语义）。会话不存在/运行中返回 false（路由 409）。
+   */
+  requestHandoff(id: string, note?: string): { ok: boolean; error?: string } {
+    const session = this.sessions.get(id)
+    if (!session) return { ok: false, error: 'Session not found' }
+    if (session.running) return { ok: false, error: 'Session is already running' }
+    const src = join(session.record.cwd, '.rivet', 'HANDOFF.md')
+    const dest = join(getSessionDir(session.record.cwd), `${session.record.id}.handoff.md`)
+    session.pendingHandoff = { src, dest, sinceMs: Date.now() }
+    if (!this.run(id, buildHandoffPrompt(src, note))) {
+      session.pendingHandoff = undefined
+      return { ok: false, error: 'Session is already running' }
+    }
+    return { ok: true }
+  }
+
+  /**
+   * run 收尾时的 handoff 归档：交接 run 产出项目内文档后拷贝到会话目录
+   * <id>.handoff.md 并补一条 system 事件（新会话于是自动注入交接内容）。
+   * best-effort——拷贝失败不阻断 done 事件。
+   */
+  private settleHandoffArchive(session: InternalSession): void {
+    const pending = session.pendingHandoff
+    if (!pending) return
+    session.pendingHandoff = undefined
+    try {
+      if (existsSync(pending.src) && statSync(pending.src).mtimeMs > pending.sinceMs) {
+        // dest 父目录在真实 agent 路径下由 SessionPersist 构造创建；但 best-effort
+        // 不依赖那个时序（懒构建/异常会话里可能尚无目录）。
+        mkdirSync(dirname(pending.dest), { recursive: true })
+        copyFileSync(pending.src, pending.dest)
+        this.append(session, 'handoff_archived', {
+          text: `✦ 交接文档已写入 ${pending.src} 并归档 ${pending.dest}——新会话将自动注入交接内容。`,
+          src: pending.src,
+          dest: pending.dest,
+        })
+      }
+    } catch { /* best-effort：归档失败不阻断会话收尾 */ }
   }
 
   /**

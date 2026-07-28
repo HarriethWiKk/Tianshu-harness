@@ -14,6 +14,8 @@ function ev(over: Partial<WorkerActivityEvent>): WorkerActivityEvent {
   return { workOrderId: 'wo_abc', profile: 'code_scout', kind: 'text', ...over }
 }
 
+const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms))
+
 describe('shortOrderLabel', () => {
   it('strips wo_ prefix and takes the last colon segment', () => {
     assert.equal(shortOrderLabel('wo_abc123'), 'abc123')
@@ -138,15 +140,17 @@ describe('createDelegationActivityMapper', () => {
     assert.equal(a[2]!.tokenCount, 2000)
   })
 
-  it('objective 仅在首条 running 事件携带（查表或 event.objective）', () => {
+  it('objective 仅在首条 running 事件携带（查表或 event.objective）', async () => {
     const acts: DelegationActivity[] = []
     const map = createDelegationActivityMapper('p', a => acts.push(a), {
       objectiveOf: (id) => id === 'wo_a' ? 'find auth bugs' : undefined,
+      coalesceMs: 5,
     })
     map(ev({ workOrderId: 'wo_a', kind: 'tool_use', detail: 'grep' }))
     map(ev({ workOrderId: 'wo_a', kind: 'tool_use', detail: 'read_file' }))
     map(ev({ workOrderId: 'wo_b', kind: 'tool_use', objective: 'from coordinator' }))
     map(ev({ workOrderId: 'wo_b', kind: 'text', detail: 'x' }))
+    await sleep(30)  // text 经尾沿合并后发出
     assert.equal(acts[0]!.objective, 'find auth bugs')
     assert.equal(acts[1]!.objective, undefined)
     assert.equal(acts[2]!.objective, 'from coordinator')
@@ -176,7 +180,7 @@ describe('createDelegationActivityMapper', () => {
     assert.deepEqual(acts[2]!.contract, contract)
   })
 
-  it('objective 为空时 contract 仍只发一次——两者分开记账', () => {
+  it('objective 为空时 contract 仍只发一次——两者分开记账', async () => {
     // objective 的「查不到就下条再试」是有意的（objectiveOf 首条可能还没就绪），
     // 但那道守卫曾连 contract 一起管：objective 恰好为空时 contract 跟着每条重发，
     // 下游按「首条才带」去重就会为同一 worker 反复打派发卡。
@@ -189,11 +193,12 @@ describe('createDelegationActivityMapper', () => {
       allowedToolsDigest: 'grep,read_file +2',
     }
     const acts: DelegationActivity[] = []
-    const map = createDelegationActivityMapper('p', a => acts.push(a))
+    const map = createDelegationActivityMapper('p', a => acts.push(a), { coalesceMs: 5 })
     // objective 全程缺席（coordinator 未附带、无 objectiveOf 兜底）
     map(ev({ workOrderId: 'wo_a', kind: 'tool_use', contract }))
     map(ev({ workOrderId: 'wo_a', kind: 'tool_use', contract }))
     map(ev({ workOrderId: 'wo_a', kind: 'text', contract }))
+    await sleep(30)  // text 经尾沿合并后发出
     assert.deepEqual(acts[0]!.contract, contract, '首条仍带 contract')
     assert.equal(acts[1]!.contract, undefined)
     assert.equal(acts[2]!.contract, undefined)
@@ -228,5 +233,125 @@ describe('createDelegationActivityMapper', () => {
     assert.match(acts[1]!.progressLine!, /续跑 1\/2/)
     assert.equal(acts[1]!.toolUseCount, 1, '补偿轮播报不是一次工具调用')
     assert.equal(acts[1]!.tokenCount, undefined)
+  })
+
+  describe('text/thinking 尾沿合并', () => {
+    it('窗口内连续 text delta 合并为一条，eventDetail 字节完整', async () => {
+      const acts: DelegationActivity[] = []
+      const map = createDelegationActivityMapper('p', a => acts.push(a), { coalesceMs: 20 })
+      map(ev({ kind: 'text', detail: 'Hello, ' }))
+      map(ev({ kind: 'text', detail: '世界' }))
+      map(ev({ kind: 'text', detail: '！\n第二行' }))
+      assert.equal(acts.length, 0, '窗口未满不得提前发出')
+      await sleep(60)
+      assert.equal(acts.length, 1, '尾沿到时发出且仅发出一条')
+      assert.equal(acts[0]!.eventKind, 'text')
+      // WorkerMirrorStore 靠 eventDetail 重建完整转录——多字节/换行一个字节都不能丢
+      assert.equal(acts[0]!.eventDetail, 'Hello, 世界！\n第二行')
+      assert.equal(acts[0]!.progressLine, '写入中')
+    })
+
+    it('合并事件携带发出时的最新 toolUseCount/tokenCount', async () => {
+      const acts: DelegationActivity[] = []
+      const map = createDelegationActivityMapper('p', a => acts.push(a), { coalesceMs: 20 })
+      map(ev({ kind: 'tool_use', detail: 'grep' }))
+      map(ev({ kind: 'tool_use', detail: 'read_file' }))
+      map(ev({ kind: 'turn', detail: '3200' }))
+      map(ev({ kind: 'text', detail: 'a' }))
+      map(ev({ kind: 'text', detail: 'b' }))
+      await sleep(60)
+      assert.equal(acts.length, 4)
+      const merged = acts[3]!
+      assert.equal(merged.eventDetail, 'ab')
+      assert.equal(merged.toolUseCount, 2)
+      assert.equal(merged.tokenCount, 3200)
+    })
+
+    it('text→thinking 切换：先 flush 旧槽，再开新槽', async () => {
+      const acts: DelegationActivity[] = []
+      const map = createDelegationActivityMapper('p', a => acts.push(a), { coalesceMs: 20 })
+      map(ev({ kind: 'text', detail: '正文一' }))
+      map(ev({ kind: 'text', detail: '正文二' }))
+      map(ev({ kind: 'thinking', detail: '推理' }))
+      // kind 切换立即 flush text 槽，不等定时器
+      assert.equal(acts.length, 1)
+      assert.equal(acts[0]!.eventKind, 'text')
+      assert.equal(acts[0]!.eventDetail, '正文一正文二')
+      await sleep(60)
+      assert.equal(acts.length, 2)
+      assert.equal(acts[1]!.eventKind, 'thinking')
+      assert.equal(acts[1]!.eventDetail, '推理')
+      assert.equal(acts[1]!.progressLine, '思考中')
+    })
+
+    it('tool_use 到达前先 flush pending text，tool_use 即时透传（顺序断言）', () => {
+      const acts: DelegationActivity[] = []
+      // 大窗口证明不依赖定时器：flush + 透传都是同步完成的
+      const map = createDelegationActivityMapper('p', a => acts.push(a), { coalesceMs: 10_000 })
+      map(ev({ kind: 'text', detail: '片段A' }))
+      map(ev({ kind: 'text', detail: '片段B' }))
+      map(ev({ kind: 'tool_use', detail: 'grep' }))
+      assert.equal(acts.length, 2, 'flush 与 tool_use 透传都是同步的')
+      assert.equal(acts[0]!.eventKind, 'text')
+      assert.equal(acts[0]!.eventDetail, '片段A片段B')
+      assert.equal(acts[0]!.toolUseCount, 0, 'flush 按到达时序携带 tool_use 之前的计数')
+      assert.equal(acts[1]!.eventKind, 'tool_use')
+      assert.equal(acts[1]!.eventDetail, 'grep')
+      assert.equal(acts[1]!.toolUseCount, 1)
+    })
+
+    it('非流式事件不延迟（tool_result/turn/lifecycle/retry 即时透传）', () => {
+      const acts: DelegationActivity[] = []
+      const map = createDelegationActivityMapper('p', a => acts.push(a), { coalesceMs: 10_000 })
+      map(ev({ kind: 'tool_result', detail: 'grep' }))
+      map(ev({ kind: 'turn', detail: '100' }))
+      map(ev({ kind: 'lifecycle', detail: '续跑 1/2' }))
+      map(ev({ kind: 'retry' }))
+      assert.equal(acts.length, 4)
+      assert.deepEqual(acts.map(a => a.eventKind), ['tool_result', 'turn', 'lifecycle', 'retry'])
+    })
+
+    it('尾沿定时器到时真实发出（真实定时器，非 fake timer）', async () => {
+      const acts: DelegationActivity[] = []
+      const map = createDelegationActivityMapper('p', a => acts.push(a), { coalesceMs: 30 })
+      map(ev({ kind: 'thinking', detail: '想' }))
+      assert.equal(acts.length, 0)
+      await sleep(15)
+      assert.equal(acts.length, 0, '窗口未满不得发出')
+      await sleep(60)
+      assert.equal(acts.length, 1, '尾沿定时器到时必须发出')
+      assert.equal(acts[0]!.eventDetail, '想')
+    })
+
+    it('首条被发出的事件仍携带 objective——即使它被合并延迟', async () => {
+      const acts: DelegationActivity[] = []
+      const map = createDelegationActivityMapper('p', a => acts.push(a), {
+        coalesceMs: 20,
+        objectiveOf: (id) => id === 'wo_a' ? 'find auth bugs' : undefined,
+      })
+      map(ev({ workOrderId: 'wo_a', kind: 'text', detail: 'x' }))
+      map(ev({ workOrderId: 'wo_a', kind: 'text', detail: 'y' }))
+      assert.equal(acts.length, 0)
+      await sleep(60)
+      assert.equal(acts[0]!.objective, 'find auth bugs', '首条发出事件（合并 text）必须携带 objective')
+      map(ev({ workOrderId: 'wo_a', kind: 'tool_use', detail: 'grep' }))
+      assert.equal(acts[1]!.objective, undefined, '后续事件不再重复携带')
+    })
+
+    it('pending 槽 per-worker 独立：wo_b 的 tool_use 不冲掉 wo_a 的槽', async () => {
+      const acts: DelegationActivity[] = []
+      const map = createDelegationActivityMapper('p', a => acts.push(a), { coalesceMs: 20 })
+      map(ev({ workOrderId: 'wo_a', kind: 'text', detail: 'A' }))
+      map(ev({ workOrderId: 'wo_b', kind: 'text', detail: 'B' }))
+      map(ev({ workOrderId: 'wo_b', kind: 'tool_use', detail: 'grep' }))
+      assert.deepEqual(acts.map(a => [a.workOrderId, a.eventKind]), [
+        ['wo_b', 'text'],
+        ['wo_b', 'tool_use'],
+      ], '只有 wo_b 自己的 pending 被 flush')
+      await sleep(60)
+      assert.equal(acts.length, 3)
+      assert.equal(acts[2]!.workOrderId, 'wo_a')
+      assert.equal(acts[2]!.eventDetail, 'A')
+    })
   })
 })

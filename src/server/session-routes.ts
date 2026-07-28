@@ -666,6 +666,20 @@ export function buildSessionRoutes(
       return { status: 200, body: rec }
     }, apiToken),
 
+    // /handoff（桌面 plus 面板入口）——登记归档任务后发起交接 run：
+    // agent 写项目内 .rivet/HANDOFF.md，run 收尾自动归档 <id>.handoff.md
+    // （loadPrevHandoff 注入管线认的位置，与 TUI /handoff 同语义）。
+    'POST /sessions/:id/handoff': withAuth((body, params) => {
+      const data = (body ?? {}) as { note?: unknown }
+      const note = typeof data.note === 'string' && data.note.trim() ? data.note.trim() : undefined
+      const res = manager.requestHandoff(params!.id!, note)
+      if (!res.ok) {
+        const status = res.error === 'Session not found' ? 404 : 409
+        return { status, body: { error: res.error } }
+      }
+      return { status: 200, body: manager.getSession(params!.id!) }
+    }, apiToken),
+
     'POST /sessions/:id/prompt': withAuth(async (body, params) => {
       const data = (body ?? {}) as { prompt?: string; images?: unknown }
       if (!data.prompt || typeof data.prompt !== 'string' || !data.prompt.trim()) {

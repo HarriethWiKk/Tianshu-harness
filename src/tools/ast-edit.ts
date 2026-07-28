@@ -155,7 +155,7 @@ export const AST_EDIT_TOOL: Tool = {
     for (const p of paths) {
       const resolved = resolve(params.cwd ?? process.cwd(), p)
       try {
-        allFiles.push(...collectFiles(resolved))
+        allFiles.push(...await collectFiles(resolved))
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err)
         return { content: `错误：${message}`, isError: true }

@@ -405,6 +405,39 @@ describe('InputLine', () => {
     it('returns null when no more history', () => {
       assert.equal(new InputLine().handleKey('up', '', false, false), null)
     })
+
+    it('多行内容：首行按上原地停，不翻历史（防误触）', () => {
+      const input = new InputLine({ history: ['old1', 'old2'] })
+      input.setValue('line1\nline2\nline3', 0) // 光标在首行行首
+      const ev = input.handleKey('up', '', false, false)
+      // 不翻历史（value 不变），返回 null（原地停）
+      assert.equal(ev, null)
+      assert.equal(input.value, 'line1\nline2\nline3')
+    })
+
+    it('多行内容：末行按下原地停，不翻历史', () => {
+      const input = new InputLine({ history: ['old1', 'old2'] })
+      input.setValue('line1\nline2\nline3', 'line1\nline2\nline3'.length) // 光标在末行行尾
+      const ev = input.handleKey('down', '', false, false)
+      assert.equal(ev, null)
+      assert.equal(input.value, 'line1\nline2\nline3')
+    })
+
+    it('多行内容：方向键仍可在行间移动', () => {
+      const input = new InputLine({ history: ['old1'] })
+      input.setValue('line1\nline2\nline3', 'line1\nline2\nline3'.length) // 末行行尾
+      const ev = input.handleKey('up', '', false, false)
+      assert.ok(ev?.type === 'change')
+      assert.equal(input.value, 'line1\nline2\nline3') // value 不变，只是光标上移
+    })
+
+    it('多行内容：Ctrl+P 仍能翻历史（替代入口）', () => {
+      const input = new InputLine({ history: ['old1', 'old2'] })
+      input.setValue('line1\nline2', 0)
+      const ev = input.handleKey('ctrl_p', '', true, false)
+      assert.ok(ev?.type === 'change')
+      assert.equal(input.value, 'old1') // Ctrl+P 翻到历史，不受多行禁用影响
+    })
   })
 
   describe('vim mode', () => {

@@ -149,6 +149,21 @@ function uniqueBranch(cwd: string, baseBranch: string): string {
   return `${baseBranch}-${Date.now()}`
 }
 
+async function branchExistsAsync(cwd: string, branch: string): Promise<boolean> {
+  return (await gitAsync(cwd, ['show-ref', '--verify', '--quiet', `refs/heads/${branch}`])).ok
+}
+
+async function uniqueBranchAsync(cwd: string, baseBranch: string): Promise<string> {
+  if (!(await branchExistsAsync(cwd, baseBranch))) return baseBranch
+  // Same collision-avoidance strategy as uniqueBranch (see above).
+  for (let attempt = 1; attempt <= 20; attempt++) {
+    const suffix = Math.random().toString(36).slice(2, 8)
+    const candidate = `${baseBranch}-${suffix}`
+    if (!(await branchExistsAsync(cwd, candidate))) return candidate
+  }
+  return `${baseBranch}-${Date.now()}`
+}
+
 export function createWorktree(cwd: string, sessionId: string, branch = `rivet-hands-${sessionId.slice(0, 8)}`): CreatedWorktree {
   const safeSessionId = sessionId.replace(/[^a-zA-Z0-9_-]/g, '-')
   branch = uniqueBranch(cwd, branch)
@@ -165,6 +180,32 @@ export function createWorktree(cwd: string, sessionId: string, branch = `rivet-h
     // If the branch somehow appeared mid-flight, pick a fresh unique one.
     if (branchExists(cwd, branch)) {
       branch = uniqueBranch(cwd, `rivet-hands-${safeSessionId.slice(0, 8)}`)
+    }
+  }
+  throw new Error(`failed to create git worktree for ${sessionId}: ${lastError}`)
+}
+
+/**
+ * Async createWorktree — identical retry/unique-branch semantics, but every git
+ * invocation goes through gitAsync so the full-tree checkout never blocks the
+ * main event loop (the hands dispatch path shares the TUI's loop).
+ */
+export async function createWorktreeAsync(cwd: string, sessionId: string, branch = `rivet-hands-${sessionId.slice(0, 8)}`): Promise<CreatedWorktree> {
+  const safeSessionId = sessionId.replace(/[^a-zA-Z0-9_-]/g, '-')
+  branch = await uniqueBranchAsync(cwd, branch)
+  let lastError = ''
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const wtPath = mkdtempSync(join(tmpdir(), `rivet-wt-${safeSessionId.slice(0, 8)}-${attempt}-`))
+    const result = await gitAsync(cwd, buildWorktreeArgs(wtPath, branch))
+    if (result.ok) {
+      writeOwnerMarker(wtPath, sessionId)
+      return { path: wtPath, branch }
+    }
+    lastError = result.stderr || result.stdout || '(git produced no output)'
+    try { rmSync(wtPath, { recursive: true, force: true }) } catch {}
+    // If the branch somehow appeared mid-flight, pick a fresh unique one.
+    if (await branchExistsAsync(cwd, branch)) {
+      branch = await uniqueBranchAsync(cwd, `rivet-hands-${safeSessionId.slice(0, 8)}`)
     }
   }
   throw new Error(`failed to create git worktree for ${sessionId}: ${lastError}`)
@@ -203,9 +244,11 @@ export function removeWorktree(cwd: string, wtPath: string, branch?: string, opt
   try { rmSync(join(wtPath, OWNER_FILE), { force: true }) } catch {}
 }
 
-/** Async removeWorktree — same contract, event loop stays free during removal. */
-export async function removeWorktreeAsync(cwd: string, wtPath: string): Promise<void> {
+/** Async removeWorktree — same contract (including branch deletion), event loop stays free during removal. */
+export async function removeWorktreeAsync(cwd: string, wtPath: string, branch?: string, opts?: { keepBranch?: boolean }): Promise<void> {
   await gitAsync(cwd, ['worktree', 'remove', '--force', wtPath])
+  if (branch && !opts?.keepBranch) await gitAsync(cwd, ['branch', '-D', branch])
+  // Clean up owner marker so the reaper doesn't try to reap an already-removed worktree
   try { rmSync(join(wtPath, OWNER_FILE), { force: true }) } catch {}
 }
 

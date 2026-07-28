@@ -144,7 +144,7 @@ export async function runHandsSession(config: HandsSessionConfig): Promise<Hands
     // guarantee that lets multiple sessions share a cwd. The only loss is the
     // worktree-scoped diff (collected below only when a real worktree exists).
     try {
-      wt = config.wtCoordinator.create(config.order.id)
+      wt = await config.wtCoordinator.create(config.order.id)
     } catch {
       wt = { path: config.cwd }
       inPlace = true
@@ -352,6 +352,6 @@ export async function runHandsSession(config: HandsSessionConfig): Promise<Hands
 
     return { result, usage: turnUsage, writeGate }
  } finally {
-    config.wtCoordinator.remove(config.order.id)
+    await config.wtCoordinator.remove(config.order.id)
  }
 }

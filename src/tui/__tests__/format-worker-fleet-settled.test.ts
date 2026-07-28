@@ -3,8 +3,9 @@
  * 返回值契约测试。
  *
  * 契约：
- *  1. clearGroup 把组内 worker 移入归档区并返回其视图（首见时间升序）；
- *     无记录返回空数组；归档后 /tasks 仍可查（getCompletedWorkers）。
+ *  1. clearGroup 把组内 worker 移入归档区并返回 { settled, evictedIds }——
+ *     settled 为本组视图（首见时间升序），evictedIds 为归档区封顶淘汰的 id；
+ *     无记录时两者皆空；归档后 /tasks 仍可查（getCompletedWorkers）。
  *  2. 沉淀卡头行聚合：通过数/总工具/总 token/最长耗时。
  *  3. 每 worker 一行与 live 树同构（├─/└─ + glyph + 标签 + 统计 + 耗时 + 摘要尾）。
  *  4. 超过 maxRows 折叠为 …(+N)；全通过 success 色，有失败 warning 色。
@@ -100,7 +101,7 @@ describe('FleetRegistry.clearGroup 返回归档视图', () => {
     fleet.apply(act('w1', 'passed', { progressLine: 'done', toolUseCount: 20 }), 3000)
     fleet.apply(act('w2', 'failed', { progressLine: 'boom' }), 4000)
 
-    const settled = fleet.clearGroup('tool-1', 5000)
+    const { settled } = fleet.clearGroup('tool-1', 5000)
     assert.equal(settled.length, 2)
     assert.equal(settled[0]!.workerId, 'w1', '首见升序')
     assert.equal(settled[1]!.workerId, 'w2')
@@ -113,7 +114,7 @@ describe('FleetRegistry.clearGroup 返回归档视图', () => {
   it('无该组记录返回空数组；不影响其它组', () => {
     const fleet = new FleetRegistry()
     fleet.apply(act('w1', 'running'))
-    assert.deepEqual(fleet.clearGroup('other-tool'), [])
+    assert.deepEqual(fleet.clearGroup('other-tool'), { settled: [], evictedIds: [] })
     assert.equal(fleet.getActiveWorkers().length, 1, '其它组 worker 不受影响')
   })
 })

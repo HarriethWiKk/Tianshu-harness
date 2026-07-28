@@ -17,6 +17,11 @@ import type { WorkerPanelStatus } from './worker-panel-model.js'
 /** Max activity log entries kept per worker (ring buffer). */
 const ACTIVITY_LOG_MAX = 20
 
+/** 终态归档区（terminalRecords）上限：超出时按 Map 插入序淘汰最旧归档。
+ *  与 SessionJobs.MAX_TERMINAL_JOBS / JobRegistry.MAX_TERMINAL_ROWS 同一模式
+ *  （f2495993）——淘汰只影响内存态，会话 JSONL 磁盘记录保留。 */
+export const TERMINAL_RECORDS_CAP = 50
+
 
 export interface FleetWorkerView {
   /** Work order id（稳定的 per-worker 标识，区别于 spawning tool id）。 */
@@ -117,6 +122,18 @@ export class FleetRegistry {
   private records = new Map<string, FleetRecord>()
   /** 终态 worker 归档区：clearGroup 后仍可被 detail pager 查询。 */
   private terminalRecords = new Map<string, FleetRecord>()
+  /** 状态版本计数：每次真实状态变更 +1。 */
+  private stateVersion = 0
+
+  /**
+   * 单调递增的状态版本。调用方按 version 缓存 fleet 面板（sort + 视图分配），
+   * version 未变即跳过整段重建。只在实际发生状态变更时递增：apply 真实写入/
+   * 更新记录（终态重放仅补缺 model/usage 才算）、clearGroup 有归档/淘汰、
+   * markSeen 真改了 unread、clear 清空前非空。
+   */
+  get version(): number {
+    return this.stateVersion
+  }
 
   /**
    * 归约一条委派活动事件。
@@ -154,8 +171,11 @@ export class FleetRegistry {
       // 终态重放（settle 即时事件 + 批末兜底循环双发是设计使然）：冻结终态
       // 时刻与状态——不重算 elapsed、不重复标 unread，只补缺 model/usage。
       if (existing.terminal && terminal) {
-        if (activity.model && !existing.model) existing.model = activity.model
-        if (activity.usage && !existing.usage) existing.usage = activity.usage
+        let filled = false
+        if (activity.model && !existing.model) { existing.model = activity.model; filled = true }
+        if (activity.usage && !existing.usage) { existing.usage = activity.usage; filled = true }
+        // 无变化的纯重放不算状态变更（版本不变，调用方不必重建面板）。
+        if (filled) this.stateVersion++
         return
       }
       // running → terminal 转变时标记 unread（用户尚未查看终态结果）
@@ -180,6 +200,7 @@ export class FleetRegistry {
       if (tokens > existing.tokenCount) existing.tokenCount = tokens
       if (activity.model) existing.model = activity.model
       if (activity.usage) existing.usage = activity.usage
+      this.stateVersion++
       return
     }
 
@@ -204,6 +225,7 @@ export class FleetRegistry {
       summary: activity.summary,
       contract: activity.contract,
     })
+    this.stateVersion++
   }
 
   private toView(r: FleetRecord, now: number): FleetWorkerView {
@@ -234,7 +256,11 @@ export class FleetRegistry {
   /** 标记某 worker 的终态结果已被查看（detail 打开时调用）。 */
   markSeen(workerId: string): void {
     const r = this.records.get(workerId) ?? this.terminalRecords.get(workerId)
-    if (r) r.unread = false
+    // 仅当真的改了 unread 才算状态变更（重复 markSeen / 未知 id 不计版本）。
+    if (r?.unread) {
+      r.unread = false
+      this.stateVersion++
+    }
   }
 
   /** 终态且未读的 worker 数量（GlanceBar / 通知行用）。 */
@@ -282,10 +308,14 @@ export class FleetRegistry {
 
   /**
    * 委派工具终态时把该组 worker 移入归档区，而不是删除。
-   * 返回本组刚归档的 worker 视图（按首见时间升序）——供完成沉淀卡渲染；
-   * 该组无记录时返回空数组。
+   * 返回：
+   * - settled：本组刚归档的 worker 视图（按首见时间升序）——供完成沉淀卡渲染；
+   *   该组无记录时为空数组。
+   * - evictedIds：归档区超出 TERMINAL_RECORDS_CAP 时本次被淘汰的最旧终态
+   *   workerId（Map 插入序；未超限时为空）——调用方可据此同步清理关联状态
+   *   （如 worker 镜像）。
    */
-  clearGroup(parentToolId: string, now: number = Date.now()): FleetWorkerView[] {
+  clearGroup(parentToolId: string, now: number = Date.now()): { settled: FleetWorkerView[]; evictedIds: string[] } {
     const settled: FleetRecord[] = []
     for (const [id, r] of this.records) {
       if (r.parentToolId === parentToolId) {
@@ -294,9 +324,30 @@ export class FleetRegistry {
         settled.push(r)
       }
     }
-    return settled
-      .sort((a, b) => a.startedAt - b.startedAt)
-      .map(r => this.toView(r, now))
+    const evictedIds = this.evictTerminalOverflow()
+    if (settled.length > 0 || evictedIds.length > 0) this.stateVersion++
+    return {
+      settled: settled
+        .sort((a, b) => a.startedAt - b.startedAt)
+        .map(r => this.toView(r, now)),
+      evictedIds,
+    }
+  }
+
+  /**
+   * 归档区超出 TERMINAL_RECORDS_CAP 时按 Map 插入序淘汰最旧归档，返回被淘汰的
+   * workerId。归档区里本来就只有终态记录，无「running 永不淘汰」问题（对照
+   * job-store 的 evictTerminals，f2495993）。
+   */
+  private evictTerminalOverflow(): string[] {
+    const evicted: string[] = []
+    while (this.terminalRecords.size > TERMINAL_RECORDS_CAP) {
+      const oldest = this.terminalRecords.keys().next()
+      if (oldest.done) break
+      this.terminalRecords.delete(oldest.value)
+      evicted.push(oldest.value)
+    }
+    return evicted
   }
 
   /** 按 id 查找 worker（active 优先，其次归档区）。 */
@@ -360,7 +411,10 @@ export class FleetRegistry {
   }
 
   clear(): void {
+    // 空仓 clear 无状态变更，不计版本。
+    if (this.records.size === 0 && this.terminalRecords.size === 0) return
     this.records.clear()
     this.terminalRecords.clear()
+    this.stateVersion++
   }
 }

@@ -29,63 +29,63 @@ describe('WorktreeCoordinator', () => {
     coordinator = new WorktreeCoordinator(baseDir)
   })
 
-  after(() => {
-    coordinator.cleanupAll()
+  after(async () => {
+    await coordinator.cleanupAll()
     rmSync(baseDir, { recursive: true, force: true })
   })
 
-  it('creates a worktree for a worker session and returns the path', () => {
-    const wt = coordinator.create('worker-aaa')
+  it('creates a worktree for a worker session and returns the path', async () => {
+    const wt = await coordinator.create('worker-aaa')
     assert.ok(existsSync(wt.path), `worktree path must exist: ${wt.path}`)
     assert.ok(wt.path.includes('rivet-wt-'), `path should include rivet-wt- prefix: ${wt.path}`)
     assert.ok(wt.branch.startsWith('rivet-hands-'), `branch should start with rivet-hands-: ${wt.branch}`)
     assert.equal(git(wt.path, ['rev-parse', '--abbrev-ref', 'HEAD']).trim(), wt.branch)
-    coordinator.remove('worker-aaa')
+    await coordinator.remove('worker-aaa')
   })
 
-  it('removes a worktree by worker id', () => {
-    const wt = coordinator.create('worker-bbb')
+  it('removes a worktree by worker id', async () => {
+    const wt = await coordinator.create('worker-bbb')
     const wtPath = wt.path
     assert.ok(existsSync(wtPath))
-    coordinator.remove('worker-bbb')
+    await coordinator.remove('worker-bbb')
     // Worktree directory and worker branch should be removed
     assert.equal(existsSync(wtPath), false)
     assert.throws(() => git(baseDir, ['rev-parse', '--verify', wt.branch]))
   })
 
-  it('cleanupAll removes all active worktrees', () => {
-    const wt1 = coordinator.create('worker-ccc')
-    const wt2 = coordinator.create('worker-ddd')
+  it('cleanupAll removes all active worktrees', async () => {
+    const wt1 = await coordinator.create('worker-ccc')
+    const wt2 = await coordinator.create('worker-ddd')
     assert.ok(existsSync(wt1.path))
     assert.ok(existsSync(wt2.path))
-    coordinator.cleanupAll()
+    await coordinator.cleanupAll()
     assert.equal(existsSync(wt1.path), false)
     assert.equal(existsSync(wt2.path), false)
   })
 
-  it('tracks active worktrees per worker id', () => {
-    const wt = coordinator.create('worker-eee')
+  it('tracks active worktrees per worker id', async () => {
+    await coordinator.create('worker-eee')
     assert.equal(coordinator.getActiveCount(), 1)
-    coordinator.remove('worker-eee')
+    await coordinator.remove('worker-eee')
     assert.equal(coordinator.getActiveCount(), 0)
   })
 
-  it('getWorktree returns handle for active worktree', () => {
-    const wt = coordinator.create('worker-fff')
+  it('getWorktree returns handle for active worktree', async () => {
+    const wt = await coordinator.create('worker-fff')
     const handle = coordinator.getWorktree('worker-fff')
     assert.ok(handle)
     assert.equal(handle.path, wt.path)
     assert.equal(handle.branch, wt.branch)
-    coordinator.remove('worker-fff')
+    await coordinator.remove('worker-fff')
   })
 
   it('getWorktree returns undefined for unknown worker id', () => {
     assert.equal(coordinator.getWorktree('nonexistent'), undefined)
   })
 
-  it('removing unknown worker id is a no-op', () => {
+  it('removing unknown worker id is a no-op', async () => {
     // Should not throw
-    coordinator.remove('nonexistent')
+    await coordinator.remove('nonexistent')
     assert.equal(coordinator.getActiveCount(), 0)
   })
 })

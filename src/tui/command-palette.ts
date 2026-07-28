@@ -82,6 +82,7 @@ export function getPaletteCommands(): PaletteCommand[] {
     { name: '/scroll', description: 'Browse output history' },
     { name: '/theme', description: 'Switch color theme' },
     { name: '/fork', description: 'Fork current session' },
+    { name: '/handoff', description: '写结构化交接文档（五章节），归档后自动注入新会话', argsHint: '[备注]' },
     { name: '/vim', description: 'Toggle vim keybindings' },
     { name: '/effort', description: 'Set reasoning effort (off|low|medium|high|max)', argsHint: 'off|low|medium|high|max' },
     { name: '/domain', description: '查看或切换星域人格 (list|<name>|auto|off)', argsHint: 'list|<name>|auto|off' },

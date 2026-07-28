@@ -36,7 +36,7 @@ describe('semantic-index', () => {
   it('isStale detects modified files', () => {
     mkdirSync(join(TEST_DIR, 'src'), { recursive: true })
     writeFileSync(join(TEST_DIR, 'src', 'stale.ts'), 'const x = 1')
-    const idx = new SemanticIndex(TEST_DIR)
+    const idx = new SemanticIndex(TEST_DIR, undefined, { staleTtlMs: 0 })
     idx.rebuild(10)
     assert.equal(idx.isStale(), false)
 
@@ -50,7 +50,7 @@ describe('semantic-index', () => {
     try { rmSync(join(TEST_DIR, '.rivet'), { recursive: true }) } catch {}
     mkdirSync(join(TEST_DIR, 'src'), { recursive: true })
     writeFileSync(join(TEST_DIR, 'src', 'a.ts'), 'const a = 1')
-    const idx = new SemanticIndex(TEST_DIR)
+    const idx = new SemanticIndex(TEST_DIR, undefined, { staleTtlMs: 0 })
     idx.rebuild(10)
     assert.equal(idx.isStale(), false)
 
@@ -62,7 +62,7 @@ describe('semantic-index', () => {
   it('isStale detects deleted files', () => {
     mkdirSync(join(TEST_DIR, 'src'), { recursive: true })
     writeFileSync(join(TEST_DIR, 'src', 'del.ts'), 'const d = 1')
-    const idx = new SemanticIndex(TEST_DIR)
+    const idx = new SemanticIndex(TEST_DIR, undefined, { staleTtlMs: 0 })
     idx.rebuild(10)
     assert.equal(idx.isStale(), false)
 
@@ -133,6 +133,61 @@ describe('semantic-index', () => {
     const hits = idx.search('authenticate user token', 5)
     assert.ok(hits.length >= 1)
     assert.ok(hits[0]!.file.includes('searchable.ts'))
+  })
+
+  it('isStale returns cached verdict within TTL without rescanning', () => {
+    const dir = join(TEST_DIR, 'ttl-cache')
+    mkdirSync(join(dir, 'src'), { recursive: true })
+    writeFileSync(join(dir, 'src', 'c.ts'), 'const c = 1')
+    const idx = new SemanticIndex(dir, undefined, { staleTtlMs: 60_000 })
+    idx.rebuild(10)
+    assert.equal(idx.isStale(), false)
+
+    // Change on disk is invisible while the cached verdict is still fresh
+    writeFileSync(join(dir, 'src', 'c.ts'), 'const c = 2')
+    assert.equal(idx.isStale(), false)
+  })
+
+  it('isStale rescans after TTL expiry and rebuild rewrites the cache', async () => {
+    const dir = join(TEST_DIR, 'ttl-expiry')
+    mkdirSync(join(dir, 'src'), { recursive: true })
+    writeFileSync(join(dir, 'src', 'e.ts'), 'const e = 1')
+    const idx = new SemanticIndex(dir, undefined, { staleTtlMs: 30 })
+    idx.rebuild(10)
+
+    writeFileSync(join(dir, 'src', 'e.ts'), 'const e = 2')
+    await new Promise(resolve => setTimeout(resolve, 50))
+    assert.equal(idx.isStale(), true) // TTL expired → real scan sees the change
+
+    // Rebuild must overwrite the cached `true` with an accurate fresh verdict
+    idx.rebuild(10)
+    assert.equal(idx.isStale(), false)
+  })
+
+  it('incrementalUpdate rewrites the staleness cache', async () => {
+    const dir = join(TEST_DIR, 'ttl-incr')
+    mkdirSync(join(dir, 'src'), { recursive: true })
+    writeFileSync(join(dir, 'src', 'u.ts'), 'const u = 1')
+    const idx = new SemanticIndex(dir, undefined, { staleTtlMs: 30 })
+    idx.rebuild(10)
+
+    writeFileSync(join(dir, 'src', 'u.ts'), 'const u = 2')
+    await new Promise(resolve => setTimeout(resolve, 50))
+    assert.equal(idx.isStale(), true)
+
+    idx.incrementalUpdate()
+    assert.equal(idx.isStale(), false) // fresh verdict cached — no TTL wait needed
+  })
+
+  it('staleTtlMs 0 disables the cache', () => {
+    const dir = join(TEST_DIR, 'ttl-zero')
+    mkdirSync(join(dir, 'src'), { recursive: true })
+    writeFileSync(join(dir, 'src', 'z.ts'), 'const z = 1')
+    const idx = new SemanticIndex(dir, undefined, { staleTtlMs: 0 })
+    idx.rebuild(10)
+
+    writeFileSync(join(dir, 'src', 'z.ts'), 'const z = 2')
+    assert.equal(idx.isStale(), true) // every call rescans
   })
 
   teardown()

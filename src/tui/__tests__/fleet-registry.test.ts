@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { FleetRegistry } from '../fleet-registry.js'
+import { FleetRegistry, TERMINAL_RECORDS_CAP } from '../fleet-registry.js'
 import type { DelegationActivity } from '../../tools/types.js'
 
 function running(workOrderId: string, parentToolId: string, profile?: string, progressLine?: string): DelegationActivity {
@@ -275,4 +275,86 @@ test('FleetRegistry: 同轮内的终态重放不被误判成新一轮', () => {
   assert.equal(w.summary, '结论')
   assert.equal(w.contract?.objective, '审查缓存边界', '重放不得清掉本轮契约')
   assert.equal(w.terminal, true)
+})
+
+// ─── version 计数（调用方按 version 缓存 fleet 面板，未变跳过重建） ───
+
+test('FleetRegistry: version — apply 新增与更新各递增一次', () => {
+  const fleet = new FleetRegistry()
+  assert.equal(fleet.version, 0)
+  fleet.apply(running('wo_v1', 't'), 0)
+  assert.equal(fleet.version, 1, '新增记录')
+  fleet.apply(running('wo_v1', 't', undefined, '⚙ grep'), 1)
+  assert.equal(fleet.version, 2, '更新既有记录')
+  fleet.apply({ workOrderId: 'wo_v1', parentToolId: 't', status: 'passed' }, 2)
+  assert.equal(fleet.version, 3, 'running→terminal 更新')
+})
+
+test('FleetRegistry: version — 终态重放无变化不递增，补缺 model/usage 才递增', () => {
+  const fleet = new FleetRegistry()
+  fleet.apply(running('wo_v2', 't'), 0)
+  fleet.apply({ workOrderId: 'wo_v2', parentToolId: 't', status: 'passed' }, 1)
+  const v = fleet.version
+  // 完全相同（无 model/usage 可补）的终态重放 → 版本不变
+  fleet.apply({ workOrderId: 'wo_v2', parentToolId: 't', status: 'passed' }, 2)
+  assert.equal(fleet.version, v)
+  // 重放补上此前缺失的 model → 真实状态变更
+  fleet.apply({ workOrderId: 'wo_v2', parentToolId: 't', status: 'passed', model: 'm1' }, 3)
+  assert.equal(fleet.version, v + 1)
+  // model 已存在，重放无可补 → 不变
+  fleet.apply({ workOrderId: 'wo_v2', parentToolId: 't', status: 'passed', model: 'm1' }, 4)
+  assert.equal(fleet.version, v + 1)
+  // 重放补上 usage → 递增
+  fleet.apply({ workOrderId: 'wo_v2', parentToolId: 't', status: 'passed', usage: { input_tokens: 10, output_tokens: 5 } }, 5)
+  assert.equal(fleet.version, v + 2)
+})
+
+test('FleetRegistry: version — clearGroup / markSeen / clear 的递增时机', () => {
+  const fleet = new FleetRegistry()
+  fleet.apply(running('wo_v3', 'toolA'), 0)
+  fleet.apply({ workOrderId: 'wo_v3', parentToolId: 'toolA', status: 'passed' }, 1)
+  const v0 = fleet.version
+
+  fleet.markSeen('wo_v3')
+  assert.equal(fleet.version, v0 + 1, 'unread true→false 是真实变更')
+  fleet.markSeen('wo_v3')
+  assert.equal(fleet.version, v0 + 1, '已读再 markSeen 无变更')
+  fleet.markSeen('wo_missing')
+  assert.equal(fleet.version, v0 + 1, '未知 id 无变更')
+
+  fleet.clearGroup('other-tool')
+  assert.equal(fleet.version, v0 + 1, '空组 clearGroup 无归档无淘汰，不计版本')
+  const res = fleet.clearGroup('toolA')
+  assert.equal(res.settled.length, 1)
+  assert.deepEqual(res.evictedIds, [])
+  assert.equal(fleet.version, v0 + 2, '归档是真实变更')
+
+  fleet.clear()
+  assert.equal(fleet.version, v0 + 3, '非空 clear 计版本')
+  fleet.clear()
+  assert.equal(fleet.version, v0 + 3, '空仓 clear 不计版本')
+})
+
+test('FleetRegistry: clearGroup — 归档区封顶 TERMINAL_RECORDS_CAP，按插入序淘汰最旧并回报 evictedIds', () => {
+  const fleet = new FleetRegistry()
+  const total = TERMINAL_RECORDS_CAP + 2
+  for (let i = 0; i < total; i++) {
+    fleet.apply({ workOrderId: `wo_cap_${i}`, parentToolId: `tool_${i}`, status: 'passed' }, i)
+    const r = fleet.clearGroup(`tool_${i}`, i + total)
+    // settled 内容不受封顶影响：本组刚归档的 worker 完整返回
+    assert.equal(r.settled.length, 1)
+    assert.equal(r.settled[0]!.workerId, `wo_cap_${i}`)
+    assert.equal(r.settled[0]!.status, 'passed')
+    if (i < TERMINAL_RECORDS_CAP) {
+      assert.deepEqual(r.evictedIds, [], '未超上限不淘汰')
+    } else {
+      assert.deepEqual(r.evictedIds, [`wo_cap_${i - TERMINAL_RECORDS_CAP}`], '超上限时淘汰最旧归档')
+    }
+    assert.ok(fleet.completedSize() <= TERMINAL_RECORDS_CAP, '归档区永不超过上限')
+  }
+  assert.equal(fleet.completedSize(), TERMINAL_RECORDS_CAP)
+  assert.equal(fleet.getWorkerById('wo_cap_0'), undefined, '最旧归档已被淘汰')
+  assert.equal(fleet.getWorkerById('wo_cap_1'), undefined)
+  assert.ok(fleet.getWorkerById(`wo_cap_${total - 1}`), '最新归档保留')
+  assert.equal(fleet.getCompletedWorkers().length, TERMINAL_RECORDS_CAP)
 })

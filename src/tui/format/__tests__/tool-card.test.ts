@@ -47,6 +47,25 @@ describe('formatToolCardLive', async () => {
     assert.ok(!plain.some(l => l.includes('line1')), 'first line dropped')
   })
 
+  it('accepts pre-split outputTailLines and skips re-splitting outputTail', async () => {
+    // live 区每帧渲染时调用方按累加器引用缓存切分结果；预切行必须与 outputTail 路径一致。
+    const output = 'line1\nline2\nline3\nline4\n'
+    const viaTail = formatToolCardLive({
+      toolName: 'bash', outputTail: output, columns: 80, tailLines: 2,
+    }, theme).map(stripAnsi)
+    const viaLines = formatToolCardLive({
+      toolName: 'bash', outputTail: output, outputTailLines: ['line1', 'line2', 'line3', 'line4'], columns: 80, tailLines: 2,
+    }, theme).map(stripAnsi)
+    assert.deepEqual(viaLines, viaTail)
+  })
+
+  it('pre-split empty outputTailLines falls back to the placeholder row', async () => {
+    const lines = formatToolCardLive({
+      toolName: 'bash', outputTail: '', outputTailLines: undefined, columns: 80, tailLines: 3,
+    }, theme)
+    assert.equal(lines.length, 1 + 3, 'header + fixed tail rows')
+  })
+
   it('renders a spinner bullet when tick is provided', async () => {
     const lines = formatToolCardLive({
       toolName: 'bash',

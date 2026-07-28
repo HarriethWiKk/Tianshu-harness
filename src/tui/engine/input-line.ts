@@ -984,17 +984,21 @@ export class InputLine {
   /** Up：多行且不在首行时上移一行，否则取上一条历史。 */
   private moveUpOrHistory(): InputLineEvent | null {
     if (this._value.includes('\n')) {
+      // 多行：方向键专注行间导航，到首行原地停，不翻历史（防误触——
+      // 多行编辑时光标频繁停在首行，按上想继续编辑却跳走）。
+      // 多行时翻历史用 Ctrl+P（historyPrev）/ Ctrl+N（historyNext）。
       const { line, col } = this.getLineCol(this._cursor)
       if (line > 0) {
         this.sealUndo()
         this._cursor = this.posFromLineCol(line - 1, col)
         return { type: 'change', value: this._value, cursor: this._cursor }
       }
+      return null
     }
     return this.historyPrev()
   }
 
-  /** Down：多行且不在末行时下移一行，否则取下一条历史。 */
+  /** Down：多行时专注行间导航（末行原地停，不翻历史）；单行取下一条历史。 */
   private moveDownOrHistory(): InputLineEvent | null {
     if (this._value.includes('\n')) {
       const { line, col } = this.getLineCol(this._cursor)
@@ -1004,6 +1008,7 @@ export class InputLine {
         this._cursor = this.posFromLineCol(line + 1, col)
         return { type: 'change', value: this._value, cursor: this._cursor }
       }
+      return null
     }
     return this.historyNext()
   }

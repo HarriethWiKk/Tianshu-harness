@@ -2,6 +2,7 @@ import { createProviderClient, resolveApiKey } from '../api/factory.js'
 import { resolveCapabilities } from '../api/provider.js'
 import { createAuthProvider } from '../auth/registry.js'
 import { PromptEngine } from '../prompt/engine.js'
+import type { FrozenSnapshotData } from '../prompt/frozen-snapshot.js'
 import { detectModelFamily } from '../prompt/static.js'
 import { createVolatileSnapshot } from '../prompt/volatile-snapshot.js'
 import { resolvePromptBlocks, invalidatePromptBlocks } from '../prompt/block-policy.js'
@@ -75,8 +76,9 @@ export interface AgentConfigInput {
     prompt?: string
     maxTokens: number
   }
-  /** /cd: previous PromptEngine whose frozen snapshots the new one inherits. */
-  inheritFrozenFrom?: PromptEngine
+  /** /cd: previous PromptEngine whose frozen snapshots the new one inherits.
+   *  resume 场景传盘存 FrozenSnapshotData（<id>.frozen.json），同语义。 */
+  inheritFrozenFrom?: PromptEngine | FrozenSnapshotData
 }
 
 export interface MainAgentConfigInputParams {
@@ -92,8 +94,9 @@ export interface MainAgentConfigInputParams {
   auth?: AuthProvider
   habituationThreshold?: number
   permissions?: PermissionConfig
-  /** /cd: previous PromptEngine whose frozen snapshots the new one inherits. */
-  inheritFrozenFrom?: PromptEngine
+  /** /cd: previous PromptEngine whose frozen snapshots the new one inherits.
+   *  resume 场景传盘存 FrozenSnapshotData（<id>.frozen.json），同语义。 */
+  inheritFrozenFrom?: PromptEngine | FrozenSnapshotData
 }
 
 export function createMainAgentConfigInput(params: MainAgentConfigInputParams): AgentConfigInput {

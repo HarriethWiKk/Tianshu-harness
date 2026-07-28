@@ -73,6 +73,26 @@ describe('evaluateWaveGate', () => {
     assert.match(record.checks[0]!.detail ?? '', /2 tests failed/)
   })
 
+  it('reduces async runCommand results (Promise-returning injection)', async () => {
+    const ran: string[] = []
+    const record = await evaluateWaveGate({
+      cwd: '/fake',
+      wave: 0,
+      changedFiles: [],
+      commands: ['npm test', 'npx tsc --noEmit'],
+      runCommand: async (_cwd, cmd) => {
+        ran.push(cmd)
+        await new Promise(r => setTimeout(r, 5))
+        return cmd === 'npm test' ? { ok: false, detail: 'async: 1 failing' } : { ok: true }
+      },
+    })
+    assert.equal(ran.length, 2)
+    assert.equal(record.passed, false)
+    assert.equal(record.checks[0]!.status, 'failed')
+    assert.match(record.checks[0]!.detail ?? '', /async: 1 failing/)
+    assert.equal(record.checks[1]!.status, 'passed')
+  })
+
   it('marks non-runnable commands unverifiable without failing the gate', async () => {
     const ran: string[] = []
     const record = await evaluateWaveGate({

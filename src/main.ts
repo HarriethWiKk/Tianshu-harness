@@ -42,6 +42,7 @@ import type { ApprovalMode } from './agent/loop-types.js'
 import { statSync } from 'node:fs'
 import { join as pathJoin } from 'node:path'
 import { formatWelcome } from './tui/format/welcome.js'
+import { HANDOFF_NUDGE_RATIO, formatHandoffNudge } from './tui/handoff.js'
 import { color } from './tui/engine/ansi.js'
 import type { RewindMode } from './tui/format/rewind.js'
 import { explainToolRisk } from './agent/risk-explain.js'
@@ -1775,6 +1776,18 @@ async function main() {
   // 与 cursor-resident live region 的相对光标假设冲突，切换 model/theme/domain
   // 提交内容触发滚动时造成顶部残影/塌行。随交互增长终端原生滚动自然把输入框保持在视口底部。
   app.start()
+
+  // 首屏交接提醒（resume 场景）：上下文已过半的会话，建议先 /handoff 再开新会话——
+  // 交接自动注入新会话，比整段回连省前缀重建成本。
+  if (existingMsgCount > 0) {
+    try {
+      const est = ctx.session.getEstimatedTokens()
+      const max = ctx.agent.config.contextWindow
+      if (max > 0 && est / max >= HANDOFF_NUDGE_RATIO) {
+        app.commitStatic(formatHandoffNudge(est / max))
+      }
+    } catch { /* best-effort */ }
+  }
 
   // ── 会话恢复入口（Claude Code parity）───────────────────────────
   // 裸 --resume/-r：自动打开 Chronicle 会话选择器（Enter 直接切换）。

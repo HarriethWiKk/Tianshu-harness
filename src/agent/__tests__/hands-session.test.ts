@@ -43,8 +43,8 @@ describe('runHandsSession', () => {
     wtCoordinator = new WorktreeCoordinator(baseDir)
   })
 
-  after(() => {
-    wtCoordinator.cleanupAll()
+  after(async () => {
+    await wtCoordinator.cleanupAll()
     rmSync(baseDir, { recursive: true, force: true })
   })
 
@@ -254,7 +254,7 @@ describe('runHandsSession', () => {
       assert.ok(diffArtifact, 'must collect diff against feature/base instead of hard-coded main')
       assert.ok(diffArtifact!.content.includes('fromFeature'), diffArtifact!.content)
     } finally {
-      featureCoordinator.cleanupAll()
+      await featureCoordinator.cleanupAll()
       rmSync(featureBaseDir, { recursive: true, force: true })
     }
   })

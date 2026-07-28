@@ -28,8 +28,10 @@ import type { WriteProbe } from '../context/write-evidence-probe.js'
 import { createContextLayer, createContextLayerReport, type ContextLayerReport } from './context-layer.js'
 import { debugLog } from '../utils/debug.js'
 import { skillRegistry } from '../skills/skill-loader.js'
+import { parseFrozenSnapshotData, type FrozenSnapshotData } from './frozen-snapshot.js'
 
 export type { PrefixFingerprint, DriftEvent, ContextLayerReport }
+export type { FrozenSnapshotData } from './frozen-snapshot.js'
 
 /**
  * T7 request-time collapse: window fill-ratio above which the *full* pass runs
@@ -121,8 +123,10 @@ export interface PromptEngineConfig {
   /** /cd: inherit frozen snapshots + T7 watermark from a previous engine so a
    *  mid-session cwd switch replays historical user messages byte-identically.
    *  The prefix cache then only tail-cuts at the next user boundary (same cost
-   *  model as a domain switch) instead of a /resume-style byte-0 full miss. */
-  inheritFrozenFrom?: PromptEngine
+   *  model as a domain switch) instead of a /resume-style byte-0 full miss.
+   *  FrozenSnapshotData 形态：resume 时从 `<id>.frozen.json` 读回的盘存快照，
+   *  与活引擎继承同语义。形状不合法（v!==1/非数组）静默忽略继承。 */
+  inheritFrozenFrom?: PromptEngine | FrozenSnapshotData
 }
 
 export class PromptEngine {
@@ -262,13 +266,24 @@ export class PromptEngine {
     this.config = config
     // /cd frozen inheritance — adopt the previous engine's committed snapshot
     // state BEFORE any build, so historical slots resolve to the old bytes.
+    // resume 走同一入口：盘存 FrozenSnapshotData（<id>.frozen.json）与活引擎同语义。
     const inherit = config.inheritFrozenFrom
-    if (inherit) {
+    if (inherit instanceof PromptEngine) {
       this.frozenUserMerged = new Map([...inherit.frozenUserMerged].map(([k, v]) => [k, [...v]]))
       this.frozenPendingMerged = new Map(inherit.frozenPendingMerged)
       this.firstUserKey = inherit.firstUserKey
       this.collapseWatermark = inherit.collapseWatermark
       this.collapseTokenStep = inherit.collapseTokenStep
+    } else {
+      const data = inherit ? parseFrozenSnapshotData(inherit) : undefined
+      if (data) {
+        // 深拷贝——盘存数据可能被调用方复用/再写，不得共享引用。
+        this.frozenUserMerged = new Map(data.frozenUserMerged.map(([k, v]) => [k, [...v]]))
+        this.frozenPendingMerged = new Map(data.frozenPendingMerged)
+        this.firstUserKey = data.firstUserKey
+        this.collapseWatermark = data.collapseWatermark
+        this.collapseTokenStep = data.collapseTokenStep
+      }
     }
     this.systemPrompt = buildSystemPrompt(config.staticCtx)
     this.frozenBase = buildStableVolatileBlock(config.volatileCtx)
@@ -338,6 +353,41 @@ export class PromptEngine {
     } else {
       this.frozenUserMerged.set(content, [pending])
     }
+    // 快照固化事件——resume 缓存继承的盘存写挂在这里（见 bootstrap 的
+    // wireFrozenSnapshotPersist）。hook 异常绝不影响请求构建。
+    if (this.onFrozenSnapshotCommitCb) {
+      try { this.onFrozenSnapshotCommitCb() } catch { /* listener must not break builds */ }
+    }
+  }
+
+  /** Fired by commitFrozenSnapshot（唯一快照固化点）；由 bootstrap 接线盘存写。 */
+  private onFrozenSnapshotCommitCb?: () => void
+
+  /** 注册快照固化回调（每次 user 边界 commit 后触发，低频）。 */
+  setOnFrozenSnapshotCommit(fn: () => void): void {
+    this.onFrozenSnapshotCommitCb = fn
+  }
+
+  /**
+   * 导出冻结前缀快照的可序列化形态（深拷贝）——随会话落盘，
+   * resume 时经 inheritFrozenFrom 喂回，历史 user 消息恢复原始字节。
+   */
+  exportFrozenSnapshot(): FrozenSnapshotData {
+    return {
+      v: 1,
+      frozenUserMerged: [...this.frozenUserMerged].map(([k, v]) => [k, [...v]] as [string, string[]]),
+      frozenPendingMerged: [...this.frozenPendingMerged],
+      firstUserKey: this.firstUserKey,
+      collapseWatermark: this.collapseWatermark,
+      collapseTokenStep: this.collapseTokenStep,
+    }
+  }
+
+  /** 冻结锚点总数（resume 公告「继承 N 个前缀锚点」用）。 */
+  getFrozenAnchorCount(): number {
+    let n = 0
+    for (const arr of this.frozenUserMerged.values()) n += arr.length
+    return n
   }
 
   buildOaiRequest(inputMessages: OaiMessage[], toolHistory?: ToolHistoryEntry[], contextWindow?: number, options?: { sidePath?: boolean; onOrphanRepair?: (repairedMessages: OaiMessage[], count: number) => void; writeProbe?: WriteProbe }): OaiChatRequest {

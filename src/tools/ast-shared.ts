@@ -119,8 +119,12 @@ const MAX_FILES = 5000
  *  though Dirent.isDirectory() is already symlink-safe (lstatSync on the root
  *  only); nested real dirs this deep indicate a generated/ vendored tree. */
 const MAX_DEPTH = 25
+/** Yield cadence during the recursive walk: a full-repo sync readdir traversal
+ *  is a long synchronous slice, and in an in-process worker that freezes TUI
+ *  input — yield to the event loop every ~500 directory entries. */
+const YIELD_EVERY_ENTRIES = 500
 
-export function collectFiles(searchPath: string): string[] {
+export async function collectFiles(searchPath: string): Promise<string[]> {
   const excludeDirs = resolveExcludeDirs()
   const abs = resolve(searchPath)
   if (!existsSync(abs)) return []
@@ -128,7 +132,8 @@ export function collectFiles(searchPath: string): string[] {
   if (stat.isFile()) return [abs]
   if (!stat.isDirectory()) return []
   const files: string[] = []
-  const walk = (dir: string, depth: number): void => {
+  let entriesSinceYield = 0
+  const walk = async (dir: string, depth: number): Promise<void> => {
     if (files.length >= MAX_FILES || depth > MAX_DEPTH) return
     let entries: Dirent[]
     try {
@@ -145,13 +150,17 @@ export function collectFiles(searchPath: string): string[] {
       const full = join(dir, entry.name)
       if (entry.isDirectory()) {
         if (excludeDirs.has(entry.name)) continue
-        walk(full, depth + 1)
+        await walk(full, depth + 1)
       } else if (entry.isFile()) {
         files.push(full)
       }
+      if (++entriesSinceYield >= YIELD_EVERY_ENTRIES) {
+        entriesSinceYield = 0
+        await new Promise<void>(r => setImmediate(r))
+      }
     }
   }
-  walk(abs, 0)
+  await walk(abs, 0)
   return files
 }
 

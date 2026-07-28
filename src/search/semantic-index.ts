@@ -14,6 +14,10 @@ import { type EmbeddingProvider, NullEmbeddingProvider } from './embedding-provi
 /** Cap on chunks embedded in one pass to bound first-search latency/cost. */
 const MAX_EMBED_CHUNKS = 4000
 
+/** isStale() verdict cache window — in-process workers call semantic_search at
+ *  high frequency on the same event loop; avoid a full-repo rescan per call. */
+export const STALE_CHECK_TTL_MS = 30_000
+
 const INDEX_VERSION = 1
 const SKIP_DIRS = new Set(['node_modules', '.git', 'dist', 'build', '.rivet', 'coverage', 'target', 'vendor', '__pycache__', '.venv', 'venv'])
 // Polyglot: index a broad set of source languages, not just the TS/JS family.
@@ -48,10 +52,14 @@ export class SemanticIndex {
   private vectors = new VectorIndex()
   /** Set when chunks change so the next hybrid search re-embeds lazily. */
   private vectorsDirty = false
+  /** Last isStale() verdict; reused for staleTtlMs to skip redundant rescans. */
+  private staleCache: { at: number; stale: boolean } | null = null
+  private readonly staleTtlMs: number
 
-  constructor(cwd: string, provider: EmbeddingProvider = new NullEmbeddingProvider()) {
+  constructor(cwd: string, provider: EmbeddingProvider = new NullEmbeddingProvider(), opts?: { staleTtlMs?: number }) {
     this.cwd = cwd
     this.provider = provider
+    this.staleTtlMs = opts?.staleTtlMs ?? STALE_CHECK_TTL_MS
     this.loadMeta()
     this.loadVectors()
   }
@@ -71,6 +79,7 @@ export class SemanticIndex {
   /** Load persisted snapshot on cold start. Restores fileHashes and chunks so
    *  isStale() works immediately and searches succeed without a full rebuild. */
   private loadMeta(): void {
+    this.staleCache = null // reloaded state: any cached verdict no longer applies
     const path = this.indexPath()
     if (!existsSync(path)) return
     try {
@@ -154,11 +163,23 @@ export class SemanticIndex {
 
     walk(this.cwd)
     this.persistMeta()
+    // Index just synced with disk — record an accurate fresh verdict.
+    this.staleCache = { at: Date.now(), stale: false }
     return { indexed, skipped }
   }
 
-  /** Check if the index is stale by comparing file hashes against the current filesystem. */
+  /** Check if the index is stale by comparing file hashes against the current filesystem.
+   *  The verdict is cached for staleTtlMs — workers may call this on every search. */
   isStale(): boolean {
+    const now = Date.now()
+    if (this.staleCache && now - this.staleCache.at < this.staleTtlMs) return this.staleCache.stale
+    const stale = this.scanIsStale()
+    this.staleCache = { at: now, stale }
+    return stale
+  }
+
+  /** Full filesystem scan backing isStale() — synchronous, like its caller. */
+  private scanIsStale(): boolean {
     // Quick count check: new files added since last index
     let diskCount = 0
     try {
@@ -286,6 +307,8 @@ export class SemanticIndex {
     }
 
     this.persistMeta()
+    // Index just synced with disk — record an accurate fresh verdict.
+    this.staleCache = { at: Date.now(), stale: false }
     return { reindexed, removed: toRemove.length, fallbackRebuild: false }
   }
 
@@ -403,6 +426,8 @@ export class SemanticIndex {
   }
 
   persistMeta(): void {
+    // Persisted state may differ from a previously cached verdict — invalidate.
+    this.staleCache = null
     const dir = join(this.cwd, '.rivet')
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
     const snapshot: SemanticIndexSnapshot = {

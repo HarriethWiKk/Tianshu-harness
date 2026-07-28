@@ -15,6 +15,10 @@ import type { DelegationActivity } from '../tools/types.js'
 
 /** 每个 worker 镜像的最大消息数（环形，旧消息滚出）。 */
 export const MIRROR_MESSAGE_CAP = 50
+/** 镜像 worker 记录数上限：超出时按 Map 插入序淘汰最旧 worker。wo_<uuid>
+ *  每次派发都是新 id，无上限则长会话无界增长；淘汰只影响实时镜像，完整
+ *  历史走 worker session JSONL（detail pager 通道）。 */
+export const MIRROR_WORKER_CAP = 50
 /** 单条聚合 text 消息的最大长度（防失控 worker 撑爆内存）。 */
 const TEXT_MESSAGE_MAX_CHARS = 8_000
 
@@ -40,6 +44,11 @@ export class WorkerMirrorStore {
   private recordOf(workerId: string): MirrorRecord {
     let r = this.records.get(workerId)
     if (!r) {
+      // 新建记录前封顶：按 Map 插入序淘汰最旧 worker（见 MIRROR_WORKER_CAP）。
+      if (this.records.size >= MIRROR_WORKER_CAP) {
+        const oldest = this.records.keys().next()
+        if (!oldest.done) this.records.delete(oldest.value)
+      }
       r = { messages: [], openText: '', openTextAt: 0 }
       this.records.set(workerId, r)
     }

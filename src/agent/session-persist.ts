@@ -6,6 +6,7 @@ import { sessionsDir } from '../config/paths.js'
 import type { ContentBlock, Message } from '../api/types.js'
 import type { OaiAssistantMessage, OaiMessage, OaiToolCall, OaiToolMessage } from '../api/oai-types.js'
 import { stableStringify } from '../api/stable-json.js'
+import { parseFrozenSnapshotData, type FrozenSnapshotData } from '../prompt/frozen-snapshot.js'
 
 function legacyMessageToOaiMessages(message: Message): OaiMessage[] {
   if (typeof message.content === 'string') {
@@ -140,6 +141,7 @@ function parseSessionLine(line: string): unknown | null {
 export class SessionPersist {
   private filePath: string
   private metadataPath: string
+  private frozenPath: string
   private sessionId: string
   private cwd: string
 
@@ -155,6 +157,7 @@ export class SessionPersist {
     this.sessionId = sessionId
     this.filePath = join(getSessionDir(cwd), `${sessionId}.jsonl`)
     this.metadataPath = join(getSessionDir(cwd), `${sessionId}.meta.json`)
+    this.frozenPath = join(getSessionDir(cwd), `${sessionId}.frozen.json`)
   }
 
   getBackupDir(): string {
@@ -508,6 +511,27 @@ export class SessionPersist {
     }
   }
 
+  /**
+   * 冻结前缀快照落盘（`<id>.frozen.json`）——resume 缓存继承的写侧。
+   * 由 PromptEngine 的 onFrozenSnapshotCommit 钩子在每个 user 边界触发（低频）。
+   */
+  writeFrozenSnapshot(data: FrozenSnapshotData): void {
+    writeFileAtomicSync(this.frozenPath, JSON.stringify(data))
+  }
+
+  /**
+   * 读回冻结前缀快照（resume 缓存继承的读侧）。
+   * 不存在 / 坏 JSON / 形状校验失败一律 undefined——调用方降级为全量重建。
+   */
+  readFrozenSnapshot(): FrozenSnapshotData | undefined {
+    if (!existsSync(this.frozenPath)) return undefined
+    try {
+      return parseFrozenSnapshotData(JSON.parse(readFileSync(this.frozenPath, 'utf-8')))
+    } catch {
+      return undefined
+    }
+  }
+
   loadMemory(): SessionMemoryState {
     return loadSessionMemory(getSessionDir(this.cwd), this.sessionId)
   }
@@ -593,8 +617,12 @@ export class SessionPersist {
 
   /** Write structured handoff text for this session. */
   writeHandoff(text: string): void {
-    const handoffPath = join(getSessionDir(this.cwd), `${this.sessionId}.handoff.md`)
-    writeFileAtomicSync(handoffPath, text)
+    writeFileAtomicSync(this.getHandoffPath(), text)
+  }
+
+  /** 会话归档交接文档路径（`<id>.handoff.md`）——loadPrevHandoff 注入管线认的位置。 */
+  getHandoffPath(): string {
+    return join(getSessionDir(this.cwd), `${this.sessionId}.handoff.md`)
   }
 
   /**
@@ -751,7 +779,19 @@ export function formatExitSummary(
   const title = (meta?.title ?? '').replace(/\s+/g, ' ').trim().slice(0, 60)
   const head = `会话已保存: ${short} · ${turns}轮${title ? ` · “${title}”` : ''}`
   // 告别行在前、事实在后：退出时刻也是品牌触点（✦ = 天枢启明星）。
-  return `✦ 后会有期 — 星轨已存档\n${head}\n恢复: rivet --continue（最近会话）或 rivet --resume ${short}`
+  // 缓存成本备注：回连不是免费的——TTL 内继承冻结锚点 ≈ 只读缓存价，
+  // 过期则整段历史全量重建一次前缀（长会话数元级），随手 --continue 前看一眼。
+  return `✦ 后会有期 — 星轨已存档\n${head}\n恢复: rivet --continue（最近会话）或 rivet --resume ${short}\n缓存成本：尽快回连 ≈ 继承冻结锚点（只读缓存价）；间隔过久缓存过期 → 全量重建一次前缀（长会话数元级）。`
+}
+
+/**
+ * shutdown 自动交接（buildSessionHandoff 结构化摘要）是否该写：
+ * 会话内 /handoff（或人工编辑）已产出更新的交接文档时（mtime 晚于 agent 创建时间）
+ * 不覆盖——自动摘要只是「会话内没做手动交接」的兜底。
+ */
+export function shouldAutoWriteHandoff(existingMtimeMs: number | null, sessionStartMs: number): boolean {
+  if (existingMtimeMs === null) return true
+  return existingMtimeMs <= sessionStartMs
 }
 
 /** Compact relative time for session lists, e.g. "刚刚" / "5分钟前" / "3天前". */
@@ -810,6 +850,7 @@ export function evictOldSessionsInternal(dir: string, keepSessionId: string, lim
     try { unlinkSync(join(dir, `${id}.meta.json`)) } catch { /* ignore */ }
     try { unlinkSync(join(dir, `${id}.memory.json`)) } catch { /* ignore */ }
     try { unlinkSync(join(dir, `${id}.claims.jsonl`)) } catch { /* ignore */ }
+    try { unlinkSync(join(dir, `${id}.frozen.json`)) } catch { /* ignore */ }
     // Clean up same-name session directory (backups/, and any stray files).
     // Without this, getBackupDir() creates <id>/backups/ that evict never removes.
     try { rmSync(join(dir, id), { recursive: true, force: true }) } catch { /* ignore */ }

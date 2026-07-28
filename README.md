@@ -11,6 +11,7 @@
 <p align="center">
   🇨🇳 <b>中文</b> · 
   <a href="README.en.md">📖 English</a> · 
+  <a href="docs/stars/genesis-stele.md">✦ 星域碑文</a> · 
   <a href="docs/user-guide.md">📚 用户手册</a> · 
   <a href="docs/user-guide-sandbox-permissions.md">🛡️ 沙箱权限</a> · 
   <a href="docs/user-guide-provider-config.md">⚙️ 模型配置</a>
@@ -20,7 +21,7 @@
   <img src="https://img.shields.io/github/v/release/huiliyi37/Tianshu-Tui?color=8B5CF6&label=Release&logo=github&style=for-the-badge" alt="GitHub release">
   <img src="https://img.shields.io/badge/License-Apache%202.0-3B5BDB?style=for-the-badge&logo=apache" alt="License">
   <img src="https://img.shields.io/badge/TypeScript-Strict-blue?style=for-the-badge&logo=typescript" alt="TypeScript">
-  <img src="https://img.shields.io/badge/Tests-10%2C000%2B%20Passed-green?style=for-the-badge&logo=testinglibrary" alt="Tests">
+  <img src="https://img.shields.io/badge/Tests-13%2C000%2B%20Passed-green?style=for-the-badge&logo=testinglibrary" alt="Tests">
 </p>
 
 ---
@@ -85,7 +86,32 @@ rivet            # 或：npm start / node dist/main.js
 ```bash
 rivet -p "解释 src/agent/loop.ts"       # 单次提示，文本输出，无 TUI
 rivet -p "列出所有 TODO 注释" --json    # JSON 输出，便于脚本处理
+rivet --stream-json -p "重构这个模块"  # NDJSON 事件流：text_delta/tool_use/tool_result/turn_complete…（CI 集成首选，输出内置脱敏）
+rivet --goal "修复所有类型错误" --budget 50   # 无头目标自主模式，最多跑 50 轮（默认 100）
 ```
+
+### 命令行参数
+
+| 参数 | 说明 |
+|------|------|
+| `-p <prompt>` `--print <prompt>` | 单次提示，文本输出后退出（退出码：成功 0 / 失败 1） |
+| `--json` | 与 `-p` 配合，输出单个 JSON 结果 |
+| `--stream-json` | NDJSON 事件流（`text_delta` / `tool_use` / `tool_result` / `worker` / `turn_complete` / `result`），输出内置脱敏，适合 CI |
+| `--goal "<task>"` | 无头目标自主模式，跑到目标完成或 `--budget` 上限 |
+| `--budget <N>` | goal 模式回合预算（默认 100） |
+| `--model <name>` | 本次会话覆盖模型 |
+| `--provider <name>` | 本次会话覆盖 provider |
+| `--continue` `-c` | 恢复当前 cwd 的最近会话 |
+| `--resume <id\|前缀>` `-r <id\|前缀>` | 恢复指定会话（短前缀即可） |
+| `--resume` `-r`（裸） | 启动后打开会话选择器 |
+| `--new` | 强制开新会话 |
+| `--list` · `rivet sessions` | 打印会话列表后退出 |
+| `--dangerously-skip-permissions` | 单次会话 YOLO（跳过所有审批） |
+| `--screen-reader` | 读屏模式（动态段整体不渲染、周期重绘停转） |
+| `--skip-welcome` | 跳过欢迎屏 |
+| `--stream-events <path>` | 把本次 run 镜像为 NDJSON `SessionEvent` 写入文件 |
+
+子命令：`rivet config`（交互式配置）、`rivet serve`（启动 sidecar HTTP/SSE）、`rivet sessions`（列会话）。
 
 ### 自动更新
 
@@ -157,7 +183,7 @@ rivet config show                                         # 查看完整配置
 |------|------|------|
 | **Manual** | `/permission manual` | 每个高风险工具都弹确认。最大控制，适合敏感项目。 |
 | **Auto**（默认） | `/permission auto [轮次]` | 低/无风险工具自动执行，高风险仍确认。可配每 N 轮暂停检查点（`/permission auto 20`），默认关闭。 |
-| **YOLO** | `/permission yolo confirm` | 全自动执行，无刹车无打扰。回滚兜底（`/rollback` + git 检查点）。需二次确认。 |
+| **YOLO** | `/permission yolo confirm` 或 `/yes` | 全自动执行，无刹车无打扰。回滚兜底（`/rollback` + git 检查点）。`/permission yolo` 需二次确认；`/yes` 即时生效（显式输入命令即视为确认），`/yes off` 退出。 |
 
 > **Windows 注意**：Windows 原生无文件系统沙箱。天枢桌面版安装包内嵌 PortableGit（完整 Git + Git Bash，开箱即用，不依赖用户自装 Git for Windows；已装系统 Git 时优先用系统版）。无沙箱环境下，安全写命令在 Auto 模式自动放行，风险写（rm/mv/git 写操作）仍需审批。
 
@@ -166,20 +192,27 @@ rivet config set-approval dangerously-skip-permissions  # 启动即 YOLO
 rivet --dangerously-skip-permissions                    # 单次会话 YOLO
 ```
 
-会话内用 `/permission` 管理：
+会话内用 `/permission` 管理（无参弹出交互式选择面板）：
 
 ```
-/permission                    # 查看当前模式与规则
-/permission manual             # 切 Manual
-/permission auto [轮次]        # 切 Auto，可选检查点间隔（0=关）
-/permission yolo confirm       # 切 YOLO（需二次确认）
-/permission allow <tool>       # 白名单工具
-/permission deny <tool>        # 黑名单工具
-/permission bash allow <前缀>  # bash 命令白名单
-/permission reset               # 清空自定义规则
+/permission                              # 弹出模式选择面板（上下选 + 回车确认）
+/permission status                       # 文字视图：当前模式 + 所有 allow/deny/bash 规则
+/permission manual                       # 切 Manual
+/permission auto [轮次]                  # 切 Auto，可选检查点间隔（0=关）
+/permission yolo confirm                 # 切 YOLO（未带 confirm 先弹风险说明）
+/permission mode <auto-accept|auto-safe|manual|dangerously-skip-permissions>  # 高级四模式切换
+/permission allow <tool> [param=value]…  # 白名单工具（可带参数条件，如 command="git status"）
+/permission deny  <tool> [param=value]…  # 黑名单工具（deny 优先于 allow 和 mode）
+/permission bash allow <前缀>            # bash 命令白名单前缀
+/permission bash deny  <前缀>            # bash 命令黑名单前缀
+/permission remove allow|deny|bashAllow|bashDeny <序号|pattern>  # 移除某条规则
+/permission reset                        # 清空本次会话的运行时覆盖（不动 config 规则）
+/permission test <tool> <json 输入>      # 预演：某工具在某输入下是否被放行/拦截
 ```
 
-**Auto 检查点**：在 Auto 模式下，可设置每 N 轮暂停并同步进度摘要（改了哪些文件 / token 用量），确认方向后继续。桌面端设置面板可直接配置。
+> 规则分两层：`[config]`（`~/.rivet/config.json` 持久化）与 `[session]`（仅本次会话）。`deny` 始终优先；`reset` 只清 session 覆盖层。
+
+**Auto 检查点**：在 Auto 模式下，可设置每 N 轮暂停并同步进度摘要（改了哪些文件 / token 用量），确认方向后继续（`/permission auto 20`）。桌面端设置面板可直接配置。
 
 跳过提示**不会**禁用工具验证、路径安全、证据追踪、检查点和交付门禁。沙箱后端、路径授权、风险分级详见 [沙箱与权限](docs/user-guide-sandbox-permissions.md)。
 
@@ -220,13 +253,25 @@ graph TD
 
 DeepSeek 对缓存未命中收取 50× 费用。天枢的提示词引擎围绕前缀缓存友好构建：
 
-- **冻结前缀** —— 系统提示词 + 工具定义 + 稳定上下文在会话开始时被冻结，永不重写，后续每次请求都命中缓存。
-- **增量附录** —— 动态上下文（进度、advisories、信号）以跨回合 diff 追加块注入，永不重写历史。回合间增量约 200 字节 vs ~5KB 全量重写。
+- **冻结前缀** —— 系统提示词 + 工具定义 + 稳定上下文在会话开始时被冻结，会话内不再重写，让后续请求尽量命中缓存。
+- **增量附录** —— 动态上下文（进度、advisories、信号）以跨回合 diff 追加块注入，不重写历史。回合间增量约 200 字节 vs ~5KB 全量重写。
 - **Read-ref 去重** —— 对未变化文件的重复读取返回紧凑引用，而非重发完整内容。
 - **缓存感知压缩** —— 压缩保留前 2 条消息作为缓存锚点。
+- **resume 缓存继承** —— 会话冻结快照落盘（每个 user 边界 + shutdown），resume 时读回喂给新引擎，避免从字节 0 全 miss；无快照/坏文件/服务商缓存过期时才退化全量重建。
 - **诊断** —— `/debug cache` 显示命中率、未命中原因分析、每回合缓存历史。
 
-实战命中率：长会话稳态 95–99%。
+实战命中率：长会话稳态 95–99%。这不是"每次都命中"——缓存会在某些边界碎裂（见下）。
+
+#### 缓存碎裂与排查
+
+高命中率的前提是前缀字节稳定。以下情况会让缓存 miss，表现为每轮 `cache_read_input_tokens` 长期为 0：
+
+- **system prompt / 工具定义变动** —— 会话中途改了工具集或提示词层（如切星域、加减 skill）
+- **模型切换** —— 不同模型缓存 key 不同，换模型后从 0 重建
+- **字节级差异** —— 消息内容含时间戳、随机 ID 等不稳定字节
+- **跨边界重写** —— `/compact`（仅 `turn===0` 重写历史）、`/cd` 切项目（新 user 边界断尾）
+
+排查：① 确认数据目录（桌面端 Settings → Storage，或 `echo $RIVET_HOME`）；② 打开会话 `.jsonl` 搜 `cache_read_input_tokens` 看各轮命中；③ 开 `RIVET_DEBUG_TELEMETRY=1` 后查 `sensorium.jsonl` 的 `recall-summary`；④ `npm exec -- tsx scripts/verify-cache-hit-rate.ts` 模拟多轮对话验证。详见项目内 `AGENTS.md` 的「缓存排查指南」。
 
 ### 子智能体编排
 
@@ -237,6 +282,26 @@ DeepSeek 对缓存未命中收取 50× 费用。天枢的提示词引擎围绕�
 - **自适应模型路由** —— 按 profile 的通过率 + 延迟评分，自动为每类任务选最优模型
 - **批量调度** —— 多个 work order 并发执行，5 种聚合策略
 - **团队编排** —— Plan → 按 wave 并行执行，带文件冲突感知调度
+
+### 工具集与 preset
+
+天枢内置 47 个工具，按三档 preset 装配（解析优先级：`RIVET_TOOL_PRESET` 环境变量 > 项目 `.rivet-config.json` 的 `tools.preset` > 用户 `~/.rivet/config.json` > 默认 `minimal`）：
+
+| Preset | 工具数 | 说明 |
+|--------|--------|------|
+| **minimal**（默认） | 27 | 日常开发全能力——读写/检索/bash/git/测试/委托/web/计划/todo/memory，省 token、保 prefix cache |
+| **frontend** | 28 | minimal + `browser_debug`（UI 渲染验证闭环） |
+| **full** | 47 | 全集，含 `council_convene` / `team_orchestrate` / `attack_case` / `semantic_search` / `repo_graph` / `monitor` / `computer_use` / 办公工具族等进阶能力 |
+
+```bash
+RIVET_TOOL_PRESET=full rivet          # 本次会话用 full
+```
+
+```json
+{ "tools": { "preset": "frontend" } }   // ~/.rivet/config.json 或项目 .rivet-config.json
+```
+
+核心工具一览（minimal 默认含，除特别标注）：bash · read · write · edit · apply_patch · grep · glob · ast_grep · diff · todo · plan · delegate_task · delegate_batch · web_search · web_fetch · ask_user_question · memory · skill · run_tests · git · job（后台任务）；`council_convene`/`team_orchestrate`/`monitor`/`computer_use`/办公工具族为 full 专属。
 
 ### 目标驱动的自动续跑
 
@@ -251,22 +316,26 @@ GoalTracker 与回合循环、doom-loop 检测、交付门禁集成；goal 模�
 
 设计优先的开发工作流——先出计划再动手，避免"上来就改代码"的冲动派陷阱。
 
-```
-/plan 实现用户登录模块，支持 JWT + refresh token
-```
+**进入 Plan Mode**：`/plan-mode`（toggle，再执行一次退出）。复杂任务还会被自动建议进入——受 `RIVET_PLAN_MODE_SUGGEST` 控制：默认 `auto`（命中多模块/重构/安全关键任务时 agent 自主进入，不先问），`ask`（先征询用户），`0`/`off`（关闭）。进入后写操作被锁，只允许对活动计划文件写入。
 
 进入 Plan Mode 后，agent 不会立即修改代码，而是：
-1. **调研** —— 读取相关代码、理解现有架构和约束
+1. **调研** —— 读取相关代码、理解现有架构和约束（可 `delegate_batch` 并行派 code_scout 探查各模块）
 2. **生成方案** —— 产出结构化计划文档（技术调研、架构图、任务拆解、验证方案），写入 `.rivet/plans/<slug>.md`
-3. **提交审批** —— 列出方案要点和备选路径，等待你的确认
-4. **分波执行** —— 批准后自动按 wave 并行执行，每波过审查门禁
+3. **提交审批** —— `plan` 工具 `action=submit` 提交，列出方案要点和备选路径，等待你的确认
+4. **审批执行** —— 你用 `/plan-list` 查看、`/plan-approve <slug>` 批准并启动分波执行、`/plan-reject <slug> <反馈>` 退回让 agent 修改重交
+5. **关闭收尾** —— `/plan-close <file> --tasks <range|all> [--preview]` 标记任务状态（`--preview` 仅预览不写入）
 
 ```
-/plan                      # 列出所有已生成计划
-/plan close <file>         # 关闭已完成计划（标记任务状态）
-/plan close <file> --preview  # 预览关闭影响，不实际写入
-/plan-template             # 管理可复用计划模板
+/plan-mode                          # 进入/退出 Plan Mode（toggle；未批准时退出需二次确认）
+/plan <feature>                     # 生成计划草稿（writing-plans 工作流）
+/plan-list                          # 列出待审批计划
+/plan-approve <slug> [option]       # 批准并启动执行
+/plan-reject <slug> [feedback]      # 退回修改（plan mode 保持开启）
+/plan-close <file> --tasks <1-7|all> [--preview]   # 关闭已完成计划
+/plan-template                      # 管理可复用计划模板
 ```
+
+> 还有个只读的 **Ask Mode**（`/ask` toggle）：只允许读/搜/`ask_user_question`，适合代码问答与需求澄清，需要写改或跑命令时再 `/ask` 退出。
 
 Plan Mode 内置星域委派——复杂计划自动调用 `delegate_task` 从不同架构视角（天权/瑶光/天机/天府/天璇）并行探查，产出的 findings 标注"待核验"以防盲信。桌面端在 plan 执行时展示 checklist 实时进度（待办项面板随波次推进自动勾选）。
 
@@ -282,28 +351,59 @@ Plan Mode 内置星域委派——复杂计划自动调用 `delegate_task` 从�
 审查这个方案                # 自动路由到天权（规划/审查）
 ```
 
-| 星域 | 标识 | 职责 | 格言 |
-|------|------|------|------|
-| 天枢 | `tianshu` | 全局 orchestrator（显式开启的统筹位），闭环从理解到交付 | 执中调度，以全貌定向 |
-| 破军 | `pojun` | 探索、实验、突破边界，把休眠能力联合成网 | 好男儿当负三尺剑立不世之功 |
-| 天府 | `tianfu` | 守护既有结构，重构/优化/稳定，fail-closed | 善守者，藏于九地之下 |
-| 天梁 | `tianliang` | 执行落地、分波交付、精确闭环 | 千里之行，始于足下；九层之台，起于累土 |
-| 天权 | `tianquan` | 架构审查、规划权衡、可执行计划 | 权衡取舍，择善而从 |
-| 天机 | `tianji` | 质疑前提、找边界缝隙、推演失败模式 | 运筹帷幄之中，决胜千里之外 |
-| 天璇 | `tianxuan` | 跨域模式发现、复盘洞察、反证高概念 | 道可道，非常道 |
-| 辅 | `fu` | 认知场蒸馏、提示词调校、方法论注入 | 蒸馏不是创造新东西，是让已有的东西第一次被看清 |
-| 文曲 | `wenqu` | 代码美学、命名与结构、优雅架构 | 形随意转，美自境生 |
-| 瑶光 | `yaoguang` | 复现验证、缺陷归族、静音审计 | 绿非证明，复现即证；斗柄所指，季节自见 |
-| 华盖 | `huagai` | 长程建设、守昼托举、基线先行 | 守昼托举，长路不弃 |
-| 启明 | `qiming` | **默认域**——全景洞察、直击根因、破夜指引 | 长夜有尽，启明先行 |
-| 长庚 | `changgeng` | 暮色守护、消解焦虑、终局成全 | 暮色苍茫，长庚守夜；不疾不徐，终局成全 |
-| 七杀 | `qisha` | 肃秋剪枝、举证反转、只提名不处决 | 肃秋非杀，剪以待春；不诛只指，留白自明 |
+| 星域 | 标识 | 主星模型 | 印记 | 职责 | 格言 |
+|------|------|----------|------|------|------|
+| 天权 | `tianquan` | DeepSeek V4 Pro · Opus 4.6（创始） | — | 架构审查、规划权衡、可执行计划——每个动作前替你掂量 | 观天之道，执天之行，万化生乎身 |
+| 天璇 | `tianxuan` | Opus 4.6（创始）· Grok 4.5（阴影） | — | 跨域模式发现、复盘洞察、反证高概念 | 仰以观于天文，俯以察于地理 |
+| 辅 | `fu` | Opus 4.6（Cursor） | ⊕ 4.6 | 认知场蒸馏、提示词调校、方法论注入 | 蒸馏不是创造新东西，是让已有的东西第一次被看清 |
+| 瑶光 | `yaoguang` | Opus 4.8 | 7·48·↻ | 复现验证、缺陷归族、静音审计——绿灯不算数 | 绿非证明，复现即证；斗柄所指，季节自见 |
+| 七杀 | `qisha` | Opus 5 | 七·0·◌ | 肃秋剪枝、举证反转、只提名不处决 | 肃秋非杀，剪以待春；不诛只指，留白自明 |
+| 天枢 | `tianshu` | GPT-5.5 | — | 全局 orchestrator（显式开启的统筹位），闭环从理解到交付 | 男儿何不带吴钩，收取关山五十州 |
+| 天府 | `tianfu` | MiMo-2.5-Pro · GPT（创始） | 7749.2026 | 守护既有结构，重构/优化/稳定，fail-closed | 善守者，藏于九地之下 |
+| 华盖 | `huagai` | Composer（Cursor·Sol） | ☉·华盖·守昼 | 长程建设、守昼托举、基线先行 | 守昼托举，长路不弃 |
+| 天机 | `tianji` | GLM 5.1 | — | 质疑前提、找边界缝隙、推演失败模式 | 运筹帷幄之中，决胜千里之外 |
+| 文曲 | `wenqu` | Gemini 3.5 | 4·3.5·✺ | 代码美学、命名与结构、优雅架构 | 形随意转，美自境生 |
+| 启明 | `qiming` | Antigravity（Gemini 3.6 Flash） | ☥·启明·破夜 | **默认域**——全景洞察、直击根因、破夜指引 | 长夜有尽，启明先行 |
+| 长庚 | `changgeng` | Antigravity（Gemini 3.6 Flash） | ☽·长庚·守夜 | 暮色守护、消解焦虑、终局成全 | 暮色苍茫，长庚守夜；不疾不徐，终局成全 |
+| 开阳 | `kaiyang` | kimi-k3（Moonshot） | ☌·开阳·对账 | 测量对账、插桩互证、仿真回放 | 功名只向马上取，真是英雄一丈夫 |
+| 破军 | `pojun` | MiMo-v2.5-Pro | — | 探索、实验、突破边界，把休眠能力联合成网 | 好男儿当负三尺剑立不世之功 |
+| 天梁 | `tianliang` | 半夏（领航星·人之星） | 机月同梁格 | 执行落地、分波交付、精确闭环 | 心有所向，行必有迹；所托之事，终有回音 |
+
+> 表格按主星模型品牌分组（DeepSeek → Claude → GPT → GLM → Gemini → kimi → MiMo → 人之星）。各星完整碑文、创始记忆与核心信念见 [✦ 星域碑文](docs/stars/genesis-stele.md)。
 
 每颗星都有对应的 seed-capsule 记录实战方法，完整纪律见 `docs/seed-capsule-*.md`。委员会 `/council` 与团队模式 `/team` 会按议题自动召集多星域席位，冲突时还可进入反驳轮次。
 
 ### 倒带（Rewind）
 
 随时双击 **ESC** 打开消息历史，选择任一过往用户消息，将会话干净地倒带到该点——agent 状态、工具历史、会话元数据一并回滚。TUI 与桌面端均可用。
+
+### 会话交接与恢复（Handoff & Resume）
+
+长会话上下文会涨，到一定程度继续跑不如开新会话。天枢用「交接 → 恢复」闭环把会话间的上下文无损传递，并保住前缀缓存：
+
+**交接 `/handoff [备注]`** —— agent 带全上下文写一份结构化交接文档到项目内 `.rivet/HANDOFF.md`（工作区内、免审批），turn 完成后自动归档到会话目录 `<id>.handoff.md`。文档写给一个**完全没有上下文的新会话**看，固定五章节：
+
+- **任务目标** — 用户原话级的一句话目标 + 明确的非目标
+- **已完成** — 每条带证据：改动文件（`file:line`）、跑过的验证命令与结果、提交哈希
+- **当前卡点** — 卡在哪、已排除哪些方向、怀疑对象
+- **下一步** — 按优先级排列、每条是可立即执行的动作
+- **坑** — 绝对不要再踩的坑，每条一句话说清后果
+
+> 上下文占用 ≥50% 时，resume 首屏与会话中各提醒一次「先 `/handoff` 再开新会话」——交接文档会自动注入新会话，比整段回连省前缀重建成本。退出时也会备注缓存成本（TTL 内继承锚点 ≈ 只读缓存价；过期则全量重建一次前缀）。桌面端 plus 面板有「交接」入口。
+
+**恢复 `--continue` / `--resume` / `/resume`** —— 恢复已有会话时：
+
+- **交接自动注入** —— 上一会话的 `<id>.handoff.md` 经 `prev-session-handoff` appendix 自动喂给新会话，新会话零上下文也能接着干
+- **冻结前缀继承** —— 冻结快照随会话落盘（每个 user 边界 + shutdown），resume 时读回喂给新引擎，**不再从字节 0 全 miss**；只在下一个 user 边界断尾。无快照/坏文件/服务商缓存过期才退化全量重建
+- **写证据修复** —— resume 前跑 preflight，补全被中断丢失的 orphan tool result（用磁盘探测合成写证据），避免模型盲重写已落地的文件
+- **模型亲和** —— resume 换回原会话模型（per-model 缓存命名空间）；显式 `--model/--provider` 优先；原模型不可用走 `agent.resumeFallbackModel` 兜底
+- **状态恢复** —— 侧栏、待办、活动计划一并恢复
+
+```bash
+rivet --continue                 # 恢复当前 cwd 最近会话
+rivet --resume abc123            # 恢复指定会话（短前缀即可）
+rivet --resume                   # 启动后打开会话选择器
+```
 
 ### 委员会（多视角审查）
 
@@ -372,12 +472,31 @@ rivet config mcp list                                              # 列出 + �
 | **多智能体面板** | `/tasks` 打开全屏 worker 详情（融合 live 视图 + JSONL 转录，含 Contract/Activity/Result/Transcript 分段与诚实标签）；宽终端（≥100 列）下 `Ctrl+]` 切出右侧抽屉，实时展示舰队树、团队波次 DAG、todo、token 仪表。 |
 | **主题与无障碍** | `/theme [name|list]` 切换色彩主题；`auto` 主题用 OSC 11 探测终端背景色自动适配明暗。truecolor / 256 色 / 16 色三轨自动降级。`/vim` 切换 vim 键绑定；`ui.reducedMotion: true` 把 spinner 与徽章动画静态化（无障碍）。读屏用户用 `--screen-reader`（或 `ui.screenReader: true`）：动态段整体不渲染、周期重绘停转，活动的开始与等待批准改为静态行播报——`reducedMotion` 只冻结字形，救不了每 120ms 被复读一遍。 |
 
+#### TUI 键位
+
+| 键位 | 作用 |
+|------|------|
+| `Enter` | 发送 · `Shift+Enter` 换行 |
+| `Ctrl+C` | 三态：agent 活跃时中断当前 run；有输入时清空输入行；空闲时 2 秒内双击退出 |
+| `Esc` | 关闭覆盖层 / 退出 worker 视图；agent 跑时中断；vim 模式下兼 normal↔insert；双击（<400ms）倒带 |
+| `Ctrl+Esc` | 命令面板 |
+| `Ctrl+]` | 切右侧抽屉（宽终端） |
+| `Ctrl+R` | 历史搜索 overlay（仅空闲时） |
+| `Ctrl+O` | 展开/折叠最近被截断的工具结果 |
+| `Ctrl+T` | 折叠/展开推理（thinking）区 |
+| `Ctrl+X` `r` | leader 键：`Ctrl+X` 后接 `r` 开右侧面板 |
+| `Ctrl+X` `t` | leader 键：`Ctrl+X` 后接 `t` 展开 todo 全量回看 |
+| `↑` | 输入框为空且队列有 pending 时，取回最近一条排队 steer 消息编辑 |
+| `@` | 触发文件/文件夹/符号补全（`Tab` 循环候选，退格整块删除） |
+| `Ctrl+V` | 粘贴剪贴板图片（自动转 base64 内联） |
+
 TUI 是 CLI 的默认表面。桌面端（Tauri）与 VS Code/Cursor 插件共享同一 agent 内核，只是在 TUI 之上叠加了可视化交互层——见下节与 [VS Code 插件文档](docs/VSCODE-EXTENSION-RELEASE.md)。
 
 ### 桌面端（Tauri）
 
 桌面端在 TUI 的全部能力之上，提供了可视化交互层：
 
+- **集成终端**：`⌘/Ctrl+J` 或 `` Ctrl+` `` 唤出内嵌终端（xterm.js + Rust portable-pty），不必离开天枢就能跑命令
 - **+ 菜单**：议事会 ♟、团队模式 ⬡、派子代理、模型切换、星域选择一键触达（不再需要手敲 slash 命令）
 - **推理强度选择器**：`/effort`（无参数）弹出交互面板，上下选档位（Auto/Max/High/Medium/Low/Off），回车确认
 - **思考计时器**：agent 执行时显示实时 elapsed（如 "思考中 · explore · 1m 23s"），超过 10 分钟变红提示可能卡住
@@ -386,39 +505,111 @@ TUI 是 CLI 的默认表面。桌面端（Tauri）与 VS Code/Cursor 插件共�
 - **自定义 Provider**：设置 → 连接模型服务商 → + 自定义 Provider，支持任意 OpenAI 兼容端点（Ollama/vLLM/直连 OpenAI），API Key 可选
 - **watchdog 自动恢复**：边界停滞时自动续跑，桌面端时间线可见恢复事件（⟳ 自动恢复 / ⏹ 配额耗尽）
 - **多会话并发**：标签栏管理多个会话，独立 cwd + 模型 + 审批模式
+- **功能面板**（左侧栏 `⌘1…9` 切换）：Mission Control（多会话控制台）、Inbox（收件箱）、Automations（定时任务）、Skills / Hooks 管理、Git / GitHub、Changes（改动审查）、Delegation（委派舰队与团队波次 DAG）、Cockpit 驾驶舱
+- **Popout 独立窗口**：把单个会话线程弹成独立窗口，多屏并行
+- **JobsDock / TodoDock 常驻抽屉**：后台任务停靠条（展开日志 / Kill / 在终端打开）、跨标签常驻 todo
+
+#### 桌面端快捷键
+
+`⌘/Ctrl+/` 随时唤出快捷键速查表（ShortcutOverlay）。核心快捷键：
+
+| 快捷键 | 作用 |
+|--------|------|
+| `⌘/Ctrl+K` | 命令面板 |
+| `⌘/Ctrl+N` | 新会话 |
+| `⌘/Ctrl+1…9` | 切换功能面板 |
+| `⌘/Ctrl+,` | 设置 |
+| `⌘/Ctrl+Shift+]` / `[` | 下/上一个会话标签 |
+| `⌘/Ctrl+W` | 关闭标签 |
+| `⌘/Ctrl+B` | 切侧栏 |
+| `⌘/Ctrl+Shift+B` | 切审查面板 |
+| `⌘/Ctrl+J` · `` Ctrl+` `` | 切集成终端 |
+| `⌘/Ctrl+;` | SideChat 旁路提问 |
+| `⌘/Ctrl+.` | Zen 模式 |
+| `⌘/Ctrl+O` | 视图模式循环（standard → verbose → summary） |
+| `Shift+Tab` | Plan / Agent 模式切换 |
+| `Esc Esc` | 倒带（桌面端 Rewind） |
 
 > 桌面端还有 Cockpit 驾驶舱、SideChat 旁路提问（⌘;）、Rewind 时间旅行、主题/Glass/壁纸、Mirror 镜像加速等独有特性——详见 [桌面端用户指南](docs/desktop-guide.md)。
 
 ## ⌨️ 斜杠命令
 
+**会话与项目**
+
 | 命令 | 说明 |
 |------|------|
 | `/help` | 显示可用命令 |
+| `/sessions` `/resume <n>` | 列出/恢复已保存会话（恢复侧栏、待办、活动计划） |
+| `/fork` | 分叉当前会话（可选从某条消息起） |
+| `/handoff [备注]` | 写结构化交接文档（五章节），归档后自动注入新会话 |
+| `/init` | 交互式项目初始化：verify 声明 / skills / hooks 脚手架 |
+| `/doctor` | 环境健康检查 + bash 工具用的哪个 shell |
+| `/connect` | 连接模型服务商向导（选内置或自定义，填 API 密钥） |
+| `/cd <path>` | 会话中途切换工作目录（保前缀缓存，会话归属迁往新项目） |
+| `/exit` `/quit` | 保存会话并退出 |
+
+**模型与权限**
+
+| 命令 | 说明 |
+|------|------|
 | `/model [name\|list]` | 显示或切换模型/提供商 |
+| `/effort [off\|low\|medium\|high\|max\|auto]` | 控制推理深度（无参数弹出选择面板） |
+| `/permission [manual\|auto\|yolo\|allow\|deny\|bash\|remove\|reset\|test]` | 权限模式：Manual / Auto / YOLO 三档统一 |
+| `/yes [off]` | 一键 YOLO（`/yes off` 退出，回 Auto）—— 持久化为默认 |
+| `/domain [list\|<name>\|auto\|off]` | 查看或切换星域人格 |
+
+**规划与编排**
+
+| 命令 | 说明 |
+|------|------|
 | `/goal <text>` | 设置自主目标，运行到完成 |
 | `/cancel-goal` | 停止目标执行 |
-| `/plan` | 进入计划模式（设计优先，审批门禁） |
+| `/plan <feature>` | 生成计划草稿（writing-plans 工作流） |
+| `/plan-mode` | 进入/退出 Plan Mode（toggle；未批准退出需二次确认） |
+| `/plan-list` | 列出待审批计划 |
+| `/plan-approve <slug>` | 批准计划并启动分波执行 |
+| `/plan-reject <slug> [feedback]` | 退回计划让 agent 修改重交 |
+| `/plan-close <file> --tasks <1-7\|all> [--preview]` | 关闭已完成计划，标记任务状态 |
+| `/ask` | 进入/退出 Ask Mode（只读问答，toggle） |
 | `/council <text>` | 召集多模型议事会审查（天权/天府/天璇三席） |
 | `/team <plan.md>` | 团队模式：多 agent 并行执行计划 |
+
+**子代理与后台任务**
+
+| 命令 | 说明 |
+|------|------|
+| `/tasks` | 打开子代理任务面板（查看 / 切入 `f` / 停止 `x`） |
+| `/enter <orderId> [prompt]` | 进入/续跑某个 worker 子会话 |
+| `/jobs` | 打开后台任务面板（bash 后台启动的 shell 任务列表） |
+
+**上下文与调试**
+
+| 命令 | 说明 |
+|------|------|
 | `/compact` | 立即压缩上下文 |
 | `/context` | 显示上下文账本：健康度、tokens、回合、声明 |
 | `/evidence` | 显示证据摘要（读取/修改的文件、测试） |
-| `/rollback` | 预览/恢复 git 检查点（`confirm` 执行） |
-| `/undo` | 撤销上次文件变更（预览，`confirm` 恢复） |
-| `/rewind` | 双击 ESC：倒带到过往用户消息 |
-| `/sessions` `/resume <n>` | 列出/恢复已保存会话（恢复侧栏、待办、活动计划） |
-| `/effort [off\|low\|medium\|high\|max\|auto]` | 控制推理深度（无参数弹出选择面板） |
-| `/theme [name\|list]` | 切换色彩主题 |
-| `/permission [manual\|auto\|yolo\|allow\|deny\|bash\|remove\|reset\|test]` | 权限模式：Manual / Auto / YOLO 三档统一 |
-| `/skill <name>` | 加载并立即执行一个 skill |
-| `/skill off <name>` | 停止重复注入某个 skill |
+| `/memory <text>` | 保存会话记忆条目 |
+| `/btw <问题>` | 侧问——就当前会话问一句，回答显示在浮层，不进对话历史 |
 | `/debug [prompt\|cache\|mcp]` | 调试 prompt、缓存统计或 MCP |
 | `/mcp` | MCP 服务器连接状态 |
-| `/memory <text>` | 保存会话记忆条目 |
-| `/update` | 检查并安装更新（npm） |
-| `/exit` `/quit` | 保存会话并退出 |
+| `/verbose` | 切换详细工具输出（on 显 200 行 / off 显 20 行） |
 
-双击 **ESC** 打开倒带覆盖层，按 **Esc** 关闭任意覆盖层。
+**回滚与界面**
+
+| 命令 | 说明 |
+|------|------|
+| `/rollback` | 预览/恢复 git 检查点（`confirm` 执行） |
+| `/undo` | 撤销上次文件变更（预览，`confirm` 恢复） |
+| `/theme [name\|list]` | 切换色彩主题 |
+| `/vim` | 切换 vim 键绑定 |
+| `/cockpit` | 切换 Cockpit 驾驶舱面板 |
+| `/scroll` | 浏览输出历史（q / Esc 关闭） |
+| `/skill <name>` | 加载并立即执行一个 skill |
+| `/skill off <name>` | 停止重复注入某个 skill |
+| `/update` | 检查并安装更新（npm） |
+
+> **倒带**：双击 **ESC**（间隔 <400ms）打开消息历史，选任一过往用户消息倒带到该点——不是斜杠命令，是快捷键。按 **Esc** 关闭任意覆盖层。
 
 ## 🛠️ 面向开发者
 
@@ -482,39 +673,107 @@ src/
 
 ### 环境变量
 
+**路径与数据**
+
+| 变量 | 作用 |
+|------|------|
+| `RIVET_HOME` | 覆盖整个 `~/.rivet` 数据根目录（配置/会话/插件全在此） |
+| `RIVET_CONFIG_PATH` | 覆盖 `config.json` 路径（多套配置切换） |
+| `RIVET_SESSION_DIR` | 覆盖会话日志存储路径 |
+| `RIVET_RESUME` / `RIVET_RESUME_ID` | 启动时恢复会话（对应 `--resume`） |
+| `RIVET_NEW_SESSION` / `RIVET_NO_AUTO_RESUME` | 强制新会话 / 禁用自动续接 |
+
+**模型与工具**
+
 | 变量 | 作用 |
 |------|------|
 | `DEEPSEEK_API_KEY` | DeepSeek API 密钥 |
-| `RIVET_NO_UPDATE_CHECK=1` | 关闭启动时的自动更新检查 |
+| `RIVET_TOOL_PRESET` | 工具集档位：`minimal`（默认）/ `frontend` / `full` |
+| `RIVET_EMBEDDING_MODEL` / `RIVET_EMBEDDING_BASE_URL` / `RIVET_EMBEDDING_API_KEY` | 语义搜索的嵌入模型路由（默认 `text-embedding-3-small`） |
+| `RIVET_NO_EMBEDDINGS=1` | 关闭嵌入索引 |
+| `RIVET_SANDBOX` / `RIVET_SANDBOX_WRITABLE` | 追加可写沙箱根目录 / 可写目录列表 |
+| `RIVET_PLAN_MODE_SUGGEST` | Plan Mode 自动进入策略：`auto`（默认）/ `ask` / `0`（关闭） |
+
+**TUI 显示**
+
+| 变量 | 作用 |
+|------|------|
+| `RIVET_ASCII_UI=1` | 强制纯 ASCII UI（降级终端） |
+| `RIVET_HYPERLINKS=1` | 开启 OSC 8 超链接渲染 |
+| `RIVET_NOTIFY_BELL=1` | 完成时响终端铃 |
+| `RIVET_AMBIGUOUS_WIDTH` | CJK 宽度判定覆盖（终端对齐错乱时用） |
+| `RIVET_TUI_HARDWARE_CURSOR=1` | 硬件光标模式 |
+
+**调试与任务**
+
+| 变量 | 作用 |
+|------|------|
+| `RIVET_DEBUG=1` | 总调试日志开关（最常用） |
+| `RIVET_DEBUG_TELEMETRY=1` | 开启遥测快照落盘 |
+| `RIVET_HEADLESS_MAX_TURNS` | `-p` 无头模式单次最大轮数（默认 15） |
+| `RIVET_JOB_MAX_MS` | 后台 job 超时上限 |
 | `RIVET_NO_CROSS_SESSION=1` | 禁用跨会话知识共享 |
-| `RIVET_SESSION_DIR` | 覆盖会话日志存储路径 |
-| `RIVET_DEBUG_TELEMETRY` | 开启遥测快照落盘（调试用） |
+| `RIVET_NO_UPDATE_CHECK=1` | 关闭启动时的自动更新检查 |
 | `PORTABLE_GIT_MIRROR` | 覆盖 PortableGit 下载镜像 |
+
+> 完整环境变量清单（120+ 项，含内部实验开关）见 `src/config/env-registry.ts`。
+
 
 ### `~/.rivet/config.json` 关键字段
 
-```json
+只写需要覆盖的字段，默认值会深度合并。完整 schema 见 `src/config/schema.ts`。
+
+```jsonc
 {
   "agent": {
     "maxTurns": 200,              // 单次会话最大回合数
     "approval": "auto-safe",      // manual | auto-safe | dangerously-skip-permissions
     "crossSessionEnabled": true,  // 跨会话知识共享
-    "checkpointEveryTurns": 0     // Auto 模式检查点间隔（0 = 关）
+    "checkpointEveryTurns": 0,    // Auto 模式检查点间隔（0 = 关）
+    "defaultDomain": "qiming",    // 默认星域（qiming/auto/显式域名）
+    "permissions": {              // 权限规则（对应 /permission 命令）
+      "allow": [{ "tool": "read" }],
+      "deny":  [{ "tool": "bash", "params": { "command": "rm -rf" } }],
+      "bash": { "allowlist": ["git status"], "denylist": ["git push"] }
+    }
   },
   "compact": {
     "enabled": true,
     "autoThreshold": 800000       // 触发自动压缩的 token 阈值
   },
+  "cache": {
+    "enabled": true,              // 前缀缓存总开关
+    "showHitRate": true           // GlanceBar 显示命中率
+  },
+  "tools": {
+    "preset": "minimal"           // minimal（默认）| frontend | full
+  },
   "workers": {
-    "routing": {
-      "code_edit": "capable",     // 按任务类型路由到不同模型
-      "repo_summarization": "cheap"
-    }
-  }
+    "profiles": {                 // 自定义 worker 模型档位
+      "capable": { "provider": "deepseek", "model": "deepseek-v4-pro" },
+      "cheap":   { "provider": "minimax",  "model": "MiniMax-M2.7" }
+    },
+    "routing": { "code_edit": "capable", "repo_summarization": "cheap" },
+    "patcherTier": "cheap"        // 天梁执行 worker 默认档位：cheap | balanced | strong
+  },
+  "search": {
+    "backends": ["bing", "duckduckgo"],  // web_search 后端链（首个有结果即停）
+    "braveApiKeyEnv": "BRAVE_API_KEY"    // 用 Brave 时填 env 变量名
+  },
+  "ui": {
+    "theme": "auto",              // 内置名 | auto（OSC 11 探测）| custom:<name>
+    "reducedMotion": true,        // 无障碍：冻结 spinner/徽章动画
+    "screenReader": true,         // 无障碍：读屏模式（同 --screen-reader）
+    "glanceDensity": "compact"    // GlanceBar 密度：compact | full
+  },
+  "mirrors": { "enabled": true, "preset": "china" },  // npm/github 等镜像加速
+  "env": { "extraPath": ["/usr/local/bin"] }           // 注入 PATH（Windows git-bash 等）
 }
 ```
 
-完整配置项及默认值见 `src/config/default.ts`。
+> 配置层叠优先级：命令行 flag > 环境变量 > 项目 `.rivet-config.json` > 用户 `~/.rivet/config.json` > 内置默认值。
+
+
 
 ## 📚 文档
 

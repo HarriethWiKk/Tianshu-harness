@@ -263,6 +263,9 @@ export interface FormatToolCardLiveInput {
   toolInput?: Record<string, unknown>
   /** 已累积的流式输出 */
   outputTail?: string
+  /** 预切分的 tail 行（可选）：提供时跳过 outputTail 的整串 split——live 区每帧渲染
+   *  时调用方可按累加器字符串引用缓存切分结果，避免 60fps 下重复扫描 ≤64KB 全串。 */
+  outputTailLines?: string[]
   /** 已运行时长（毫秒） */
   elapsedMs?: number
   /** 末尾输出显示行数 */
@@ -288,7 +291,11 @@ export function formatToolCardLive(input: FormatToolCardLiveInput, theme: RivetT
   }
 
   const lines: string[] = [header]
-  const tail = (input.outputTail ?? '').replace(/\n+$/, '')
+  // 优先用调用方预切的行（按累加器引用缓存），否则从 outputTail 现切。
+  const tailRows = input.outputTailLines ?? (() => {
+    const tail = (input.outputTail ?? '').replace(/\n+$/, '')
+    return tail ? tail.split('\n') : undefined
+  })()
   const tailCount = input.tailLines ?? 3
   // BODY_FIRST_PREFIX = '⎿  ' (3 display columns) — content has columns-3 available.
   const maxWidth = Math.max(10, input.columns - 3)
@@ -296,8 +303,8 @@ export function formatToolCardLive(input: FormatToolCardLiveInput, theme: RivetT
   // 固定 tail 区域高度：内容不足时顶部补空行，避免卡片高度随输出变化而跳动。
   const isBrowserDebug = input.toolName === 'browser_debug'
   const tailLines: string[] = []
-  if (tail) {
-    const shown = tail.split('\n').slice(-tailCount).map(l => {
+  if (tailRows && tailRows.length > 0) {
+    const shown = tailRows.slice(-tailCount).map(l => {
       // 按显示宽度截断（CJK 2 列、ambiguous 2 列）。… 自身 2 列，预算留给它。
       const ellW = displayWidth('…', WIDE)
       const clipped = displayWidth(l, WIDE) > maxWidth

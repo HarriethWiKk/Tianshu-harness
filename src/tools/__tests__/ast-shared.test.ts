@@ -72,40 +72,40 @@ describe('language inference', () => {
 // ── collectFiles ──────────────────────────────────────────────────
 
 describe('collectFiles', () => {
-  it('returns files matching directory walk', () => {
-    const files = collectFiles(testDir)
+  it('returns files matching directory walk', async () => {
+    const files = await collectFiles(testDir)
     const names = files.map(f => f.replace(testDir + '/', ''))
     assert.ok(names.includes('sample.ts'), `expected sample.ts, got ${names.join(', ')}`)
     assert.ok(names.includes('sample.js'), `expected sample.js`)
   })
 
-  it('skips node_modules', () => {
-    const files = collectFiles(testDir)
+  it('skips node_modules', async () => {
+    const files = await collectFiles(testDir)
     assert.ok(!files.some(f => f.includes('node_modules')), 'should not include node_modules files')
   })
 
-  it('skips .git', () => {
-    const files = collectFiles(testDir)
+  it('skips .git', async () => {
+    const files = await collectFiles(testDir)
     assert.ok(!files.some(f => f.includes('.git/')), 'should not include .git files')
   })
 
-  it('skips .rivet', () => {
-    const files = collectFiles(testDir)
+  it('skips .rivet', async () => {
+    const files = await collectFiles(testDir)
     assert.ok(!files.some(f => f.includes('.rivet/')), 'should not include .rivet files')
   })
 
-  it('does NOT skip .hidden-dir (only well-known tool dirs)', () => {
-    const files = collectFiles(testDir)
+  it('does NOT skip .hidden-dir (only well-known tool dirs)', async () => {
+    const files = await collectFiles(testDir)
     assert.ok(files.some(f => f.includes('.hidden-dir')), 'should include .hidden-dir files')
   })
 
-  it('returns nested files', () => {
-    const files = collectFiles(testDir)
+  it('returns nested files', async () => {
+    const files = await collectFiles(testDir)
     assert.ok(files.some(f => f.includes('sub/nested.tsx')), 'should include nested files')
   })
 
-  it('returns single file when path is a file', () => {
-    const files = collectFiles(join(testDir, 'sample.ts'))
+  it('returns single file when path is a file', async () => {
+    const files = await collectFiles(join(testDir, 'sample.ts'))
     assert.equal(files.length, 1)
   })
 })
@@ -183,7 +183,7 @@ describe('collectFiles configurable exclusion', () => {
       await mkdir(join(dir, 'src'), { recursive: true })
       await writeFile(join(dir, 'dist', 'bundle.js'), 'compiled')
       await writeFile(join(dir, 'src', 'real.ts'), 'source')
-      const files = collectFiles(dir)
+      const files = await collectFiles(dir)
       assert.ok(files.some(f => f.includes('real.ts')), 'src file should be collected')
       assert.ok(!files.some(f => f.includes('dist')), 'dist should be excluded')
       await rm(dir, { recursive: true, force: true })
@@ -199,11 +199,11 @@ describe('collectFiles configurable exclusion', () => {
       await writeFile(join(dir, 'target', 'release'), 'binary')
       await writeFile(join(dir, 'src', 'main.rs'), 'source')
       // target is NOT in the default exclude list
-      let files = collectFiles(dir)
+      let files = await collectFiles(dir)
       assert.ok(files.some(f => f.includes('target')), 'target collected without env override')
 
       process.env.RIVET_AST_EXCLUDE = 'target, vendor'
-      files = collectFiles(dir)
+      files = await collectFiles(dir)
       assert.ok(!files.some(f => f.includes('target')), 'target excluded via RIVET_AST_EXCLUDE')
       assert.ok(files.some(f => f.includes('main.rs')), 'src still collected')
 

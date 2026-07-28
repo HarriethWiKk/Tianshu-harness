@@ -73,8 +73,8 @@ describe('runHandsSession × 预算耗尽在 worktree 内续跑 (Wave 7)', () =>
     wtCoordinator = new WorktreeCoordinator(baseDir)
   })
 
-  after(() => {
-    wtCoordinator.cleanupAll()
+  after(async () => {
+    await wtCoordinator.cleanupAll()
     rmSync(baseDir, { recursive: true, force: true })
   })
 

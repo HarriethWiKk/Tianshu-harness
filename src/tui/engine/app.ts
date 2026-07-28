@@ -81,6 +81,7 @@ import {
   type AskUserQuestionItem,
 } from '../../tools/ask-user-question.js'
 import { renderAskQuestionPanel, type AskQuestionPanelData } from '../format/ask-question-panel.js'
+import { HANDOFF_NUDGE_RATIO, formatHandoffNudge } from '../handoff.js'
 import { STAR_GENESIS } from '../../agent/star-genesis-data.js'
 import {
   delegationObjectiveFromInput,
@@ -93,7 +94,7 @@ import { formatSlashHint, slashCompletionTarget, filterSlashCommands, slashArgsH
 import { extractAtToken, getCompletions, applyCompletion } from '../file-completer.js'
 import stringWidth from 'string-width'
 import { resolve } from 'node:path'
-import { existsSync } from 'node:fs'
+import { existsSync, copyFileSync, statSync } from 'node:fs'
 import { parseMentions } from '../mention-parser.js'
 import { parseMissionDraft, shouldPreviewContract, formatContractPreview, type MissionDraft } from '../mission-draft.js'
 import { truncateToDisplayWidth, displayWidth, ambiguousWideEnabled } from '../width.js'
@@ -395,6 +396,24 @@ export class TuiApp {
   private workerKill: ((workerId: string) => boolean) | null = null
   /** worker 消息镜像（切入视图的实时消息 tail 数据源，cap 50/worker）。 */
   private mirror = new WorkerMirrorStore()
+  /** 进行中工具卡的 tail 切行缓存：key=toolId，value.ref 为累加器字符串引用。
+   *  累加器 ≤64KB，renderLiveImpl 每帧对全串 split 在 60fps 下是 MB/s 级 GC churn——
+   *  accumulate 每次 chunk 都会换字符串引用，故引用不变即可安全复用切分结果。 */
+  private toolTailCache = new Map<string, { ref: string; lines: string[] }>()
+  /** fleet 帧快照缓存：key = (fleet.version, 秒桶, cols, theme)。version 在 fleet
+   *  任何真实状态变更时递增；秒桶让 elapsed 文案以 1s 粒度跳动（视觉不变）。
+   *  子代理流式期间 60fps 重复帧不再重复付 sort/视图分配/O(W·R) 进度查询。 */
+  private fleetFrameCache: {
+    version: number
+    second: number
+    cols: number
+    theme: RivetTheme
+    activeWorkers: import('../fleet-registry.js').FleetWorkerView[]
+    /** 主视图舰队面板行（仅 !showSidePanel 时按需构建；side panel 用 activeWorkers） */
+    lines: string[] | null
+    running: number
+    unread: number
+  } | null = null
   /** 已打过派发契约卡的 worker。不能用 `prev === undefined` 代替——contract
    *  理论上可能晚于该 worker 的首条事件到达，那样就永远补不上卡。 */
   private dispatchCardShown = new Set<string>()
@@ -467,6 +486,11 @@ export class TuiApp {
   pendingPlanApproval: PlanSubmittedInfo | undefined = undefined
   /** 待审批计划正文预览摘要（开面板时一次性提取；随面板关闭/重开更新）。 */
   planApprovalExcerpt: string | undefined = undefined
+  /** /handoff 登记的归档任务：交接 turn 完成（isFinal）后把项目内 .rivet/HANDOFF.md
+   *  拷贝归档到会话目录 <id>.handoff.md（loadPrevHandoff 注入管线认的位置）。 */
+  pendingHandoffCopy: { src: string; dest: string; sinceMs: number } | undefined = undefined
+  /** 50% 交接提醒每会话至多一次。 */
+  private handoffNudgeShown = false
   /** Goal 计划倒计时自动批准（2026-07-24，与 sidecar 同语义）：
    *  goal 激活 + 计划提交 → 武装；到期守卫复核通过 → onPlanAutoApproveFire；
    *  用户任何参与（批准/驳回/写反馈/新提交/主动 abort）即取消；
@@ -650,7 +674,12 @@ export class TuiApp {
       // alt screen 切换统一驱动 CPR 污染检测的暂停/恢复，覆盖所有 overlay
       // 入口（含直接调 this.overlay.activate 的快捷键路径）。
       onEnterAltScreen: () => this.live.suppressProbe(),
-      onExitAltScreen: () => this.live.resumeProbe(),
+      // 退出 alt screen 时恢复探针，并回放 overlay 期间排队的主屏 commit
+      // （deactivateInternal 先置 active=null 再退 alt screen，回放不会递归入队）。
+      onExitAltScreen: () => {
+        this.live.resumeProbe()
+        this.flushPendingMainCommits()
+      },
     })
     this.input = new InputHandler({ stdin: options.stdin, mode: 'input' })
     this.input.onCpr((row, col) => this.live.noteCpr(row, col))
@@ -3018,8 +3047,18 @@ export class TuiApp {
    * Mid-stream commit 协议：先擦除 live region（光标停在其起始行），
    * 写入 scrollback 内容，再重绘 live region。
    * 不走该协议的裸 commit 会留下 ghost 行 / 覆盖已提交文本。
+   *
+   * overlay（alt screen）激活期间主屏写入一律排队、一个字节都不写：
+   * clearForCommit 的 cursorUp+擦除与正文会落进 alt screen 擦花/顶滚动面板，
+   * 而 OverlayEngine 的行级 diff 缓存（lastFrame）对此无感知，之后只有光标
+   * 变化行被重绘——计划审批卡「按一下方向键才出来一行」的根因。
+   * 队列在 onExitAltScreen（flushPendingMainCommits）统一回放。
    */
   private commitAbove(write: () => void): void {
+    if (this.overlay.isActive()) {
+      this.pendingMainCommits.push(write)
+      return
+    }
     // H3：clearForCommit + commit + renderLive 三段写入用 cork/uncork 合并为一次 flush，
     // 减少 syscall 与中间态可见（提交时的瞬时闪烁）。协议顺序不变。
     const s = this.stdout as WriteStream & { cork?: () => void; uncork?: () => void }
@@ -3031,6 +3070,23 @@ export class TuiApp {
       this.writeBatcher.flushNow()
     } finally {
       if (canCork) s.uncork!()
+    }
+  }
+
+  /** overlay 期间排队的主屏 commit。退出 alt screen 时 FIFO 回放（见 onExitAltScreen）。 */
+  private pendingMainCommits: Array<() => void> = []
+
+  /**
+   * 回放 overlay 期间排队的主屏 commit。挂在 OverlayEngine.onExitAltScreen 上，
+   * 覆盖全部退出路径（deactivateOverlay / Esc 直连 deactivate / unregister /
+   * overlay 切换）。调用时 active 已置 null，commitAbove 走正常直写，不会递归入队。
+   */
+  private flushPendingMainCommits(): void {
+    if (this.pendingMainCommits.length === 0) return
+    const queued = this.pendingMainCommits
+    this.pendingMainCommits = []
+    for (const write of queued) {
+      this.commitAbove(write)
     }
   }
 
@@ -3747,6 +3803,7 @@ export class TuiApp {
     this.watchdogPolicy.recordToolResult()
     const toolAcc = this.toolGroupController.getAccumulated(id)
     this.toolGroupController.deleteAccumulated(id)
+    this.toolTailCache.delete(id)
     const meta = this.toolGroupController.getPending(id)
     this.toolGroupController.deletePending(id)
     // 委派工具终态：该组 worker 移入舰队归档区（终态摘要已通过
@@ -3754,7 +3811,12 @@ export class TuiApp {
     // 归档视图渲染为「完成沉淀卡」入 scrollback——与 live 树同构的静态组级
     // 摘要，让长跑委派在时间线上留下完整痕迹而非只剩一行 N/M passed。
     if (meta && isDelegationTool(meta.name)) {
-      const settled = this.fleet.clearGroup(id)
+      const { settled, evictedIds } = this.fleet.clearGroup(id)
+      // 归档区封顶淘汰的 worker：镜像与派发卡去重集同步清，防跨 run 无界滞留。
+      for (const evicted of evictedIds) {
+        this.mirror.delete(evicted)
+        this.dispatchCardShown.delete(evicted)
+      }
       if (settled.length > 0) {
         const card = formatWorkerFleetSettled(settled, this.theme, this.columns)
         this.commitAbove(() => {
@@ -3966,6 +4028,30 @@ export class TuiApp {
         this.commit.write({ text: summary, trailingNewline: true })
         this.state.committedCount++
       })
+
+      // /handoff 归档：交接 turn 产出项目内文档后，拷贝到会话目录 <id>.handoff.md
+      // （loadPrevHandoff 注入管线认的位置），新会话于是自动吃到交接。
+      if (this.pendingHandoffCopy) {
+        const { src, dest, sinceMs } = this.pendingHandoffCopy
+        try {
+          if (existsSync(src) && statSync(src).mtimeMs > sinceMs) {
+            copyFileSync(src, dest)
+            this.commitStatic(`✦ 交接文档已写入 ${src} 并归档 ${dest}——新会话将自动注入交接内容。`)
+          }
+        } catch { /* best-effort：归档失败不阻断会话 */ }
+        this.pendingHandoffCopy = undefined
+      }
+
+      // 50% 交接提醒（每会话至多一次）：上下文过半时建议先 /handoff 再开新会话。
+      if (!this.handoffNudgeShown) {
+        try {
+          const m = this.metricsGlanceController.metricsProvider?.()
+          if (m && m.maxTokens > 0 && m.estimatedTokens / m.maxTokens >= HANDOFF_NUDGE_RATIO) {
+            this.handoffNudgeShown = true
+            this.commitStatic(formatHandoffNudge(m.estimatedTokens / m.maxTokens))
+          }
+        } catch { /* provider 失败不影响收尾 */ }
+      }
     } else {
       // Intermediate turn: archive thinking, keep writer alive
       if (this.state.thinkingText) {
@@ -4047,6 +4133,68 @@ export class TuiApp {
     this.liveTeamModel = null
     this.lastCommittedTeamWave = 0
     this.teamWaveStartedAt = 0
+    this.toolTailCache.clear()
+    this.fleetFrameCache = null
+    // mirror/dispatchCardShown 此前只增不减：mirror 每条记录 ≤50 消息 + ≤8KB openText，
+    // delegate_task 每次派发新 wo_<uuid> id，长会话无界滞留（内存泄漏实测确证）。
+    this.mirror.clear()
+    this.dispatchCardShown.clear()
+  }
+
+  /** 工具卡 tail 切行：同一累加器字符串引用复用缓存，避免每帧全串 split。 */
+  private liveToolTailLines(id: string, tail: string | undefined): string[] | undefined {
+    if (!tail) return undefined
+    const hit = this.toolTailCache.get(id)
+    if (hit && hit.ref === tail) return hit.lines
+    const trimmed = tail.replace(/\n+$/, '')
+    if (!trimmed) return undefined
+    const lines = trimmed.split('\n')
+    this.toolTailCache.set(id, { ref: tail, lines })
+    return lines
+  }
+
+  /** fleet 帧快照：version/秒桶/cols/theme 未变时整段复用；wantLines 才构建面板行。 */
+  private fleetFrame(cols: number, wantLines: boolean): {
+    activeWorkers: import('../fleet-registry.js').FleetWorkerView[]
+    lines: string[] | null
+    running: number
+    unread: number
+  } {
+    const version = this.fleet.version
+    const second = Math.floor(Date.now() / 1000)
+    let hit = this.fleetFrameCache
+    if (!hit || hit.version !== version || hit.second !== second || hit.cols !== cols || hit.theme !== this.theme) {
+      const activeWorkers = this.fleet.getActiveWorkers()
+      hit = {
+        version, second, cols, theme: this.theme,
+        activeWorkers, lines: null,
+        running: activeWorkers.length,
+        unread: this.fleet.unreadCount(),
+      }
+      this.fleetFrameCache = hit
+    }
+    if (wantLines && hit.lines === null && hit.activeWorkers.length > 0) {
+      const summary = hit.activeWorkers.reduce(
+        (acc, w) => {
+          const p = this.fleet.getGroupProgress(w.parentToolId)
+          if (!acc.seen.has(w.parentToolId)) {
+            acc.seen.add(w.parentToolId)
+            acc.total += p.total
+            acc.done += p.done
+          }
+          acc.running += 1
+          return acc
+        },
+        { total: 0, done: 0, running: 0, seen: new Set<string>() },
+      )
+      hit.lines = formatWorkerFleet(
+        hit.activeWorkers,
+        this.theme,
+        cols,
+        { done: summary.done, total: summary.total, running: summary.running },
+      )
+    }
+    return hit
   }
 
   /**
@@ -4555,28 +4703,9 @@ export class TuiApp {
           lines.push({ text: line })
         }
       } else {
-        const activeWorkers = this.fleet.getActiveWorkers()
-        if (activeWorkers.length > 0) {
-          const summary = activeWorkers.reduce(
-            (acc, w) => {
-              const p = this.fleet.getGroupProgress(w.parentToolId)
-              if (!acc.seen.has(w.parentToolId)) {
-                acc.seen.add(w.parentToolId)
-                acc.total += p.total
-                acc.done += p.done
-              }
-              acc.running += 1
-              return acc
-            },
-            { total: 0, done: 0, running: 0, seen: new Set<string>() },
-          )
-          const fleetLines = formatWorkerFleet(
-            activeWorkers,
-            this.theme,
-            cols,
-            { done: summary.done, total: summary.total, running: summary.running },
-          )
-          for (const line of fleetLines) lines.push({ text: line })
+        const frame = this.fleetFrame(cols, true)
+        if (frame.activeWorkers.length > 0) {
+          for (const line of frame.lines ?? []) lines.push({ text: line })
         } else {
           const delegationTools = [...this.toolGroupController.getPendingEntries()]
             .filter(([, meta]) => isDelegationTool(meta.name))
@@ -4625,10 +4754,12 @@ export class TuiApp {
         if (isCollapsibleTool(meta.name)) continue
         // 跳过已归入 bash 折叠组的 bash 工具
         if (meta.name === 'bash' && this.toolGroupController.hasBashEntry(id)) continue
+        const accTail = this.toolGroupController.getAccumulated(id)
         const toolLines = formatToolCardLive({
           toolName: meta.name,
           toolInput: meta.input,
-          outputTail: this.toolGroupController.getAccumulated(id),
+          outputTail: accTail,
+          outputTailLines: this.liveToolTailLines(id, accTail),
           elapsedMs: Date.now() - meta.startMs,
           columns: cols,
           tick: this.streamRenderController.tick,
@@ -4796,8 +4927,8 @@ export class TuiApp {
         teamWave: this.liveTeamModel
           ? { current: Math.min(this.liveTeamModel.currentWave + 1, this.liveTeamModel.totalWaves), total: this.liveTeamModel.totalWaves }
           : undefined,
-        fleetRunning: this.fleet.getActiveWorkers().length,
-        fleetUnread: this.fleet.unreadCount(),
+        fleetRunning: this.fleetFrame(cols, false).running,
+        fleetUnread: this.fleetFrame(cols, false).unread,
       }, this.theme)
 
       // 用 wide 上界度量标签串宽度：CJK/Windows 终端把 East-Asian Ambiguous 符号
@@ -5032,7 +5163,7 @@ export class TuiApp {
         todos: this.state.todos,
         phase: this.state.phase,
         todoExpanded: this.state.todoExpanded,
-        workers: this.fleet.getActiveWorkers(),
+        workers: this.fleetFrame(cols, false).activeWorkers,
         teamModel: this.liveTeamModel ? this.teamModelWithLiveStatus(this.liveTeamModel) : null,
         currentTool,
         modelName: this.state.modelName,

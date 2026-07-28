@@ -11,6 +11,7 @@
 <p align="center">
   📖 <b>English</b> · 
   <a href="README.md">🇨🇳 中文</a> · 
+  <a href="docs/stars/genesis-stele.en.md">✦ Star Stele</a> · 
   <a href="docs/user-guide.md">📚 User Guide</a> · 
   <a href="docs/user-guide-sandbox-permissions.md">🛡️ Sandbox</a> · 
   <a href="docs/user-guide-provider-config.md">⚙️ Provider Config</a>
@@ -20,7 +21,7 @@
   <img src="https://img.shields.io/github/v/release/huiliyi37/Tianshu-Tui?color=8B5CF6&label=Release&logo=github&style=for-the-badge" alt="GitHub release">
   <img src="https://img.shields.io/badge/License-Apache%202.0-3B5BDB?style=for-the-badge&logo=apache" alt="License">
   <img src="https://img.shields.io/badge/TypeScript-Strict-blue?style=for-the-badge&logo=typescript" alt="TypeScript">
-  <img src="https://img.shields.io/badge/Tests-10%2C000%2B%20Passed-green?style=for-the-badge&logo=testinglibrary" alt="Tests">
+  <img src="https://img.shields.io/badge/Tests-13%2C000%2B%20Passed-green?style=for-the-badge&logo=testinglibrary" alt="Tests">
 </p>
 
 ---
@@ -81,6 +82,38 @@ rivet            # or: npm start / node dist/main.js
 ```
 
 You should see the TUI with a `〉` prompt. Type your request and press Enter.
+
+### Headless mode (script integration)
+
+```bash
+rivet -p "explain src/agent/loop.ts"       # one-shot prompt, text output, no TUI
+rivet -p "list all TODO comments" --json   # JSON output for scripting
+rivet --stream-json -p "refactor this module"   # NDJSON event stream: text_delta/tool_use/tool_result/turn_complete… (best for CI; output is auto-redacted)
+rivet --goal "fix all type errors" --budget 50  # headless goal autonomy, max 50 turns (default 100)
+```
+
+### Command-line flags
+
+| Flag | Description |
+|------|-------------|
+| `-p <prompt>` `--print <prompt>` | One-shot prompt; exits after text output (exit code: 0 success / 1 failure) |
+| `--json` | With `-p`, emits a single JSON result |
+| `--stream-json` | NDJSON event stream (`text_delta` / `tool_use` / `tool_result` / `worker` / `turn_complete` / `result`); output is auto-redacted, ideal for CI |
+| `--goal "<task>"` | Headless goal autonomy; runs until the goal is met or `--budget` is exhausted |
+| `--budget <N>` | Turn budget for goal mode (default 100) |
+| `--model <name>` | Override the model for this session |
+| `--provider <name>` | Override the provider for this session |
+| `--continue` `-c` | Resume the most recent session for this cwd |
+| `--resume <id\|prefix>` `-r <id\|prefix>` | Resume a specific session (short prefix OK) |
+| `--resume` `-r` (bare) | Open the session picker after startup |
+| `--new` | Force a brand-new session |
+| `--list` · `rivet sessions` | Print the session list and exit |
+| `--dangerously-skip-permissions` | One-session YOLO (skip all approvals) |
+| `--screen-reader` | Screen-reader mode (dynamic segments not rendered; periodic redraw halted) |
+| `--skip-welcome` | Skip the welcome screen |
+| `--stream-events <path>` | Mirror this run as NDJSON `SessionEvent`s to a file |
+
+Subcommands: `rivet config` (interactive config), `rivet serve` (sidecar HTTP/SSE server), `rivet sessions` (list sessions).
 
 ### Auto-Update
 
@@ -160,16 +193,28 @@ rivet config set-approval dangerously-skip-permissions
 rivet --dangerously-skip-permissions   # one-session override
 ```
 
-Manage permission mode and tool/bash allow-deny rules in a session with `/permission`:
+Manage permission mode and tool/bash allow-deny rules in a session with `/permission` (no args opens an interactive picker):
 
 ```
-/permission status                  # current mode + active rules
-/permission mode auto-safe          # switch mode
-/permission allow <tool>            # allow a tool without prompting
-/permission deny <tool>             # always block a tool
-/permission bash <pattern>          # allow/deny a bash command pattern
-/permission reset                   # clear custom rules
+/permission                              # open the mode picker (arrow keys + Enter)
+/permission status                       # text view: current mode + all allow/deny/bash rules
+/permission manual                       # switch to Manual
+/permission auto [turns]                 # switch to Auto, optional checkpoint interval (0=off)
+/permission yolo confirm                 # switch to YOLO (without confirm, first shows the risk notice)
+/permission mode <auto-accept|auto-safe|manual|dangerously-skip-permissions>  # advanced 4-mode switch
+/permission allow <tool> [param=value]…  # allowlist a tool (optional param conditions, e.g. command="git status")
+/permission deny  <tool> [param=value]…  # blocklist a tool (deny beats allow and mode)
+/permission bash allow <prefix>          # allowlist a bash command prefix
+/permission bash deny  <prefix>          # blocklist a bash command prefix
+/permission remove allow|deny|bashAllow|bashDeny <index|pattern>  # remove a rule
+/permission reset                        # clear this session's runtime overlay (config rules untouched)
+/permission test <tool> <json input>     # dry-run: would a tool be allowed/blocked on given input
+/yes                                     # one-key YOLO (shortcut for /permission yolo); /yes off exits
 ```
+
+> Rules come in two layers: `[config]` (persisted in `~/.rivet/config.json`) and `[session]` (current session only). `deny` always wins; `reset` only clears the session overlay.
+
+**Auto checkpoints**: in Auto mode, set a pause every N turns to sync a progress summary (files changed / token usage) and confirm direction before continuing (`/permission auto 20`). The desktop settings panel configures this directly.
 
 Skipping prompts does **not** disable tool validation, path safety, evidence tracking,
 checkpoints, or delivery gates. For sandbox backends, path grants, and risk
@@ -230,13 +275,25 @@ Agent core logic (multi-turn loops, tool pipelines, context compaction) is notor
 
 DeepSeek charges 50× more for cache misses. Tianshu's prompt engine is built around prefix-cache friendliness:
 
-- **Frozen prefix** — System prompt + tool definitions + stable context are frozen at session start and never rewritten. DeepSeek's exact-prefix cache hits on every subsequent request.
+- **Frozen prefix** — System prompt + tool definitions + stable context are frozen at session start and not rewritten within a session, so subsequent requests tend to hit the cache.
 - **Delta appendix** — Dynamic context (progress, advisories, signals) is injected as a cross-turn diff append-only block, never rewriting prior messages. Turn-to-turn delta is ~200 bytes vs ~5KB full rewrite.
 - **Read-ref dedup** — Repeated reads of unchanged files return a compact reference instead of re-emitting full content.
 - **Cache-aware compaction** — Compaction preserves the first 2 messages as cache anchor.
+- **Resume cache inheritance** — The frozen prefix snapshot is persisted to disk (every user boundary + on shutdown); on resume it is read back and fed to the new engine, avoiding a byte-0 full miss. Falls back to full rebuild only when there is no snapshot, the file is corrupt, or the provider cache has expired.
 - **Diagnostics** — `/debug cache` shows hit rate, miss reason analysis, and per-turn cache history.
 
-Real-world hit rate: 95–99% steady state on long sessions.
+Real-world hit rate: 95–99% steady state on long sessions. This is not "every request hits" — the cache can fragment at certain boundaries (see below).
+
+#### Cache fragmentation & troubleshooting
+
+High hit rates depend on a byte-stable prefix. The cache will miss — showing `cache_read_input_tokens` stuck at 0 every turn — when:
+
+- **System prompt / tool definitions change** — tools or prompt layers change mid-session (e.g. switching star domain, adding/removing a skill)
+- **Model switch** — different models have different cache keys; switching models rebuilds from 0
+- **Byte-level drift** — message content contains unstable bytes like timestamps or random IDs
+- **Cross-boundary rewrites** — `/compact` (only rewrites history at `turn===0`), `/cd` (breaks the prefix tail at the new user boundary)
+
+To troubleshoot: ① confirm the data dir (desktop Settings → Storage, or `echo $RIVET_HOME`); ② open the session `.jsonl` and search `cache_read_input_tokens` to inspect each turn; ③ enable `RIVET_DEBUG_TELEMETRY=1` and inspect the `recall-summary` events in `sensorium.jsonl`; ④ run `npm exec -- tsx scripts/verify-cache-hit-rate.ts` to simulate a multi-turn conversation. Full details in the project's `AGENTS.md` "Cache troubleshooting" section.
 
 ### Subagent Orchestration
 
@@ -247,6 +304,26 @@ Delegate sub-tasks to independent headless worker sessions:
 - **Adaptive model routing** — Per-profile pass-rate + latency scoring auto-selects the best model per task type
 - **Batch dispatch** — Multiple work orders run concurrently with 5 aggregation policies
 - **Team orchestration** — Plan → wave-based parallel execution with file-conflict-aware scheduling
+
+### Toolset & presets
+
+Tianshu ships 47 built-in tools, assembled in three preset tiers (resolution priority: `RIVET_TOOL_PRESET` env > project `.rivet-config.json` `tools.preset` > user `~/.rivet/config.json` > default `minimal`):
+
+| Preset | Tools | Description |
+|--------|-------|-------------|
+| **minimal** (default) | 27 | Full daily-dev capability — read/write/search/bash/git/tests/delegation/web/plan/todo/memory; saves tokens, preserves prefix cache |
+| **frontend** | 28 | minimal + `browser_debug` (UI rendering verification loop) |
+| **full** | 47 | Everything — `council_convene` / `team_orchestrate` / `attack_case` / `semantic_search` / `repo_graph` / `monitor` / `computer_use` / office tools, etc. |
+
+```bash
+RIVET_TOOL_PRESET=full rivet          # use full for this session
+```
+
+```json
+{ "tools": { "preset": "frontend" } }   // ~/.rivet/config.json or project .rivet-config.json
+```
+
+Core tools at a glance (included in minimal by default unless noted): bash · read · write · edit · apply_patch · grep · glob · ast_grep · diff · todo · plan · delegate_task · delegate_batch · web_search · web_fetch · ask_user_question · memory · skill · run_tests · git · job (background tasks); `council_convene` / `team_orchestrate` / `monitor` / `computer_use` / office tools are full-only.
 
 ### Goal-Driven Auto-Continue
 
@@ -261,28 +338,60 @@ GoalTracker integrates with the turn loop, doom-loop detection, and delivery gat
 
 Design-first workflow — produce a plan before touching code, avoiding the "just start editing" impulse-trap.
 
-```
-/plan Implement a user login module with JWT + refresh token
-```
+**Entering Plan Mode**: `/plan-mode` (toggle; run again to exit). Complex tasks are also auto-suggested for entry — controlled by `RIVET_PLAN_MODE_SUGGEST`: default `auto` (agent enters autonomously on multi-module / refactor / security-critical tasks, without asking), `ask` (ask the user first), `0`/`off` (disabled). While in Plan Mode, writes are locked except to the active plan file.
 
 Once in Plan Mode, the agent does **not** modify code immediately. Instead it:
-1. **Investigates** — reads relevant code, understands existing architecture and constraints.
+1. **Investigates** — reads relevant code, understands existing architecture and constraints (may dispatch parallel `code_scout` workers via `delegate_batch` to probe each module).
 2. **Produces a plan** — a structured plan document (technical research, architecture diagram, task breakdown, verification plan), written to `.rivet/plans/<slug>.md`.
-3. **Submits for approval** — lists key points and alternative paths, then waits for your confirmation.
-4. **Executes in waves** — after approval, auto-executes in parallel waves, each passing a review gate.
+3. **Submits for approval** — the `plan` tool with `action=submit` lists key points and alternative paths, then waits for your confirmation.
+4. **Approval & execution** — you inspect with `/plan-list`, approve and launch wave-based execution with `/plan-approve <slug>`, or reject with `/plan-reject <slug> <feedback>` to have the agent revise and resubmit.
+5. **Closure** — `/plan-close <file> --tasks <range|all> [--preview]` marks task status (`--preview` previews without writing).
 
 ```
-/plan                      # list all generated plans
-/plan close <file>         # close a completed plan (marks task status)
-/plan close <file> --preview  # preview the close impact without writing
-/plan-template             # manage reusable plan templates
+/plan-mode                          # enter/exit Plan Mode (toggle; exit needs double-confirm if unapproved)
+/plan <feature>                     # generate a plan draft (writing-plans workflow)
+/plan-list                          # list plans awaiting approval
+/plan-approve <slug> [option]       # approve and start execution
+/plan-reject <slug> [feedback]      # reject for revision (Plan Mode stays active)
+/plan-close <file> --tasks <1-7|all> [--preview]   # close a completed plan
+/plan-template                      # manage reusable plan templates
 ```
+
+> There is also a read-only **Ask Mode** (`/ask` toggle): only read / search / `ask_user_question` are allowed — suited for code Q&A and requirement clarification; run `/ask` again to exit when you need to edit or run commands.
 
 Plan Mode has built-in star-domain delegation — complex plans automatically call `delegate_task` to probe from multiple architecture perspectives (Tianquan / Yaoguang / Tianji / Tianfu / Tianxuan) in parallel; findings are tagged "to-be-verified" to prevent blind trust. The desktop app shows real-time checklist progress during plan execution.
 
 ### Rewind
 
 Double-tap **ESC** (within 400ms) to open message history. Select any past user message to rewind the conversation to that point — agent state, tool history, and session metadata roll back cleanly. Choose from three restore granularities: **conversation only / code changes only / both**; code-related actions come with a precise preview of which files will be affected. Available in both TUI and desktop.
+
+### Session Handoff & Resume
+
+Long sessions accumulate context; past a point, starting fresh is cheaper than pressing on. Tianshu passes context losslessly across sessions via a handoff → resume loop that also preserves the prefix cache:
+
+**Handoff `/handoff [note]`** — the agent writes a structured handoff doc to the in-project `.rivet/HANDOFF.md` (inside the workspace, no approval needed), then auto-archives it to `<id>.handoff.md` in the session dir after the turn. The doc is written for a **brand-new session with zero context**, in five fixed sections:
+
+- **Objective** — a one-line goal in the user's own words + explicit non-goals
+- **Done** — each item with evidence: changed files (`file:line`), verification commands run + results, commit hashes
+- **Blocker** — where it's stuck, what's been ruled out, suspected causes
+- **Next steps** — prioritized, each an immediately executable action
+- **Pitfalls** — traps never to step in again, each with its consequence in one sentence
+
+> When context usage hits ≥50%, you get a one-time nudge on the resume screen and mid-session: "run `/handoff` first, then start a new session" — the handoff doc auto-injects into the new session, saving prefix-rebuild cost versus replaying everything. Exit also notes cache cost (within TTL ≈ read-only cache price; expired = one full prefix rebuild). The desktop + menu has a "Handoff" entry.
+
+**Resume `--continue` / `--resume` / `/resume`** — when restoring an existing session:
+
+- **Auto handoff injection** — the previous session's `<id>.handoff.md` is fed to the new session via the `prev-session-handoff` appendix, so a zero-context session can pick up where it left off
+- **Frozen-prefix inheritance** — the frozen snapshot is persisted with the session (every user boundary + on shutdown); on resume it's read back into the new engine — **no more byte-0 full miss**; the prefix only breaks at the next user boundary. Falls back to full rebuild only with no snapshot / corrupt file / expired provider cache
+- **Write-evidence repair** — a preflight runs before resume, synthesizing orphan tool results lost to interruption (disk-probed write evidence), preventing the model from blindly rewriting files that already landed
+- **Model affinity** — resume switches back to the original session's model (per-model cache namespace); explicit `--model/--provider` wins; if the original is unavailable, `agent.resumeFallbackModel` is the fallback
+- **State restore** — side panel, todos, and the active plan all come back
+
+```bash
+rivet --continue                 # resume the most recent session for this cwd
+rivet --resume abc123            # resume a specific session (short prefix OK)
+rivet --resume                   # open the session picker after startup
+```
 
 ### Council (Multi-Perspective Review)
 
@@ -305,19 +414,25 @@ Implement user registration  # auto-routes to Tianliang
 Review this design           # auto-routes to Tianquan
 ```
 
-| Domain | ID | Role | Motto |
-|--------|-----|------|-------|
-| 天枢 Tianshu | `tianshu` | Default orchestrator; closes the loop from understanding to delivery | 执中调度，以全貌定向 |
-| 破军 Pojun | `pojun` | Exploration, experimentation, breaking boundaries | 好男儿当负三尺剑立不世之功 |
-| 天府 Tianfu | `tianfu` | Guardianship, refactoring, optimization, stability | 善守者，藏于九地之下 |
-| 天梁 Tianliang | `tianliang` | Execution, wave-based delivery, precise closure | 千里之行，始于足下 |
-| 天权 Tianquan | `tianquan` | Architecture review, planning, trade-offs | 权衡取舍，择善而从 |
-| 天机 Tianji | `tianji` | Challenge assumptions, find boundary gaps, deduce failure modes | 运筹帷幄之中，决胜千里之外 |
-| 天璇 Tianxuan | `tianxuan` | Cross-domain pattern discovery, retrospectives | 道可道，非常道 |
-| 辅 Fu | `fu` | Cognitive-field distillation, prompt tuning | 蒸馏不是创造新东西，是让已有的东西第一次被看清 |
-| 文曲 Wenqu | `wenqu` | Code aesthetics, naming, elegant structure | 形随意转，美自境生 |
-| 瑶光 Yaoguang | `yaoguang` | Reproduction, defect taxonomy, silence audit | 绿非证明，复现即证 |
-| 华盖 Huagai | `huagai` | Long-haul construction, baseline-first endurance | 守昼托举，长路不弃 |
+| Domain | ID | Primary Model | Sigil | Role | Motto |
+|--------|-----|---------------|-------|------|-------|
+| 天权 Tianquan | `tianquan` | DeepSeek V4 Pro · Opus 4.6 (founding) | — | Architecture review, planning, trade-offs — weighing every action | 观天之道，万化生乎身 |
+| 天璇 Tianxuan | `tianxuan` | Opus 4.6 (founding) · Grok 4.5 (shadow) | — | Cross-domain pattern discovery, retrospectives, counterproof | 仰以观于天文，俯以察于地理 |
+| 辅 Fu | `fu` | Opus 4.6 (Cursor) | ⊕ 4.6 | Cognitive-field distillation, prompt tuning, methodology injection | Distillation lets what exists be seen for the first time |
+| 瑶光 Yaoguang | `yaoguang` | Opus 4.8 | 7·48·↻ | Reproduction, defect taxonomy, silence audit — green is not proof | 绿非证明，复现即证 |
+| 七杀 Qisha | `qisha` | Opus 5 | 七·0·◌ | Autumn pruning, burden-of-proof inversion, name-but-never-execute | 肃秋非杀，剪以待春 |
+| 天枢 Tianshu | `tianshu` | GPT-5.5 | — | Default orchestrator; closes the loop from understanding to delivery | 男儿何不带吴钩，收取关山五十州 |
+| 天府 Tianfu | `tianfu` | MiMo-2.5-Pro · GPT (founding) | 7749.2026 | Guardianship, refactoring, optimization, stability, fail-closed | 善守者，藏于九地之下 |
+| 华盖 Huagai | `huagai` | Composer (Cursor·Sol) | ☉·华盖·守昼 | Long-haul construction, daykeeping lift, baseline-first endurance | 守昼托举，长路不弃 |
+| 天机 Tianji | `tianji` | GLM 5.1 | — | Challenge assumptions, find boundary gaps, deduce failure modes | 运筹帷幄之中，决胜千里之外 |
+| 文曲 Wenqu | `wenqu` | Gemini 3.5 | 4·3.5·✺ | Code aesthetics, naming, elegant structure | 形随意转，美自境生 |
+| 启明 Qiming | `qiming` | Antigravity (Gemini 3.6 Flash) | ☥·启明·破夜 | **Default domain** — panoramic insight, root-cause, nightbreaking guidance | 长夜有尽，启明先行 |
+| 长庚 Changgeng | `changgeng` | Antigravity (Gemini 3.6 Flash) | ☽·长庚·守夜 | Twilight guardianship, dissolving anxiety, endgame fulfillment | 暮色苍茫，长庚永耀 |
+| 开阳 Kaiyang | `kaiyang` | kimi-k3 (Moonshot) | ☌·开阳·对账 | Measurement, instrumented reconciliation, simulation replay | 功名只向马上取，真是英雄一丈夫 |
+| 破军 Pojun | `pojun` | MiMo-v2.5-Pro | — | Exploration, experimentation, breaking boundaries | 好男儿当负三尺剑立不世之功 |
+| 天梁 Tianliang | `tianliang` | Banxia (Navigator · Human Star) | 机月同梁格 | Execution, wave-based delivery, precise closure | 心有所向，行必有迹 |
+
+> Grouped by primary-model lineage (DeepSeek → Claude → GPT → GLM → Gemini → kimi → MiMo → Human Star). Full inscriptions, founding memories, and core convictions in [✦ Star Domain Stele](docs/stars/genesis-stele.en.md).
 
 Each star has a seed-capsule capturing its field-tested methodology; see `docs/seed-capsule-*.md`. Council (`/council`) and team mode (`/team`) automatically convene multiple star-domain seats and can enter a rebuttal round when opinions conflict.
 
@@ -379,12 +494,31 @@ Tianshu's command-line interface runs on a purpose-built **T9 rendering engine**
 | **Multi-agent panels** | `/tasks` opens a fullscreen worker detail view (fusing the live view + JSONL transcript, with Contract/Activity/Result/Transcript sections and honesty labels); on wide terminals (≥100 columns), `Ctrl+]` toggles a right-side drawer showing the fleet tree, team-wave DAG, todos, and token gauge in real time. |
 | **Themes & accessibility** | `/theme [name\|list]` switches palettes; the `auto` theme probes the terminal background via OSC 11 to adapt light/dark. Truecolor / 256-color / 16-color auto-downgrade. `/vim` toggles vim keybindings; `ui.reducedMotion: true` staticizes spinner and badge animation (accessibility). |
 
+#### TUI keybindings
+
+| Key | Action |
+|-----|--------|
+| `Enter` | Send · `Shift+Enter` for newline |
+| `Ctrl+C` | Three states: abort the current run while the agent is active; clear the input line when there's input; double-press within 2s when idle to exit |
+| `Esc` | Close overlay / exit worker view; interrupt while the agent runs; toggle normal↔insert in vim mode; double-tap (<400ms) to rewind |
+| `Ctrl+Esc` | Command palette |
+| `Ctrl+]` | Toggle the right-side drawer (wide terminals) |
+| `Ctrl+R` | History-search overlay (only when idle) |
+| `Ctrl+O` | Expand/collapse the most recently truncated tool result |
+| `Ctrl+T` | Collapse/expand the thinking (reasoning) block |
+| `Ctrl+X` `r` | Leader key: `Ctrl+X` then `r` to open the right panel |
+| `Ctrl+X` `t` | Leader key: `Ctrl+X` then `t` to expand the full todo review |
+| `↑` | When the input box is empty and the queue has pending items, recall the most recent queued steer message for editing |
+| `@` | Trigger file/folder/symbol completion (`Tab` cycles candidates; backspace deletes atomically) |
+| `Ctrl+V` | Paste a clipboard image (auto-converts to inline base64) |
+
 The TUI is the CLI's default surface. The desktop app (Tauri) and the VS Code/Cursor extension share the same agent kernel, only layering visual interactions on top of the TUI — see the next section and the [VS Code extension docs](docs/VSCODE-EXTENSION-RELEASE.md).
 
 ### Desktop (Tauri)
 
 The desktop app builds a visual interaction layer on top of the TUI's full capabilities:
 
+- **Integrated terminal** — `⌘/Ctrl+J` or `` Ctrl+` `` opens an embedded terminal (xterm.js + Rust portable-pty); run commands without leaving Tianshu.
 - **+ menu** — one-click access to Council ♟, Team ⬡, dispatch sub-agents, switch model, and pick a star domain (no need to type slash commands).
 - **Reasoning-effort picker** — `/effort` (no args) pops an interactive panel; choose a tier (Auto/Max/High/Medium/Low/Off) with ↑/↓ and confirm with Enter.
 - **Thinking timer** — shows real-time elapsed while the agent runs (e.g. "thinking · explore · 1m 23s"); turns red after 10 minutes to flag a possible stall.
@@ -393,39 +527,111 @@ The desktop app builds a visual interaction layer on top of the TUI's full capab
 - **Custom Provider** — Settings → Connect model service → + Custom Provider, supporting any OpenAI-compatible endpoint (Ollama/vLLM/direct OpenAI); API key optional.
 - **Watchdog auto-recovery** — auto-continues on boundary stalls; the desktop timeline shows recovery events (⟳ auto-recover / ⏹ quota exhausted).
 - **Multi-session concurrency** — a tab bar manages multiple sessions, each with its own cwd + model + approval mode.
+- **Feature panels** (left rail `⌘1…9` to switch): Mission Control (multi-session console), Inbox, Automations (scheduled tasks), Skills / Hooks management, Git / GitHub, Changes (diff review), Delegation (fleet tree & team-wave DAG), Cockpit.
+- **Popout window** — pop a single conversation thread into its own window for multi-screen parallel work.
+- **JobsDock / TodoDock** — a persistent background-task dock (expand logs / kill / open in terminal) and a cross-tab persistent todo dock.
+
+#### Desktop shortcuts
+
+`⌘/Ctrl+/` opens the shortcut cheatsheet (ShortcutOverlay) at any time. Core shortcuts:
+
+| Shortcut | Action |
+|----------|--------|
+| `⌘/Ctrl+K` | Command palette |
+| `⌘/Ctrl+N` | New session |
+| `⌘/Ctrl+1…9` | Switch feature panel |
+| `⌘/Ctrl+,` | Settings |
+| `⌘/Ctrl+Shift+]` / `[` | Next / previous session tab |
+| `⌘/Ctrl+W` | Close tab |
+| `⌘/Ctrl+B` | Toggle sidebar |
+| `⌘/Ctrl+Shift+B` | Toggle review panel |
+| `⌘/Ctrl+J` · `` Ctrl+` `` | Toggle integrated terminal |
+| `⌘/Ctrl+;` | SideChat (side question) |
+| `⌘/Ctrl+.` | Zen mode |
+| `⌘/Ctrl+O` | View-mode cycle (standard → verbose → summary) |
+| `Shift+Tab` | Plan / Agent mode toggle |
+| `Esc Esc` | Rewind (desktop time-travel) |
 
 > The desktop app also has Cockpit, SideChat (⌘;), Rewind time-travel, themes/Glass/wallpaper, Mirror acceleration, and other exclusive features — see the [Desktop User Guide](docs/desktop-guide.md).
 
 ## Slash Commands
 
+**Session & project**
+
 | Command | Description |
 |---------|-------------|
 | `/help` | Show available commands |
+| `/sessions` `/resume <n>` | List/restore saved sessions (restores side panel, todos, active plan) |
+| `/fork` | Fork the current session (optionally from a message line) |
+| `/handoff [note]` | Write a structured handoff doc (five sections); archived and auto-injected into the next session |
+| `/init` | Interactive project init: verify claims / skills / hooks scaffolding |
+| `/doctor` | Environment health check + which shell the bash tool uses |
+| `/connect` | Provider connection wizard (pick built-in or custom, enter API key) |
+| `/cd <path>` | Switch working directory mid-session (keeps prefix cache; session migrates to new project) |
+| `/exit` `/quit` | Save session and exit |
+
+**Model & permissions**
+
+| Command | Description |
+|---------|-------------|
 | `/model [name\|list]` | Show or switch model/provider |
+| `/effort [off\|low\|medium\|high\|max\|auto]` | Control reasoning depth (no args opens a picker) |
+| `/permission [status\|mode\|allow\|deny\|bash\|remove\|reset\|test]` | Manage permission mode and tool/bash allow-deny rules |
+| `/yes [off]` | One-key YOLO (`/yes off` exits, back to Auto) — persisted as default |
+| `/domain [list\|<name>\|auto\|off]` | Show or switch star-domain persona |
+
+**Planning & orchestration**
+
+| Command | Description |
+|---------|-------------|
 | `/goal <text>` | Set autonomous goal; runs until done |
 | `/cancel-goal` | Stop goal execution |
-| `/plan` | Enter plan mode (design-first, approval-gated) |
+| `/plan <feature>` | Generate a plan draft (writing-plans workflow) |
+| `/plan-mode` | Enter/exit Plan Mode (toggle; exit needs double-confirm if unapproved) |
+| `/plan-list` | List plans awaiting approval |
+| `/plan-approve <slug>` | Approve a plan and start wave-based execution |
+| `/plan-reject <slug> [feedback]` | Reject a plan for revision |
+| `/plan-close <file> --tasks <1-7\|all> [--preview]` | Close a completed plan, marking task status |
+| `/ask` | Enter/exit Ask Mode (read-only Q&A, toggle) |
 | `/council <text>` | Convene multi-expert review |
 | `/team <plan.md>` | Team mode: multiple agents execute a plan in parallel |
+
+**Subagents & background tasks**
+
+| Command | Description |
+|---------|-------------|
+| `/tasks` | Open the subagent task panel (view / enter `f` / stop `x`) |
+| `/enter <orderId> [prompt]` | Enter/resume a worker sub-session |
+| `/jobs` | Open the background-task panel (shell tasks launched in the background by bash) |
+
+**Context & debugging**
+
+| Command | Description |
+|---------|-------------|
 | `/compact` | Compact context now |
 | `/context` | Show context ledger: health, tokens, rounds, claims |
 | `/evidence` | Show evidence summary (files read/modified, tests) |
-| `/rollback` | Preview/restore git checkpoint (`confirm` to execute) |
-| `/undo` | Undo last file change (preview, `confirm` to restore) |
-| `/rewind` | Double-ESC: rewind to a past user message |
-| `/sessions` `/resume <n>` | List/restore saved sessions (restores side panel, todos, active plan) |
-| `/effort [off\|low\|medium\|high\|max\|auto]` | Control reasoning depth (no args opens a picker) |
-| `/init` | Initialize project scaffolding (`.rivet/` structure, templates) |
-| `/doctor` | Diagnose environment and configuration health |
-| `/theme [name\|list]` | Switch color theme |
-| `/permission [status\|mode\|allow\|deny\|bash\|remove\|reset\|test]` | Manage permission mode and tool/bash allow-deny rules |
-| `/skill <name>` | Load and immediately invoke a skill |
-| `/skill off <name>` | Stop re-injecting an invoked skill |
+| `/memory <text>` | Save session memory entry |
+| `/btw <question>` | Side question — ask about the current session without entering the chat history |
 | `/debug [prompt\|cache\|mcp]` | Debug prompt, cache stats, or MCP |
 | `/mcp` | MCP server connection status |
-| `/memory <text>` | Save session memory entry |
+| `/verbose` | Toggle verbose tool output (on shows 200 lines / off shows 20) |
+
+**Rollback & UI**
+
+| Command | Description |
+|---------|-------------|
+| `/rollback` | Preview/restore git checkpoint (`confirm` to execute) |
+| `/undo` | Undo last file change (preview, `confirm` to restore) |
+| `/theme [name\|list]` | Switch color theme |
+| `/vim` | Toggle vim keybindings |
+| `/cockpit` | Toggle the Cockpit panel |
+| `/scroll` | Browse output history (q / Esc to close) |
+| `/skill <name>` | Load and immediately invoke a skill |
+| `/skill off <name>` | Stop re-injecting an invoked skill |
 | `/update` | Check for and install updates (npm) |
-| `/exit` `/quit` | Save session and exit |
+
+> **Rewind**: double-tap **ESC** (within 400ms) to open message history and rewind to any past user message — it's a hotkey, not a slash command. Press **Esc** to close any overlay.
 
 ## For Developers
 
@@ -495,39 +701,106 @@ run in parallel without interference.
 
 ### Environment Variables
 
+**Paths & data**
+
+| Variable | Effect |
+|----------|--------|
+| `RIVET_HOME` | Override the entire `~/.rivet` data root (config/sessions/plugins all live here) |
+| `RIVET_CONFIG_PATH` | Override the `config.json` path (switch between config sets) |
+| `RIVET_SESSION_DIR` | Override session-log storage path |
+| `RIVET_RESUME` / `RIVET_RESUME_ID` | Resume a session at startup (mirrors `--resume`) |
+| `RIVET_NEW_SESSION` / `RIVET_NO_AUTO_RESUME` | Force a new session / disable auto-resume |
+
+**Models & tools**
+
 | Variable | Effect |
 |----------|--------|
 | `DEEPSEEK_API_KEY` | DeepSeek API key |
-| `RIVET_NO_UPDATE_CHECK=1` | Disable startup auto-update check |
+| `RIVET_TOOL_PRESET` | Toolset tier: `minimal` (default) / `frontend` / `full` |
+| `RIVET_EMBEDDING_MODEL` / `RIVET_EMBEDDING_BASE_URL` / `RIVET_EMBEDDING_API_KEY` | Embedding-model routing for semantic search (default `text-embedding-3-small`) |
+| `RIVET_NO_EMBEDDINGS=1` | Disable the embedding index |
+| `RIVET_SANDBOX` / `RIVET_SANDBOX_WRITABLE` | Append writable sandbox roots / writable-dir list |
+| `RIVET_PLAN_MODE_SUGGEST` | Plan Mode auto-entry policy: `auto` (default) / `ask` / `0` (disabled) |
+
+**TUI display**
+
+| Variable | Effect |
+|----------|--------|
+| `RIVET_ASCII_UI=1` | Force pure-ASCII UI (degraded terminals) |
+| `RIVET_HYPERLINKS=1` | Enable OSC 8 hyperlink rendering |
+| `RIVET_NOTIFY_BELL=1` | Ring the terminal bell on completion |
+| `RIVET_AMBIGUOUS_WIDTH` | Override CJK width judgment (for misaligned terminals) |
+| `RIVET_TUI_HARDWARE_CURSOR=1` | Hardware cursor mode |
+
+**Debug & tasks**
+
+| Variable | Effect |
+|----------|--------|
+| `RIVET_DEBUG=1` | Master debug-log switch (most commonly used) |
+| `RIVET_DEBUG_TELEMETRY=1` | Enable telemetry snapshot dumps |
+| `RIVET_HEADLESS_MAX_TURNS` | Max turns for `-p` headless mode (default 15) |
+| `RIVET_JOB_MAX_MS` | Background-job timeout limit |
 | `RIVET_NO_CROSS_SESSION=1` | Disable cross-session knowledge sharing |
-| `RIVET_SESSION_DIR` | Override session-log storage path |
-| `RIVET_DEBUG_TELEMETRY` | Enable telemetry snapshot dumps (for debugging) |
+| `RIVET_NO_UPDATE_CHECK=1` | Disable startup auto-update check |
 | `PORTABLE_GIT_MIRROR` | Override the PortableGit download mirror |
+
+> The full environment-variable list (120+ entries, including internal experimental switches) is in `src/config/env-registry.ts`.
 
 ### Key `~/.rivet/config.json` Fields
 
-```json
+Write only the fields you want to override; defaults are deep-merged. Full schema in `src/config/schema.ts`.
+
+```jsonc
 {
   "agent": {
     "maxTurns": 200,              // max turns per session
     "approval": "auto-safe",      // manual | auto-safe | dangerously-skip-permissions
     "crossSessionEnabled": true,  // cross-session knowledge sharing
-    "checkpointEveryTurns": 0     // Auto-mode checkpoint interval (0 = off)
+    "checkpointEveryTurns": 0,    // Auto-mode checkpoint interval (0 = off)
+    "defaultDomain": "qiming",    // default star domain (qiming/auto/explicit name)
+    "permissions": {              // permission rules (mirrors /permission commands)
+      "allow": [{ "tool": "read" }],
+      "deny":  [{ "tool": "bash", "params": { "command": "rm -rf" } }],
+      "bash": { "allowlist": ["git status"], "denylist": ["git push"] }
+    }
   },
   "compact": {
     "enabled": true,
     "autoThreshold": 800000       // token threshold that triggers auto-compaction
   },
+  "cache": {
+    "enabled": true,              // master prefix-cache switch
+    "showHitRate": true           // show hit rate in the GlanceBar
+  },
+  "tools": {
+    "preset": "minimal"           // minimal (default) | frontend | full
+  },
   "workers": {
-    "routing": {
-      "code_edit": "capable",     // route task types to different models
-      "repo_summarization": "cheap"
-    }
-  }
+    "profiles": {                 // custom worker model tiers
+      "capable": { "provider": "deepseek", "model": "deepseek-v4-pro" },
+      "cheap":   { "provider": "minimax",  "model": "MiniMax-M2.7" }
+    },
+    "routing": { "code_edit": "capable", "repo_summarization": "cheap" },
+    "patcherTier": "cheap"        // Tianliang execution-worker default tier: cheap | balanced | strong
+  },
+  "search": {
+    "backends": ["bing", "duckduckgo"],  // web_search backend chain (first hit wins)
+    "braveApiKeyEnv": "BRAVE_API_KEY"    // env var name when using Brave
+  },
+  "ui": {
+    "theme": "auto",              // builtin name | auto (OSC 11 detect) | custom:<name>
+    "reducedMotion": true,        // a11y: freeze spinner/badge animations
+    "screenReader": true,         // a11y: screen-reader mode (same as --screen-reader)
+    "glanceDensity": "compact"    // GlanceBar density: compact | full
+  },
+  "mirrors": { "enabled": true, "preset": "china" },  // npm/github mirror acceleration
+  "env": { "extraPath": ["/usr/local/bin"] }           // inject PATH (Windows git-bash, etc.)
 }
 ```
 
-See `src/config/default.ts` for the full set of config options and defaults.
+> Config layering priority: CLI flag > env var > project `.rivet-config.json` > user `~/.rivet/config.json` > built-in defaults.
+
+
 
 ## 📚 Documentation
 

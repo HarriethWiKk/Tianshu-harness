@@ -14,9 +14,9 @@
  * - 逃生阀：RIVET_WAVE_GATE=0 整体禁用（保持 advisory-only 旧行为）。
  */
 
-import { spawnSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { resolve } from 'node:path'
+import { spawnHidden } from '../tools/spawn-hidden.js'
 import { gateTypecheckRunner, runChangedFilesTypecheckOutcomeMemo, typecheckGateEnabled, type TypecheckRunner } from './typecheck-gate.js'
 import { evaluateTestPresence, testPresenceGateEnabled } from './test-presence.js'
 
@@ -77,21 +77,49 @@ export interface EvaluateWaveGateInput {
   /** 该波任务声明的验证命令（TeamTask.verification 去重）。 */
   commands: string[]
   typecheckRunner?: TypecheckRunner
-  /** 测试钩子：命令执行器。缺省 spawnSync sh -c。 */
-  runCommand?: (cwd: string, command: string) => { ok: boolean; detail?: string }
+  /** 测试钩子：命令执行器。缺省异步 spawn（shell）。允许返回 Promise——
+   *  同步注入经 await 兼容。 */
+  runCommand?: (cwd: string, command: string) => { ok: boolean; detail?: string } | Promise<{ ok: boolean; detail?: string }>
   /** 测试钩子：文件存在性判定。缺省 existsSync(resolve(cwd, f))。 */
   fileExists?: (relPath: string) => boolean
 }
 
-function defaultRunCommand(cwd: string, command: string): { ok: boolean; detail?: string } {
-  try {
-    const res = spawnSync(command, { cwd, shell: true, encoding: 'utf-8', timeout: 300_000 })
-    if (res.status === 0) return { ok: true }
-    const tail = `${res.stdout ?? ''}\n${res.stderr ?? ''}`.trim().split('\n').slice(-5).join('\n')
-    return { ok: false, detail: tail.slice(0, 500) }
-  } catch (err) {
-    return { ok: false, detail: err instanceof Error ? err.message : String(err) }
-  }
+// 异步 spawn（spawnHidden 模式，同 typecheck-gate.ts 的 declared runner）——
+// 同步 spawnSync 最长阻塞主线程 5 分钟，期间 TUI 完全无响应。
+function defaultRunCommand(cwd: string, command: string): Promise<{ ok: boolean; detail?: string }> {
+  return new Promise((resolvePromise) => {
+    let stdout = ''
+    let stderr = ''
+    let settled = false
+    // 尾部 5 行 / 500 字符摘要——与旧 spawnSync 路径逐字节一致。
+    const tail = (): string =>
+      `${stdout}\n${stderr}`.trim().split('\n').slice(-5).join('\n').slice(0, 500)
+    const settle = (result: { ok: boolean; detail?: string }): void => {
+      if (settled) return
+      settled = true
+      resolvePromise(result)
+    }
+    try {
+      const child = spawnHidden(command, [], { cwd, shell: true, stdio: ['ignore', 'pipe', 'pipe'] })
+      child.stdout?.on('data', (d: Buffer) => { stdout += d.toString() })
+      child.stderr?.on('data', (d: Buffer) => { stderr += d.toString() })
+      const timer = setTimeout(() => {
+        try { child.kill('SIGKILL') } catch { /* already gone */ }
+        settle({ ok: false, detail: tail() })
+      }, 300_000)
+      child.on('close', (code) => {
+        clearTimeout(timer)
+        if (code === 0) settle({ ok: true })
+        else settle({ ok: false, detail: tail() })
+      })
+      child.on('error', (err) => {
+        clearTimeout(timer)
+        settle({ ok: false, detail: err.message })
+      })
+    } catch (err) {
+      settle({ ok: false, detail: err instanceof Error ? err.message : String(err) })
+    }
+  })
 }
 
 /** 评估一个波的门禁：typecheck + 白名单验证命令。纯计算 + 受注入 I/O，可测。 */
@@ -153,7 +181,7 @@ export async function evaluateWaveGate(input: EvaluateWaveGateInput): Promise<Wa
       checks.push({ command, status: 'unverifiable', detail: '非白名单验证命令形状——请人工执行确认' })
       continue
     }
-    const res = run(input.cwd, command)
+    const res = await run(input.cwd, command)
     checks.push({ command, status: res.ok ? 'passed' : 'failed', detail: res.detail })
   }
 

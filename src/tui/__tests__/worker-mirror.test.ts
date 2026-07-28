@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { WorkerMirrorStore, MIRROR_MESSAGE_CAP } from '../worker-mirror.js'
+import { WorkerMirrorStore, MIRROR_MESSAGE_CAP, MIRROR_WORKER_CAP } from '../worker-mirror.js'
 import type { DelegationActivity } from '../../tools/types.js'
 
 function ev(over: Partial<DelegationActivity>): DelegationActivity {
@@ -95,4 +95,26 @@ test('WorkerMirror: 同轮内终态重放不清空本轮转录', () => {
 
   const joined = store.getMessages('batch:0').map(m => m.content).join('\n')
   assert.match(joined, /本轮正文/, '终态重放走的是终态分支，不该被当成新一轮')
+})
+
+test('WorkerMirror: worker 记录数封顶 MIRROR_WORKER_CAP — 最旧 worker 淘汰，现存记录不受影响', () => {
+  const store = new WorkerMirrorStore()
+  const total = MIRROR_WORKER_CAP + 3
+  for (let i = 0; i < total; i++) {
+    store.apply(ev({ workOrderId: `wo_${i}`, eventKind: 'tool_use', eventDetail: `t${i}` }), i)
+  }
+  assert.equal(store.has('wo_0'), false, '最旧 worker 镜像应被淘汰')
+  assert.equal(store.has('wo_1'), false)
+  assert.equal(store.has('wo_2'), false)
+  assert.equal(store.has('wo_3'), true, '第 51 条起必须保留')
+  assert.equal(store.has(`wo_${total - 1}`), true, '最新 worker 必须保留')
+  // 现存记录内容不受淘汰影响
+  const last = store.getMessages(`wo_${total - 1}`)
+  assert.equal(last.length, 1)
+  assert.equal(last[0]!.content, `t${total - 1}`)
+  assert.deepEqual(store.getMessages('wo_3').map(m => m.content), ['t3'])
+  // 被淘汰的 id 再来事件 → 作为全新记录重建（不复活旧镜像），且仍受封顶约束
+  store.apply(ev({ workOrderId: 'wo_0', eventKind: 'tool_use', eventDetail: 'new' }), 999)
+  assert.deepEqual(store.getMessages('wo_0').map(m => m.content), ['new'])
+  assert.equal(store.has('wo_3'), false, '新建记录触发下一轮最旧淘汰')
 })

@@ -1227,3 +1227,37 @@ describe('/btw 侧问派发', () => {
     assert.ok(entries[0]!.includes('不可用'), `expected unavailable notice: ${entries[0]}`)
   })
 })
+
+
+describe('/handoff 命令', () => {
+  it('未注入 submitToAgent 时明确提示，不静默', async () => {
+    let captured = ''
+    const ctx = makeCtx({
+      parts: ['/handoff'],
+      pushStatic: (entry: LogEntry) => { captured += `${entry.content}\n` },
+    })
+    const handled = await handleSlashCommand(ctx)
+    assert.equal(handled, true)
+    assert.match(captured, /不支持 \/handoff/)
+  })
+
+  it('注入 submitToAgent 时提交交接指令并登记归档任务', async () => {
+    let submitted = ''
+    let registered: { src: string; dest: string } | undefined
+    const ctx = makeCtx({
+      parts: ['/handoff', '重点记下缓存方案'],
+      submitToAgent: (prompt: string) => { submitted = prompt },
+      onHandoffStart: (src: string, dest: string) => { registered = { src, dest } },
+      currentSessionId: 'sess-handoff-001',
+    })
+    const handled = await handleSlashCommand(ctx)
+    assert.equal(handled, true)
+    // 交接指令指向项目内 .rivet/HANDOFF.md（工作区内免审批）
+    assert.ok(submitted.includes('/cwd/.rivet/HANDOFF.md'), `prompt 含项目内路径: ${submitted.slice(0, 200)}`)
+    assert.match(submitted, /## 任务目标/)
+    assert.match(submitted, /用户补充指示：重点记下缓存方案/)
+    // 归档任务：src=项目内文档，dest=会话目录 <id>.handoff.md
+    assert.equal(registered?.src, '/cwd/.rivet/HANDOFF.md')
+    assert.ok(registered?.dest.includes('sess-handoff-001.handoff.md'), `dest: ${registered?.dest}`)
+  })
+})

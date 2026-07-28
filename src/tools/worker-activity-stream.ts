@@ -42,6 +42,22 @@ export interface DelegationActivityMapperOpts {
   /** Resolve the contract projection by workOrderId. Like objective, only
    *  attached on the first running event per worker. */
   contractOf?: (workOrderId: string) => ContractProjection | undefined
+  /** text/thinking delta 尾沿合并窗口（ms），默认 120。测试可注入小值。 */
+  coalesceMs?: number
+}
+
+const DEFAULT_COALESCE_MS = 120
+
+/** text/thinking 尾沿合并槽：同 kind 连续 delta 累积进 parts，到时/切换/非流式事件触发 flush。 */
+interface PendingStreamSlot {
+  kind: 'text' | 'thinking'
+  parts: string[]
+  /** 首个 delta 原样保留作透传基底（profile/authority/objective/contract）。 */
+  base: WorkerActivityEvent
+  /** 组成事件里首个非空 objective/contract（可能晚于首个 delta 才携带）。 */
+  objective?: string
+  contract?: ContractProjection
+  timer?: ReturnType<typeof setTimeout>
 }
 
 /**
@@ -53,6 +69,13 @@ export interface DelegationActivityMapperOpts {
  * - turn 事件携带累计 token 总数（worker 每 turn 结束上报一次）
  * 每条 running 事件都带上最新计数，读模型（FleetRegistry / 桌面面板）只做归约。
  * objective 仅在该 worker 首条 running 事件携带（避免每 tick 重复传输）。
+ *
+ * text/thinking delta 做 per-worker 尾沿合并（默认 120ms）：同 kind 连续 delta
+ * 累积为一条发出，eventDetail 是 parts 拼接全文（下游 WorkerMirrorStore 靠它重建
+ * 完整转录，一个字节都不能丢）——否则每个 token 一条事件会打满 TUI 帧。flush
+ * 触发：尾沿定时器到时 / 同 worker kind 切换（text↔thinking，先 flush 旧槽再起
+ * 新槽）/ 该 worker 任意非流式事件到达（非流式事件不合并、不延迟，先 flush 再
+ * 即时透传，保持时序）。
  */
 export function createDelegationActivityMapper(
   parentToolId: string,
@@ -66,18 +89,23 @@ export function createDelegationActivityMapper(
   // 管着——objective 恰好为空时，contract 会跟着每条事件重发，下游按「首条才带」
   // 的约定去重就会漏。
   const contractSent = new Set<string>()
+  const coalesceMs = opts?.coalesceMs ?? DEFAULT_COALESCE_MS
+  // pending 槽 flush 即删；槽数受单次委派的 worker 数约束，不随事件流增长。
+  const pending = new Map<string, PendingStreamSlot>()
 
-  return (event: WorkerActivityEvent) => {
-    let c = counters.get(event.workOrderId)
+  const counterOf = (workOrderId: string) => {
+    let c = counters.get(workOrderId)
     if (!c) {
       c = { toolUseCount: 0, tokenCount: 0 }
-      counters.set(event.workOrderId, c)
+      counters.set(workOrderId, c)
     }
-    if (event.kind === 'tool_use') c.toolUseCount += 1
-    if (event.kind === 'turn') {
-      const n = Number(event.detail)
-      if (Number.isFinite(n) && n > c.tokenCount) c.tokenCount = n
-    }
+    return c
+  }
+
+  // 实际发出一条 activity。objective/contract 的「首条携带、查不到下条再试」
+  // 记账以发出时刻为准——被合并延迟的首条事件照常携带。
+  const emit = (event: WorkerActivityEvent, detail: string | undefined) => {
+    const c = counterOf(event.workOrderId)
     const line = activityProgressLine(event)
     let objective: string | undefined
     let contract: ContractProjection | undefined
@@ -103,9 +131,51 @@ export function createDelegationActivityMapper(
       toolUseCount: c.toolUseCount,
       tokenCount: c.tokenCount > 0 ? c.tokenCount : undefined,
       eventKind: event.kind,
-      eventDetail: event.detail,
+      eventDetail: detail,
       ...(contract ? { contract } : {}),
     })
+  }
+
+  const flushPending = (workOrderId: string) => {
+    const slot = pending.get(workOrderId)
+    if (!slot) return
+    if (slot.timer) clearTimeout(slot.timer)
+    pending.delete(workOrderId)
+    const merged: WorkerActivityEvent = { ...slot.base }
+    if (slot.objective !== undefined) merged.objective = slot.objective
+    if (slot.contract !== undefined) merged.contract = slot.contract
+    emit(merged, slot.parts.join(''))
+  }
+
+  return (event: WorkerActivityEvent) => {
+    if (event.kind === 'text' || event.kind === 'thinking') {
+      const cur = pending.get(event.workOrderId)
+      if (cur && cur.kind !== event.kind) flushPending(event.workOrderId)
+      let slot = pending.get(event.workOrderId)
+      if (!slot) {
+        slot = { kind: event.kind, parts: [], base: event }
+        pending.set(event.workOrderId, slot)
+      }
+      if (event.detail) slot.parts.push(event.detail)
+      if (slot.objective === undefined && event.objective !== undefined) slot.objective = event.objective
+      if (slot.contract === undefined && event.contract !== undefined) slot.contract = event.contract
+      // 尾沿定时器：每个新 delta 重置；unref 不拖进程退出。
+      if (slot.timer) clearTimeout(slot.timer)
+      const timer = setTimeout(() => flushPending(event.workOrderId), coalesceMs)
+      if (typeof timer.unref === 'function') timer.unref()
+      slot.timer = timer
+      return
+    }
+    // 非流式事件：先 flush 该 worker 的 pending（合并事件按到达时序携带此前计数），
+    // 再更新计数并即时透传本事件。
+    flushPending(event.workOrderId)
+    const c = counterOf(event.workOrderId)
+    if (event.kind === 'tool_use') c.toolUseCount += 1
+    if (event.kind === 'turn') {
+      const n = Number(event.detail)
+      if (Number.isFinite(n) && n > c.tokenCount) c.tokenCount = n
+    }
+    emit(event, event.detail)
   }
 }
 

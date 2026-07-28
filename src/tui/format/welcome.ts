@@ -1,7 +1,7 @@
 /**
  * T9 格式化函数 — 首屏欢迎（概念 D「星阁」定稿：圆角框 + 北斗刊头 + 单列正文）。
  *
- * 渲染结构（9 行）：
+ * 渲染结构（10 行）：
  *   ╭─ 天枢  T I Ā N S H Ū  Code ───────────────────────────── v2.23.0 ─╮
  *   │ ✦────────∙─────✦────✧──────✧──────────────────────────────       │
  *   │ ╰─✧────✧─╯                                                       │
@@ -9,7 +9,8 @@
  *   │ deepseek-v4 · ◎high · auto-safe                                  │
  *   │ ~/app/deepseek-tui/opencode-tui · #7281                          │
  *   │                                                                  │
- *   │ /init 生成项目说明   /domain 切换星域   /help 全部命令 · ctrl+p    │
+ *   │ /init 生成项目说明   /domain 切换星域   /help 全部命令 · ctrl+esc  │
+ *   │ ⏜ /handoff 上下文 50%–70% 时交接给新会话                          │
  *   ╰──────────────────────────────────────────────────────────────────╯
  *
  * 设计纪律：
@@ -61,7 +62,8 @@ export interface FormatWelcomeInput {
   separator?: string
 }
 
-/** 星阁 9 行框 + 首尾呼吸空行 2 行 + 输入框 3 行 + 底部状态栏余量。 */
+/** 星阁框 + 首尾呼吸空行 2 行 + 输入框 3 行 + 底部状态栏余量。
+ *  框体行数动态：北斗 3 行（含空行）+ 配置/位置 2 行 + 引导 1 行 + handoff 提示 1 行 = 7 内容行 + 顶底框 2 = 9 框体行。 */
 const BANNER_ROWS = 11
 const RESERVED_ROWS = 5
 
@@ -93,7 +95,7 @@ const DIPPER_BOWL = [
 const TIPS = [
   { cmd: '/init', desc: '生成项目说明' },
   { cmd: '/domain', desc: '切换星域' },
-  { cmd: '/help', desc: '全部命令 · ctrl+p 命令面板' },
+  { cmd: '/help', desc: '全部命令 · ctrl+esc 命令面板' },
 ] as const
 
 function truncateToWidth(text: string, maxWidth: number): string {
@@ -285,6 +287,13 @@ export function formatWelcome(input: FormatWelcomeInput, theme: RivetTheme): str
     tipsPlain = next
   }
   if (tipsText) body.push('', tipsText)
+
+  // handoff 提示行：使用中提醒（非启动引导），独立成行避免贪心装填挤压。
+  // 与会话中 formatHandoffNudge 同口径——首屏先埋一次认知，过半时再提醒。
+  // 内容不带边线（row() 统一加），超宽时 truncateToDisplayWidth 安全截断带色串。
+  const handoffFull = `${color('⏜', theme.secondary)} ${color('/handoff', theme.brandColor)} ${color('上下文 50%–70% 时交接给新会话（文档自动注入，比续跑省前缀重建）', theme.muted)}`
+  const handoffShort = `${color('⏜', theme.secondary)} ${color('/handoff', theme.brandColor)} ${color('上下文过半时交接给新会话', theme.muted)}`
+  body.push(displayWidth(handoffFull, cal) > inner ? handoffShort : handoffFull)
 
   // 首尾空行是呼吸位：清屏后不贴顶边，底框也不与输入框顶框直接粘连
   // （main.ts 把输入框 append 在欢迎页正下方）。

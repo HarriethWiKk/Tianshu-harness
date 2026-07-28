@@ -219,7 +219,7 @@ export function formatWorkerFleet(
  * 与 live 树的差异：无活动续行，每 worker 一行附带终态摘要尾（≤50 字符）；
  * 头行聚合全组统计（通过数/总工具/总 token/最长耗时）。超过 maxRows 折叠
  * 为 `…(+N)`。workers 应为同一委派组的终态视图（FleetRegistry.clearGroup
- * 的返回值）。
+ * 返回值的 settled 字段）。
  *
  * 头行配色：全部通过 → success；任一失败/受阻 → warning。
  */

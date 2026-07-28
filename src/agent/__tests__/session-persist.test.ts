@@ -1,9 +1,9 @@
 import { describe, it, beforeEach, afterEach, before, after, mock } from 'node:test'
 import assert from 'node:assert/strict'
-import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, mkdirSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { MAX_SESSION_MESSAGE_JSON_CHARS, SessionPersist, evictOldSessionsInternal, projectSlug, serializeSessionMessage, formatExitSummary } from '../session-persist.js'
+import { MAX_SESSION_MESSAGE_JSON_CHARS, SessionPersist, evictOldSessionsInternal, getSessionDir, projectSlug, serializeSessionMessage, formatExitSummary, shouldAutoWriteHandoff } from '../session-persist.js'
 import type { OaiMessage } from '../../api/oai-types.js'
 
 describe('SessionPersist', () => {
@@ -680,5 +680,118 @@ describe('formatExitSummary（退出回连指引）', () => {
     const out = formatExitSummary({ title: long, turnCount: 1 }, SID)
     assert.ok(out)
     assert.ok(!out!.includes('x'.repeat(61)), '标题应截断')
+  })
+})
+
+
+describe('SessionPersist — 冻结前缀快照（resume 缓存继承）', () => {
+  let tempDir: string
+
+  beforeEach(() => {
+    tempDir = mkdtempSync(join(tmpdir(), 'rivet-test-'))
+    process.env.RIVET_SESSION_DIR = tempDir
+  })
+
+  afterEach(() => {
+    rmSync(tempDir, { recursive: true, force: true })
+    delete process.env.RIVET_SESSION_DIR
+  })
+
+  const sampleSnapshot = () => ({
+    v: 1 as const,
+    frozenUserMerged: [['m1', ['snapshot-a', 'snapshot-b']] as [string, string[]]],
+    frozenPendingMerged: [['m2', 'pending-c'] as [string, string]],
+    firstUserKey: 'm1',
+    collapseWatermark: 42,
+    collapseTokenStep: 7,
+  })
+
+  it('writeFrozenSnapshot → readFrozenSnapshot 往返一致', () => {
+    const persist = new SessionPersist('frozen-session-001', tempDir)
+    persist.writeFrozenSnapshot(sampleSnapshot())
+    assert.deepEqual(persist.readFrozenSnapshot(), sampleSnapshot())
+  })
+
+  it('无文件 / 坏 JSON / 坏形状一律降级 undefined', () => {
+    const persist = new SessionPersist('frozen-session-002', tempDir)
+    assert.equal(persist.readFrozenSnapshot(), undefined, '无文件')
+
+    const frozenPath = join(getSessionDir(tempDir), 'frozen-session-002.frozen.json')
+    writeFileSync(frozenPath, '{not json')
+    assert.equal(persist.readFrozenSnapshot(), undefined, '坏 JSON')
+
+    writeFileSync(frozenPath, JSON.stringify({ v: 2, frozenUserMerged: [], frozenPendingMerged: [], firstUserKey: null, collapseWatermark: 0, collapseTokenStep: -1 }))
+    assert.equal(persist.readFrozenSnapshot(), undefined, '版本不符')
+  })
+
+  it('evictOldSessionsInternal 连带删除 .frozen.json', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'rivet-evict-'))
+    try {
+      // 造 limit+1 个会话，最老的带 frozen 文件
+      for (let i = 0; i < 4; i++) {
+        const id = `evict-${String(i).padStart(3, '0')}`
+        const p = join(dir, `${id}.jsonl`)
+        writeFileSync(p, '{}')
+        // mtime 递增保证淘汰序确定
+        const t = new Date(Date.now() - (100 - i) * 1000)
+        utimesSync(p, t, t)
+      }
+      writeFileSync(join(dir, 'evict-000.frozen.json'), '{}')
+      const evicted = evictOldSessionsInternal(dir, 'evict-003', 3)
+      assert.deepEqual(evicted, ['evict-000'])
+      assert.ok(!existsSync(join(dir, 'evict-000.frozen.json')), 'frozen 文件应随会话一并淘汰')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+
+describe('formatExitSummary — 缓存成本备注', () => {
+  it('含回连缓存成本提醒（TTL 内继承锚点 / 过期全量重建）', () => {
+    const out = formatExitSummary({ title: 't', turnCount: 5 }, '3f415454-aaaa-bbbb-cccc-1234567890ab')
+    assert.ok(out)
+    assert.match(out!, /缓存成本/)
+    assert.match(out!, /继承冻结锚点/)
+    assert.match(out!, /全量重建一次前缀/)
+  })
+})
+
+describe('shouldAutoWriteHandoff — shutdown 自动交接防覆盖', () => {
+  const SESSION_START = 1_000_000
+
+  it('无既有文件 → 写（兜底）', () => {
+    assert.equal(shouldAutoWriteHandoff(null, SESSION_START), true)
+  })
+
+  it('旧文件（mtime ≤ 会话开始）→ 重写（上一会话/本次未手动交接）', () => {
+    assert.equal(shouldAutoWriteHandoff(SESSION_START - 1, SESSION_START), true)
+    assert.equal(shouldAutoWriteHandoff(SESSION_START, SESSION_START), true)
+  })
+
+  it('会话内更新的文件（mtime > 会话开始）→ 跳过（/handoff 或人工编辑不被摘要覆盖）', () => {
+    assert.equal(shouldAutoWriteHandoff(SESSION_START + 1, SESSION_START), false)
+  })
+})
+
+describe('SessionPersist — getHandoffPath', () => {
+  let tempDir: string
+
+  beforeEach(() => {
+    tempDir = mkdtempSync(join(tmpdir(), 'rivet-test-'))
+    process.env.RIVET_SESSION_DIR = tempDir
+  })
+
+  afterEach(() => {
+    rmSync(tempDir, { recursive: true, force: true })
+    delete process.env.RIVET_SESSION_DIR
+  })
+
+  it('返回会话目录下 <id>.handoff.md，writeHandoff 写入同一路径', () => {
+    const persist = new SessionPersist('handoff-path-001', tempDir)
+    const p = persist.getHandoffPath()
+    assert.ok(p.endsWith('handoff-path-001.handoff.md'))
+    persist.writeHandoff('# 交接')
+    assert.ok(existsSync(p), 'writeHandoff 与 getHandoffPath 同路径')
   })
 })

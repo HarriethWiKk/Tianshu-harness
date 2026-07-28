@@ -45,10 +45,19 @@ export function boxCharsFor(separator: string): BoxCharSet {
 
 /**
  * 框内内容区宽度（不含 `│ ` 与 ` │`）。首屏欢迎框与输入框共用，保证等宽。
- * 下限 20 是输入框可用性底线：再窄就没法编辑了。
+ *
+ * 硬约束：框体外宽 = inner + 4（`│ ` + inner + ` │`）必须 ≤ columns，否则
+ * 右边线折到下一行。故 inner 上限 = columns - 4。
+ *
+ * - columns >= 26：`columns - 6`（在上限内再留 2 列呼吸）—— 正常终端
+ * - columns < 26：`columns - 4`（框体顶满，外宽 = columns，贴右边界不超出）
+ * - 下限 0：columns < 4 时框体无法成立，返回 0 让上层降级（极罕见）
+ *
+ * 此前固定下限 20 会让 < 26 列终端的框体外宽(24)超出边界、右边线折行。
  */
 export function boxInnerWidth(columns: number): number {
-  return Math.max(20, columns - 6)
+  if (columns >= 26) return columns - 6
+  return Math.max(0, columns - 4)
 }
 
 /**

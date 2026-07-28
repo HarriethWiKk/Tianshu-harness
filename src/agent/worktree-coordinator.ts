@@ -1,4 +1,4 @@
-import { createWorktree, removeWorktree } from './worktree.js'
+import { createWorktreeAsync, removeWorktreeAsync } from './worktree.js'
 
 export interface WorktreeHandle {
   path: string
@@ -11,6 +11,10 @@ export interface WorktreeHandle {
  * isolated from the primary session's working directory.
  *
  * Worktrees are cleaned up when the worker completes or fails.
+ *
+ * All git operations are async: `git worktree add/remove` is a full-tree
+ * checkout — seconds on large repos — and the hands dispatch/recycle path runs
+ * on the same event loop as the TUI, which must not freeze.
  */
 export class WorktreeCoordinator {
   private active: Map<string, WorktreeHandle> = new Map()
@@ -21,30 +25,30 @@ export class WorktreeCoordinator {
    * Create a new worktree for a worker session.
    * Cleans up any stale worktree for the same worker id first.
    */
-  create(workerId: string): WorktreeHandle {
+  async create(workerId: string): Promise<WorktreeHandle> {
     // Cleanup any stale worktree for this worker id
-    this.remove(workerId)
+    await this.remove(workerId)
 
     const branch = `rivet-hands-${workerId.slice(0, 8)}`
-    const wt = createWorktree(this.baseCwd, workerId, branch)
+    const wt = await createWorktreeAsync(this.baseCwd, workerId, branch)
     const handle: WorktreeHandle = { path: wt.path, branch: wt.branch }
     this.active.set(workerId, handle)
     return handle
   }
 
   /** Remove a worktree by worker id. No-op if not found. */
-  remove(workerId: string): void {
+  async remove(workerId: string): Promise<void> {
     const handle = this.active.get(workerId)
     if (handle) {
-      removeWorktree(this.baseCwd, handle.path, handle.branch)
+      await removeWorktreeAsync(this.baseCwd, handle.path, handle.branch)
       this.active.delete(workerId)
     }
   }
 
   /** Remove all active worktrees. Best-effort. */
-  cleanupAll(): void {
+  async cleanupAll(): Promise<void> {
     for (const [id] of this.active) {
-      this.remove(id)
+      await this.remove(id)
     }
   }
 
