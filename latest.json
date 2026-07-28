@@ -1,11 +1,19 @@
 {
   "version": "2.24.2",
   "notes": "会话交接闭环 + 玻璃/主题修复 + TUI 输入优化 + README 大扩充",
-  "pub_date": "2026-07-28T02:23:05.622Z",
+  "pub_date": "2026-07-28T05:06:45.534Z",
   "platforms": {
     "windows-x86_64": {
       "url": "https://github.com/huiliyi37/Tianshu-Tui/releases/download/v2.24.2/Tianshu_2.24.2_x64-setup.exe",
       "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaDZmcFdBUytLR1laQlNDY2hlMVlUdjZya3NPWXh0STlqNG9EVi9sMmVpYnR5VFFHQ3BUK3ErWVRweVR0Y2pQU1BUdFY0S1RwVm5SZy9FQlVsRHlpOVBzNGtpbXZBWEE4PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg1MjA4MzI1CWZpbGU6VGlhbnNodV8yLjI0LjJfeDY0LXNldHVwLmV4ZQowRWo1TWtnZHQ5bTkzcDZsbjdYbmxOcEhaRkJIalJhY3MwazUxdDA3SG9ucVBIbWc3bEhxLzZ4bzljblVodnprbmFxN3dNQzBDcW9JVTZqQ29Oc3pDQT09Cg=="
+    },
+    "darwin-aarch64": {
+      "url": "https://github.com/huiliyi37/Tianshu-Tui/releases/download/v2.24.2/Tianshu_2.24.2_aarch64.app.tar.gz",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaDZmcFdBUytLR2IxVUpjVU1Md1pGbTlsRjVSZFZrL3Rma1BIRDBZdHJXeVlEZWttUndrTElPTkZIWDFUd0Q1NzczRzV4L0dSN1VRUkc0M0hQamhIWC9DVncvNktURVFVPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg1MjExNjk4CWZpbGU6VGlhbnNodS5hcHAudGFyLmd6CnpMRzhJRmFVcGRiTmFSdk5ldS9qU0JQYVRCMjdUMk8xQ3B3RUo5TGpuUmF0UkZNTk43QVRFV0MwcDV0eU5vbS8rcjdwOVZlTTRlZzNLU0lJUXpHSkR3PT0K"
+    },
+    "darwin-x86_64": {
+      "url": "https://github.com/huiliyi37/Tianshu-Tui/releases/download/v2.24.2/Tianshu_2.24.2_x64.app.tar.gz",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaDZmcFdBUytLR1k1b0dlVGRjS0kyWE1oMzRXYmtQdFEwM2pyazZjdURxMmF5Y1lYR1ZGZWw4VUVtcVdTWHIrSlR1S00yTS9ub3d6R1F1K1UwQ2YrdElEdFcra3BPRFFzPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg1MjE1MTk4CWZpbGU6VGlhbnNodS5hcHAudGFyLmd6ClhxSmxsOVY1WXV4TVdyNWw4cWVMMUVhVnlaWTFzbXJsYlZqdHVVWTJQcjY4eVgrVGh5QUYzR2JTSnFGOWI2UUN4d0E3YkdOT3FMZkNaNXVGdW11QkFRPT0K"
     }
   }
 }
