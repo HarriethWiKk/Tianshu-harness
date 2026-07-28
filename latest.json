@@ -1,19 +1,11 @@
 {
-  "version": "2.24.0",
-  "notes": "星域图鉴创世碑文 + 后台 Job 可视化 + 子代理输出档 16384 + 读类豁免风暴折叠 + 诊断态分流 + 桌面端体验全线优化",
-  "pub_date": "2026-07-27T08:00:00.000Z",
+  "version": "2.24.2",
+  "notes": "会话交接闭环 + 玻璃/主题修复 + TUI 输入优化 + README 大扩充",
+  "pub_date": "2026-07-28T02:23:05.622Z",
   "platforms": {
-    "darwin-aarch64": {
-      "url": "https://github.com/huiliyi37/Tianshu-Tui/releases/download/v2.24.0/Tianshu_2.24.0_aarch64.app.tar.gz",
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaDZmcFdBUytLR1VLOExGdHRXM2FhTEcwZkNYR1MxRGRpbllVRVl0TFlRSTJ4ZFQyMGppVnJrOXlVVHhXU1c1NVVjL0dhTldSR284blZXc0ZNY2lQWDYzUTBaclVBOGdVPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg1MTM3NDUyCWZpbGU6VGlhbnNodV8yLjI0LjBfYWFyY2g2NC5hcHAudGFyLmd6CkU2Rk8wWWtkVitpN1JJOTFxREJ0ZnJMdG9iZktUNEdtQjB0eTlmcW9SMHJHVEl2ZG1YRXRyZ200ZG1QTWMrSmIzd0s1MUdIWFk4Z1ZsZ0lQRWxoOEJRPT0K"
-    },
-    "darwin-x86_64": {
-      "url": "https://github.com/huiliyi37/Tianshu-Tui/releases/download/v2.24.0/Tianshu_2.24.0_x64.app.tar.gz",
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaDZmcFdBUytLR2NaSlIxaTQyOXowWjJwVno5RDQvamlUUWdON1E1cHBDT2s3WDVPeVROZmdrbjFvOHZkMndkTXJFYlNCWnkzZllIbnh3WEJtakxFdFRGSVpnUXZhS1FrPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg1MTM3NDYzCWZpbGU6VGlhbnNodV8yLjI0LjBfeDY0LmFwcC50YXIuZ3oKd2lkQWNiaWlEU3dhOTRKTU9RSExodjIreVlPMlpmcklRYTdOMHMxaHFobkgyZThlRkNGK0JySDFPNXdJWHh1bEkyZlhRTCtzNmdKUmpRK1BWZEEwQ1E9PQo="
-    },
     "windows-x86_64": {
-      "url": "https://github.com/huiliyi37/Tianshu-Tui/releases/download/v2.24.0/Tianshu_2.24.0_x64-setup.exe",
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaDZmcFdBUytLR1dNNkYwQjNuQWxnTnZLandQUWNkalFVNno1dmFMd3VPaElrQ2xtcTZlU200VnhtUjNoeUxxTkU0SERWeVB4UWdmNml1Tk9jemxpamlCL3NUeFljY0FVPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg1MTQ2MDI0CWZpbGU6VGlhbnNodV8yLjI0LjBfeDY0LXNldHVwLmV4ZQo4VmllWW4rZU9NNzBVZGJLTFc2RnNWZmZnTXB0citrMzBjeUlhVlRoRHJiT1FFaXJ3L0p0TEJ4NC9QM3dSbGJJck1OUGdTMHVZSm1ITDVLaU9pbk9BQT09Cg=="
+      "url": "https://github.com/huiliyi37/Tianshu-Tui/releases/download/v2.24.2/Tianshu_2.24.2_x64-setup.exe",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaDZmcFdBUytLR2QrVXlJTG5xNUd3RElzQVQ2dlNtM1dVMlY3VzRzOVZtdzhYbllXNVdQODIyRjhoY2VzaUs2b3VMZURtN1F0OWo1QUlJNkhxWU1DOXNnenRKQUFTZHdrPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg1MjA1MDkwCWZpbGU6VGlhbnNodV8yLjI0LjJfeDY0LXNldHVwLmV4ZQpEbzNKbU01MzNqaWpoQXE3RUY5a01rL29ieE5vdFpXMGFlTUJXVDN1WnhQOHFvTEllbkRvL25GK1czbW05WjZ0SmdwZVQ2NTdnNE9wRHFVY2JQVHpEZz09Cg=="
     }
   }
 }
