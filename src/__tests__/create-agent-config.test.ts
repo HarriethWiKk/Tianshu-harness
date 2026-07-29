@@ -50,6 +50,7 @@ const testConfig = {
     permissions: { allow: [], deny: [], bash: { allowlist: [], denylist: [] }, additionalReadDirs: [], additionalWriteDirs: [] },
     review: { profiles: {}, skipAuto: false, mechanicalFastPath: true },
     goal: { judge: { enabled: true, maxRuns: 3, browser: false } },
+    delivery: { autoCommit: true },
   },
   compact: { enabled: true, autoThreshold: 800_000, autoFloor: 500_000, model: 'flash', qualityCompact: { perTokenThreshold: 0.55, subscriptionThreshold: 0.45, subscriptionCeiling: 0.6 } },
 } satisfies Pick<Config, 'agent' | 'compact'>

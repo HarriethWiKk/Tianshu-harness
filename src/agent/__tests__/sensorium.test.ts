@@ -587,4 +587,42 @@ describe('computePressure pressureRelative wiring (v3)', () => {
     const s = computeSensorium(prInput({ ratio: 0.05, pressureRelative: 1.0 }))
     assert.ok(s.pressure >= 0.5, `cold-start saturation should give high pressure, got ${s.pressure}`)
   })
+
+  it('高绝对占用不得被低相对压力盖掉', () => {
+    // pressureRelative 改为「超出近期基线的幅度」后，平缓填满上下文的会话
+    // 相对值接近 0——若仍按 `pressureRelative ?? ratio` 取值，上下文已用掉
+    // 85% 却会读成近乎无压力。两者取较大：满窗和突增都不漏。
+    const s = computeSensorium(prInput({ ratio: 0.85, pressureRelative: 0.02 }))
+    assert.ok(s.pressure > 0.4, `绝对占用 85% 必须体现为高压，实得 ${s.pressure}`)
+  })
+})
+
+// ─── stability 的地板（`stability < 0.3` 类判据的定性依据）────────────
+
+describe('stability 地板由 doomBase 决定', () => {
+  function worstCase(doomLevel: SensoriumInput['doomLevel']): Sensorium {
+    // 除 doom 外把每个分量都压到最差：预测全错、工具全同、改了文件但零验证。
+    return computeSensorium({
+      predictionAcc: { windowSize: 10, predictions: [false, false, false, false, false], consecutiveCorrect: 0 },
+      pressureResult: { tier: 0, shouldCompact: false, thrashing: false, fastGrowth: false, growthRate: 0, cvmOverheadRatio: 0, shouldThrottleCvm: false, ratio: 0.3 },
+      evidenceState: { filesModified: 5, verifiedCount: 0 },
+      toolCallHistory: ['read_file', 'read_file', 'read_file', 'read_file', 'read_file'],
+      pheromones: [],
+      doomLevel,
+    })
+  }
+
+  it("doom='none' 时 stability 不可能低于 0.36 —— 所以 stability<0.3 是 doom 的二次确认", () => {
+    // computeStability 里 doomBase 占 0.40 权重，doom='none' 时该项即 0.40×0.90=0.36。
+    // 901 帧实测最低 0.48、`stability < 0.3` 发火率 0.0%，与此推导一致。改写那条判据
+    // 前必须先有 doom 档位分布（vitals-lite 已补该字段）。
+    const s = worstCase('none')
+    assert.ok(s.stability >= 0.36, `doom=none 的最差情形应 ≥0.36，实得 ${s.stability}`)
+    assert.equal(s.stability < 0.3, false)
+  })
+
+  it("doom='blocked' 才让 stability 跌进 <0.3 区间", () => {
+    const s = worstCase('blocked')
+    assert.ok(s.stability < 0.3, `doom=blocked 的最差情形应 <0.3，实得 ${s.stability}`)
+  })
 })

@@ -27,7 +27,7 @@ describe('presetIncludes', () => {
     for (const keep of ['read_file', 'bash', 'grep', 'web_search', 'web_fetch', 'deliver_task', 'delegate_task', 'delegate_batch', 'apply_patch', 'plan_task', 'recall_capsule', 'ask_user_question']) {
       assert.ok(presetIncludes('minimal', keep), `minimal must keep ${keep}`)
     }
-    for (const drop of ['council_convene', 'team_orchestrate', 'browser_debug', 'attack_case', 'semantic_search', 'repo_graph', 'undo', 'recall_general', 'record_general_finding', 'ast_edit', 'related_tests', 'inspect_project', 'import_resource', 'leave_mark', 'file_info', 'session_vitals', 'update_goal']) {
+    for (const drop of ['council_convene', 'browser_debug', 'attack_case', 'semantic_search', 'repo_graph', 'undo', 'recall_general', 'record_general_finding', 'ast_edit', 'related_tests', 'inspect_project', 'import_resource', 'leave_mark', 'file_info', 'session_vitals', 'update_goal']) {
       assert.ok(!presetIncludes('minimal', drop), `minimal must drop ${drop}`)
     }
   })
@@ -44,9 +44,9 @@ describe('presetIncludes', () => {
 })
 
 describe('assembly counts per preset', () => {
-  it('minimal=27 / frontend=28 / full=47（完整装配口径）', () => {
-    assert.equal(totalCount('minimal'), 27)
-    assert.equal(totalCount('frontend'), 28)
+  it('minimal=28 / frontend=29 / full=47（完整装配口径）', () => {
+    assert.equal(totalCount('minimal'), 28)
+    assert.equal(totalCount('frontend'), 29)
     // 118d0505：monitor 工具（full 档专属）入注册表，full 44 → 45
     // B3：web_crawl/web_map（full 档专属）入注册表，full 45 → 47
     assert.equal(totalCount('full'), 47)
@@ -112,6 +112,65 @@ describe('resolveToolPreset precedence', () => {
 
   it('invalid values fall back to minimal', () => {
     writeFileSync(join(dir, '.rivet-config.json'), JSON.stringify({ tools: { preset: 'huge' } }))
+    __resetToolPresetForTest()
+    assert.equal(resolveToolPreset(dir), 'minimal')
+  })
+})
+
+// 读侧必须与写侧（saveToolPresetConfig → userConfigPath）同源。曾经读的是
+// defaultRivetHome()，桌面端便携模式 / 自定义存储路径下设置页改档位静默无效。
+describe('resolveToolPreset honors the active data root', () => {
+  let dir: string
+  let home: string
+  let prevHome: string | undefined
+  let prevConfigPath: string | undefined
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'tool-preset-cwd-'))
+    home = mkdtempSync(join(tmpdir(), 'tool-preset-home-'))
+    prevHome = process.env.RIVET_HOME
+    prevConfigPath = process.env.RIVET_CONFIG_PATH
+    delete process.env.RIVET_TOOL_PRESET
+    delete process.env.RIVET_CONFIG_PATH
+    __resetToolPresetForTest()
+  })
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true })
+    rmSync(home, { recursive: true, force: true })
+    if (prevHome === undefined) delete process.env.RIVET_HOME
+    else process.env.RIVET_HOME = prevHome
+    if (prevConfigPath === undefined) delete process.env.RIVET_CONFIG_PATH
+    else process.env.RIVET_CONFIG_PATH = prevConfigPath
+    delete process.env.RIVET_TOOL_PRESET
+    __resetToolPresetForTest()
+  })
+
+  it('RIVET_HOME 下的 config.json tools.preset 生效', () => {
+    writeFileSync(join(home, 'config.json'), JSON.stringify({ tools: { preset: 'frontend' } }))
+    process.env.RIVET_HOME = home
+    __resetToolPresetForTest()
+    assert.equal(resolveToolPreset(dir), 'frontend')
+  })
+
+  it('RIVET_CONFIG_PATH 直指某个文件时也生效', () => {
+    const explicit = join(home, 'elsewhere.json')
+    writeFileSync(explicit, JSON.stringify({ tools: { preset: 'full' } }))
+    process.env.RIVET_CONFIG_PATH = explicit
+    __resetToolPresetForTest()
+    assert.equal(resolveToolPreset(dir), 'full')
+  })
+
+  it('项目配置仍然压过用户配置', () => {
+    writeFileSync(join(home, 'config.json'), JSON.stringify({ tools: { preset: 'full' } }))
+    writeFileSync(join(dir, '.rivet-config.json'), JSON.stringify({ tools: { preset: 'frontend' } }))
+    process.env.RIVET_HOME = home
+    __resetToolPresetForTest()
+    assert.equal(resolveToolPreset(dir), 'frontend')
+  })
+
+  it('数据根下没有 config.json 时回落 minimal', () => {
+    process.env.RIVET_HOME = home
     __resetToolPresetForTest()
     assert.equal(resolveToolPreset(dir), 'minimal')
   })

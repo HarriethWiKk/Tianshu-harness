@@ -80,12 +80,23 @@ export interface SpinnerStatusInput {
   phase: SpinnerPhase
   elapsedMs: number
   stalled?: boolean
+  /**
+   * 审批等待中（onApprovalRequired 挂起）。设置后 spinner 不再轮换「思索中」
+   * 动词冒充模型活动，改为如实显示「等待审批 <tool> · Ns」——把「失去响应」
+   * 变成「可见的等待」。waitMs 是审批等待时长（非 turn 时长）。
+   */
+  approvalWait?: { toolName: string; waitMs: number }
 }
 
 export function formatSpinnerStatus(input: SpinnerStatusInput, theme: RivetTheme): string | null {
   if (input.phase === 'idle') return null
   const useAscii = useAsciiGlyphs()
   const frame = spinnerFrame(input.tick, useAscii)
+  if (input.approvalWait) {
+    const { toolName, waitMs } = input.approvalWait
+    const text = `${frame} 等待审批 ${toolName} · ${formatElapsedHuman(waitMs)}`
+    return color(text, theme.warning)
+  }
   const label = `${verbFor(input.elapsedMs)}…`
   const text = `${frame} ${label} ${formatElapsedHuman(input.elapsedMs)}`
   const phaseColor: Record<SpinnerPhase, string> = {

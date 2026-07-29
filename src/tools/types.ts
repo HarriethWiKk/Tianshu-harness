@@ -17,6 +17,10 @@ export interface DelegationActivity {
   workOrderId: string
   /** The delegation tool call that spawned this worker (delegation tree parent). */
   parentToolId: string
+  /** 派发这个 worker 的父 worker 的 work order id（嵌套委派专属）。顶层
+   *  委派缺省——parentToolId 已足够把 worker 挂到工具卡下；只有 worker 再派
+   *  sub-worker 时由 coordinator 盖章，UI 据此渲染真实父子层级。 */
+  parentWorkerId?: string
   profile?: string
   /** 星域 id（星名来源），从 WorkerActivityEvent.authority 透传。 */
   authority?: string

@@ -744,6 +744,11 @@ export class TurnStepProducer {
         } : null,
         confidenceMeasured: s?.quality?.confidence === 'measured',
         decisivenessMeasured: s?.decisiveness != null,
+        // doom 档位（2026-07-29 补）：stability 的地板由 doomBase 的 0.40 权重决定，
+        // 不带这一档就无法判断 `stability < 0.3` 类判据该改写成什么——那条判据的
+        // 定性至今卡在缺这个分布上。注意 doomLevel 只在 SensoriumInput 上，
+        // Sensorium 快照本身不携带，所以这里从 loop 侧现取。
+        doomLevel: this.self.getDoomLoopLevel(),
         ctxRatio: r2(pressureResult.ratio),
         cvmOverheadRatio: Math.round(pressureResult.cvmOverheadRatio * 10_000) / 10_000,
         throttled: pressureResult.shouldThrottleCvm,

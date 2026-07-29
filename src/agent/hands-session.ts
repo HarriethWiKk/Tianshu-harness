@@ -153,11 +153,14 @@ export async function runHandsSession(config: HandsSessionConfig): Promise<Hands
   config.order.workerCwd = wt.path
   try {
     const scopeResult = materializeScope(config.cwd, wt.path, worktreeScopeFiles(config.order))
+    // Only block on genuinely unreachable scope entries (path escape / outside
+    // repo). Files that don't exist yet in base (toBeCreated) are expected for
+    // new-file-creating tasks — the worker will create them. T1 fix, 2026-07-29.
     if (scopeResult.missing.length > 0) {
       return {
         result: buildBlockedWorkerResult(
           config.order,
-          `Worker scope file(s) are missing or outside the project: ${scopeResult.missing.join(', ')}`,
+          `Worker scope file(s) are outside the project: ${scopeResult.missing.join(', ')}`,
         ),
         usage: {},
      }

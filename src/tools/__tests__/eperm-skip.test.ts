@@ -1,6 +1,7 @@
 import { describe, it, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync, existsSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync, readdirSync } from 'node:fs'
+import type { Dirent } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 
@@ -29,12 +30,32 @@ const isWindows = process.platform === 'win32'
 const isRoot = process.getuid?.() === 0
 const shouldSkip = isWindows || isRoot
 
-/** Create a temp dir under cwd (not /var/folders — sandboxed tmpdir may block mkdtemp). */
+/**
+ * 脚手架落在 OS 临时目录，**不要**落在 `process.cwd()`。
+ *
+ * 原先建在 cwd 下（`.eperm-skip-test`），理由是"沙箱 tmpdir 可能挡 mkdtemp"。那个
+ * 顾虑 runner 已经统一处理了：`scripts/run-node-tests.ts::resolveTestTmp` 先探测
+ * tmpdir 可写性，不行才回退到仓库内 `.test-tmp`，并把 TMPDIR/TMP/TEMP 指过去
+ * （两处引用的都是同一个 EPERM 起因 7cc487b2）。在这里再自己绕一遍，只会把残骸写进
+ * 仓库：本文件造的 chmod 000 目录在进程被硬杀时删不掉（afterEach 根本不执行），
+ * 曾在一个 vsw 快照里留下 `.eperm-skip-test/AppData/Local/Packages`，把 du / rm /
+ * 同步公开仓的 rsync 全卡住。
+ */
 function makeTempDir(prefix: string): string {
-  const base = join(process.cwd(), `.${prefix}`)
-  if (existsSync(base)) rmSync(base, { recursive: true, force: true })
-  mkdirSync(base, { recursive: true })
-  return base
+  return mkdtempSync(join(tmpdir(), `${prefix}-`))
+}
+
+/**
+ * 递归恢复目录权限，让 chmod 000 的目录可被删除。
+ * 不用固定子目录清单——以后新增受限目录时清单必漏，残骸又会留下。
+ */
+function restorePermissions(dir: string): void {
+  try { chmodSync(dir, 0o755) } catch { return }
+  let entries: Dirent[]
+  try { entries = readdirSync(dir, { withFileTypes: true }) } catch { return }
+  for (const entry of entries) {
+    if (entry.isDirectory()) restorePermissions(join(dir, entry.name))
+  }
 }
 
 describe('EPERM silent-skip integration', { skip: shouldSkip && 'skipped: Windows or root' }, () => {
@@ -45,15 +66,17 @@ describe('EPERM silent-skip integration', { skip: shouldSkip && 'skipped: Window
   })
 
   afterEach(() => {
-    // Restore permissions before cleanup (chmod 000 dirs are not deletable)
-    const tryChmod = (d: string) => {
-      try { chmodSync(d, 0o755) } catch { /* already gone or accessible */ }
-    }
-    for (const sub of ['.Spotlight-V100', 'user-denied', 'AppData/Local/Packages']) {
-      const p = join(tmpRoot, sub)
-      if (existsSync(p)) tryChmod(p)
-    }
+    // chmod 000 的目录删不掉，必须先恢复权限再删。
+    restorePermissions(tmpRoot)
     rmSync(tmpRoot, { recursive: true, force: true })
+  })
+
+  it('脚手架必须落在 TMPDIR 指向的位置，不能硬编码 cwd', () => {
+    // 断言的是"尊重 TMPDIR"，不是"不在仓库里"——沙箱环境下 runner 的回退目录
+    // `<cwd>/.test-tmp` 本身就在仓库内，那是有意的降级（见 resolveTestTmp）。
+    // 硬编码 cwd 才是问题：本文件造的 chmod 000 目录在进程被硬杀时删不掉，
+    // 会永久留在 git 工作树里。
+    assert.ok(tmpRoot.startsWith(tmpdir()), `脚手架应在 ${tmpdir()} 下，实得 ${tmpRoot}`)
   })
 
   /** Restricted dir that traversals actually descend into: `.Spotlight-V100` is

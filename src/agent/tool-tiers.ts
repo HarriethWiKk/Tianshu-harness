@@ -59,6 +59,11 @@ export const CORE_TOOLS = [
   // （DeepSeek V4 创建 ¥3/M、高峰 ¥6/M，一次一两块）；早期窗口挂载则等于
   // 没有这个功能。常驻是唯一缓存零成本方案——schema 字节稳定进冻结前缀。
   'attack_case',
+  // 编排入口（2026-07-29 从 EXTENDED 升入 CORE）：team_orchestrate 是唯一
+  // 能派发多 worker 波次 + 门禁 + 审查的主控工具，放在 EXTENDED 等于入口
+  // 被默认 deny-list 摘除、用户到不了这条链路。T3 修复——与 attack_case
+  // 同理由：中途挂载 = 改 tool fingerprint = 前缀全量重建。
+  'team_orchestrate',
 ] as const
 
 /**
@@ -70,8 +75,12 @@ export const EXTENDED_TOOLS = [
   'browser',
   'computer_use',
   'repo_graph',
+  // council_convene 留在 EXTENDED（不随 team_orchestrate 升入 CORE）：
+  // 议事会是多视角审查决策，使用频率远低于编排、每次调用的成本也更高
+  // （fanout 3-5 审查 worker），不适合占 CORE 常驻字节预算。
+  // 主控可用 /tools enable council_convene 或通过 team_orchestrate 触发
+  // review gate（L3 = council 审查队，语义等价但入口由编排承担）。
   'council_convene',
-  'team_orchestrate',
   'import_resource',
   'apply_patch',
   'undo',

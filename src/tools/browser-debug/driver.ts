@@ -3,7 +3,7 @@
  */
 
 import { shouldCaptureResponseBody, truncateResponseBody } from './log-capture.js'
-import { PLAYWRIGHT_INSTALL_HINT } from '../net/playwright-driver.js'
+import { PLAYWRIGHT_INSTALL_HINT, isBrowserMissingError, loadPlaywrightCore } from '../net/playwright-driver.js'
 
 export interface DriverEvents {
   onConsole(level: string, text: string): void
@@ -150,12 +150,7 @@ interface PwChromium {
 }
 
 async function loadPlaywright(): Promise<{ chromium: PwChromium }> {
-  const specifier = 'playwright-core'
-  try {
-    return (await import(specifier)) as never
-  } catch {
-    throw new Error(`Playwright chromium unavailable. ${PLAYWRIGHT_INSTALL_HINT}`)
-  }
+  return (await loadPlaywrightCore()) as never
 }
 
 function stringifyEvalResult(result: unknown): string {
@@ -427,10 +422,21 @@ function buildDriver(
 
 export const playwrightDriverFactory: BrowserDebugDriverFactory = async (opts) => {
   const mod = await loadPlaywright()
-  const context = await mod.chromium.launchPersistentContext(opts.userDataDir, {
-    headless: opts.headless,
-    viewport: opts.viewport ?? DEFAULT_VIEWPORT,
-  })
+  // 安装提示只挂在真正"浏览器可执行文件缺失"的启动失败上（与 net/playwright-driver
+  // 的 launchChromium 同口径）。挂在模块加载失败上会把排查引向错误方向。
+  let context: PwContext
+  try {
+    context = await mod.chromium.launchPersistentContext(opts.userDataDir, {
+      headless: opts.headless,
+      viewport: opts.viewport ?? DEFAULT_VIEWPORT,
+    })
+  } catch (err) {
+    if (isBrowserMissingError(err)) {
+      const msg = err instanceof Error ? err.message : String(err)
+      throw new Error(`${PLAYWRIGHT_INSTALL_HINT}\n（原始错误：${msg.split('\n')[0]}）`)
+    }
+    throw err
+  }
   const existing = context.pages()
   const page = existing.length > 0 ? existing[0]! : await context.newPage()
   const tracker = attachPageTracker(context, opts.events, page)

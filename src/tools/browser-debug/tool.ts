@@ -33,6 +33,8 @@ import {
   MIN_VIEWPORT,
   type BrowserDebugDriverFactory,
 } from './driver.js'
+import { act, extract, observe } from './ai-primitives.js'
+import type { ActionKind } from './locator.js'
 
 export interface BrowserDebugToolOptions {
   driverFactory?: BrowserDebugDriverFactory
@@ -147,6 +149,9 @@ type BrowserDebugAction =
   | 'status'
   | 'clear_logs'
   | 'close'
+  | 'act'
+  | 'extract'
+  | 'observe'
 
 function parseNavUrl(raw: string): { url: URL } | { error: string } {
   let url: URL
@@ -294,7 +299,15 @@ API 联调技巧：
 - clear_cookies — 清除所有 cookie（重置会话）
 - set_storage {kind, key, value} / clear_storage {kind} — 写入/重置 Web Storage
 - pages — 列出打开的标签页/弹窗（OAuth 弹窗自动成为操作目标）
-- status / clear_logs / await_login / close`,
+- status / clear_logs / await_login / close
+
+自然语言原语（省掉"取全量 DOM 算 selector"的往返）：
+- act {instruction, value?, action?, submit?} — 如 {instruction:"点击登录按钮"}。定位是**启发式**的
+  （文本/aria-label/placeholder 模糊匹配 + 角色加权），不是语义理解：把握不足或有多个同样像的
+  目标时**不动手**，返回候选 selector 清单让你自己选。措辞越贴近页面原文命中越准；
+  要精确指定用引号包住原文，如 {instruction:'点击 "忘记密码？" 链接'}。
+- extract {schema, selector?} — 取相关区域文本 + 你的 schema 一并返回；解析由你做，工具不解析。
+- observe {question} — 返回可交互元素清单（带 selector，可直接接 act/click）+ 页面文本；判断由你做。`,
       input_schema: {
         type: 'object',
         properties: {
@@ -306,9 +319,18 @@ API 联调技巧：
               'wait', 'cookies', 'storage', 'pages',
               'set_cookie', 'clear_cookies', 'set_storage', 'clear_storage',
               'await_login', 'status', 'clear_logs', 'close',
+              'act', 'extract', 'observe',
             ],
             description: '要执行的操作。',
           },
+          instruction: { type: 'string', description: 'act：自然语言指令，如 "点击登录按钮"。用引号包住页面原文可精确指定。' },
+          act_kind: {
+            type: 'string',
+            enum: ['click', 'type', 'select', 'hover'],
+            description: 'act：显式指定动作；不给则从措辞推断（"点击…"→click、"输入…"→type），推不出按 click。',
+          },
+          schema: { type: 'string', description: 'extract：想要的数据描述，如 "所有商品名和价格"。' },
+          question: { type: 'string', description: 'observe：想问页面的问题，如 "有没有错误提示"。' },
           url: { type: 'string', description: 'open/navigate 的目标 URL。' },
           connect_url: { type: 'string', description: 'open 的 CDP 端点，如 http://127.0.0.1:9222。' },
           request_id: { type: 'string', description: 'network_detail：来自 network 输出的 id（如 r2）。' },
@@ -319,7 +341,7 @@ API 联调技巧：
           text: { type: 'string', description: 'type 要填入的文本。' },
           submit: { type: 'boolean', description: 'type：填完后按 Enter（提交表单）。' },
           key: { type: 'string', description: 'press：键盘按键（Enter/Tab/…）；set_storage：存储键名。' },
-          value: { type: 'string', description: 'select 选项值 / set_cookie 值 / set_storage 值。' },
+          value: { type: 'string', description: 'select 选项值 / set_cookie 值 / set_storage 值 / act 要输入或选中的值（也接受 text）。' },
           state: { type: 'string', enum: ['load', 'domcontentloaded', 'networkidle'], description: 'wait：等待的载入状态（无选择器时）。' },
           to: { type: 'string', enum: ['top', 'bottom'], description: 'scroll：无选择器时的页面目标（默认 bottom）。' },
           go: { type: 'string', enum: ['back', 'forward', 'reload'], description: 'history：导航方向。' },
@@ -488,6 +510,31 @@ API 联调技巧：
               session.driver.evaluate(expression),
             )
             return { content: result.slice(0, SNAPSHOT_MAX) }
+          }
+          case 'act': {
+            // 定位与执行都在 primitives 里；这里只做参数搬运。value/text 两个名字
+            // 都收——已有的 type action 用 text，别让模型记两套。
+            return await withLiveLogs(session, params.onOutput, () =>
+              act(session.driver, {
+                instruction: params.input.instruction as string,
+                value: (params.input.value ?? params.input.text) as string | undefined,
+                action: params.input.act_kind as ActionKind | undefined,
+                submit: params.input.submit === true,
+              }),
+            )
+          }
+          case 'extract': {
+            return await withLiveLogs(session, params.onOutput, () =>
+              extract(session.driver, {
+                schema: params.input.schema as string,
+                selector: params.input.selector as string | undefined,
+              }),
+            )
+          }
+          case 'observe': {
+            return await withLiveLogs(session, params.onOutput, () =>
+              observe(session.driver, { question: params.input.question as string }),
+            )
           }
           case 'click': {
             const selector = params.input.selector as string | undefined
@@ -691,11 +738,23 @@ API 联调技巧：
             const size = session.driver.viewportSize()
             const sizeNote = size ? `（视口 ${size.width}×${size.height}）` : ''
             const tooBig = png.byteLength > SCREENSHOT_VISION_MAX_BYTES
+            // 附图能不能被看见，取决于当前模型有无视觉能力、有无配 visionModel 桥——
+            // 三条分支里最后一条是静默丢弃。这条结果文字原先只说"截图于 X → artifact Y"，
+            // 不含任何页面信息，模型收到它无法区分"我看到了页面"和"我拿到一个我看不见
+            // 的文件名"，于是可能凭截图存在就断言渲染正常。截图是验证手段，一个能让模型
+            // 声称验证过它其实没看见的东西的工具，比没有这个工具更糟。read_file 读图时
+            // 早就用两种情况都讲清的写法处理了同一问题（且实测正是那句话把模型拉去了
+            // observe），这里对齐它——不需要知道当前模型的能力，也就不必把 config 穿进来。
+            // computer_use 无此缺口：它的结果文本始终带无障碍树，图掉了页面结构还在。
+            const blindNote = '\n（视觉模型可直接看图；非视觉模型该附件会被自动丢弃——'
+              + '若你没有真的看到画面，不要凭截图存在断言渲染结果，改用 observe / extract / eval 读 DOM。）'
             return {
               content: `${BROWSER_SCREENSHOT_OF_PREFIX} ${session.driver.currentUrl()}${sizeNote}`
                 + (artifactId ? ` → artifact ${artifactId}` : '')
                 + pngNote
-                + (tooBig ? `\n（${Math.round(png.byteLength / 1024)}KB 超出视觉通道上限，未附图——缩小视口后重截，或用 eval 量 DOM。）` : ''),
+                + (tooBig
+                  ? `\n（${Math.round(png.byteLength / 1024)}KB 超出视觉通道上限，未附图——缩小视口后重截，或用 eval 量 DOM。）`
+                  : blindNote),
               images: tooBig ? undefined : [`data:image/png;base64,${base64}`],
             }
           }

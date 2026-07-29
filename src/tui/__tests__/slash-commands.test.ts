@@ -1261,3 +1261,39 @@ describe('/handoff 命令', () => {
     assert.ok(registered?.dest.includes('sess-handoff-001.handoff.md'), `dest: ${registered?.dest}`)
   })
 })
+
+describe('/logs', () => {
+  it('打印数据根、会话 id 与六维门控 —— 用户不该为找日志去读源码', async () => {
+    let captured = ''
+    const ctx = makeCtx({
+      parts: ['/logs'],
+      currentSessionId: 'sess-logs-001',
+      pushStatic: (entry: LogEntry) => { captured += `${entry.content}\n` },
+    })
+
+    const handled = await handleSlashCommand(ctx)
+
+    assert.equal(handled, true)
+    assert.match(captured, /数据根:/)
+    assert.ok(captured.includes('sess-logs-001'), `应带上当前会话 id: ${captured.slice(0, 300)}`)
+    assert.ok(captured.includes('RIVET_DEBUG_TELEMETRY'), '六维为空的首要原因是门控，必须写出来')
+    assert.ok(captured.includes('sidecar'), '桌面排查线索也要在 TUI 里可见')
+  })
+
+  it('输出里给出 open 子命令的出路 —— 只告诉路径还得让用户自己 cd', async () => {
+    let captured = ''
+    const ctx = makeCtx({
+      parts: ['/logs'],
+      currentSessionId: 'sess-logs-002',
+      pushStatic: (entry: LogEntry) => { captured += `${entry.content}\n` },
+    })
+
+    await handleSlashCommand(ctx)
+
+    assert.match(captured, /\/logs open/)
+    assert.match(captured, /\/logs open desktop/)
+  })
+
+  // `open` 的真实行为（目标选择、opener 调用）在 logs-cli 那层用注入的 opener
+  // 测，这里不重复——在 TUI 层跑它会真的拉起文件管理器。
+})

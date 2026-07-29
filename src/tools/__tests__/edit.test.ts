@@ -68,6 +68,73 @@ describe('edit_file tool', () => {
     assert.ok(/^\+z$/m.test(result.uiContent!))
   })
 
+  it('edits source lines that legitimately contain regex literals', async () => {
+    // 2026-07-27 实测：编辑 action-intent-detector.ts 里的 TOOL_VERB_PATTERN 被拦。
+    // old_string 是文件里真实存在的正则字面量源码，模型抄得完全正确，
+    // 但守卫在读文件之前就凭「含 (?: 」判定为「把正则当模式用」。
+    // 这个仓库满是正则字面量，事前无条件拦等于禁止编辑它们。
+    const file = join(TEST_DIR, 'intent.ts')
+    const pattern = '  /(grep|read|查(?:看|找)?|跑(?:一?下)?)/i'
+    writeFileSync(file, `const TOOL_VERB_PATTERN =\n${pattern}\n`)
+
+    const result = await EDIT_FILE_TOOL.execute(makeParams({
+      file_path: file,
+      old_string: pattern,
+      new_string: '  /(grep|read|(?<!Git\\s)bash|查(?:看|找)?|跑(?:一?下)?)/i',
+    }))
+
+    assert.ok(!result.isError, `字面存在于文件中的正则源码必须可编辑，实得：${result.content}`)
+    assert.ok(readFileSync(file, 'utf-8').includes('(?<!Git\\s)bash'), '新内容必须落盘')
+  })
+
+  it('explains regex misuse only when old_string actually failed to match', async () => {
+    // 守卫本身的价值要保住：真把正则当模式用（文件里并不存在该字面量）时，
+    // 报错必须点出「edit_file 是精确匹配不是正则」，而不是让模型对着
+    // 「未找到 old_string」反复重试。
+    const file = join(TEST_DIR, 'literal.ts')
+    writeFileSync(file, 'const version = "v2024"\n')
+
+    const result = await EDIT_FILE_TOOL.execute(makeParams({
+      file_path: file,
+      old_string: 'const version = "v\\d{4}"',
+      new_string: 'const version = "v2026"',
+    }))
+
+    assert.equal(result.isError, true)
+    assert.ok(/正则/.test(result.content), `匹配失败且含正则标记时必须给出正则诊断：${result.content}`)
+  })
+
+  it('treats string "false" booleans as false, not truthy', async () => {
+    // 模型会把布尔参数写成字符串（2026-07-27 实测传过 dry_run="true"）。
+    // 裸 `as boolean` 下 "false" 是真值：dry_run="false" 会让编辑静默退化成
+    // 预览——模型以为改完了，磁盘上什么都没变。
+    const file = join(TEST_DIR, 'strbool.txt')
+    writeFileSync(file, 'alpha\n')
+    const result = await EDIT_FILE_TOOL.execute(makeParams({
+      file_path: file,
+      old_string: 'alpha',
+      new_string: 'beta',
+      dry_run: 'false',
+    }))
+
+    assert.ok(!result.isError, result.content)
+    assert.equal(readFileSync(file, 'utf-8'), 'beta\n', 'dry_run="false" 必须真的写盘')
+  })
+
+  it('honors string "true" for dry_run without writing', async () => {
+    const file = join(TEST_DIR, 'strbool2.txt')
+    writeFileSync(file, 'alpha\n')
+    const result = await EDIT_FILE_TOOL.execute(makeParams({
+      file_path: file,
+      old_string: 'alpha',
+      new_string: 'beta',
+      dry_run: 'true',
+    }))
+
+    assert.ok(!result.isError, result.content)
+    assert.equal(readFileSync(file, 'utf-8'), 'alpha\n', 'dry_run="true" 不得写盘')
+  })
+
   it('rejects non-unique old_string', async () => {
     const file = join(TEST_DIR, 'dup.txt')
     writeFileSync(file, 'abc abc')

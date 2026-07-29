@@ -13,8 +13,9 @@ export interface PressureResult {
   cvmOverheadRatio: number
   /** Should CVM throttle its injections to reduce overhead? */
   shouldThrottleCvm: boolean
-  /** v3：相对压力 — 当前 ratio 相对于历史 p90 的归一化值 (0-1)。
-   *  tokenHistory < 5 条时为 undefined。下游可用此替代绝对阈值 0.5 判定高压。 */
+  /** 相对压力 — 当前 ratio 超出近期基线（历史 p90）的幅度，log2 压缩到 0-1：
+   *  持平基线为 0，涨到基线 2 倍为 1.0。tokenHistory < 5 条时为 undefined。
+   *  与绝对占用互补，不可单独替代它——消费侧取两者较大。 */
   pressureRelative?: number
 }
 
@@ -78,12 +79,21 @@ export class PressureMonitor {
     const growthRate = ratio - prevRatio
     const fastGrowth = growthRate >= FAST_GROWTH_THRESHOLD
 
-    // ── Relative pressure: current ratio vs historical p90 ──
-    // 绝对阈值 0.5 在 ctxRatio 均值 ~10% 时永远不触发（见计划二节）。
-    // 相对压力以近期历史为基线，当前 ratio 超过 p90 时 pressureRelative → 1.0。
+    // ── Relative pressure: 当前 ratio 超出近期基线的幅度 ──
+    // 绝对阈值 0.5 在 ctxRatio 均值 ~10% 时永远不触发，所以这一维衡量「相对
+    // 自己最近的水位涨了多少」，与绝对占用互补（消费侧取两者较大，见
+    // sensorium.ts::computePressure）。
+    //
+    // 不能直接用 min(1, ratio / p90)：上下文单调增长时当前 ratio 几乎必然是
+    // 尾部 20 轮的最大值、p90 约等于次大值，比值恒 ≥1 而被钉死在 1.0。该写法
+    // 上线后实测 901 轮里 662 轮（73.5%）pressure 恰为 0.50，这一维不再携带
+    // 信息（见 docs/analysis/2026-07-28-第二轮指标监测.md）。
+    //
+    // 改为对「超出倍数」取 log2：持平基线记 0，涨到基线的 2 倍记 1.0。平缓
+    // 增长每轮只超出百分之几，落在 0.0x 量级；真实突增仍能报满。
     const historyRatios = this.tokenHistory.map(h => h.tokens / this.contextWindow)
     const pressureRelative = historyRatios.length >= 5
-      ? Math.min(1, ratio / Math.max(p90(historyRatios), 0.01))
+      ? Math.max(0, Math.min(1, Math.log2(Math.max(ratio / Math.max(p90(historyRatios), 0.01), 1))))
       : undefined
 
     // Record for next comparison

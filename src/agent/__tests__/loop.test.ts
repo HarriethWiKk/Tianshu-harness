@@ -1598,10 +1598,13 @@ describe('AgentLoop — convergence emission cooldown', () => {
     assert.equal(conv.expect?.kind, 'course_changed', 'build 变体必须携带 course_changed 谓词')
   })
 
+  // 轮次 20：诊断态阶梯给了 4 轮额外余量，turn 14 的只读在 W3 分流下不算停滞。
+  // 这里要证明的是「diagnostic 变体依然可达」——它是 B1b/M4 刻意保留的一等路径，
+  // 若永不触发就成了死代码。
   it('对照:diagnostic 变体仍是认知工具 tool_appears（不受 B1b 影响）', async () => {
     const agent = stuckLoop() // 全只读历史 + filesModified=0 → diagnostic
     const submits = captureSubmits(agent)
-    await agent.runConvergenceCheck(14, 'plan', true, false, makeCallbacks())
+    await agent.runConvergenceCheck(20, 'plan', true, false, makeCallbacks())
     const conv = submits.find(e => e.key === 'convergence')
     assert.ok(conv, 'expected a convergence advisory emission')
     assert.equal(conv.expect?.kind, 'tool_appears')
@@ -1637,21 +1640,25 @@ describe('AgentLoop — convergence emission cooldown', () => {
     assert.ok(reason.includes('近 1 轮'), `expected phase-relative count in wording: ${reason}`)
   })
 
+  // 轮次落在 20+ 而非 14+：`stuckLoop` 全只读无改动 → activityMode='diagnostic'，
+  // W3 分流给诊断会话多 4 轮读取余量（起罚 turn≥12，见 convergence-detector 的
+  // 诊断阶梯）。本用例考的是冷却重置语义，轮号只是脚手架 —— 取一个诊断态下确实
+  // 算停滞的轮次即可，不要靠"14 轮只读就该被催"这个前提。
   it('user intervention resets the cooldown and skips that turn', async () => {
     const agent = stuckLoop()
     let shifts = 0
     const cb = { ...makeCallbacks(), onDecisionShift: () => { shifts++ } }
 
-    await agent.runConvergenceCheck(14, 'plan', true, false, cb) // emit (cooldown start)
+    await agent.runConvergenceCheck(20, 'plan', true, false, cb) // emit (cooldown start)
     assert.equal(shifts, 1, 'first turn should emit')
 
-    await agent.runConvergenceCheck(15, 'plan', true, false, cb) // within cooldown → skip
+    await agent.runConvergenceCheck(21, 'plan', true, false, cb) // within cooldown → skip
     assert.equal(shifts, 1, 'within cooldown should not emit')
 
-    await agent.runConvergenceCheck(15, 'plan', true, true, cb) // user intervened → skip + reset
+    await agent.runConvergenceCheck(21, 'plan', true, true, cb) // user intervened → skip + reset
     assert.equal(shifts, 1, 'user-intervention turn must not emit a nudge')
 
-    await agent.runConvergenceCheck(16, 'plan', true, false, cb) // reset → emit despite <3 turns since last
+    await agent.runConvergenceCheck(22, 'plan', true, false, cb) // reset → emit despite <3 turns since last
     assert.equal(shifts, 2, 'cooldown should have been reset by user intervention, allowing an immediate re-emit')
   })
 })
@@ -1903,18 +1910,21 @@ describe('AgentLoop — convergence score-abort grace turn', () => {
     return agent
   }
 
+  // 轮次 24+：`degenerateAgent` 是全只读窗口 → activityMode='diagnostic'，W3 分流的
+  // 诊断阶梯把最重档推到 turn≥24。这两条考的是 grace-turn 与用户介入重置，轮号只是
+  // 脚手架；取一个 L3 确实可达的轮次，否则断言 'proceed' 会因为 L3 根本到不了而空过。
   it('demotes the first score-abort to a kick, then aborts on the next turn', async () => {
     const agent = degenerateAgent()
     let aborts = 0
     let shifts = 0
     const cb = { ...makeCallbacks(), onAbort: () => { aborts++ }, onDecisionShift: () => { shifts++ } }
 
-    const first = await agent.runConvergenceCheck(22, 'execute', true, false, cb)
+    const first = await agent.runConvergenceCheck(24, 'execute', true, false, cb)
     assert.equal(first.action, 'proceed', 'first L3 hit must be demoted — no prior-turn warning was delivered')
     assert.equal(aborts, 0)
     assert.equal(shifts, 1, 'the demoted turn must still emit the warning/改道 so the model and user see it')
 
-    const second = await agent.runConvergenceCheck(23, 'execute', true, false, cb)
+    const second = await agent.runConvergenceCheck(25, 'execute', true, false, cb)
     assert.equal(second.action, 'abort', 'still stuck one turn after the warning → abort proceeds')
     assert.equal(aborts, 1)
   })
@@ -1923,9 +1933,9 @@ describe('AgentLoop — convergence score-abort grace turn', () => {
     const agent = degenerateAgent()
     const cb = makeCallbacks()
 
-    await agent.runConvergenceCheck(22, 'execute', true, false, cb) // demoted + warning
-    await agent.runConvergenceCheck(23, 'execute', true, true, cb)  // user spoke → reset
-    const after = await agent.runConvergenceCheck(24, 'execute', true, false, cb)
+    await agent.runConvergenceCheck(24, 'execute', true, false, cb) // demoted + warning
+    await agent.runConvergenceCheck(25, 'execute', true, true, cb)  // user spoke → reset
+    const after = await agent.runConvergenceCheck(26, 'execute', true, false, cb)
     assert.equal(after.action, 'proceed', 'post-intervention L3 hit must get a fresh grace turn, not an instant abort')
   })
 

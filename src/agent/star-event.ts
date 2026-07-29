@@ -67,7 +67,6 @@ export interface StarPhaseContext {
   /** YOLO（无上限轮次）下的归航证据门：交付验证通过时为真（2026-07-25）。
    *  有界会话恒为 false/缺省——归航仍只认最终轮。 */
   readyByEvidence?: boolean
-  shouldEscalate: boolean
   /** True if complexity > 0.5 was ever reached this session.
    *  Enables contracting phase (plan was decomposed, now settled). */
   hasEnteredHighComplexity: boolean
@@ -93,30 +92,30 @@ export interface StarEvent {
  * Map a Sensorium snapshot + runtime context to a StarPhase.
  *
  * Priority order (first match wins):
- * 1. Encore: shouldEscalate + turn>1 + confidence<0.3 → 二次请星
- * 2. Testing: isRunningTests → 试锋
- * 3. Delivering: momentum>0.8 + (isFinalTurn | readyByEvidence) → 归航
- * 4. Implementing: confidence>0.6 + isWriting → 铸形
- * 5. Decomposing: complexity>0.5 → 排阵
- * 6. Contracting: wasHighComplexity + confidence>0.7 + complexity<0.4 + !writing + !testing → 立约
- * 7. Locating: freshness>0.7 → 寻迹
- * 8. Planning: shouldEscalate + turn===1 / freshness≤0.4 → 请星
+ * 1. Testing: isRunningTests → 试锋
+ * 2. Delivering: momentum>0.8 + (isFinalTurn | readyByEvidence) → 归航
+ * 3. Implementing: confidence>0.6 + isWriting → 铸形
+ * 4. Decomposing: complexity>0.5 → 排阵
+ * 5. Contracting: wasHighComplexity + confidence>0.7 + complexity<0.4 + !writing + !testing → 立约
+ * 6. Locating: freshness>0.7 → 寻迹
+ * 7. Default: freshness>0.4 ? 寻迹 : 请星
+ *
+ * 请星（tianshu-encore）不由本映射产出——它的活体入口是 kick-hook 的
+ * `shouldEscalateFromKick`（confidence<0.2 && complexity>0.5）。此前这里还有两条
+ * 以 `ctx.shouldEscalate` 为前置的分支（Encore / 首轮 Planning），而 5ae389d1 把
+ * `deriveStrategy().shouldEscalate` 关成恒 false 后它们再无可达路径，已随本次清理
+ * 移除；`StarPhaseContext` 也不再携带该字段。
  */
 export function mapSensoriumToPhase(
   s: Sensorium,
   ctx: StarPhaseContext,
 ): StarPhase {
-  // 1. Encore: low confidence mid-task
-  if (ctx.shouldEscalate && ctx.turn > 1 && s.confidence < 0.3) {
-    return 'tianshu-encore'
-  }
-
-  // 2. Testing
+  // 1. Testing
   if (ctx.isRunningTests) {
     return 'kaiyang-testing'
   }
 
-  // 3. Delivering: high momentum on final turn (or YOLO evidence gate)
+  // 2. Delivering: high momentum on final turn (or YOLO evidence gate)
   // W4（2026-07-25）：momentum 需实测才可信——no-data 回退 0 本就不会命中
   // >0.8，显式守卫钉死意图（防未来阈值调整误引入 no-data 误判）。
   // 复盘修复（2026-07-25）：YOLO 无最终轮，readyByEvidence（交付验证通过）
@@ -126,32 +125,29 @@ export function mapSensoriumToPhase(
     return 'yaoguang-delivering'
   }
 
-  // 4. Implementing: confident + writing code
+  // 3. Implementing: confident + writing code
   if (s.confidence > 0.6 && ctx.isWriting) {
     return 'yuheng-implementing'
   }
 
-  // 5. Decomposing: high complexity
+  // 4. Decomposing: high complexity
   if (s.complexity > 0.5) {
     return 'tianji-decomposing'
   }
 
-  // 6. Contracting: plan was complex, now settled → 立约
+  // 5. Contracting: plan was complex, now settled → 立约
   if (ctx.hasEnteredHighComplexity && s.confidence > 0.7 && s.complexity < 0.4 && !ctx.isWriting && !ctx.isRunningTests) {
     return 'tianquan-contracting'
   }
 
-  // 7. Locating: high freshness (familiar codebase)
+  // 6. Locating: high freshness (familiar codebase)
   if (s.freshness > 0.7) {
     return 'tianxuan-locating'
   }
 
-  // 8. Planning: default / first-turn escalation
-  if (ctx.shouldEscalate && ctx.turn === 1) {
-    return 'tianshu-planning'
-  }
-
-  // Default: start with locating/planning based on freshness
+  // 7. Default: locating/planning based on freshness。本仓语料里 freshness 最低
+  // 0.57（901 帧），这一分叉的 planning 侧从未命中——但那是语料特性不是结构：
+  // computeFreshness 在信息素弱且 git/fs 变更率高时可以低到 0，别当恒真删掉。
   return s.freshness > 0.4 ? 'tianxuan-locating' : 'tianshu-planning'
 }
 

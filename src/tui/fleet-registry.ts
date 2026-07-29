@@ -30,6 +30,8 @@ export interface FleetWorkerView {
   shortLabel: string
   /** 派生该 worker 的委派工具调用 id（委派树父节点）。 */
   parentToolId: string
+  /** 嵌套委派的父 worker order id（顶层委派缺省）。 */
+  parentWorkerId?: string
   profile: string
   /** 星域 id（星名来源），从 DelegationActivity.authority 透传。 */
   authority?: string
@@ -77,6 +79,7 @@ export interface FleetGroupProgress {
 interface FleetRecord {
   workerId: string
   parentToolId: string
+  parentWorkerId?: string
   profile: string
   authority?: string
   authorityReason?: string
@@ -186,6 +189,7 @@ export class FleetRegistry {
       existing.activityLog = log
       if (activity.failureReason) existing.failureReason = activity.failureReason
       if (activity.profile) existing.profile = activity.profile
+      if (activity.parentWorkerId && !existing.parentWorkerId) existing.parentWorkerId = activity.parentWorkerId
       if (activity.authority) existing.authority = activity.authority
       if (activity.authorityReason) existing.authorityReason = activity.authorityReason
       if (activity.progressLine) existing.activity = activity.progressLine
@@ -207,6 +211,7 @@ export class FleetRegistry {
     this.records.set(activity.workOrderId, {
       workerId: activity.workOrderId,
       parentToolId: activity.parentToolId,
+      parentWorkerId: activity.parentWorkerId,
       profile: activity.profile ?? 'worker',
       authority: activity.authority,
       authorityReason: activity.authorityReason,
@@ -233,6 +238,7 @@ export class FleetRegistry {
       workerId: r.workerId,
       shortLabel: shortOrderLabel(r.workerId),
       parentToolId: r.parentToolId,
+      parentWorkerId: r.parentWorkerId,
       profile: r.profile,
       authority: r.authority,
       authorityReason: r.authorityReason,

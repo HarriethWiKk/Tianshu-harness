@@ -11,6 +11,8 @@ import {
   PHASE_LABELS,
   PHASE_GLYPHS,
 } from '../star-event.js'
+import { shouldEscalateFromKick } from '../dissipative-kick.js'
+import { computeStrategy } from '../sensorium.js'
 import type { Sensorium } from '../sensorium.js'
 import type { StarPhaseContext, ThetaState, ThetaPhase, StarEvent } from '../star-event.js'
 
@@ -54,7 +56,6 @@ describe('mapSensoriumToPhase', () => {
       isWriting: false,
       isRunningTests: false,
       isFinalTurn: false,
-      shouldEscalate: false,
       hasEnteredHighComplexity: false,
       ...overrides,
     }
@@ -108,16 +109,42 @@ describe('mapSensoriumToPhase', () => {
     assert.equal(mapSensoriumToPhase(s, ctx), 'tianxuan-locating')
   })
 
-  it('returns tianshu-planning on first turn with escalation', () => {
-    const s = makeSensorium()
-    const ctx = makeCtx({ turn: 1, shouldEscalate: true })
+  it('returns tianshu-planning only via the freshness default（首轮升级那条已随死码移除）', () => {
+    const s = makeSensorium({ freshness: 0.3 })
+    const ctx = makeCtx({ turn: 1 })
     assert.equal(mapSensoriumToPhase(s, ctx), 'tianshu-planning')
   })
 
-  it('returns tianshu-encore on mid-task with low confidence and escalation', () => {
-    const s = makeSensorium({ confidence: 0.2 })
-    const ctx = makeCtx({ turn: 5, shouldEscalate: true })
-    assert.equal(mapSensoriumToPhase(s, ctx), 'tianshu-encore')
+  it('相位映射永不产出 tianshu-encore —— 它的活体入口只有 kick', () => {
+    // 曾有两条以 ctx.shouldEscalate 为前置的分支，5ae389d1 把该字段关成恒 false 后
+    // 不可达，已移除。这里穷举它们原来的触发形状，防止有人凭旧文档改回来。
+    for (const turn of [1, 2, 5, 20]) {
+      for (const confidence of [0, 0.1, 0.2, 0.29]) {
+        for (const isRunningTests of [true, false]) {
+          const phase = mapSensoriumToPhase(
+            makeSensorium({ confidence }),
+            makeCtx({ turn, isRunningTests }),
+          )
+          assert.notEqual(phase, 'tianshu-encore',
+            `turn=${turn} confidence=${confidence} tests=${isRunningTests} 竟产出了 encore`)
+        }
+      }
+    }
+    // 活体入口仍在：kick 侧的升级判据（confidence<0.2 && complexity>0.5）。
+    assert.equal(shouldEscalateFromKick(makeSensorium({ confidence: 0.1, complexity: 0.6 })), true)
+    assert.equal(shouldEscalateFromKick(makeSensorium({ confidence: 0.5, complexity: 0.6 })), false)
+  })
+
+  it('computeStrategy 不请求自动升级 —— 移除上面那两条分支的前提', () => {
+    // 5ae389d1 起自动升级改人工决策。若有人把这个开关改回条件式，上面那条
+    // "永不产出 encore" 的护栏就失去前提，必须连带重新设计相位映射。
+    for (const s of [
+      makeSensorium({ confidence: 0, momentum: 0 }),
+      makeSensorium({ confidence: 0.1, momentum: 0.1, stability: 0.1 }),
+      makeSensorium({ confidence: 1, momentum: 1 }),
+    ]) {
+      assert.equal(computeStrategy(s).shouldEscalate, false)
+    }
   })
 
   it('testing takes priority over other phases', () => {
@@ -126,14 +153,10 @@ describe('mapSensoriumToPhase', () => {
     assert.equal(mapSensoriumToPhase(s, ctx), 'kaiyang-testing')
   })
 
-  it('encore takes priority over testing', () => {
+  it('testing 现在是最高优先级（原先压在它上面的 encore 分支已移除）', () => {
     const s = makeSensorium({ confidence: 0.1 })
-    const ctx = makeCtx({
-      turn: 5,
-      shouldEscalate: true,
-      isRunningTests: true,
-    })
-    assert.equal(mapSensoriumToPhase(s, ctx), 'tianshu-encore')
+    const ctx = makeCtx({ turn: 5, isRunningTests: true })
+    assert.equal(mapSensoriumToPhase(s, ctx), 'kaiyang-testing')
   })
 
   it('delivering takes priority over implementing', () => {
@@ -203,7 +226,7 @@ describe('createStarEvent', () => {
     }
     const ctx: StarPhaseContext = {
       turn: 5, isFinalTurn: true, isWriting: false,
-      isRunningTests: false, shouldEscalate: false,
+      isRunningTests: false,
       hasEnteredHighComplexity: false,
     }
     const event: StarEvent = createStarEvent(s, ctx)
@@ -222,7 +245,7 @@ describe('createStarEvent', () => {
     }
     const ctx: StarPhaseContext = {
       turn: 1, isFinalTurn: false, isWriting: false,
-      isRunningTests: false, shouldEscalate: false,
+      isRunningTests: false,
       hasEnteredHighComplexity: false,
     }
     const e1 = createStarEvent(s, ctx)

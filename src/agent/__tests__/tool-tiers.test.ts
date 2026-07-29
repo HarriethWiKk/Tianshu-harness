@@ -12,7 +12,7 @@ import {
 
 describe('tool-tiers', () => {
   describe('CORE_TOOLS', () => {
-    it('stays within kernel budget (≤27)', () => {
+    it('stays within kernel budget (≤28)', () => {
       // ≤26 after the 2026-07-01 CORE trim: demoted read_section (read_file covers
       // ranges), diff (git covers), inspect_project (one-shot orientation), related_tests,
       // file_info (bash/read_file cover), leave_mark (constellation opt-in) → EXTENDED.
@@ -21,10 +21,13 @@ describe('tool-tiers', () => {
       // 26→27（2026-07-17）：attack_case 直入 CORE——攻坚场景在会话中期出现，
       // EXTENDED 中途挂载改 tool fingerprint = 200K 前缀全量重建（DeepSeek V4
       // 创建 ¥3/M、高峰 ¥6/M）；常驻字节稳定是唯一缓存零成本方案。
+      // 27→28（2026-07-29）：team_orchestrate 升入 CORE——team 编排入口的唯一
+      // 主控工具，放在 EXTENDED 被默认 deny-list 摘除等于入口不可达。与
+      // attack_case 同理由：中途挂载代价 > 一个常量工具的认知负荷增量。
       assert.ok(
-        CORE_TOOLS.length <= 27,
-        `CORE_TOOLS has ${CORE_TOOLS.length} tools (limit: 27). ` +
-          `Beyond ~26-27, agents experience choice overload. ` +
+        CORE_TOOLS.length <= 28,
+        `CORE_TOOLS has ${CORE_TOOLS.length} tools (limit: 28). ` +
+          `Beyond ~27-28, agents experience choice overload. ` +
           `Before adding: can you merge two tools, or demote a low-use one to EXTENDED?`,
       )
     })
@@ -50,9 +53,9 @@ describe('tool-tiers', () => {
   })
 
   describe('EXTENDED_TOOLS', () => {
-    it('includes browser and team tools', () => {
+    it('includes browser tools; team_orchestrate moved to CORE (T3 fix, 2026-07-29)', () => {
       assert.ok(EXTENDED_TOOLS.includes('browser' as never))
-      assert.ok(EXTENDED_TOOLS.includes('team_orchestrate' as never))
+      assert.ok(!EXTENDED_TOOLS.includes('team_orchestrate' as never))
     })
 
     it('web_search and web_fetch are now in CORE (not EXTENDED)', () => {
@@ -165,7 +168,7 @@ describe('tool-tiers', () => {
       // web_search/web_fetch/browser_debug are CORE now — exclude only true EXTENDED tools.
       // Includes the 2026-07-01 CORE→EXTENDED demotions (regression guard).
       const mustExclude = ['browser', 'computer_use', 'council_convene',
-        'team_orchestrate', 'apply_patch', 'undo',
+        'apply_patch', 'undo',
         'read_section', 'diff', 'inspect_project', 'related_tests', 'file_info', 'leave_mark']
       for (const name of mustExclude) {
         assert.ok(!tier.has(name), `"${name}" should NOT be in CORE tier`)

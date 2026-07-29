@@ -40,7 +40,7 @@ describe('materializeScope', () => {
 
   it('leaves tracked files alone when already visible in worktree', () => {
     const result = materializeScope(repoDir, wtDir, ['tracked.ts'])
-    assert.deepEqual(result, { materialized: [], missing: [] })
+    assert.deepEqual(result, { materialized: [], missing: [], toBeCreated: [] })
   })
 
   it('copies untracked relative files into worker worktree', () => {
@@ -50,6 +50,7 @@ describe('materializeScope', () => {
 
     assert.deepEqual(result.materialized, ['plan.md'])
     assert.deepEqual(result.missing, [])
+    assert.deepEqual(result.toBeCreated, [])
     assert.ok(existsSync(join(wtDir, 'plan.md')))
   })
 
@@ -104,8 +105,9 @@ describe('materializeScope', () => {
     assert.equal(result.materialized.length, 0)
   })
 
-  it('reports missing relative files', () => {
+  it('reports non-existent relative files as toBeCreated (worker will create them)', () => {
     const result = materializeScope(repoDir, wtDir, ['missing.md'])
-    assert.deepEqual(result.missing, ['missing.md'])
+    assert.deepEqual(result.missing, [])
+    assert.deepEqual(result.toBeCreated, ['missing.md'])
   })
 })

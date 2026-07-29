@@ -46,6 +46,7 @@ function makeContext(opts: {
   reviewConfig?: import('../../config/schema.js').ReviewConfig
   isAutoReviewOff?: boolean
   goalAchieved?: boolean
+  autoCommit?: boolean
 }) {
   const baseline = createWorktreeBaseline({
     branch: 'feat/b1',
@@ -89,6 +90,7 @@ function makeContext(opts: {
     reviewConfig: opts.reviewConfig,
     isAutoReviewOff: opts.isAutoReviewOff !== undefined ? () => opts.isAutoReviewOff! : undefined,
     isGoalAchieved: opts.goalAchieved !== undefined ? () => opts.goalAchieved! : undefined,
+    autoCommit: opts.autoCommit,
   }))
 
   const params: ToolCallParams = {
@@ -368,6 +370,30 @@ describe('deliver-task — semantic task delivery tool', () => {
     assert.deepEqual(calls, [{ files: ['src/a.ts'], message: 'feat: scoped delivery' }])
     assert.match(result.content, /Scoped commit created/)
     assert.match(result.content, /commit abc123/)
+  })
+
+  it('autoCommit=false skips git commit but still produces delivery report', async () => {
+    const calls: Array<{ files: string[]; message: string }> = []
+    const { tool, params } = makeContext({
+      taskId: 't1',
+      ownedFiles: ['src/a.ts'],
+      dirtyFiles: ['src/a.ts'],
+      verifications: [{ command: 'npx tsc --noEmit', status: 'passed' }],
+      commitOwnedFiles: (_cwd, files, message) => {
+        calls.push({ files, message })
+        return { ok: true, output: 'commit abc123' }
+      },
+      autoCommit: false,
+    })
+
+    const result = await tool.execute({ ...params, input: { commit: true, message: 'feat: scoped delivery' } })
+
+    assert.equal(result.isError ?? false, false)
+    // Must NOT have called commitOwnedFiles
+    assert.deepEqual(calls, [])
+    // Must contain the manual-commit-mode message
+    assert.match(result.content, /自动提交已关闭/)
+    assert.match(result.content, /agent\.delivery\.autoCommit/)
   })
 
   it('describes complex spec checklist audit in the tool schema', () => {

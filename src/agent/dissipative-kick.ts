@@ -39,6 +39,16 @@ export interface KickActions {
  * This is the V4-level reframe. V2-level is strategy-shift (same frame).
  */
 export function shouldKick(s: Sensorium): boolean {
+  // `stability < 0.3` 在 doom='none' 下数学不可达：computeStability 里 doomBase 占
+  // 0.40 权重，doom='none' 时该项单独就是 0.40×0.90=0.36。所以这条合取实际等价于
+  // 「momentum 低 **且** doom 已经 warn/blocked，且预测率与工具多样性同时贴地」——
+  // 它是 doom loop 的二次确认，不是独立的稳定性信号（901 帧实测 stability 最低
+  // 0.48，发火率 0.0%）。
+  //
+  // 想改成直读 doom 档位，代价还不止阈值：`Sensorium` 快照并不携带 doomLevel
+  // （它只在 `SensoriumInput` 上），得先把信号接进来。且要先知道 doom 各档的实际
+  // 占比，而遥测帧至今不带该字段（已在 vitals-lite 补上）。在拿到分布前不动阈值
+  // ——把死分支直接拍成高频分支是 v3 压力过冲的同一种错误。
   return s.momentum < 0.2 && s.stability < 0.3
 }
 

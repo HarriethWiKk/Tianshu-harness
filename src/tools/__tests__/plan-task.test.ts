@@ -102,6 +102,35 @@ describe('createPlanTaskTool writeTodos routing', () => {
   })
 })
 
+// ── timeoutMs (T2 regression guard) ──
+
+describe('timeoutMs', () => {
+  it('execute:true → 600s (aligns with team_orchestrate)', () => {
+    const tool = createPlanTaskTool({
+      getCoordinator: () => null,
+      getExecutorDeps: () => ({} as any),
+    })
+    assert.equal(typeof tool.timeoutMs, 'function')
+    assert.equal(tool.timeoutMs!({ input: { execute: true } } as any), 600_000)
+  })
+
+  it('execute:false → 120s (tool default)', () => {
+    const tool = createPlanTaskTool({
+      getCoordinator: () => null,
+      getExecutorDeps: () => ({} as any),
+    })
+    assert.equal(tool.timeoutMs!({ input: { execute: false } } as any), 120_000)
+  })
+
+  it('no execute param → 120s (default)', () => {
+    const tool = createPlanTaskTool({
+      getCoordinator: () => null,
+      getExecutorDeps: () => ({} as any),
+    })
+    assert.equal(tool.timeoutMs!({ input: {} } as any), 120_000)
+  })
+})
+
 // ── Integration: parse real plan file ──
 
 describe('integration: parse real plan file', () => {

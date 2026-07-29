@@ -28,6 +28,7 @@ async function writeEditLanding(
 import { detectEol, chooseEol, toLf, applyEol, type Eol } from './line-endings.js'
 import { getTargetEol } from '../platform.js'
 import { detectPointerPlaceholder, pointerPlaceholderError, resolveIdempotentPointer } from './pointer-guard.js'
+import { asBool } from './write-tool-helpers.js'
 import { trackFileChange, restoreLatestBackup } from '../agent/recovery-stack.js'
 import { formatActivePlanDraftReceipt } from '../agent/plan-mode.js'
 
@@ -63,6 +64,28 @@ function detectRegexPattern(oldString: string): string | null {
     if (re.test(oldString)) return name
   }
   return null
+}
+
+/**
+ * Regex-misuse diagnosis, appended to "old_string not found" errors.
+ *
+ * Deliberately NOT a pre-flight gate. It used to run before the file was even
+ * read and rejected any old_string containing regex-looking tokens, which in a
+ * codebase full of regex literals means "you may not edit those lines": on
+ * 2026-07-27 it blocked three legitimate edits whose old_string was copied
+ * verbatim and correctly from the file (TOOL_VERB_PATTERN in
+ * action-intent-detector.ts, a `split(/\r?\n/)` line in pointer-guard.ts).
+ *
+ * Presence of `\d` or `(?:` says nothing about intent — only a failed match
+ * does. So the hint now fires exactly where it is informative: the string did
+ * not match AND it looks like a pattern.
+ */
+function regexMisuseHint(oldString: string): string {
+  const pattern = detectRegexPattern(oldString)
+  if (!pattern) return ''
+  return `\n\n注意：old_string 含有正则记法（${pattern}）。edit_file 是精确字符串匹配，不是正则——`
+    + `该记法被当作字面文本处理。若你本意是按模式匹配：先用 grep 按正则找到实际内容，`
+    + `再把命中的字面文本复制为 old_string；复杂改动改用带锚点的 hash_edit。`
 }
 
 
@@ -124,19 +147,6 @@ export const EDIT_FILE_TOOL: Tool = {
       }
     }
 
-    // Regex-misuse guard: edit_file uses exact string matching, not regex.
-    // Models occasionally write \d, \w, .* etc. in old_string expecting regex
-    // semantics — this silently fails (match not found) and leads to retry
-    // loops that can corrupt the file. Catch it early with a clear message.
-    const oldStringRaw = params.input.old_string as string
-    const regexPattern = detectRegexPattern(oldStringRaw)
-    if (regexPattern) {
-      return {
-        content: `错误：old_string 含有正则模式（${regexPattern}）。\n\nedit_file 使用精确字符串匹配，不是正则表达式。该模式被当作字面文本处理，因此不会匹配。\n\n修复方法：\n- 用文件中的字面字符替换正则标记\n- 先用 grep 按正则找到实际内容，再复制粘贴为 old_string\n- 复杂模式请改用带锚点的 hash_edit`,
-        isError: true,
-      }
-    }
-
     let fileStat: Awaited<ReturnType<typeof stat>>
     try {
       fileStat = await stat(filePath)
@@ -172,10 +182,10 @@ export const EDIT_FILE_TOOL: Tool = {
         if (freshContent.includes(oldString)) {
           // old_string still matches — just re-apply the edit
           const newString = toLf(params.input.new_string as string)
-          const replaceAll = (params.input.replace_all as boolean) ?? false
+          const replaceAll = asBool(params.input.replace_all)
           if (replaceAll) {
             const newContent = freshContent.replaceAll(oldString, newString)
-            const dryRun = (params.input.dry_run as boolean) ?? false
+            const dryRun = asBool(params.input.dry_run)
             if (dryRun) {
               return buildDryRunPreview(params.cwd, filePath, freshContent, newContent)
             }
@@ -200,7 +210,7 @@ export const EDIT_FILE_TOOL: Tool = {
             return { content: buildMultipleMatchError(filePath, oldString, freshContent), isError: true }
           }
           const recovered = freshContent.replace(oldString, newString)
-          const dryRun = (params.input.dry_run as boolean) ?? false
+          const dryRun = asBool(params.input.dry_run)
           if (dryRun) {
             return buildDryRunPreview(params.cwd, filePath, freshContent, recovered)
           }
@@ -237,7 +247,7 @@ export const EDIT_FILE_TOOL: Tool = {
           const fails = incrementEditFailCount(filePath)
           const gatePrefix = fails >= 3 ? `此文件已连续编辑失败 ${fails} 次，再次编辑前必须先重新 read_file。\n\n` : ''
           return {
-            content: gatePrefix + `自你上次 read_file 以来，文件 ${filePath} 已被修改${modNote}。old_string 已不再匹配。\n\n预期位置附近的当前内容（第 ${bestIdx + 1} 行）：\n\`\`\`\n${actualWindow}\n\`\`\`\n\n请更新 old_string 以匹配当前内容后重试，或改用带锚点的 hash_edit。`,
+            content: gatePrefix + `自你上次 read_file 以来，文件 ${filePath} 已被修改${modNote}。old_string 已不再匹配。\n\n预期位置附近的当前内容（第 ${bestIdx + 1} 行）：\n\`\`\`\n${actualWindow}\n\`\`\`\n\n请更新 old_string 以匹配当前内容后重试，或改用带锚点的 hash_edit。` + regexMisuseHint(oldString),
             isError: true,
           }
         }
@@ -248,7 +258,7 @@ export const EDIT_FILE_TOOL: Tool = {
         const fails = incrementEditFailCount(filePath)
         const gatePrefix = fails >= 3 ? `此文件已连续编辑失败 ${fails} 次，再次编辑前必须先重新 read_file。\n\n` : ''
         return {
-          content: gatePrefix + `自你上次 read_file 以来，文件 ${filePath} 已被修改${modNote}。未找到 old_string。\n\n文件开头：\n\`\`\`\n${head}${freshLines.length > 30 ? `\n...（共 ${freshLines.length} 行）` : ''}\n\`\`\`\n\n请重新读取文件查看完整内容，或改用带锚点的 hash_edit。`,
+          content: gatePrefix + `自你上次 read_file 以来，文件 ${filePath} 已被修改${modNote}。未找到 old_string。\n\n文件开头：\n\`\`\`\n${head}${freshLines.length > 30 ? `\n...（共 ${freshLines.length} 行）` : ''}\n\`\`\`\n\n请重新读取文件查看完整内容，或改用带锚点的 hash_edit。` + regexMisuseHint(oldString),
           isError: true,
         }
       } catch {
@@ -276,7 +286,7 @@ export const EDIT_FILE_TOOL: Tool = {
     const content = toLf(rawContent)
     const oldString = toLf(params.input.old_string as string)
     const newString = toLf(params.input.new_string as string)
-    const replaceAll = (params.input.replace_all as boolean) ?? false
+    const replaceAll = asBool(params.input.replace_all)
 
     if (replaceAll) {
       if (!content.includes(oldString)) {
@@ -288,7 +298,7 @@ export const EDIT_FILE_TOOL: Tool = {
         }
       }
       const newContent = content.replaceAll(oldString, newString)
-      const dryRun = (params.input.dry_run as boolean) ?? false
+      const dryRun = asBool(params.input.dry_run)
       if (dryRun) {
         return buildDryRunPreview(params.cwd, filePath, content, newContent)
       }
@@ -318,7 +328,7 @@ export const EDIT_FILE_TOOL: Tool = {
       const fuzzy = findFuzzyMatch(content, oldString)
       if (fuzzy) {
         const recovered = applyFuzzyReplacement(content, fuzzy, newString)
-        const dryRun = (params.input.dry_run as boolean) ?? false
+        const dryRun = asBool(params.input.dry_run)
         if (dryRun) {
           return buildDryRunPreview(params.cwd, filePath, content, recovered)
         }
@@ -358,7 +368,7 @@ export const EDIT_FILE_TOOL: Tool = {
       }
     }
     const newContent = content.replace(oldString, newString)
-    const dryRun = (params.input.dry_run as boolean) ?? false
+    const dryRun = asBool(params.input.dry_run)
     if (dryRun) {
       return buildDryRunPreview(params.cwd, filePath, content, newContent)
     }
@@ -521,6 +531,10 @@ async function finalizeEdit(
  *   - line that "looks" the same but has subtle Unicode differences
  */
 function buildNotFoundError(filePath: string, oldString: string, fileContent: string): string {
+  return buildNotFoundErrorBody(filePath, oldString, fileContent) + regexMisuseHint(oldString)
+}
+
+function buildNotFoundErrorBody(filePath: string, oldString: string, fileContent: string): string {
   const oldLines = oldString.split('\n')
   const firstLine = oldLines[0] ?? ''
   const lastLine = oldLines[oldLines.length - 1] ?? ''

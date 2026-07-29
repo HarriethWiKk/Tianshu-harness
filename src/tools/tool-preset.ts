@@ -1,7 +1,6 @@
 import { existsSync, readFileSync } from 'node:fs'
-import { join } from 'node:path'
 import { findProjectConfig } from '../config/manager.js'
-import { defaultRivetHome } from '../config/paths.js'
+import { userConfigPath } from '../config/paths.js'
 
 /**
  * Tool preset — 会话启动期的工具装配档位（会话内冻结，前缀缓存零影响）。
@@ -16,7 +15,8 @@ import { defaultRivetHome } from '../config/paths.js'
  *   inspect_project/import_resource/leave_mark/browser_debug/monitor。
  *
  * 解析优先级：`RIVET_TOOL_PRESET` env > 项目 `.rivet-config.json` tools.preset
- * > 用户 `~/.rivet/config.json` tools.preset > 'minimal'。
+ * > 用户配置 tools.preset（`userConfigPath()`，认 RIVET_HOME/RIVET_CONFIG_PATH）
+ * > 'minimal'。
  * 变更只在下个会话生效（会话中途改工具指纹 = 前缀全量重建，反经济）。
  */
 
@@ -47,7 +47,10 @@ export function resolveToolPreset(cwd: string): ToolPreset {
   }
 
   if (!preset) {
-    const userPath = join(defaultRivetHome(), 'config.json')
+    // 必须与写侧同源（saveToolPresetConfig → userConfigPath）。用
+    // defaultRivetHome() 会漏掉 RIVET_HOME/RIVET_CONFIG_PATH——桌面端便携模式
+    // 与自定义存储路径下设置页写的档位就永远读不回来，UI 显示已保存却无效。
+    const userPath = userConfigPath()
     if (existsSync(userPath)) {
       try {
         const raw = JSON.parse(readFileSync(userPath, 'utf-8')) as { tools?: { preset?: unknown } }
@@ -76,9 +79,9 @@ export function __resetToolPresetForTest(): void {
 /** minimal 排除名单（kernel + bootstrap 统一）。full 全集；frontend 仅加
  *  browser_debug。判断逻辑见 presetIncludes。 */
 const MINIMAL_EXCLUDES: ReadonlySet<string> = new Set([
-  // 编排三件套（重 + 日常低频）
+  // 编排（重 + 日常低频）。team_orchestrate 2026-07-29 移除——它是唯一
+  // 多 worker 波次编排入口，主控必须可见（T3 修复：随 tool-tiers 升入 CORE）。
   'council_convene',
-  'team_orchestrate',
   // browser 系
   'browser_debug',
   // 重而冷门 / 零使用（2026-07-19 会话使用率审计）

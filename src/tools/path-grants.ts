@@ -23,6 +23,8 @@ import { join, resolve, sep } from 'node:path'
 import { writeFileAtomicSync } from '../fs-atomic.js'
 import { rivetHome } from '../config/paths.js'
 import { expandHome } from '../platform.js'
+import { debugLog } from '../utils/debug.js'
+import { rawOutputDir } from './output-store.js'
 
 export type GrantMode = 'read' | 'write'
 
@@ -237,18 +239,85 @@ const DEFAULT_DEPENDENCY_READ_DIRS = [
   '.gem', '.bundle',
   '.composer', '.config/composer',
   '.android',
+  '.nuget',       // .NET NuGet packages
+  '.nvm',         // Node Version Manager installations
+  '.pyenv',       // Python version manager installs
   'go',
   // In-project node_modules / vendor / Pods already live under cwd and need no
   // grant; this list only covers $HOME-level global caches.
 ]
 
+/**
+ * Environment variable overrides for dependency cache directories.
+ *
+ * Each key matches a DEFAULT_DEPENDENCY_READ_DIRS entry. When the named
+ * environment variable is set (non-empty), its value is used as the absolute
+ * directory root instead of the default `$HOME/{key}` path. Absent or empty
+ * env vars fall through to the default.
+ *
+ * Only well-known, user-facing env vars with a stable contract are listed
+ * (e.g. CARGO_HOME, GRADLE_USER_HOME). Npm/yarn/pnpm use layered config
+ * (npmrc, yarnrc) whose env-var surface is unreliable; they stay on defaults.
+ *
+ * See .rivet/knowledge/debug-t7-collapse-cache-cliff.md §4 — env var is the
+ * write side (who sets), not the read side (who reads).
+ */
+const ENV_OVERRIDES: Record<string, string> = {
+  '.cargo': 'CARGO_HOME',
+  '.rustup': 'RUSTUP_HOME',
+  '.gradle': 'GRADLE_USER_HOME',
+  '.pub-cache': 'PUB_CACHE',
+  '.gem': 'GEM_HOME',
+}
+
 export function applyDefaultDependencyReadGrants(): void {
   const home = homedir()
+  const granted: string[] = []
+  const skipped: string[] = []
   for (const rel of DEFAULT_DEPENDENCY_READ_DIRS) {
-    const root = resolve(join(home, rel))
-    if (!existsSync(root)) continue
+    const envVar = ENV_OVERRIDES[rel]
+    const root = envVar && process.env[envVar]
+      ? resolve(process.env[envVar])
+      : resolve(join(home, rel))
+    if (!existsSync(root)) {
+      skipped.push(rel)
+      continue
+    }
+    grantPath(root, 'read', { persist: false })
+    granted.push(rel)
+  }
+  debugLog(`dep read grants: ${granted.length} granted` +
+    (granted.length ? ` (${granted.join(', ')})` : '') +
+    (skipped.length ? `; ${skipped.length} skipped (${skipped.join(', ')})` : ''))
+}
+
+/**
+ * Read grants for directories Rivet itself writes outside the workspace and
+ * then tells the model to read back.
+ *
+ * `$TMPDIR/rivet-raw` holds the full output of tools whose result was truncated
+ * for the model, and the truncation footer says verbatim:
+ * `full output: read_file <rawPath> — 不要重跑命令`. Without a grant that
+ * `read_file` fails `validatePathSafe` ("Path outside project directory"), so
+ * the model can neither recover the output nor re-run the command — a closed
+ * dead end (9 occurrences across 4 sessions on 2026-07-27/28).
+ *
+ * Unlike the dependency caches above these roots are NOT existence-gated: the
+ * raw dir is created lazily on the first truncated output, so at session start
+ * it usually does not exist yet and an `existsSync` skip would make the grant
+ * never take effect. Skipping fail-closed is right for user-configured paths
+ * (a typo must not open a subtree) but wrong here — the path is ours, derived
+ * from code rather than input, and it only ever contains output this agent
+ * itself produced.
+ *
+ * Read-only, session-scoped, never persisted.
+ */
+export function applyRivetRuntimeReadGrants(): void {
+  const roots = [rawOutputDir()]
+  for (const root of roots) {
     grantPath(root, 'read', { persist: false })
   }
+  debugLog(`rivet runtime read grants: ${roots.join(', ')}`)
 }
 
 /** Test-only: clear the in-memory grant store. */

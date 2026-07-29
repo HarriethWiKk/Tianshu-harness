@@ -15,6 +15,27 @@
  * 只列入 WRITE_TOOL_NAMES 供路径提取使用，不做内容提取。
  */
 
+/**
+ * 布尔开关归一。
+ *
+ * 模型会把布尔参数写成字符串——2026-07-27 会话里实测传过 dry_run="true"、
+ * timeout="60000"。裸 `input.x as boolean` 对字符串 "false" 求值为真，
+ * 于是 dry_run="false" 会让编辑静默降级为预览（模型以为改完了），
+ * replace_all="false" 会把单处替换扩成全量替换。两种都是无声的错误结果，
+ * 比报错更难发现，所以在读取点归一。
+ */
+export function asBool(value: unknown, fallback = false): boolean {
+  if (typeof value === 'boolean') return value
+  if (typeof value === 'string') {
+    const v = value.trim().toLowerCase()
+    if (v === 'true' || v === '1' || v === 'yes') return true
+    if (v === 'false' || v === '0' || v === 'no' || v === '') return false
+  }
+  if (typeof value === 'number') return value !== 0
+  if (value === null || value === undefined) return fallback
+  return Boolean(value)
+}
+
 /** 所有写工具名（供各检测器引用，替代各自的 EDIT_TOOLS / WRITE_TOOLS） */
 export const WRITE_TOOL_NAMES = new Set([
   'edit_file',

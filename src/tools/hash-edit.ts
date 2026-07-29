@@ -5,6 +5,7 @@ import type { Tool, ToolCallParams } from './types.js'
 import { validatePath } from './path-validate.js'
 import { syntaxCheck, checkSyntax } from './syntax-check.js'
 import { detectPointerPlaceholder, pointerPlaceholderError, resolveIdempotentPointer } from './pointer-guard.js'
+import { asBool } from './write-tool-helpers.js'
 import { getFileReadMtime, noteFileObserved, recordSuccessfulEdit, wasFileEditedBySession, incrementEditFailCount, resetEditFailCount } from './read-file.js'
 import { landingWriteFile, delegatedToToolResult, isDelegateRejected } from './client-delegate.js'
 import { trackFileChange, restoreLatestBackup } from '../agent/recovery-stack.js'
@@ -292,21 +293,39 @@ export const HASH_EDIT_TOOL: Tool = {
 锚点格式为 L<line>:<8-char-hex>（完整哈希校验）或 L<line>
 （仅位置快速路径——仅在你刚读过该文件时使用）。提供 1-3 个
 锚点：首尾锚点定义含两端在内的替换区间；中间锚点校验区间内部。
-单锚点模式替换该行。
+单锚点模式替换该行（要插入就把该行内容原样放进 new_string 首/尾）。
 
 哈希：SHA256(line_content_without_trailing_cr)[0:8]。
 grep 结果对单文件匹配附带锚点提示。
 
-编辑成功后回传新区间的新鲜锚点（Fresh anchors）——链式编辑
-同一文件时直接使用回传锚点，不需要重新 read_file。
+### 锚点是一次性坐标
+任何对该文件的写入都会让此前取得的锚点作废——包括你自己上一次的
+hash_edit / edit_file / write_file。编辑点之后的所有行号还会整体漂移
+（漂移量 = 新行数 − 旧行数）。拿旧锚点重试同一调用只会再次失败。
 
-仅位置模式（L<line> 无哈希）适合首次编辑；链式编辑优先用回传的完整哈希锚点（L<line>:<hash>）。
+同一文件连续编辑：
+- 改**刚编辑过的那一块**：用成功回传的「新鲜锚点」（只覆盖编辑点前后
+  各一行与新块首尾）。
+- 改**该文件的其他位置**：先用 grep 重新取锚点。read_file 的输出不带
+  哈希，只有 grep 会给出 L<line>:<hash> 提示。
+- 一次要改多处时，**从文件末尾往前改**——这样先改的位置不会让后面
+  待改位置的行号漂移。
+
+仅位置模式（L<line> 无哈希）适合首次编辑，且绝不能连续链式使用；
+链式编辑一律用带哈希的完整锚点（L<line>:<hash>）。
+
+### 示例
+替换 L5-L7：anchors=["L5:a1b2c3d4","L7:e5f6a7b8"], new_string="新5\\n新6\\n新7"
+删除 L10-L12：anchors=["L10:deadbeef","L12:cafebabe"], new_string=""
+在 L42 后插入：anchors=["L42:feedface"], new_string="<L42 原内容>\\n新增行"
 
 多处改动、超过约 20 行的编辑或结构性重构，优先用
 apply_patch 加 unified diff。
 
 注意：new_string 较大时，消息历史只保留短指针
-（file_path + 大小）。后续轮次用 read_file 回看当前内容。`,
+（file_path + 大小）。后续轮次用 read_file 回看当前内容。
+new_string 必须是真实文件内容，绝不能把 [hash_edit applied to …]
+这类回吐指针当成内容传回来。`,
     input_schema: {
       type: 'object',
       properties: {
@@ -462,7 +481,7 @@ apply_patch 加 unified diff。
           const newContent = [...before, ...newLines, ...after].join('\n')
 
           const recoveredCount = anchors.reduce((n, a, i) => a.hash !== null && a.line !== recoveredAnchors[i]!.line ? n + 1 : n, 0)
-          const dryRun = (params.input.dry_run as boolean) ?? false
+          const dryRun = asBool(params.input.dry_run)
           if (dryRun) {
             return buildHashDryRunPreview(params.cwd, filePath, content, newContent)
           }
@@ -510,7 +529,7 @@ apply_patch 加 unified diff。
     const newLines = newString === '' ? [] : newString.split('\n')
     const newContent = [...before, ...newLines, ...after].join('\n')
 
-    const dryRun = (params.input.dry_run as boolean) ?? false
+    const dryRun = asBool(params.input.dry_run)
     if (dryRun) {
       return buildHashDryRunPreview(params.cwd, filePath, content, newContent)
     }

@@ -169,6 +169,8 @@ export function tapAgentCallbacks(
       emit('delegation', {
         workerId: a.workOrderId,
         parentId: a.parentToolId,
+        // 嵌套委派的父 worker order id（与 sidecar emitDelegationActivity 对齐）。
+        parentWorkerId: a.parentWorkerId,
         profile: a.profile,
         authority: a.authority,
         authorityReason: a.authorityReason,

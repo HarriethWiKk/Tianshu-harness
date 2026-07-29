@@ -268,6 +268,56 @@ test('getEventsAsync lazily loads via loadEventsAsync and shares one in-flight r
   assert.equal(asyncCalls, 1)
 })
 
+test('尾部读优先于全量读，且被截头部的信息经 diskFirstSeq / artifactIds 带出', async () => {
+  const seed: PersistedSession[] = [{
+    record: {
+      id: 'a', status: 'completed', createdAt: 1, updatedAt: 9,
+      cwd: '/work', lastSeq: 4, pendingApprovals: 0,
+    },
+    events: [
+      ev(1, 'artifact', { id: 'head-art' }),
+      ev(2, 'text_delta', { text: 'a' }),
+      ev(3, 'text_delta', { text: 'b' }),
+      ev(4, 'text_delta', { text: 'c' }),
+    ],
+  }]
+  const mem = new LazyMemoryPersistence(seed)
+  let tailCalls = 0
+  let fullCalls = 0
+  let sawMaxEvents = -1
+  ;(mem as SessionPersistenceAdapter).loadEventsAsync = async () => { fullCalls += 1; return [] }
+  ;(mem as SessionPersistenceAdapter).loadEventsTailAsync = async (id: string, maxEvents: number) => {
+    tailCalls += 1
+    sawMaxEvents = maxEvents
+    const all = mem.events.get(id) ?? []
+    return {
+      events: all.slice(Math.max(0, all.length - maxEvents)).map((e) => ({ ...e })),
+      diskFirstSeq: all[0]!.seq,
+      lastSeq: all[all.length - 1]!.seq,
+      artifactIds: all.filter((e) => e.type === 'artifact').map((e) => String(e.data.id)),
+      total: all.length,
+    }
+  }
+  // 环容量 2 → 头部两条（含那条 artifact）落在窗口外。
+  const mgr = new RuntimeSessionManager({
+    createAgent: () => new NoopAgent(),
+    persistence: mem,
+    maxEvents: 2,
+  })
+
+  const replay = await mgr.getEventsAsync('a', 0)
+  assert.equal(tailCalls, 1, '有尾部读就不该走全量读')
+  assert.equal(fullCalls, 0)
+  assert.equal(sawMaxEvents, 2, '环容量必须传给读取侧，截断才可能在那边发生')
+  assert.deepEqual(replay!.events.map((e) => e.seq), [3, 4], '只回放环内尾部')
+  assert.equal(replay!.lastSeq, 4, 'lastSeq 来自磁盘全量而非窗口')
+
+  // 被截头部仍要可见：replay_window 据 diskFirstSeq 告诉前端还有更早的历史。
+  const win = mgr.getReplayWindow('a')
+  assert.equal(win!.diskFirstSeq, 1, '磁盘最早 seq 来自被截头部')
+  assert.equal(win!.floorSeq, 3, '内存环起点是窗口首条')
+})
+
 test('a sync load winning the race is not clobbered by the stale async snapshot', async () => {
   const seed: PersistedSession[] = [{
     record: {

@@ -1,6 +1,7 @@
 import type { ContentBlock, Message } from '../api/types.js'
 import type { OaiMessage, OaiAssistantMessage } from '../api/oai-types.js'
 import type { ApiInvariant, ApiInvariantStatus, ApiRound } from './types.js'
+import { estimateImageTokens } from './image-tokens.js'
 
 function estimateMessageTokens(msg: Message): number {
   const content = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content)
@@ -230,12 +231,12 @@ function estimateOaiMessageTokens(msg: OaiMessage): number {
   if (msg.role === 'assistant') {
     content = (msg.content ?? '') + (msg.reasoning_content ?? '') + (msg.tool_calls ? JSON.stringify(msg.tool_calls) : '')
   } else if (msg.role === 'user' && Array.isArray(msg.content)) {
-    let textLen = 0, imageCount = 0
+    let textLen = 0, imageTokens = 0
     for (const part of msg.content) {
       if (part.type === 'text') textLen += part.text.length
-      else imageCount++
+      else imageTokens += estimateImageTokens(part.image_url.url)
     }
-    return Math.ceil(textLen / 4) + imageCount * 765
+    return Math.ceil(textLen / 4) + imageTokens
   } else {
     content = msg.content as string
   }

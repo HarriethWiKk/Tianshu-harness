@@ -1,6 +1,7 @@
 import { describe, it, before, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'fs'
+import { spawnSync } from 'child_process'
 import { join } from 'path'
 import { tmpdir } from 'os'
 import { GREP_TOOL, GREP_EMPTY_RESULT } from '../grep.js'
@@ -185,6 +186,35 @@ describe('GREP_TOOL', () => {
       process.env.PATH = savedPath
       resetResolvedEnvCache()
       rmSync(fbDir, { recursive: true, force: true })
+    }
+  })
+
+  it('hit-cap kill of rg is not misreported as rg failure', async () => {
+    // grep 命中上限后会主动 SIGTERM 掉 rg，此时 close 的 code 是 null。
+    // 把它当成「rg 失败」会丢弃已收结果、退化成慢速全树扫描，并对模型谎称环境缺 rg。
+    if (spawnSync('rg', ['--version'], { stdio: 'ignore' }).status !== 0) return
+
+    const capDir = mkdtempSync(join(tmpdir(), 'grep-cap-'))
+    try {
+      mkdirSync(join(capDir, 'src'), { recursive: true })
+      // 输出量远超 200KB stdout 上限，确保 kill 落下时 rg 仍在流式输出。
+      const lines = Array.from({ length: 50_000 }, (_, i) => `CAP_NEEDLE payload line ${i}`)
+      writeFileSync(join(capDir, 'src', 'huge.ts'), lines.join('\n'))
+
+      const result = await GREP_TOOL.execute({
+        input: { pattern: 'CAP_NEEDLE', path: 'src', max_results: 100_000, literal: true },
+        toolUseId: 'test',
+        cwd: capDir,
+      })
+
+      assert.ok(!result.isError, `grep must not error, got: ${result.content}`)
+      assert.ok(
+        !result.content.includes('未找到 ripgrep'),
+        `rg 可用且只是命中上限被 kill，不得谎报「未找到 ripgrep」：${result.content.slice(0, 200)}`,
+      )
+      assert.ok(result.content.includes('CAP_NEEDLE'), '已收集的 rg 结果必须保留，不能丢弃')
+    } finally {
+      rmSync(capDir, { recursive: true, force: true })
     }
   })
 

@@ -147,7 +147,12 @@ function bindSourceTestPairs(tasks: TeamTask[]): TeamTask[] {
     consumed.add(task.id)
 
     const files = touchFiles(task)
-    // Only look for test-only tasks to merge into this one
+    // Only look for test-only tasks to merge into this one.
+    // Empty scope tasks can't have source-test relationships.
+    if (files.length === 0) {
+      result.push(task)
+      continue
+    }
     let merged = false
     for (const other of tasks) {
       if (consumed.has(other.id)) continue

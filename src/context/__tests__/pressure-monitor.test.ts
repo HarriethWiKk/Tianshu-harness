@@ -19,6 +19,46 @@ describe('PressureMonitor', () => {
     assert.equal(result.shouldCompact, true)
   })
 
+  // ─── pressureRelative 分辨率（2026-07-28 第二轮监测）───────────────
+  //
+  // 旧实现 min(1, ratio / p90(history)) 在单调增长的会话里注定饱和：当前
+  // ratio 几乎必然是尾部 20 轮里的最大值，p90 约等于次大值，比值恒 ≥1。
+  // 实测 901 轮中 662 轮（73.5%）pressure 恰为 0.50——由 verifCoverage=1.00
+  // （债务项恰为 0）与 0.50×contextPressure 反解出 contextPressure 恰为 1.0。
+  // 后果：上下文压力这一维不再携带信息，而 pressure>0.7 的三处下游判定
+  // 因最大值只到 0.68 从未触发。
+  describe('pressureRelative resolution', () => {
+    it('does not saturate on smooth monotonic growth', () => {
+      const pm = new PressureMonitor(1_000_000)
+      // 每轮 +2000 token 的平缓增长，占用率始终很低（1%→3%），正是生产实况
+      let last = 0
+      for (let turn = 1; turn <= 15; turn++) {
+        last = pm.check(10_000 + turn * 2_000, turn).pressureRelative ?? -1
+      }
+
+      assert.notEqual(last, -1, '历史足够时必须给出 pressureRelative')
+      assert.ok(last < 0.3, `平缓增长不得读成高压，实得 ${last}`)
+    })
+
+    it('still reports high relative pressure on a genuine spike', () => {
+      const pm = new PressureMonitor(1_000_000)
+      for (let turn = 1; turn <= 10; turn++) pm.check(50_000, turn)
+      // 相对近期基线翻倍——真实异常，必须报出来
+      const spiked = pm.check(100_000, 11).pressureRelative
+
+      assert.ok(spiked !== undefined && spiked >= 0.9, `2× 基线应接近满值，实得 ${spiked}`)
+    })
+
+    it('keeps returning undefined until history reaches 5 entries', () => {
+      const pm = new PressureMonitor(1_000_000)
+      for (let turn = 1; turn <= 5; turn++) {
+        assert.equal(pm.check(10_000 * turn, turn).pressureRelative, undefined,
+          `第 ${turn} 轮历史不足，应为 undefined`)
+      }
+      assert.notEqual(pm.check(60_000, 6).pressureRelative, undefined)
+    })
+  })
+
   it('detects thrashing when compact frequency is high', () => {
     const pm = new PressureMonitor(100_000)
     pm.recordCompaction(1)

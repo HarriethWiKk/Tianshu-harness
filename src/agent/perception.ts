@@ -8,7 +8,6 @@ export interface StarPhaseContextInput {
   turn: number
   maxTurns: number
   recentTools: string[]
-  shouldEscalate: boolean
   hasEnteredHighComplexity: boolean
   /** 交付证据门（evidence.deliveryStatus === 'verified'）——YOLO 无最终轮，
    *  归航改由交付证据抬升（2026-07-25 复盘修复）。 */
@@ -101,7 +100,6 @@ export function buildStarPhaseContext(input: StarPhaseContextInput): StarPhaseCo
     // 结构性不可达。用交付证据（验证通过）替代轮次边界；有界会话不走此门，
     // 语义保持「最终轮才归航」不变。
     readyByEvidence: input.maxTurns <= 0 && (input.deliveryVerified ?? false),
-    shouldEscalate: input.shouldEscalate,
     hasEnteredHighComplexity: input.hasEnteredHighComplexity,
   }
 }

@@ -51,6 +51,7 @@ export function getPaletteCommands(): PaletteCommand[] {
     { name: '/btw', description: '侧问 — 就当前会话问一句，不进对话历史', argsHint: '<问题>' },
     { name: '/compact', description: 'Compact conversation context' },
     { name: '/connect', description: '连接模型服务商（选内置或自定义，填写 API 密钥）' },
+    { name: '/config', description: '设置面板 — 子代理路由 / 审查子代理 / 识图模型 / 基础项' },
     { name: '/model', description: 'Show or switch model', argsHint: 'list|<model-id>' },
     { name: '/model list', description: 'List available models' },
     { name: '/chat', description: 'Switch to lightweight chat mode' },
@@ -107,6 +108,7 @@ export function getPaletteCommands(): PaletteCommand[] {
     { name: '/exit', description: 'Save session and exit' },
     { name: '/update', description: 'Check and install the latest Rivet release' },
     { name: '/doctor', description: 'Environment health check + which shell the bash tool uses' },
+    { name: '/logs', description: '本会话的日志落点（会话 / 缓存 / 六维 / 桌面），含门控与回收说明', argsHint: '[open [desktop]]' },
     { name: '/init', description: '交互式项目初始化：verify 声明 / skills / hooks 脚手架' },
     { name: '/cd', description: '会话中途切换工作目录（保前缀缓存，会话归属迁往新项目）', argsHint: '<path>' },
   ]

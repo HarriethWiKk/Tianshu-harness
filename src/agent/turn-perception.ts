@@ -155,7 +155,6 @@ export class TurnPerceptionController {
       turn: input.turn,
       maxTurns: this.deps.maxTurns,
       recentTools,
-      shouldEscalate: nextStrategy.shouldEscalate,
       hasEnteredHighComplexity: this.hasEnteredHighComplexity,
       // YOLO 证据门归航：buildStarPhaseContext 只在 maxTurns<=0 时消费。
       // 判据用 deliveryReady（最近验证 passed 且绿后零编辑）而非 deliveryStatus——

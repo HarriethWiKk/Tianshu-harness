@@ -6,6 +6,7 @@ import { configSchema, reviewConfigSchema, workersSchema, councilConfigSchema, e
 import { DEFAULT_CONFIG } from './default.js'
 import { userConfigPath } from './paths.js'
 import { cloneProviderPreset, findPresetModel, isProviderPresetKey, type ProviderPresetKey } from './provider-presets.js'
+import { backfillPresetModelFields } from './preset-model-backfill.js'
 import { invalidateToolPreset } from '../tools/tool-preset.js'
 
 const APPROVAL_MODES = ['auto-safe', 'manual', 'auto-accept', 'dangerously-skip-permissions'] as const
@@ -200,7 +201,11 @@ export function loadConfig(options?: {
     }
   }
 
-  return configSchema.parse(base)
+  // Stored provider models are a snapshot of the preset at write time, and
+  // deepMerge replaced the array wholesale above — so preset fields added later
+  // (e.g. supportsVision) are missing from every config already on disk. Refill
+  // the absent ones here; see preset-model-backfill.ts for the scope limits.
+  return backfillPresetModelFields(configSchema.parse(base))
 }
 
 /** Load config with backward-compatible signature (no options). */
@@ -562,6 +567,27 @@ export function setCheckpointConfig(input: {
   return { checkpointEveryTurns: cfg.agent.checkpointEveryTurns }
 }
 
+// --- Delivery auto-commit toggle ---
+
+export interface DeliveryConfigSnapshot {
+  /** false = deliver_task 只出报告不提交。默认 true（向后兼容）。 */
+  autoCommit: boolean
+}
+
+export function getDeliveryConfig(): DeliveryConfigSnapshot {
+  return { autoCommit: loadConfig().agent.delivery?.autoCommit !== false }
+}
+
+export function setDeliveryConfig(input: { autoCommit?: unknown }): DeliveryConfigSnapshot {
+  const cfg = loadConfig()
+  if (input.autoCommit !== undefined) {
+    if (typeof input.autoCommit !== 'boolean') throw new Error('autoCommit must be a boolean')
+    cfg.agent.delivery = { ...cfg.agent.delivery, autoCommit: input.autoCommit }
+  }
+  saveConfig(cfg)
+  return { autoCommit: cfg.agent.delivery?.autoCommit !== false }
+}
+
 // --- Tool preset (minimal/frontend/full, session-start assembly tier) ---
 
 export interface ToolPresetConfigSnapshot {
@@ -889,13 +915,35 @@ export function clampModelTokens<T extends { contextWindow: number; maxTokens: n
   return { ...model, contextWindow, maxTokens }
 }
 
+/**
+ * Merge a model update onto the existing entry instead of replacing it.
+ *
+ * Every write path here carries a *partial* model: the desktop Settings form
+ * sends only `{id, alias, contextWindow, maxTokens}`, and `rivet config
+ * set-model` sends just what the user typed. Whole-object replacement drops
+ * every field the form does not carry — `supportsVision`, `tier`, `pricing` —
+ * and all three failures are silent: images get dropped with no error, tier
+ * falls back to guessing from the model name, cost accounting reads zero.
+ * An absent key means "caller had no opinion", so the stored value wins;
+ * clearing a field is `removeModel`'s job, not a side effect of editing a
+ * context window.
+ */
+function mergeModelUpdate(existing: ModelConfig, incoming: ModelConfig): ModelConfig {
+  const merged: Record<string, unknown> = { ...existing }
+  for (const [key, value] of Object.entries(incoming)) {
+    if (value !== undefined) merged[key] = value
+  }
+  return clampModelTokens(merged as ModelConfig)
+}
+
 export function upsertProviderModel(providerName: string, model: ModelConfig, options: UpsertProviderModelOptions = {}): void {
   const cfg = loadConfig()
   const provider = cfg.provider.providers[providerName]
   if (!provider) throw new Error(`Provider "${providerName}" not found`)
   model = clampModelTokens(model)
   const existingIndex = provider.models.findIndex(item => item.id === model.id || (model.alias !== undefined && item.alias === model.alias))
-  if (existingIndex >= 0) provider.models[existingIndex] = model
+  const existing = existingIndex >= 0 ? provider.models[existingIndex] : undefined
+  if (existing) provider.models[existingIndex] = mergeModelUpdate(existing, model)
   else provider.models.push(model)
   if (options.preferred) {
     const preferredIndex = provider.models.findIndex(item => item.id === model.id)
@@ -937,7 +985,10 @@ export function setupProvider(options: SetupProviderOptions): void {
   if (options.model) {
     const model = clampModelTokens(options.model)
     const existingIndex = next.models.findIndex(item => item.id === model.id || (model.alias !== undefined && item.alias === model.alias))
-    if (existingIndex >= 0) next.models[existingIndex] = model
+    const existing = existingIndex >= 0 ? next.models[existingIndex] : undefined
+    // Merge, never replace — see mergeModelUpdate. This is the path the desktop
+    // Settings form takes, and it only ever sends four fields.
+    if (existing) next.models[existingIndex] = mergeModelUpdate(existing, model)
     else next.models.unshift(model)
   }
   cfg.provider.providers[options.providerName] = next

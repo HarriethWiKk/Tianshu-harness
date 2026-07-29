@@ -173,6 +173,29 @@ describe('groupTeamTasks', () => {
     assert.ok(waves[0]!.reason.includes('T9'))
     assert.equal(waves[0]!.risk, 'medium')
   })
+
+  it('does NOT merge tasks with empty scope as source+test pairs (vacuum-truth T5 fix)', () => {
+    // Regression: when both tasks have empty files/touchSet, [].every(fn)
+    // returns true (vacuum truth), causing bindSourceTestPairs to incorrectly
+    // merge unrelated tasks — collapsing 7 independent tasks into ~3-4.
+    // T5 fix (2026-07-29): empty scope tasks are never source-test pairs.
+    const waves = groupTeamTasks([
+      task('T1', []),
+      task('T2', []),
+      task('T3', []),
+      task('T4', []),
+      task('T5', []),
+      task('T6', []),
+      task('T7', []),
+    ])
+
+    // All 7 tasks should survive — no vacuum-truth merging.
+    // Empty-scope tasks are disjoint by definition, so they can cohabit
+    // in waves up to MAX_WRITE_WORKERS=3. 7 tasks → 3 waves (3+3+1).
+    const allIds = waves.flatMap(w => w.taskIds).sort()
+    assert.deepEqual(allIds, ['T1', 'T2', 'T3', 'T4', 'T5', 'T6', 'T7'])
+    assert.equal(waves.length, 3, '7 empty-scope tasks should span 3 waves (capped at maxWrite=3)')
+  })
 })
 
 describe('validateTaskDependencies', () => {

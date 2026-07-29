@@ -1,7 +1,7 @@
 {
   "generator": "scripts/docs-index.ts",
   "spec": "docs/README.md",
-  "count": 994,
+  "count": 1005,
   "docs": [
     {
       "path": "docs/AB测试期间损失审计.md",
@@ -836,6 +836,92 @@
       "tags": []
     },
     {
+      "path": "docs/analysis/2026-07-28-desktop-update-signature-mismatch.md",
+      "title": "2026-07-28 桌面端「signature verification failed」签名错配归因",
+      "type": "analysis",
+      "typeSource": "inferred",
+      "status": null,
+      "statusSource": "none",
+      "date": "2026-07-28",
+      "related": [],
+      "supersedes": null,
+      "tags": []
+    },
+    {
+      "path": "docs/analysis/2026-07-28-第二轮指标监测.md",
+      "title": "第二轮指标监测 —— 闭第一轮留下的三条待数据闭环",
+      "type": "analysis",
+      "typeSource": "frontmatter",
+      "status": "draft",
+      "statusSource": "frontmatter",
+      "date": "2026-07-28",
+      "related": [
+        "docs/监测报告-2026-07-21-第一轮指标监测.md",
+        "docs/analysis/2026-07-25-hexagram-stage-doctrine-evidence.md"
+      ],
+      "supersedes": null,
+      "tags": []
+    },
+    {
+      "path": "docs/analysis/2026-07-28-阈值与分布脱钩.md",
+      "title": "阈值与分布脱钩 —— 按聚合指标改传感器的失效模式",
+      "type": "analysis",
+      "typeSource": "frontmatter",
+      "status": "draft",
+      "statusSource": "frontmatter",
+      "date": "2026-07-28",
+      "related": [
+        "docs/analysis/2026-07-28-第二轮指标监测.md",
+        "docs/监测报告-2026-07-21-第一轮指标监测.md"
+      ],
+      "supersedes": null,
+      "tags": []
+    },
+    {
+      "path": "docs/analysis/2026-07-29-team-mode-e2e-repro-and-gaps.md",
+      "title": "Team 模式端到端实测：复现手册与入口层缺陷归因",
+      "type": "analysis",
+      "typeSource": "frontmatter",
+      "status": "accepted",
+      "statusSource": "frontmatter",
+      "date": "2026-07-29",
+      "related": [
+        "../../src/tools/team-orchestrate.ts",
+        "../../src/agent/tool-tiers.ts",
+        "../../src/agent/worktree-scope.ts"
+      ],
+      "supersedes": null,
+      "tags": [
+        "team",
+        "orchestration",
+        "tool-gating",
+        "worktree",
+        "sidecar",
+        "repro"
+      ]
+    },
+    {
+      "path": "docs/analysis/2026-07-29-桌面端加载延迟归因.md",
+      "title": "桌面端「设置页 / 新建会话几秒空白」归因与混淆器成本核算",
+      "type": "analysis",
+      "typeSource": "frontmatter",
+      "status": "active",
+      "statusSource": "frontmatter",
+      "date": "2026-07-29",
+      "related": [
+        "../dev/render-debug-playbook.md",
+        "../changelog/2026-07-06-appendix-delta-byte-stability.md"
+      ],
+      "supersedes": null,
+      "tags": [
+        "desktop",
+        "performance",
+        "bundle",
+        "obfuscator",
+        "session-manager"
+      ]
+    },
+    {
       "path": "docs/analysis/_starflow-personality.md",
       "title": "天枢星图流：多模型人格化编排设计文档",
       "type": "analysis",
@@ -1420,6 +1506,35 @@
       "statusSource": "none",
       "date": "2026-07-26",
       "related": [],
+      "supersedes": null,
+      "tags": []
+    },
+    {
+      "path": "docs/changelog/2026-07-29-tui-settings-panel.md",
+      "title": "2026-07-29 TUI 设置面板 /config",
+      "type": "changelog",
+      "typeSource": "frontmatter",
+      "status": "done",
+      "statusSource": "frontmatter",
+      "date": "2026-07-29",
+      "related": [
+        "docs/changelog/2026-07-29-vision-channel-honesty-and-test-entry-hardening.md",
+        "docs/user-guide-vision.md"
+      ],
+      "supersedes": null,
+      "tags": []
+    },
+    {
+      "path": "docs/changelog/2026-07-29-vision-channel-honesty-and-test-entry-hardening.md",
+      "title": "2026-07-29 视觉通道诚实性修复 + 测试入口挂死护栏补齐",
+      "type": "changelog",
+      "typeSource": "frontmatter",
+      "status": "done",
+      "statusSource": "frontmatter",
+      "date": "2026-07-29",
+      "related": [
+        "docs/changelog/2026-07-26-frontend-visual-verification-loop.md"
+      ],
       "supersedes": null,
       "tags": []
     },
@@ -2883,6 +2998,30 @@
       "status": null,
       "statusSource": "none",
       "date": "2026-07-27",
+      "related": [],
+      "supersedes": null,
+      "tags": []
+    },
+    {
+      "path": "docs/releases/v2.24.2.md",
+      "title": "v2.24.2 迭代记录",
+      "type": "release",
+      "typeSource": "inferred",
+      "status": null,
+      "statusSource": "none",
+      "date": "2026-07-28",
+      "related": [],
+      "supersedes": null,
+      "tags": []
+    },
+    {
+      "path": "docs/releases/v2.24.3.md",
+      "title": "v2.24.3 迭代记录",
+      "type": "release",
+      "typeSource": "inferred",
+      "status": null,
+      "statusSource": "none",
+      "date": "2026-07-28",
       "related": [],
       "supersedes": null,
       "tags": []
@@ -11840,6 +11979,18 @@
       "tags": []
     },
     {
+      "path": "docs/user-guide-vision.md",
+      "title": "识图能力用户手册（视觉通道）",
+      "type": "guide",
+      "typeSource": "inferred",
+      "status": null,
+      "statusSource": "none",
+      "date": null,
+      "related": [],
+      "supersedes": null,
+      "tags": []
+    },
+    {
       "path": "docs/user-guide.md",
       "title": "Rivet 用户手册",
       "type": "guide",
@@ -11890,6 +12041,18 @@
     {
       "path": "docs/更新镜像部署技术实录.md",
       "title": "天枢桌面端更新镜像部署技术实录",
+      "type": "unclassified",
+      "typeSource": "inferred",
+      "status": null,
+      "statusSource": "none",
+      "date": null,
+      "related": [],
+      "supersedes": null,
+      "tags": []
+    },
+    {
+      "path": "docs/电网作业安全现场智能管控-AI模型应用情况报告.md",
+      "title": "电网作业安全现场智能管控——人工智能统推模块模型应用情况报告（初稿）",
       "type": "unclassified",
       "typeSource": "inferred",
       "status": null,

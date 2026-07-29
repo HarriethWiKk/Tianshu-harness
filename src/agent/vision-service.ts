@@ -47,17 +47,25 @@ export async function describeImages(
     stream: true,
   }
 
-  const chunks: string[] = []
+  // 两个回调携带的是**同一段文本**，不是两半：onTextDelta 是流式增量（给 UI），
+  // onContentBlock 在收流结束时把累积的完整文本再发一次（给持久化——openai-client
+  // 那处注释写明 agent loop 靠 content block 落库）。消费方必须取其一；原先两边都
+  // 往一个数组里塞，于是每次桥接的描述都被精确复制一遍：注入主历史的 token 翻倍，
+  // 模型读到的还是一段自我重复的文字。实测 MiniMax-M3 描述一张截图返回 3516 字，
+  // 其中一半是复本。以 content block 为准（它是权威终值），没有它才退回增量拼接
+  // （早退/中断/未实现该回调的 client）。
+  const deltas: string[] = []
+  const blocks: string[] = []
   let error: Error | undefined
   let stopReason = ''
 
   await client.stream(
     request,
     {
-      onTextDelta: (text) => { chunks.push(text) },
+      onTextDelta: (text) => { deltas.push(text) },
       onThinkingDelta: () => { /* vision models rarely stream reasoning; ignore */ },
       onContentBlock: (block) => {
-        if (block.type === 'text' && block.text) chunks.push(block.text)
+        if (block.type === 'text' && block.text) blocks.push(block.text)
       },
       onStopReason: (reason) => { stopReason = reason },
       onError: (err) => { error = err },
@@ -66,9 +74,7 @@ export async function describeImages(
   )
 
   if (error) throw error
-  if (stopReason === 'length') {
-    chunks.push('\n[图片描述被截断]')
-  }
+  const text = blocks.length > 0 ? blocks.join('') : deltas.join('')
 
-  return chunks.join('').trim()
+  return (stopReason === 'length' ? `${text}\n[图片描述被截断]` : text).trim()
 }

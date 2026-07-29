@@ -7,8 +7,17 @@ import { applyCommandFilter } from './command-filters.js'
 // Lazily compute RAW_DIR so tests (or agents inside a Seatbelt boundary) can
 // redirect TMPDIR at runtime. Module-level `const RAW_DIR = join(tmpdir(), ...)`
 // captures the path at import time — before any before() hook runs.
-function rawDir(): string {
+//
+// Exported because the truncation footer tells the model to `read_file` this
+// path, and `read_file` only allows out-of-workspace reads that carry a path
+// grant. path-grants.ts::applyRivetRuntimeReadGrants must grant exactly this
+// directory — sharing the getter keeps the two sides from drifting apart.
+export function rawOutputDir(): string {
   return join(tmpdir(), 'rivet-raw')
+}
+
+function rawDir(): string {
+  return rawOutputDir()
 }
 const STALE_TTL_MS = 3_600_000 // 1 hour
 const CLEAN_INTERVAL = 10 // clean every N calls

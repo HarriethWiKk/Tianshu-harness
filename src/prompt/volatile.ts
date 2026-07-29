@@ -752,7 +752,7 @@ export function buildDynamicAppendixParts(ctx: VolatileContext, maxChars?: numbe
 export function buildDynamicAppendix(ctx: VolatileContext, maxChars?: number): string {
   const parts = buildDynamicAppendixParts(ctx, maxChars)
   if (parts.length === 0) return ''
-  return `<context-update>\n${parts.map(p => p.content).join('\n\n')}\n</context-update>`
+  return `<context-update>\n${parts.map(p => p.content).join('\n')}\n</context-update>`
 }
 
 // ── Global Workspace Theory: salience scoring ──────────────────────

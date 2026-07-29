@@ -31,6 +31,11 @@ docs/sessions/
 .github/workflows/
 # 一次性/本地诊断脚本与评估产物
 desktop/scripts/perf-*.ts
+# 例外：perf-session-open-script.test.ts 会 spawn 这个脚本，它已经不是一次性
+# 诊断而是可复现基线。被 ignore 挡在库外时那条测试只在作者本机能过，任何全新
+# clone 都挂 ERR_MODULE_NOT_FOUND。（同类的 perf-stream-baseline.ts 早已入库——
+# ignore 规则对已跟踪文件不生效，不需要额外例外。）
+!desktop/scripts/perf-session-open.ts
 scripts/summarize-*.ts
 scripts/swebench-*.sh
 # 自动生成的计划、研究与设计草稿

@@ -80,6 +80,15 @@ RIVET_DEBUG_RENDER=1 RIVET_ACTIVATION_DEV_BYPASS=1 npm --prefix desktop run taur
 
 **修法已在** `use-scroll-intent.ts`（独立 hook，wheel/键盘/滚动条三路同步 intent ref）。
 
+### 症状 5：点设置页 / 新建会话，几秒纯空白（不是骨架屏，是什么都没有）
+
+**先分清运行方式**——dev 与打包态是两回事：
+
+- **dev 模式**：已解决。覆盖层是懒加载的，Vite 要在点击那一刻现场转译整棵子树（设置页 92 个本地模块 + 15 个三方包），而当时 `<Suspense fallback={null}>` 在 chunk 到位前一个像素都不渲染。修法是空闲预热（`lib/lazy-view.ts` 的 `usePrefetchOnIdle`）+ 可见占位（`OverlayFallback` / `PaneSkeleton`）。**新增覆盖层时照此办理，别再用 `fallback={null}`**（有 `eager-bundle-guard` 守着分组页不被并回主 chunk）
+- **打包态**：**仍未解释**。后端（52ms）、chunk 体积、混淆器运行时开销均已排除。下一步是在打包应用内开 devtools 录 Performance 时间线，而不是继续推演；Tauri 自定义协议的资源加载开销是当前最靠前的未验证嫌疑
+
+详见 [`docs/analysis/2026-07-29-桌面端加载延迟归因.md`](../analysis/2026-07-29-桌面端加载延迟归因.md)。
+
 ## 已踩过的坑（高价值案例）
 
 ### 坑 1：SSE 响应头没 flush，新会话骨架屏卡 6 秒（2026-07-19）
@@ -142,6 +151,21 @@ if let Some(window) = app.get_webview_window("main") {
 **教训**：
 - Tauri 2 的配置层有 bug，涉及原生窗口装饰时优先用**运行时 API**（`set_decorations`、`set_transparent` 等）兜底
 - 改 `tauri.*.conf.json` 后必须清 `target/debug/build/{tianshu-desktop,tauri-build}-*`，否则可能用缓存的旧合并结果
+
+### 坑 5：`/health` 的 `loopLagMaxMs` 是启动残留，别拿它归因当前操作（2026-07-29）
+
+**现象**：最大会话（43,717 事件）冷读 972ms，同时 `/health` 报 `loopLagMaxMs ≈ 950`。数值贴得极近，看着就是「历史解析堵死了事件循环」。
+
+**根因**：`loopLagMaxMs` 是**进程存活以来的最大值**，不是当前操作的。在 uptime 4 秒、一个会话都还没读过的 sidecar 上它就已经是 950——那是启动期的开销。真去测冷读期间的滞后，最大只有 1.5–16ms：parse 早就卸载到了 cpuPool，主线程一直是通的。
+
+**真问题在另一处**：worker 把全量 43,717 条解析结果搬回主线程，调用方随即按内存环容量截到 5,000 条。structured clone 的成本与条数成正比（全量 139ms vs 尾部 14ms），九成搬运纯属浪费。修法是把截断挪进 worker（`parseEventsTailRaw`），只让尾部过线程边界。
+
+**教训**：
+- 累计型指标（max/total）不能用来归因单次操作。要测某段区间就在那段区间内自己采样
+- 两个数字接近不等于同一个因果。这次 950 与 972 的贴合纯属巧合，差点据此改错地方
+- worker 卸载的收益要算两笔账：**CPU 不占主线程**是一笔，**结果搬回来**是另一笔。凡是 worker 返回大数组的地方都值得复查后者
+
+详见 [`docs/analysis/2026-07-29-桌面端加载延迟归因.md`](../analysis/2026-07-29-桌面端加载延迟归因.md)。
 
 ## 调试时常用的命令片段
 

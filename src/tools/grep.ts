@@ -312,15 +312,20 @@ async function tryRipgrep(
         env: getResolvedEnv(cwd),
         stdio: ['ignore', 'pipe', 'pipe'],
       }))
-    } catch {
+    } catch (err) {
+      debugLog(`[grep] rg spawn failed: ${err instanceof Error ? err.message : String(err)}`)
       resolve(null)
       return
     }
 
     let stdout = ''
     let lineCount = 0
+    // 结果收够后我们自己 kill rg。必须记下来：signal kill 让 close 的 code 变成 null，
+    // 不区分就会把这条成功路径当成 rg 失败，丢弃已收结果去跑慢速全树扫描。
+    let killedAtCap = false
 
     const timer = setTimeout(() => {
+      debugLog(`[grep] rg timed out after ${TIMEOUT_MS}ms, falling back: pattern=${grepPatternLabel(pattern)}`)
       gracefulKill(child)
       resolve(null)
     }, TIMEOUT_MS)
@@ -343,31 +348,36 @@ async function tryRipgrep(
       if (!stdout.endsWith('\n')) lines.pop()
       lineCount = lines.filter(l => l.length > 0).length
       if (lineCount >= maxResults || stdout.length > 200_000) {
+        killedAtCap = true
         gracefulKill(child)
       }
     })
 
     child.stderr!.on('data', () => {})
 
-    child.on('error', () => {
+    child.on('error', (err) => {
       clearTimeout(timer)
       if (abortSignal) abortSignal.removeEventListener('abort', onAbort)
+      debugLog(`[grep] rg process error: ${err.message}`)
       resolve(null)
     })
 
-    child.on('close', (code) => {
+    child.on('close', (code, signal) => {
       clearTimeout(timer)
       if (abortSignal) abortSignal.removeEventListener('abort', onAbort)
-      if (code === 1) {
-        resolve({ content: GREP_EMPTY_RESULT })
-        return
-      }
-      if (code !== 0) {
-        resolve(null)
-        return
+      if (!killedAtCap) {
+        if (code === 1) {
+          resolve({ content: GREP_EMPTY_RESULT })
+          return
+        }
+        if (code !== 0) {
+          debugLog(`[grep] rg fallback: code=${code} signal=${signal} pattern=${grepPatternLabel(pattern)}`)
+          resolve(null)
+          return
+        }
       }
       const lines = stdout.split('\n').filter(l => l.length > 0).slice(0, maxResults)
-      const suffix = lineCount >= maxResults ? '\n...（已截断）' : ''
+      const suffix = killedAtCap || lineCount >= maxResults ? '\n...（已截断）' : ''
       const text = lines.join('\n') + suffix
       let hintedText = appendLogRangeHints(text, searchPath)
 

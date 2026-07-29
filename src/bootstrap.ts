@@ -46,7 +46,7 @@ import { TodoStore } from './tools/todo-store.js'
 import { createDelegateTaskTool } from './tools/delegate-task.js'
 import { createUndoTool } from './tools/undo.js'
 import { maybeWarnNoSandbox, applySandboxPolicyForApprovalMode } from './tools/sandbox-profile.js'
-import { applyConfiguredPathGrants, applyDefaultDependencyReadGrants, loadPersistedGrants } from './tools/path-grants.js'
+import { applyConfiguredPathGrants, applyDefaultDependencyReadGrants, applyRivetRuntimeReadGrants, loadPersistedGrants } from './tools/path-grants.js'
 import { createDelegateBatchTool } from './tools/delegate-batch.js'
 import { createTeamOrchestrateTool } from './tools/team-orchestrate.js'
 import type { PlanExecutorDeps } from './agent/plan-executor.js'
@@ -668,6 +668,7 @@ export function createInteractiveToolRegistry(
     isGoalAchieved: () => refs.goalTrackerRef.current?.isGoalAchieved() ?? false,
     getLastVerdict: () => refs.goalTrackerRef.current?.getLastVerdict() ?? null,
     reviewConfig: config.agent.review,
+    autoCommit: config.agent.delivery?.autoCommit !== false,
     isAutoReviewOff: () => refs.reviewGateRef.current === 'off',
     meridianIndexer: refs.meridianIndexer,
     getTaskContract: () => refs.getTaskContract?.(),
@@ -1939,6 +1940,10 @@ export async function bootstrapInteractiveSession(opts: BootstrapOptions = {}): 
   // inspect third-party dependency source without hitting a hang-prone approval
   // gate — see path-grants.ts::applyDefaultDependencyReadGrants.
   applyDefaultDependencyReadGrants()
+  // Read grants for dirs Rivet itself writes and then tells the model to read
+  // back ($TMPDIR/rivet-raw full tool output). Without this the truncation
+  // footer's `read_file <rawPath>` instruction is a closed dead end.
+  applyRivetRuntimeReadGrants()
 
   // 3. Provider + Auth
   const { provider, apiKey, auth } = resolveProviderAndAuth(config, opts.providerName)

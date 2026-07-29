@@ -159,6 +159,32 @@ rivet config show                                         # 查看完整配置
 }
 ```
 
+### 识图（视觉能力）
+
+图片能不能进模型看**主控模型**的能力：声明 `supportsVision` 的直接看图；不支持的，配一个识图桥（`agent.visionModel`）把图先换成文字描述；两者都没有则图片被丢弃——且会明说（TUI 给警告，截图工具的结果文字里写明"该附件已被丢弃，改用 `observe`/`extract`/`eval` 读 DOM"），不让模型凭"我截了图"断言渲染正常。
+
+内置能直接看图的模型：`glm-5.2`（glm / ccswitch）、`MiniMax-M3`（minimax）、`zai-org/GLM-5.2`（siliconflow）、`gpt-5.5`（codex）。**默认的 `deepseek-v4-pro` 不支持**，用 DeepSeek 当主控就需要桥。
+
+```jsonc
+{
+  "agent": {
+    "visionModel": {
+      "provider": "minimax",
+      "model": "MiniMax-M3",
+      "prompt": "请详细描述这张图片…",  // 可选
+      "maxTokens": 1024                 // 可选，描述的输出上限
+    }
+  }
+}
+```
+
+- **桌面端**：Settings → 集成 → 识图模型（下拉只列已配置且支持图片输入的组合，留空即关闭）。
+- **TUI**：`/config` → 识图模型（候选同桌面端；选「（关闭）」即关掉桥接，`S` 保存，下次会话生效）。
+- **图片来源**：TUI 粘贴图片路径或 `Ctrl+V` 读剪贴板、桌面端 Composer 附件（每条最多 4 张）；以及 agent 自己截的 `browser_debug` / `computer_use` 截图（每轮最多带最近 2 张进上下文）。
+- 图片走对话尾部追加，**不打断前缀缓存**；token 按分辨率估算（1280×800 ≈ 1105，不是固定值）。
+
+完整说明与排查见 [识图能力用户手册](docs/user-guide-vision.md)。
+
 ### Worker 路由（子智能体用不同模型）
 
 ```json
@@ -271,7 +297,7 @@ DeepSeek 对缓存未命中收取 50× 费用。天枢的提示词引擎围绕�
 - **字节级差异** —— 消息内容含时间戳、随机 ID 等不稳定字节
 - **跨边界重写** —— `/compact`（仅 `turn===0` 重写历史）、`/cd` 切项目（新 user 边界断尾）
 
-排查：① 确认数据目录（桌面端 Settings → Storage，或 `echo $RIVET_HOME`）；② 打开会话 `.jsonl` 搜 `cache_read_input_tokens` 看各轮命中；③ 开 `RIVET_DEBUG_TELEMETRY=1` 后查 `sensorium.jsonl` 的 `recall-summary`；④ `npm exec -- tsx scripts/verify-cache-hit-rate.ts` 模拟多轮对话验证。详见项目内 `AGENTS.md` 的「缓存排查指南」。
+排查：① `rivet logs`（或 TUI 里 `/logs`）直接打出本会话的数据根与 `cache-log.jsonl` / `sensorium.jsonl` 路径；② 打开会话 `.jsonl` 搜 `cache_read_input_tokens` 看各轮命中；③ 需要全量遥测时设 `RIVET_DEBUG_TELEMETRY=1`（或任意非空值）后查 `sensorium.jsonl`；④ `npm exec -- tsx scripts/verify-cache-hit-rate.ts` 模拟多轮对话验证。路径总览见下方「日志与排查」。
 
 ### 子智能体编排
 
@@ -439,7 +465,7 @@ rivet --resume                   # 启动后打开会话选择器
 | 来源 | 内容 |
 |------|------|
 | `.rivet/knowledge/memory.jsonl` | 项目规则、调试启发式、架构约定 |
-| `.rivet/sessions/<id>/pheromones.json` | 跨会话信号 |
+| `.rivet/sessions/<slug>/<id>/pheromones.json` | **会话内**信息素（非跨会话；跨会话知识见上一行） |
 | `.rivet/presence.json` | 伴生 agent 感知 |
 
 通过 `agent.crossSessionEnabled` 切换，强制关闭：`RIVET_NO_CROSS_SESSION=1`。
@@ -544,7 +570,9 @@ TUI 是 CLI 的默认表面。桌面端（Tauri）与 VS Code/Cursor 插件共�
 | `/handoff [备注]` | 写结构化交接文档（五章节），归档后自动注入新会话 |
 | `/init` | 交互式项目初始化：verify 声明 / skills / hooks 脚手架 |
 | `/doctor` | 环境健康检查 + bash 工具用的哪个 shell |
+| `/logs [open [desktop]]` | 本会话日志落点（会话 / 缓存 / 六维 / 桌面 sidecar），含写入门控与回收说明；`open` 在文件管理器中打开 |
 | `/connect` | 连接模型服务商向导（选内置或自定义，填 API 密钥） |
+| `/config` `/settings` `/setup` | 设置面板：子代理路由 / 审查子代理 / 识图模型 / 工具档位·审批·默认星域·默认模型 / 镜像·代理·搜索后端。`Tab` 切栏、`Enter` 编辑、`S` 保存，每项标注即时或下次会话生效 |
 | `/cd <path>` | 会话中途切换工作目录（保前缀缓存，会话归属迁往新项目） |
 | `/exit` `/quit` | 保存会话并退出 |
 
@@ -654,9 +682,60 @@ src/
 └── search/    语义搜索（BM25 + embedding RRF 融合）
 ```
 
-### 会话数据
+### 会话数据与日志排查
 
-会话日志存储在项目外的 `~/.rivet/sessions/<project-slug>/`（slug = 目录名 + cwd 哈希前缀），避免被 `glob`/`grep` 扫到、也不污染工作区。可用 `RIVET_SESSION_DIR` 覆盖。全局配置在 `~/.rivet/config.json`。每次启动得到唯一会话 ID，多个实例可并行运行互不干扰。
+会话日志存在项目外的数据根下，避免被 `glob`/`grep` 扫到、也不污染工作区。全局配置在 `<数据根>/config.json`。每次启动得到唯一会话 ID，多个实例可并行运行互不干扰。
+
+#### 先定位数据根
+
+| 端 / 安装方式 | 数据根怎么定 | 常见路径 |
+|---------------|--------------|----------|
+| CLI | `RIVET_HOME` → 平台默认 | macOS/Linux: `~/.rivet`；Windows: `%LOCALAPPDATA%\.rivet` |
+| 桌面 · 系统安装 | Settings → 存储位置（`launcher.json`）→ 平台默认 | 同上 |
+| 桌面 · 便携版 | exe 旁 `TianshuData\.rivet` | 例如 `D:\Tools\Tianshu\TianshuData\.rivet` |
+
+> **CLI 与桌面不是同一套解析链。** CLI 认环境变量 `RIVET_HOME`；桌面端认 Settings → 存储位置写入的 `launcher.json`，**不读** shell 里的 `RIVET_HOME`。两边要对齐，请在桌面设置里改，或让 CLI 也 `export RIVET_HOME` 到同一目录。
+
+#### 不用记路径：三个入口
+
+```bash
+# 终端（TUI 起不来也能用——不初始化 agent、不读配置、不联网）
+rivet logs                         # 列出本项目最近主会话的全部落点 + 是否已产生 + 门控说明
+rivet logs --session <id>          # 指定会话
+rivet logs --json                  # 结构化输出，可贴进 issue
+rivet logs open                    # 在文件管理器中打开会话目录
+rivet logs open desktop            # 打开 sidecar 日志目录（GUI 起不来时第一现场）
+```
+
+- **TUI**：`/logs`（同上清单）；`/logs open` / `/logs open desktop` 直接打开目录
+- **桌面端**：Settings → 存储位置 →「打开数据目录」/「打开日志目录」
+
+#### 本会话常见落点（相对数据根）
+
+`slug` = `<项目目录名>-<cwd 的 sha256 前 6 位>`。同名不同路径的项目不会撞车。
+
+| 文件 | 用途 | 写入条件 |
+|------|------|----------|
+| `sessions/<slug>/<id>.jsonl` | 对话主体（含 `usage` / `model_switch`） | 始终 |
+| `sessions/<slug>/<id>/cache-log.jsonl` | 逐请求缓存命中与侧路成本 | 始终 |
+| `sessions/<slug>/<id>/sensorium.jsonl` | 六维 / CVM / advisory 台账 | 轻量行默认开；全量需 `RIVET_DEBUG_TELEMETRY`（任意非空） |
+| `sessions/<slug>/<id>/frames.jsonl` | 认知帧（相位、策略） | 默认开；`RIVET_FRAME_TELEMETRY=0` 关 |
+| `logs/sidecar-<时间戳>.log` | 桌面 sidecar stdout/stderr | 每次启动一个新文件 |
+| `desktop/sidecar-exit.json` | sidecar 退出原因面包屑 | 退出时 |
+| `desktop/sessions/<id>/events.jsonl` | 桌面 UI 事件流（与上面的会话 `.jsonl` 是两份数据） | 桌面非 ephemeral 会话 |
+
+项目内另有 `<cwd>/.rivet/knowledge/`、`artifacts/`、`plans/` 等共享数据；无 `sessionId` 时六维偶尔也会回退写到 `<cwd>/.rivet/sensorium.jsonl`——`rivet logs` 会把实际路径打出来。
+
+#### 场景速查
+
+| 现象 | 先看 |
+|------|------|
+| 桌面窗口开了但助手不回话 | `rivet logs open desktop`，或 Settings →「打开日志目录」；再看 `desktop/sidecar-exit.json` |
+| 缓存命中率异常 / 成本突然升高 | `rivet logs` → 打开该会话的 `cache-log.jsonl` 与 `.jsonl` 里的 `cache_read_*` |
+| 想复盘六维 / advisory 是否生效 | 确认开了 `RIVET_DEBUG_TELEMETRY`，再读 `sensorium.jsonl` |
+| 上报 bug / 贡献排查 | `rivet logs --json` 整段贴进 issue（不含对话正文，只含路径与体积） |
+
+`RIVET_SESSION_DIR` / `RIVET_DESKTOP_DIR` 可分别搬走会话树与桌面树；生效中的覆盖会出现在 `rivet logs` 输出顶部。
 
 ## 🔒 安全
 
@@ -677,7 +756,7 @@ src/
 
 | 变量 | 作用 |
 |------|------|
-| `RIVET_HOME` | 覆盖整个 `~/.rivet` 数据根目录（配置/会话/插件全在此） |
+| `RIVET_HOME` | 覆盖整个 `~/.rivet` 数据根（CLI 生效；桌面端认 Settings → 存储位置，不读此变量） |
 | `RIVET_CONFIG_PATH` | 覆盖 `config.json` 路径（多套配置切换） |
 | `RIVET_SESSION_DIR` | 覆盖会话日志存储路径 |
 | `RIVET_RESUME` / `RIVET_RESUME_ID` | 启动时恢复会话（对应 `--resume`） |
@@ -709,7 +788,8 @@ src/
 | 变量 | 作用 |
 |------|------|
 | `RIVET_DEBUG=1` | 总调试日志开关（最常用） |
-| `RIVET_DEBUG_TELEMETRY=1` | 开启遥测快照落盘 |
+| `RIVET_DEBUG_TELEMETRY` | 任意非空值开启全量 `sensorium.jsonl`；只有字面 `1` 会额外拉起 TUI perf 那行 UI |
+| `RIVET_TELEMETRY_LITE=0` | 连 vitals-lite 轻量行一起关（默认开） |
 | `RIVET_HEADLESS_MAX_TURNS` | `-p` 无头模式单次最大轮数（默认 15） |
 | `RIVET_JOB_MAX_MS` | 后台 job 超时上限 |
 | `RIVET_NO_CROSS_SESSION=1` | 禁用跨会话知识共享 |
@@ -731,6 +811,10 @@ src/
     "crossSessionEnabled": true,  // 跨会话知识共享
     "checkpointEveryTurns": 0,    // Auto 模式检查点间隔（0 = 关）
     "defaultDomain": "qiming",    // 默认星域（qiming/auto/显式域名）
+    "visionModel": {              // 识图桥：主控模型不支持看图时，先转成文字描述
+      "provider": "minimax",      // 需已配好 key，且该模型声明 supportsVision
+      "model": "MiniMax-M3"
+    },
     "permissions": {              // 权限规则（对应 /permission 命令）
       "allow": [{ "tool": "read" }],
       "deny":  [{ "tool": "bash", "params": { "command": "rm -rf" } }],
@@ -782,6 +866,7 @@ src/
 | [`docs/user-guide.md`](docs/user-guide.md) | 安装、配置与使用指南 |
 | [`docs/desktop-guide.md`](docs/desktop-guide.md) | 桌面端用户指南（Cockpit/SideChat/Rewind/主题/Mirror 等独有特性） |
 | [`docs/user-guide-provider-config.md`](docs/user-guide-provider-config.md) | 模型提供商配置指南 |
+| [`docs/user-guide-vision.md`](docs/user-guide-vision.md) | 识图能力（视觉通道）配置与排查 |
 | [`docs/user-guide-sandbox-permissions.md`](docs/user-guide-sandbox-permissions.md) | 沙箱与权限模型完整指南 |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | 贡献指南 |
 | [`config.example.json`](config.example.json) | 示例配置（含子代理/审查模型路由） |

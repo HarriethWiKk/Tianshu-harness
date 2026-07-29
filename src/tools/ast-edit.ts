@@ -7,6 +7,7 @@ import { getTargetEol } from '../platform.js'
 import { incrementEditFailCount, resetEditFailCount } from './read-file.js'
 import { checkSyntax } from './syntax-check.js'
 import { trackFileChange, restoreLatestBackup } from '../agent/recovery-stack.js'
+import { loadAstGrepNapi } from './ast-grep-napi.js'
 
 /** Post-write syntax verification + rollback for ast_edit. Default on;
  *  RIVET_AST_EDIT_VERIFY=0 falls back to the pre-write ERROR-node gate only. */
@@ -141,12 +142,11 @@ export const AST_EDIT_TOOL: Tool = {
     const dryRun = input.dryRun !== false // default true
     const limit = typeof input.limit === 'number' && input.limit > 0 ? input.limit : 50
 
-    let napi: typeof import('@ast-grep/napi')
-    try {
-      napi = await import('@ast-grep/napi')
-    } catch {
-      return { content: '错误：未安装 @ast-grep/napi。请运行：npm install @ast-grep/napi', isError: true }
+    const loaded = await loadAstGrepNapi()
+    if (!loaded.ok) {
+      return { content: loaded.message, isError: true }
     }
+    const napi = loaded.napi
 
     const LANG_MAP = buildLangMap(napi)
     await ensureDynamicLangsRegistered(napi)

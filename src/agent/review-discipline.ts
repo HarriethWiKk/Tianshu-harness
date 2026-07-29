@@ -107,16 +107,16 @@ export function formatCaseSensitivityReviewStance(): string {
  * 三类问题，全部带着绿测试通过了交付。
  */
 export const WIRING_EFFECTIVENESS_REVIEW_STANCE: readonly string[] = [
-  '闭环必须从生产入口正向追：先识别目标项目的真实运行入口（package.json 的 bin/main/start 脚本、服务启动文件、CLI 入口、框架约定入口如 next/vite/django 的 app 根），再从入口经组合根（bootstrap/composition root/DI 容器/路由注册）逐跳追到改动点，确认它在该路径上被构造/传参/调用。"在某处找到了挂点"不是闭环证据——只出现在废弃/平行入口、示例代码、脚本或测试里的挂点不算；多入口项目（CLI+server、新旧 UI 并存）必须确认挂点位于本次改动实际影响的那条入口链上。找不到从活入口到改动点的正向链路时按 HIGH 上报断线。',
-  '逐条对照计划/提交声明的验收标准审"做没做完"，不以"提交存在、代码在场、测试绿"为完成；专找半做：字段加了但无消费端执行、能力建了但生产路径不调用、预算换了来源但仍然无人检查。',
-  '新能力沿 生产者→传输→消费者→渲染/执行 全链路走通才算接好：新增可选参数必须 grep 全部调用方，零调用方传值即死参数；新增 setter/store/bus 必须确认存在 flush/失效/读取路径，否则是死 setter；新增 config 字段必须确认运行时真的读取。',
-  '目标反效检查：改动声称减少 X（噪音/重复/成本/延迟），就构造场景验证 X 实际下降。旧通道未删、新通道又渲染同一内容的"双渲染"是典型反效——减噪提交反而增噪，按 HIGH 上报。',
-  '门控/过滤条件用运行时真实数据形态核对，不信类型签名：相对 vs 绝对路径、可选字段缺失、空集合、模型自由输入。估算真实通过率——过滤掉 ~100% 的门控等于静默关闭功能，与放行 100% 同等严重。',
-  '对结构化内容（XML/JSON/markdown 块）的截断或 slice，验证不变式保持：闭合标签、转义、配对符号不被切断；并确认截断结果是确定性的，不引入前缀缓存抖动。',
+  '从生产入口正向追闭环：识别真实入口 → 组合根 → 改动点。测试/示例里的挂点不算。找不到活入口到改动点的正向链路 = HIGH。',
+  '逐条对照提交声明审"做没做完"：字段加了但无消费端、能力建了但生产路径不调用 = 半成品。',
+  '全链路走通：新增参数→grep 全部调用方(零传值=死参数)；新增setter→确认flush/读取路径(否则死setter)；新增config→确认运行时真的读取。',
+  '目标反效：改动声称减少X，就验证X实际下降。旧通道未删+新通道双渲染 = 减噪提交反而增噪 → HIGH。',
+  '门控条件用真实数据形态核对：空集合/可选字段缺失/模型自由输入→估算通过率。~0%=静默关闭，~100%=无效门控。',
+  '结构化内容截断验证：标签闭合、转义、配对符号不被切断；结果确定性，不引入缓存抖动。',
 ]
 
 export function formatWiringEffectivenessReviewStance(): string {
-  return WIRING_EFFECTIVENESS_REVIEW_STANCE.map((directive, index) => `${index + 1}. ${directive}`).join('\n')
+  return WIRING_EFFECTIVENESS_REVIEW_STANCE.map((d, i) => `${i + 1}. ${d}`).join('\n')
 }
 
 /**

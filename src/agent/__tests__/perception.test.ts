@@ -73,7 +73,6 @@ describe('buildStarPhaseContext', () => {
       turn: 9,
       maxTurns: 10,
       recentTools: ['read_file', 'edit_file', 'run_tests'],
-      shouldEscalate: true,
       hasEnteredHighComplexity: true,
     })
 
@@ -83,7 +82,6 @@ describe('buildStarPhaseContext', () => {
       isRunningTests: true,
       isFinalTurn: true,
       readyByEvidence: false,
-      shouldEscalate: true,
       hasEnteredHighComplexity: true,
     })
   })
@@ -97,7 +95,6 @@ describe('buildStarPhaseContext', () => {
         turn,
         maxTurns: 0,
         recentTools: [],
-        shouldEscalate: false,
         hasEnteredHighComplexity: false,
       })
       assert.equal(ctx.isFinalTurn, false, `turn=${turn} 不应判为最终轮`)
@@ -111,7 +108,6 @@ describe('buildStarPhaseContext', () => {
       turn: 42,
       maxTurns: 0,
       recentTools: [],
-      shouldEscalate: false,
       hasEnteredHighComplexity: false,
       deliveryVerified: true,
     })
@@ -124,7 +120,6 @@ describe('buildStarPhaseContext', () => {
       turn: 3,
       maxTurns: 10,
       recentTools: [],
-      shouldEscalate: false,
       hasEnteredHighComplexity: false,
       deliveryVerified: true,
     })

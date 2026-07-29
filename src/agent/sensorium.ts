@@ -168,11 +168,16 @@ function computePressure(
   pr: PressureResult,
   evidence: SensoriumInput['evidenceState'],
 ): number {
-  // v3：contextPressure 优先用相对压力（pressureRelative，历史 p90 归一化），
-  // 仅在 PressureMonitor 历史不足（tokenHistory<5，pressureRelative=undefined）
-  // 时回落绝对 ratio。绝对阈值在 ctxRatio 均值 ~10% 时永远锁死在 0.05 量级，
-  // 相对压力让"超过近期基线"也能触发高压（见计划二节/五节决策⑤）。
-  const contextPressure = clamp(pr.pressureRelative ?? pr.ratio)
+  // contextPressure 取「绝对占用」与「相对近期基线的超出幅度」的较大者。
+  //
+  // 两者缺一不可，取 max 而非择一：绝对 ratio 在 ctxRatio 均值 ~10% 时锁死在
+  // 0.05 量级，察觉不到异常涨势；而相对超出幅度在平缓填满窗口时接近 0，单用
+  // 它会让「上下文已用掉 85%」读成近乎无压力。取较大者后，满窗和突增都不漏。
+  //
+  // 曾经写成 `pressureRelative ?? ratio`（择一），配合当时会饱和的
+  // pressureRelative，使 73.5% 的轮次 pressure 恰为 0.50——上下文压力路由退化
+  // 成了验证债路由（见 docs/analysis/2026-07-28-第二轮指标监测.md）。
+  const contextPressure = Math.max(clamp(pr.ratio), clamp(pr.pressureRelative ?? 0))
   const verificationDebt = evidence.filesModified > 0
     ? clamp((evidence.filesModified - evidence.verifiedCount) / Math.max(evidence.filesModified, 5))
     : 0
@@ -339,11 +344,13 @@ export function computeSensorium(input: SensoriumInput): Sensorium {
 /**
  * Derive harness-layer strategy profile from a Sensorium snapshot.
  *
- * Rules (from design doc):
+ * 实际规则（下面这段曾长期停留在设计稿版本，与代码不符，2026-07-29 对齐）：
  * - reasoningEffort: complexity > 0.7 → high; momentum > 0.8 → low; else medium
- * - explorationBreadth: stability < 0.3 → 0.9 (wide search); else 0.3 (focused)
- * - commitThreshold: pressure > 0.7 → 0.9 (cautious); else 0.6 (normal)
- * - shouldEscalate: confidence < 0.3 && momentum < 0.2 (request stronger model)
+ * - explorationBreadth: 0.3 + complexity*0.3，另加 stability<0.3 的惩罚项（连续，
+ *   非设计稿的 0.9/0.3 二值；该惩罚项在 doom='none' 时不可达，见 computeStability）
+ * - commitThreshold: 0.5 + pressureBoost + momentumDrag（连续，非设计稿的 0.9/0.6）
+ * - shouldEscalate: 恒 false（5ae389d1 起自动升级改人工决策）。字段仍在，供
+ *   cognitive-ledger / retrospect 的 schema 位；相位映射已不再读它（见 star-event）
  * - thetaCycleInterval: complexity > 0.5 → 3 (frequent); else 7 (relaxed)
  *
  * Pure function — deterministic, no side effects.
@@ -455,6 +462,10 @@ export function computeStrategy(s: Sensorium): StrategyProfile {
   // The old `pressure>0.7 ? 0.9 : 0.6` had a 0.30 cliff at the boundary; this
   // is smooth throughout. Baseline 0.5; pressure adds up to +0.15, low momentum
   // adds up to +0.25 — they compose additively.
+  // edf84a82 之后 pressure = max(绝对占用, 相对超出)，所以 >0.7 现在的含义是
+  // 「窗口真的用掉七成以上」——这正是本增益设计服务的场景，不是死分支（此前
+  // pressureRelative 饱和把它压成 0% 发火）。增益刻意保持小：填满到 100% 也只加
+  // +0.15。改它需要单独立据，别照聚合分布调。
   const pressureBoost = s.pressure > 0.7 ? (s.pressure - 0.7) * 0.5 : 0
   // W4：no-data 的 momentum=0 不是"卡住"，不加 commit 拖拽（此前空窗口
   // 每次贡献满额 +0.25，是文档初版漏掉的真实行为消费点）

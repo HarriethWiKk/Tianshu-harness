@@ -747,19 +747,24 @@ function computeConvergenceScore(
   // deliverable (review/analysis report): read-heavy work with a textual output
   // is legitimate progress, not stagnation.
   //
-  // W3 诊断态豁免：诊断会话（排查/根因分析）的正确行为就是大量读取——
-  // 把"只读无产出"当作停滞信号来惩罚在语义上是矛盾的。诊断态下惩罚
-  // 底线大幅抬高——只保留对极端长跑（turn≥20）的最轻惩罚，避免把
-  // 排查会话的正常读取节奏误判为 doom-loop。
+  // W3 诊断态分流：诊断会话（排查/根因分析）的正确行为就是大量读取——
+  // 把"只读无产出"当停滞来罚在语义上是矛盾的。所以诊断态用一条**整体右移
+  // 一档**的阶梯：起罚点从 turn≥8 推到 turn≥12，各档惩罚底线同步放宽一档。
+  //
+  // 为什么是"放缓"而不是"归零"：归零会让 score 永不下降，于是 07-23 B1b/M4
+  // 刻意做的 diagnostic advisory 变体（tool_appears + 认知工具清单）永不触发，
+  // 变成死代码；L3 保底熔断也随之失效（同一条 score 通路）。诊断会话该得到的是
+  // 更长的耐心，不是关掉探测器。实测：归零会让 loop.test.ts 的 6 条回归转红
+  // （改道节流、用户介入重置、diagnostic 变体、L3 grace-turn 与两条台账对照）。
   if (!producingReport && !withinProductiveRange && window.length >= (isGlm ? 2 : 4) && productiveRatio === 0) {
     const diagProbes = hasDiagnosticProbes(window)
     const isDiagnostic = activityMode === 'diagnostic'
     if (isDiagnostic) {
-      // 诊断态：只对极端长跑（≥20 turns）留最轻惩罚，避免彻底静音后
-      // 真停滞无法检出。no-tool 僵局和文本重复信号不受影响——那些
-      // 在诊断态下同样是有效停滞信号。
-      if (turn >= 20) penalty = Math.min(penalty, 0.5)
-      // turn < 20：完全不惩罚——诊断会话前 20 轮的读取密度是正常节奏
+      if (turn >= 24) penalty = Math.min(penalty, diagProbes ? 0.4 : 0.1)
+      else if (turn >= 20) penalty = Math.min(penalty, diagProbes ? 0.5 : 0.25)
+      else if (turn >= 16) penalty = Math.min(penalty, diagProbes ? 0.65 : 0.45)
+      else if (turn >= 12) penalty = Math.min(penalty, diagProbes ? 0.85 : 0.7)
+      // turn < 12：完全不惩罚——比 build 态（turn≥8 起罚）多给 4 轮读取余量
     } else if (isGlm) {
       if (turn >= 15) penalty = Math.min(penalty, diagProbes ? 0.25 : 0.05)
       else if (turn >= 11) penalty = Math.min(penalty, diagProbes ? 0.5 : 0.15)
@@ -1113,7 +1118,12 @@ export function evaluateConvergence(input: ConvergenceInput): ConvergenceResult 
     ? productiveInWindow / stagnationWindow.length
     : 1.0
   const distanceToLastProductive = distanceSinceLastProductive(input.recentToolHistory)
-  const productiveDistanceThreshold = windowSize * 2
+  // 诊断态右移一档而非豁免（3feac8be × c74fa263 的冲突）：诊断会话大量读取是正确
+  // 行为，但把它整条排除在停滞判据外，会让 3feac8be 专为诊断写的收敛文案
+  // （buildInjectedMessage 里 activityMode==='diagnostic' 那支）永不可达——
+  // c74fa263 加排除项时正是在扩展同一条 W3 工作，未察觉这一自我抵消。多给一倍
+  // window 的耐心，仍保留"读到彻底脱离产出"时的收敛出口。
+  const productiveDistanceThreshold = windowSize * (input.activityMode === 'diagnostic' ? 3 : 2)
   // Fix (infinity guard): when there has NEVER been a productive tool call in the
   // entire session, the session simply hasn't had a chance to be productive yet.
   // Treating Infinity >= threshold as "far from last productive" would flag every
@@ -1132,8 +1142,7 @@ export function evaluateConvergence(input: ConvergenceInput): ConvergenceResult 
     && stagnationWindow.length >= Math.min(windowSize, 4)
     && productiveRatio === 0
     && !producingReport
-    && input.activityMode !== 'diagnostic'  // W3：诊断会话的正确行为就是大量读取，不是停滞
-    && distanceToLastProductive >= productiveDistanceThreshold
+    && distanceToLastProductive >= productiveDistanceThreshold  // 诊断态门槛已右移，见上
 
   // Reasoning-aware no-tool handling. A model that keeps emitting fresh,
   // substantial, non-repetitive analysis on each no-tool turn is reasoning

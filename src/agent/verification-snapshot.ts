@@ -51,8 +51,10 @@ export interface OverlayResult {
   appliedDiff: boolean
   /** Untracked owned files copied in via materializeScope (repo-relative). */
   materialized: string[]
-  /** Owned entries outside the repo or absent from both trees. */
+  /** Scope entries outside the repo or path-escape (genuinely unreachable). */
   missing: string[]
+  /** Valid relative paths whose files don't exist yet in base (worker creates them). */
+  toBeCreated: string[]
 }
 
 export interface VerificationSnapshot {
@@ -195,7 +197,7 @@ async function overlayOwnedDiff(
   // Untracked-new owned files: copied only when the target is absent, so this
   // never clobbers the tracked overlay git apply just wrote.
   const mat = materializeScope(baseCwd, worktreePath, abs)
-  return { appliedDiff, materialized: mat.materialized, missing: mat.missing }
+  return { appliedDiff, materialized: mat.materialized, missing: mat.missing, toBeCreated: mat.toBeCreated }
 }
 
 function destroyAt(baseCwd: string, worktreePath: string): void {
@@ -239,7 +241,9 @@ export async function createVerificationSnapshot(init: VerificationSnapshotInit)
     // and stays outside the lock to keep the held section short.
     await lock.withLockAsync(async () => {
       await destroyAtAsync(init.baseCwd, path)
-      await createWorktreeAtAsync(init.baseCwd, path, init.baselineHead)
+      // sessionId 必须传：它落成 owner marker，是本快照日后能被 reapOrphanSnapshots
+      // 回收的前提。漏传就只能靠人手清，`.rivet/vsw/` 会无界增长。
+      await createWorktreeAtAsync(init.baseCwd, path, init.baselineHead, init.sessionId)
     })
     const overlay = await overlayOwnedDiff(init.baseCwd, path, init.baselineHead, ownedFiles)
     // Wire snapshot deps: symlink node_modules/.venv from base repo for tests.

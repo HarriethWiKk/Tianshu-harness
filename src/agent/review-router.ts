@@ -197,26 +197,13 @@ export async function routeReviewWorkflow(
     const reviewDidNotRun = (w: SquadronResult): boolean =>
       w.findings.length === 0 && (w.infraFailures?.length ?? 0) > 0
 
-    let wiring = await deps.spawnWiringReviewer(change, signal, options.onActivity)
-    let infraFailures = wiring.infraFailures ?? []
-    let recoveredByRetry = false
-    let attempts = 1
-
-    // Quick in-budget retry ONLY for transient failures (worker crash / bad JSON).
-    // 'budget'(max-turns 耗尽)与 'timeout' 是确定性预算不足——同预算重试必死,
-    // 是纯空耗(2026-07-19 审查空耗事故:4 worker 两轮全灭)。aborted  likewise。
-    const deterministicFailure = infraFailures.some(f => f.kind === 'timeout' || f.kind === 'budget')
-    if (reviewDidNotRun(wiring) && !deterministicFailure && !signal?.aborted) {
-      attempts = 2
-      const retry = await deps.spawnWiringReviewer(change, signal, options.onActivity)
-      if (!reviewDidNotRun(retry)) {
-        wiring = retry
-        infraFailures = retry.infraFailures ?? []
-        recoveredByRetry = true
-      } else {
-        infraFailures = [...infraFailures, ...(retry.infraFailures ?? [])]
-      }
-    }
+    const wiring = await deps.spawnWiringReviewer(change, signal, options.onActivity)
+    const infraFailures = wiring.infraFailures ?? []
+    const attempts = 1
+    // No retry (2026-07-29): deterministic failures (budget/timeout) were never
+    // retried; non-deterministic failures (json/worker crash) had a retry that
+    // empirically never recovered — same model + same budget + same prompt =
+    // same failure.  Don't pay the second worker's cost for nothing.
 
     if (hasBlockingSquadronFinding(wiring)) {
       return {
@@ -224,7 +211,6 @@ export async function routeReviewWorkflow(
         verdict: 'rejected',
         evidence: summarizeSquadronFindings(wiring),
         rounds: attempts,
-        ...(recoveredByRetry ? { recoveredByRetry } : {}),
         ...(infraFailures.length > 0 ? { infraFailures } : {}),
       }
     }
@@ -250,11 +236,8 @@ export async function routeReviewWorkflow(
     return {
       tier: 'auto',
       verdict: 'verified',
-      evidence: recoveredByRetry
-        ? 'auto wiring review: no blocking findings (recovered by retry after infra failure)'
-        : 'auto wiring review: no blocking findings',
+      evidence: 'auto wiring review: no blocking findings',
       rounds: attempts,
-      ...(recoveredByRetry ? { recoveredByRetry } : {}),
       ...(infraFailures.length > 0 ? { infraFailures } : {}),
     }
   }

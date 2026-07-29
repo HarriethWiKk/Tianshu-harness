@@ -1,6 +1,7 @@
 import type { Tool, ToolCallParams, ToolResult } from './types.js'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
+import { loadAstGrepNapi } from './ast-grep-napi.js'
 import {
   inferLang,
   resolveLang,
@@ -107,12 +108,11 @@ export const AST_GREP_TOOL: Tool = {
     const includeMeta = input.includeMeta === true
 
     // Dynamic import — @ast-grep/napi is a precompiled native addon
-    let napi: typeof import('@ast-grep/napi')
-    try {
-      napi = await import('@ast-grep/napi')
-    } catch {
-      return { content: '错误：未安装 @ast-grep/napi。请运行：npm install @ast-grep/napi', isError: true }
+    const loaded = await loadAstGrepNapi()
+    if (!loaded.ok) {
+      return { content: loaded.message, isError: true }
     }
+    const napi = loaded.napi
 
     const allFiles: string[] = []
     for (const p of paths) {

@@ -274,5 +274,9 @@ export function createPlanTaskTool(deps: {
     requiresApproval: () => true,
     isConcurrencySafe: () => false,
     isEnabled: () => true,
+    // Align with team_orchestrate (600s): execute:true runs the full plan
+    // executor loop (multi-worker dispatch + gates + review), and 120s
+    // (the tool default) physically cannot complete it. T2 fix, 2026-07-29.
+    timeoutMs: (params?: ToolCallParams) => params?.input?.execute === true ? 600_000 : 120_000,
   }
 }

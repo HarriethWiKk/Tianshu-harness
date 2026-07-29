@@ -269,38 +269,18 @@ describe('routeReviewWorkflow', () => {
       assert.equal(calls, 1, 'timeout infra failure must NOT be retried — budget is exhausted')
     })
 
-    it('retries once on non-timeout infra failure and recovers a real verdict', async () => {
+    it('does NOT retry on non-timeout infra failure (no retry policy, 2026-07-29)', async () => {
       let calls = 0
       const outcome = await routeReviewWorkflow(codeChange, {
         ...okDeps,
         spawnWiringReviewer: async () => {
           calls++
-          if (calls === 1) {
-            return { findings: [], infraFailures: [{ kind: 'json', claim: 'non-JSON worker output' }] }
-          }
-          return { findings: [], infraFailures: [] }
+          return { findings: [], infraFailures: [{ kind: 'json', claim: 'non-JSON worker output' }] }
         },
       }, { mode: 'auto' })
 
-      assert.equal(calls, 2, 'one quick retry on worker/json infra failure')
-      assert.equal(outcome.verdict, 'verified')
-      assert.equal(outcome.recoveredByRetry, true)
-    })
-
-    it('stays inconclusive when the retry also fails, accumulating failure kinds', async () => {
-      let calls = 0
-      const outcome = await routeReviewWorkflow(codeChange, {
-        ...okDeps,
-        spawnWiringReviewer: async () => {
-          calls++
-          return { findings: [], infraFailures: [{ kind: 'worker', claim: `attempt ${calls} crashed` }] }
-        },
-      }, { mode: 'auto' })
-
-      assert.equal(calls, 2)
+      assert.equal(calls, 1, 'no retry — same model + budget = same failure')
       assert.equal(outcome.verdict, 'inconclusive')
-      assert.equal(outcome.infraFailures?.length, 2, 'both attempts recorded')
-      assert.match(outcome.evidence ?? '', /retry also failed/)
     })
 
     it('keeps trivial docs/test-only changes at nudge with no child agents', async () => {

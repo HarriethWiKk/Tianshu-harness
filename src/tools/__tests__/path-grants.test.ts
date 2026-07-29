@@ -1,8 +1,8 @@
 import { describe, it, beforeEach } from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtempSync, mkdirSync, rmSync, symlinkSync, existsSync, readFileSync } from 'node:fs'
-import { homedir, tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { homedir } from 'node:os'
+import { join, resolve } from 'node:path'
 
 import { rivetHome } from '../../config/paths.js'
 import {
@@ -14,12 +14,19 @@ import {
   loadPersistedGrants,
   applyConfiguredPathGrants,
   applyDefaultDependencyReadGrants,
+  applyRivetRuntimeReadGrants,
   isPathUnder,
   _resetGrantsForTest,
 } from '../path-grants.js'
+import { rawOutputDir } from '../output-store.js'
+import { validatePathSafe } from '../path-validate.js'
+
+// macOS sandbox may deny mkdtemp in /var/folders; use project-local scratch.
+const SCRATCH = resolve('.rivet', 'scratch')
+mkdirSync(SCRATCH, { recursive: true })
 
 function tmp(): string {
-  return mkdtempSync(join(tmpdir(), 'rivet-grants-'))
+  return mkdtempSync(join(SCRATCH, 'rivet-grants-'))
 }
 
 describe('path-grants', () => {
@@ -171,9 +178,103 @@ describe('path-grants', () => {
     // Sanity: the function granted something on any realistic dev machine (one
     // of .cache / .npm / .cargo / .gradle / .pub-cache … exists). CI containers
     // may have a bare HOME, so only assert when at least one candidate exists.
-    const candidates = ['.cache', '.npm', '.cargo', '.gradle', '.pub-cache', '.m2', 'go']
+    const candidates = ['.cache', '.npm', '.cargo', '.gradle', '.pub-cache', '.m2', '.nuget', '.nvm', '.pyenv', 'go']
     const anyExists = candidates.some(c => existsSync(join(homedir(), c)))
     if (anyExists) assert.ok(grants.length >= 1, 'expected at least one HOME cache to be granted')
+  })
+
+  it('applyDefaultDependencyReadGrants: uses env var override when set and directory exists', () => {
+    const customDir = tmp()
+    try {
+      const saved = process.env.CARGO_HOME
+      process.env.CARGO_HOME = customDir
+      try {
+        applyDefaultDependencyReadGrants()
+        const grants = listGrants()
+        assert.ok(grants.some(g => isReadGranted(join(customDir, 'x'))),
+          'CARGO_HOME override should grant the custom directory')
+        const cargoGrant = grants.find(g => g.mode === 'read' && isReadGranted(join(customDir, 'x')))
+        assert.ok(cargoGrant, 'custom CARGO_HOME should appear in grants')
+        assert.equal(cargoGrant.mode, 'read')
+        assert.equal(cargoGrant.persisted, undefined) // never persisted
+      } finally {
+        if (saved !== undefined) process.env.CARGO_HOME = saved
+        else delete process.env.CARGO_HOME
+      }
+    } finally {
+      rmSync(customDir, { recursive: true, force: true })
+    }
+  })
+
+  it('applyDefaultDependencyReadGrants: skips env var path when directory does not exist', () => {
+    const missingDir = join(SCRATCH, 'does-not-exist-' + Date.now())
+    const saved = process.env.GRADLE_USER_HOME
+    process.env.GRADLE_USER_HOME = missingDir
+    try {
+      assert.equal(existsSync(missingDir), false, 'test dir must not exist')
+      applyDefaultDependencyReadGrants()
+      const grants = listGrants()
+      for (const g of grants) {
+        assert.notEqual(g.root, missingDir, 'non-existent env var dir must not be granted')
+      }
+    } finally {
+      if (saved !== undefined) process.env.GRADLE_USER_HOME = saved
+      else delete process.env.GRADLE_USER_HOME
+    }
+  })
+
+  it('applyDefaultDependencyReadGrants: empty env var falls through to default', () => {
+    // Save CARGO_HOME, set to empty string, verify the default ~/.cargo is
+    // still checked (existence-dependent — on a machine without .cargo, this
+    // just verifies it does not crash and does not grant anything based on
+    // the empty string).
+    const saved = process.env.CARGO_HOME
+    process.env.CARGO_HOME = ''
+    try {
+      _resetGrantsForTest()
+      assert.doesNotThrow(() => applyDefaultDependencyReadGrants())
+      // Empty env var must never produce a grant — it either falls through to
+      // the default (which may or may not exist) or is skipped.
+      const grants = listGrants()
+      assert.ok(grants.every(g => g.root !== ''), 'empty env var must not produce empty-string grant')
+    } finally {
+      if (saved !== undefined) process.env.CARGO_HOME = saved
+      else delete process.env.CARGO_HOME
+    }
+  })
+
+  it('applyRivetRuntimeReadGrants: raw 输出目录可读——截断 footer 指示模型读它，不授权就是死胡同', () => {
+    // bash 输出被截断时，footer 明确写着 `full output: read_file <rawPath> — 不要重跑命令`。
+    // rawPath 在 $TMPDIR 下，落在工作区外；没有 read 授权时 read_file 直接拒绝，
+    // 模型既读不到全量输出、又被告知别重跑，只能空转。
+    const rawPath = join(rawOutputDir(), 'deadbeef0123456789abcdef.raw')
+
+    assert.equal(isReadGranted(rawPath), false, '前置：默认无授权')
+
+    applyRivetRuntimeReadGrants()
+
+    assert.ok(isReadGranted(rawPath), 'rawOutputDir 必须默认拿到 read 授权')
+    // 真门禁而非仅授权表：validatePathSafe 是 read_file 实际走的那一关。
+    const gate = validatePathSafe(process.cwd(), rawPath)
+    assert.ok(gate.ok, `validatePathSafe 必须放行 rawPath，实得：${gate.ok ? '' : gate.error}`)
+
+    const grants = listGrants()
+    assert.ok(grants.every(g => g.mode === 'read'), 'runtime 授权只能是 read，写仍走审批')
+    assert.ok(grants.every(g => !g.persisted), 'runtime 授权不得持久化')
+  })
+
+  it('applyRivetRuntimeReadGrants: 目录不存在也要授权——raw 目录是首次大输出时才懒创建的', () => {
+    // 依赖缓存目录用 existsSync fail-closed 是对的（防配错开洞），但 rawOutputDir
+    // 是 Rivet 自己的目录、会话开始时通常还不存在。若照搬 existsSync 跳过，
+    // 授权永远不会生效——这条正是修复要防的回归。
+    const dir = rawOutputDir()
+    rmSync(dir, { recursive: true, force: true })
+    assert.equal(existsSync(dir), false, '前置：raw 目录不存在')
+
+    applyRivetRuntimeReadGrants()
+
+    assert.ok(isReadGranted(join(dir, 'later-created.raw')),
+      '会话启动时 raw 目录尚不存在，授权也必须生效')
   })
 })
 

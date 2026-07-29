@@ -133,6 +133,9 @@ export interface B1Context {
   /** 遗产回收 W-A1：PAL needs_user 案件快照（minimalQuestion 由 store 预计算）。
    *  交付时卡在等用户裁决的案件必须披露为遗留项 → 弱 advisory，绝不阻断。 */
   getPalNeedsUserCases?: () => Array<{ caseId: string; problem: string; minimalQuestion: string }>
+  /** config.agent.delivery.autoCommit。false 时即使 commit=true 也不实际
+   *  执行 git commit，仅输出交付报告。 */
+  autoCommit?: boolean
 }
 
 // ── Post-commit review batching ──
@@ -722,6 +725,17 @@ export function createDeliverTaskTool(getB1Context: (params?: ToolCallParams) =>
       }
 
       if (commit) {
+        // Manual commit mode — user wants to review before committing.
+        // Still run the full gate report, just skip the actual git commit.
+        if (ctx.autoCommit === false) {
+          lines.push(
+            '',
+            '🛑 自动提交已关闭（agent.delivery.autoCommit = false）。',
+            '以上交付报告与门禁状态仅供参考——变更未提交。',
+            '审查完成后由用户手动执行 git commit。',
+          )
+          return { content: lines.join('\n') }
+        }
         // Atomic commit reminder — injected at the exact moment before commit,
         // not in system prompt. Keeps prompt noise low while catching "accidental
         // batch commit" at the most dangerous moment.

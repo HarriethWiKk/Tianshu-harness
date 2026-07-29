@@ -1,0 +1,86 @@
+/**
+ * 测试 runner 的挂死护栏。
+ *
+ * 事故：4 个测试批次进程被遗弃后跑满一天多（PPID=1，合计约 50% CPU），表现为
+ * 「电脑总卡死」。两个成因——① Node 不设 `--test-timeout` 即 Infinity，任一测试卡住
+ * 批次进程就永不退出；② runner 当时没装信号处理，被打断时子进程被 reparent 到 init。
+ * 这里锁 ①，并顺带锁住非法环境变量不得把参数变成 NaN。
+ */
+
+import { test } from 'node:test'
+import assert from 'node:assert/strict'
+import { spawn } from 'node:child_process'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import {
+  DEFAULT_TEST_TIMEOUT_MS, nodeTestFlags, resolveTestTimeoutMs,
+} from '../test-runner-flags.js'
+
+test('nodeTestFlags 必须带 --test-timeout —— 缺了它挂死的测试会永久挂着', () => {
+  const flags = nodeTestFlags(1234)
+  assert.ok(flags.includes('--test-timeout=1234'), `实得 ${flags.join(' ')}`)
+  // --test 必须在最后：其后是文件列表
+  assert.equal(flags.at(-1), '--test')
+})
+
+test('resolveTestTimeoutMs 对非法值退回默认，不产出 NaN', () => {
+  assert.equal(resolveTestTimeoutMs(undefined), DEFAULT_TEST_TIMEOUT_MS)
+  assert.equal(resolveTestTimeoutMs(''), DEFAULT_TEST_TIMEOUT_MS)
+  assert.equal(resolveTestTimeoutMs('   '), DEFAULT_TEST_TIMEOUT_MS)
+  assert.equal(resolveTestTimeoutMs('abc'), DEFAULT_TEST_TIMEOUT_MS, '拼错的值不得变成 --test-timeout=NaN')
+  assert.equal(resolveTestTimeoutMs('0'), DEFAULT_TEST_TIMEOUT_MS)
+  assert.equal(resolveTestTimeoutMs('-5'), DEFAULT_TEST_TIMEOUT_MS)
+  assert.equal(resolveTestTimeoutMs('Infinity'), DEFAULT_TEST_TIMEOUT_MS, '无穷等于没有上限')
+  assert.equal(resolveTestTimeoutMs('5000'), 5000)
+})
+
+test('默认上限须显著高于实测最慢用例，只兜挂死不误杀慢测试', () => {
+  // 全量实测（16,140 条）单用例最慢 40s，另有 3 个 30s 档。低于 90s 会开始误杀，
+  // 曾以 60s 误杀两个全仓 tsc 用例。
+  assert.ok(DEFAULT_TEST_TIMEOUT_MS >= 90_000, `实得 ${DEFAULT_TEST_TIMEOUT_MS}ms，会误杀 40s 档用例`)
+})
+
+test('行为契约：--test-timeout 能把持有活跃 handle 的挂起变成失败', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'rivet-hang-guard-'))
+  try {
+    // setInterval 让事件循环非空 —— 否则 Node 会以「event loop resolved」自行收场，
+    // 掩盖掉真实挂死（子进程/socket/watcher 未回收）的情形。
+    writeFileSync(join(dir, 'hang.fixture.mts'), [
+      "import { test } from 'node:test'",
+      "test('hangs forever', async () => {",
+      '  const keepAlive = setInterval(() => {}, 1000)',
+      '  try { await new Promise(() => {}) } finally { clearInterval(keepAlive) }',
+      '})',
+      '',
+    ].join('\n'))
+
+    // 本用例自己跑在 node 测试 runner 下，环境里带着 NODE_TEST_CONTEXT。若原样继承，
+    // 子 runner 会以为自己是子报告器 —— 不判超时、直接退 0，护栏就被静默旁路。
+    const { NODE_TEST_CONTEXT: _drop, ...cleanEnv } = process.env
+
+    const started = Date.now()
+    const child = spawn(
+      process.execPath,
+      [...nodeTestFlags(2000), join(dir, 'hang.fixture.mts')],
+      { stdio: ['ignore', 'pipe', 'pipe'], env: cleanEnv },
+    )
+    let out = ''
+    child.stdout.on('data', c => { out += String(c) })
+    child.stderr.on('data', c => { out += String(c) })
+
+    // 兜底：真要是没超时，别让这个用例自己也变成僵留进程
+    const guard = setTimeout(() => child.kill('SIGKILL'), 30_000)
+    const code = await new Promise<number | null>(resolve => {
+      child.on('exit', c => resolve(c))
+    })
+    clearTimeout(guard)
+
+    const elapsed = Date.now() - started
+    assert.notEqual(code, 0, '挂死的测试必须判失败')
+    assert.match(out, /timed out after 2000ms/, `未见超时判定：\n${out.slice(-400)}`)
+    assert.ok(elapsed < 25_000, `应在超时后很快收场，实耗 ${elapsed}ms`)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})

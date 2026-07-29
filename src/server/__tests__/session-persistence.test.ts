@@ -200,6 +200,67 @@ test('loadEventsAsync handles a large log (off-thread or chunked path) correctly
   }
 })
 
+test('loadEventsTailAsync 只回传环内尾部，但头部信息不丢', async () => {
+  const dir = tmp()
+  try {
+    const p = new FileSessionPersistence(dir)
+    // 首尾各埋一条 artifact：头部那条会落在被截区间，去重集仍须包含它，
+    // 否则重开会话时旧 artifact 会被重新公告。
+    p.appendEvent('big', { seq: 1, ts: 1, type: 'artifact', data: { id: 'head-art' } })
+    const pad = 'x'.repeat(200)
+    for (let i = 2; i <= 2000; i++) {
+      p.appendEvent('big', { seq: i, ts: i, type: 'text_delta', data: { text: pad } })
+    }
+    p.appendEvent('big', { seq: 2001, ts: 2001, type: 'artifact', data: { id: 'tail-art' } })
+    p.flushSync()
+
+    const tail = await p.loadEventsTailAsync('big', 50)
+    assert.equal(tail.events.length, 50, '只回传环容量那么多')
+    assert.equal(tail.events[0]!.seq, 1952, '尾部窗口紧贴日志末尾')
+    assert.equal(tail.events[49]!.seq, 2001)
+    assert.equal(tail.total, 2001, 'total 反映全量而非窗口')
+    assert.equal(tail.diskFirstSeq, 1, '磁盘最早 seq 来自被截掉的头部')
+    assert.equal(tail.lastSeq, 2001)
+    assert.deepEqual(
+      [...tail.artifactIds].sort(),
+      ['head-art', 'tail-art'],
+      '去重集覆盖全量，含被截头部里的 artifact',
+    )
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('loadEventsTailAsync 日志短于环容量时等价于全量读', async () => {
+  const dir = tmp()
+  try {
+    const p = new FileSessionPersistence(dir)
+    p.appendEvent('s1', ev(1))
+    p.appendEvent('s1', ev(2, 'tool_result'))
+    p.flushSync()
+    appendFileSync(join(dir, 's1', 'events.jsonl'), '{"seq":3,"ts":1,"type":"tex') // crash mid-write
+    const tail = await p.loadEventsTailAsync('s1', 5000)
+    assert.deepEqual(tail.events.map((e) => e.seq), [1, 2], '坏行照样丢弃，其余不动')
+    assert.equal(tail.total, 2)
+    assert.equal(tail.diskFirstSeq, 1)
+    assert.equal(tail.lastSeq, 2)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('loadEventsTailAsync 空日志返回零值而非抛错', async () => {
+  const dir = tmp()
+  try {
+    const p = new FileSessionPersistence(dir)
+    assert.deepEqual(await p.loadEventsTailAsync('nope', 5000), {
+      events: [], diskFirstSeq: 0, lastSeq: 0, artifactIds: [], total: 0,
+    })
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('loadEventsAsync returns [] for a session with no log', async () => {
   const dir = tmp()
   try {

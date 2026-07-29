@@ -164,6 +164,32 @@ Or edit `~/.rivet/config.json` directly (only overrides needed, defaults are dee
 }
 ```
 
+### Vision (image understanding)
+
+Whether an image reaches the model depends on the **primary** model: those declaring `supportsVision` see it directly; for the others, configure a vision bridge (`agent.visionModel`) that turns the image into a text description first. With neither, the image is dropped — and said so out loud (the TUI warns, and the screenshot tool's own result text states the attachment was dropped and to read the DOM via `observe`/`extract`/`eval` instead), so the model never claims a render looks fine on the strength of a screenshot it could not see.
+
+Built-in models that see images directly: `glm-5.2` (glm / ccswitch), `MiniMax-M3` (minimax), `zai-org/GLM-5.2` (siliconflow), `gpt-5.5` (codex). **The default `deepseek-v4-pro` does not** — running DeepSeek as the primary model requires the bridge.
+
+```jsonc
+{
+  "agent": {
+    "visionModel": {
+      "provider": "minimax",
+      "model": "MiniMax-M3",
+      "prompt": "Describe this image in detail…",  // optional
+      "maxTokens": 1024                            // optional, description output cap
+    }
+  }
+}
+```
+
+- **Desktop**: Settings → Integrations → Vision model (the dropdowns list only configured models that declare image input; leave empty to disable).
+- **TUI**: `/config` → Vision model (same candidate list as desktop; pick the leading "off" entry to disable the bridge, `S` to save — takes effect next session).
+- **Where images come from**: paste an image *path* or `Ctrl+V` from the clipboard in the TUI, or attach via the desktop Composer (4 per message); plus screenshots the agent takes itself with `browser_debug` / `computer_use` (at most the 2 most recent per tool batch enter the context).
+- Images are appended at the tail of the conversation, so they **do not break the prefix cache**; tokens are estimated from resolution (1280×800 ≈ 1105, not a flat per-image constant).
+
+See the [Vision Guide](docs/user-guide-vision.md) for the full reference and troubleshooting.
+
 ### Worker Routing (different models for sub-agents)
 
 ```json
@@ -567,6 +593,7 @@ The desktop app builds a visual interaction layer on top of the TUI's full capab
 | `/init` | Interactive project init: verify claims / skills / hooks scaffolding |
 | `/doctor` | Environment health check + which shell the bash tool uses |
 | `/connect` | Provider connection wizard (pick built-in or custom, enter API key) |
+| `/config` `/settings` `/setup` | Settings panel: worker routing / review sub-agents / vision model / tool preset·approval·default domain·default model / mirrors·proxy·search backends. `Tab` switches columns, `Enter` edits, `S` saves; every field states whether it applies immediately or next session |
 | `/cd <path>` | Switch working directory mid-session (keeps prefix cache; session migrates to new project) |
 | `/exit` `/quit` | Save session and exit |
 
@@ -758,6 +785,10 @@ Write only the fields you want to override; defaults are deep-merged. Full schem
     "crossSessionEnabled": true,  // cross-session knowledge sharing
     "checkpointEveryTurns": 0,    // Auto-mode checkpoint interval (0 = off)
     "defaultDomain": "qiming",    // default star domain (qiming/auto/explicit name)
+    "visionModel": {              // vision bridge: describe images when the primary model is text-only
+      "provider": "minimax",      // must have a key configured and declare supportsVision
+      "model": "MiniMax-M3"
+    },
     "permissions": {              // permission rules (mirrors /permission commands)
       "allow": [{ "tool": "read" }],
       "deny":  [{ "tool": "bash", "params": { "command": "rm -rf" } }],
@@ -809,6 +840,7 @@ Write only the fields you want to override; defaults are deep-merged. Full schem
 | [`docs/user-guide.md`](docs/user-guide.md) | Install, configure, and usage guide |
 | [`docs/desktop-guide.md`](docs/desktop-guide.md) | Desktop user guide (Cockpit/SideChat/Rewind/themes/Mirror exclusives) |
 | [`docs/user-guide-provider-config.md`](docs/user-guide-provider-config.md) | Model provider configuration guide |
+| [`docs/user-guide-vision.md`](docs/user-guide-vision.md) | Vision channel: configuration and troubleshooting |
 | [`docs/user-guide-sandbox-permissions.md`](docs/user-guide-sandbox-permissions.md) | Full sandbox & permission model guide |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | Contributing guide |
 | [`config.example.json`](config.example.json) | Example config (with sub-agent / review model routing) |

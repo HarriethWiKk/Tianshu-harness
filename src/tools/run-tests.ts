@@ -192,18 +192,59 @@ function isTestFileFilter(filter: string): boolean {
 
 
 /**
+ * Reduce a filter to the stem used for globbing.
+ *
+ * The glob below wraps the filter in `*<stem>*.test.<ext>`, so a filter that
+ * already carries `.test` / `.spec` can never match — `edit.test` expands to
+ * `*edit.test*.test.ts`. That silently broke the most natural spellings,
+ * including this tool's own documented `filter="loop.test.ts"` example
+ * (2026-07-27 sessions: three blocked runs, one of which then reported
+ * "exit 1, 0 passed" because the unresolved filter was handed to the runner
+ * verbatim as a path).
+ *
+ * Directory components are dropped too: resolution only runs after the literal
+ * path failed to stat, so a filter like `src/wrong-dir/edit.test.ts` should
+ * still find the file by name rather than dead-end.
+ */
+function filterStem(filter: string): string {
+  const basename = filter.split(/[/\\]/).pop() ?? filter
+  return basename.replace(/\.(test|spec)(\.(ts|tsx|js|jsx|mjs|cjs))?$/, '')
+}
+
+function buildUnresolvedFilter(runner: string, safeFilter: string): BlockedTestCommand {
+  return {
+    type: 'blocked',
+    display: '(auto-detect tests)',
+    runner,
+    scope: 'targeted',
+    message: [
+      `无法把 filter "${safeFilter}" 解析为测试文件。`,
+      'filter 用于定位测试文件，不是测试名——它按 src/**/*<filter>*.test.* 匹配。',
+      `已尝试的词干："${filterStem(safeFilter)}"。`,
+      '改用文件名（如 loop.test.ts）、相对路径（src/agent/__tests__/loop.test.ts）',
+      '或去掉 filter 跑全量；要按测试名筛选请用 bash 执行项目自身的测试命令。',
+    ].join('\n'),
+    recommendedCommand: 'npm test',
+    blockedReason: 'filter_unresolved',
+    userGuidance: `无法将 "${safeFilter}" 解析为测试文件。请使用文件名或相对路径（如 src/__tests__/xxx.test.ts），或运行无过滤的 run_tests() 跑全量测试。`,
+  }
+}
+
+/**
  * Resolve a non-file-path filter string to an actual test file path.
- * Uses Node.js globSync (available in Node 22+) for cross-platform file matching.
+ * Uses Node.js glob (available in Node 22+) for cross-platform file matching.
  * Returns null if no match is found.
  */
 async function resolveFilterToTestFile(cwd: string, filter: string): Promise<string | null> {
+  const stem = filterStem(filter)
+  if (stem.length === 0) return null
   try {
     const files: string[] = []
-    for await (const f of glob(`src/**/*${filter}*.test.{ts,tsx,js,jsx,mjs,cjs}`, { cwd })) {
+    for await (const f of glob(`src/**/*${stem}*.test.{ts,tsx,js,jsx,mjs,cjs}`, { cwd })) {
       files.push(f)
     }
     if (files.length === 0) return null
-    const exact = files.find(f => f.includes('/' + filter + '.test.') || f.includes('/' + filter))
+    const exact = files.find(f => f.includes('/' + stem + '.test.') || f.includes('/' + stem))
     return exact ?? files[0] ?? null
   } catch {
     return null
@@ -282,17 +323,19 @@ async function buildTestCommand(cwd: string, filter?: string): Promise<TestComma
     // run_tests(filter="compaction-controller.test.ts") sends the bare filename
     // to tsx, which fails because the file is in src/agent/__tests__/.
     // glob for the file first; if the filter IS a valid path, use it directly.
-    let resolvedFilter = safeFilter
+    let resolvedFilter: string | null = null
     try {
       const s = await stat(join(cwd, safeFilter))
-      if (!s.isFile()) {
-        const found = await resolveFilterToTestFile(cwd, safeFilter)
-        if (found) resolvedFilter = found
-      }
+      resolvedFilter = s.isFile() ? safeFilter : await resolveFilterToTestFile(cwd, safeFilter)
     } catch {
       // File doesn't exist at the direct path — try glob resolution
-      const found = await resolveFilterToTestFile(cwd, safeFilter)
-      if (found) resolvedFilter = found
+      resolvedFilter = await resolveFilterToTestFile(cwd, safeFilter)
+    }
+    // Fail loud rather than handing an unlocated path to the runner: that
+    // yields "exit 1 / 0 passed, 0 failed", which reads as a test failure
+    // instead of a bad filter and sends the model debugging the wrong thing.
+    if (resolvedFilter === null) {
+      return buildUnresolvedFilter(runner, safeFilter)
     }
     if (base.includes('tsx') || base.includes('run-node-tests')) {
       return { type: 'run', command: 'tsx', args: ['--test', resolvedFilter], display: `tsx --test ${resolvedFilter}`, runner, scope: 'targeted' }
@@ -309,19 +352,7 @@ async function buildTestCommand(cwd: string, filter?: string): Promise<TestComma
     if (resolved) {
       return { type: 'run', command: 'node', args: ['--test', resolved], display: `node --test ${resolved}`, runner, scope: 'targeted' }
     }
-    return {
-      type: 'blocked',
-      display: '(auto-detect tests)',
-      runner,
-      scope: 'targeted',
-      message: [
-        '无法将 run_tests 的 filter 解析为 Node 测试文件。',
-        '请使用具体的 .test/.spec 文件路径，或用 bash 运行精确的项目测试命令。',
-      ].join('\n'),
-      recommendedCommand: 'npm test',
-      blockedReason: 'filter_unresolved',
-      userGuidance: `无法将 "${safeFilter}" 解析为测试文件。请使用完整路径（如 src/__tests__/xxx.test.ts），或运行无过滤的 run_tests() 跑全量测试。`,
-    }
+    return buildUnresolvedFilter(runner, safeFilter)
   }
 
   if (runner === 'vitest') {
@@ -564,20 +595,27 @@ export const RUN_TESTS_TOOL: Tool = {
 
 ### 用法
 - 修改代码后用 run_tests 验证改动
-- 用 filter 运行特定测试文件或测试名
+- filter 用于**定位测试文件**，不是筛选测试名——按 src/**/*<filter>*.test.* 匹配
 - 自动检测 Node.js 测试脚本和 Python pytest 项目
 - 无法推断出安全的 runner 时，返回受阻的验证结果，并指引改用 bash
 - 报告：exit code、失败的测试、错误详情、耗时
 
-### 示例
+### filter 怎么写
+文件名和相对路径都可以，带不带 .test/.spec 后缀都能解析：
 好：run_tests() —— 运行全部测试
-好：run_tests(filter="loop.test.ts") —— 运行指定测试文件
-好：run_tests(filter="tests/test_example.py") —— 运行一个 Python pytest 文件
-好：run_tests(timeout=300000) —— 为慢速测试套件设置更长超时`,
+好：run_tests(filter="loop.test.ts") —— 按文件名定位
+好：run_tests(filter="loop") —— 词干也可以，命中多个时取最贴近的
+好：run_tests(filter="src/agent/__tests__/loop.test.ts") —— 相对路径最精确
+好：run_tests(filter="tests/test_example.py") —— 一个 Python pytest 文件
+坏：run_tests(filter="handles empty input") —— 这是测试名，定位不到文件会受阻
+坏：run_tests(filter="star-genesis") —— 源文件名而无同名测试文件时同样受阻
+
+要按测试名筛选，用 bash 执行项目自身的测试命令（如 --test-name-pattern）。
+不确定测试文件叫什么，先用 glob 找 **/*<关键词>*.test.ts。`,
     input_schema: {
       type: 'object',
       properties: {
-        filter: { type: 'string', description: '测试文件或名称模式' },
+        filter: { type: 'string', description: '测试文件名、词干或相对路径（不是测试名）。留空跑全量。' },
         timeout: { type: 'integer', description: '超时时间（毫秒，默认：120000）' },
       },
     },

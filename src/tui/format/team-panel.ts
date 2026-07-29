@@ -72,15 +72,23 @@ function barColorKey(done: number, total: number, hasFailed: boolean): keyof Riv
   return 'primary'
 }
 
+/** 审查门 verdict 语义分类（footer 段与审查详情展示共用）。 */
+function classifyVerdict(verdict: string | undefined): 'pending' | 'passed' | 'failed' | 'other' {
+  if (!verdict) return 'pending'
+  const normalized = verdict.trim().toLowerCase().replace(/[\s_-]+/g, '-')
+  if (['pass', 'passed', 'verified', 'approve', 'approved', 'ok', 'clean', 'green', 'no-findings'].includes(normalized)) return 'passed'
+  if (['fail', 'failed', 'rejected', 'reject', 'blocked', 'changes-requested', 'red'].includes(normalized)) return 'failed'
+  return 'other'
+}
+
 /** 审查门 verdict → 展示段（glyph + 文案 + 语义色）。 */
 function gateSegment(verdict: string | undefined): { text: string; colorKey: keyof RivetTheme } {
-  if (!verdict) return { text: '审查门 ○ 待审', colorKey: 'muted' }
-  const normalized = verdict.trim().toLowerCase().replace(/[\s_-]+/g, '-')
-  const passed = ['pass', 'passed', 'verified', 'approve', 'approved', 'ok', 'clean', 'green', 'no-findings'].includes(normalized)
-  const failed = ['fail', 'failed', 'rejected', 'reject', 'blocked', 'changes-requested', 'red'].includes(normalized)
-  if (passed) return { text: `审查门 ✓ ${verdict}`, colorKey: 'success' }
-  if (failed) return { text: `审查门 ✗ ${verdict}`, colorKey: 'error' }
-  return { text: `审查门 · ${verdict}`, colorKey: 'warning' }
+  switch (classifyVerdict(verdict)) {
+    case 'pending': return { text: '审查门 ○ 待审', colorKey: 'muted' }
+    case 'passed': return { text: `审查门 ✓ ${verdict}`, colorKey: 'success' }
+    case 'failed': return { text: `审查门 ✗ ${verdict}`, colorKey: 'error' }
+    case 'other': return { text: `审查门 · ${verdict}`, colorKey: 'warning' }
+  }
 }
 
 /**
@@ -180,6 +188,21 @@ function buildEntries(model: TeamPanelModel, width: number): PanelLine[] {
     out.push([seg(' ⊗ ', 'warning'), seg(`阻塞 ${truncate(model.blocked.join('; '), rule - 8)}`, 'warning')])
   }
 
+  // ── 波间硬门禁失败卡（W2b，与桌面 gateFailed 卡同源数据）─────────────
+  // 只在失败时渲染——通过是常态，不占行。失败项逐条列出（封顶 4 条），
+  // 尾行给出续跑指引（与 wave-gate.ts 的逃生阀一致）。
+  if (model.gate && !model.gate.passed) {
+    out.push([seg(' ⛔ ', 'error'), seg(`波间门禁未通过 (Wave ${model.gate.wave})`, 'error', true)])
+    const MAX_GATE_FAILURES = 4
+    for (const failure of model.gate.failures.slice(0, MAX_GATE_FAILURES)) {
+      out.push([seg('    ⎿ ', 'dim'), seg(truncate(failure.replace(/\s+/g, ' ').trim(), rule - 8), 'warning')])
+    }
+    if (model.gate.failures.length > MAX_GATE_FAILURES) {
+      out.push([seg('    ⎿ ', 'dim'), seg(`… 另 ${model.gate.failures.length - MAX_GATE_FAILURES} 项失败`, 'muted')])
+    }
+    out.push([seg('    ⎿ ', 'dim'), seg('修复失败项后可续跑（逃生阀 RIVET_WAVE_GATE=0）', 'muted')])
+  }
+
   // ── footer：总进度 + 派发数 + 审查门 verdict ─────────────────────
   const doneCount = model.tasks.filter(t => t.status === 'done').length
   const anyFailed = model.tasks.some(t => t.status === 'failed' || t.status === 'blocked')
@@ -201,6 +224,26 @@ function buildEntries(model: TeamPanelModel, width: number): PanelLine[] {
   }
   footer.push(seg(' · ', 'dim'), seg(gate.text, gate.colorKey))
   out.push(footer)
+
+  // ── 审查详情（W2b reviewDetail）───────────────────────────────────
+  // verdict 通过时全文是低价值噪音，不渲染；未过/待定时给审查原文（封顶 6 行），
+  // 用户不用切桌面端就能看到"审查到底说了什么"。
+  if (model.reviewDetail && classifyVerdict(model.reviewVerdict) !== 'passed') {
+    const detailLines = model.reviewDetail
+      .split('\n')
+      .map(l => l.trim())
+      .filter(Boolean)
+    if (detailLines.length > 0) {
+      out.push([seg(' ✦ ', 'warning'), seg('审查详情', 'warning')])
+      const MAX_REVIEW_LINES = 6
+      for (const line of detailLines.slice(0, MAX_REVIEW_LINES)) {
+        out.push([seg('    ⎿ ', 'dim'), seg(truncate(line, rule - 8), 'muted')])
+      }
+      if (detailLines.length > MAX_REVIEW_LINES) {
+        out.push([seg('    ⎿ ', 'dim'), seg(`… 审查全文共 ${detailLines.length} 行`, 'dim')])
+      }
+    }
+  }
 
   return out
 }

@@ -70,6 +70,8 @@ import { restoreGoalTracker } from '../agent/goal-persist.js'
 import { setPlanSession } from '../agent/plan-store.js'
 import { isToolAllowed, isToolDenied, isBashCommandAllowlisted, isBashCommandDenied } from '../agent/permissions.js'
 import { getMirrorConfig, setMirrorConfig, setCheckpointConfig, setApprovalMode as persistApprovalDefault } from '../config/manager.js'
+import { SettingsFlow } from './settings-flow.js'
+import { loadSettingsDraft, loadSettingsEnv, saveSettings } from './settings-persist.js'
 import { formatMirrorStatus } from '../tools/mirror-env.js'
 import { detectEnv, formatEnvGuidance, recommendUvSetup, isPythonProject } from '../tools/env-check.js'
 import { getResolvedEnv, getResolvedPathDiff } from '../tools/resolved-env.js'
@@ -130,6 +132,7 @@ const HELP_TEXT = `Available commands:
 /mirror [status|on|off|china|default] — Toggle domestic mirrors for GitHub/npm/pip/go/rust downloads
 /python [status|setup] — Check Python/uv/Git environment or auto-setup a Python project with uv
 /doctor — Environment health check (Node/Git/Python/uv) + which shell the bash tool uses
+/logs [open [desktop]] — 本会话日志落点（会话 / 缓存 / 六维 / 桌面 sidecar），带写入门控与回收策略；open 直接在文件管理器里打开
 /init [verify] — 交互式项目初始化（verify 声明 / skills / hooks 脚手架）；verify 子命令直执行声明补缺
 /cd [<path>] — 会话中途切换工作目录（无参显示当前目录）；历史前缀缓存保留，会话归属迁往新项目
 /tools — Show available tools and their descriptions
@@ -1173,6 +1176,26 @@ const TUI_SLASH_COMMANDS: readonly TuiSlashCommandDef[] = [
 
       const guidance = formatEnvGuidance(env)
       pushStatic(createLogEntry({ type: 'system', content: lines.join('\n') + (guidance ? '\n\n' + guidance : '') }))
+      setIsStreaming(false)
+      return true
+    },
+  },
+  {
+    name: '/logs',
+    immediate: true,
+    async handler(ctx) {
+      const { parts, pushStatic, setIsStreaming, agent, currentSessionId } = ctx
+      // 直接复用 `rivet logs` 的实现，不在这里重写一遍路径推导与 open 逻辑——
+      // 两处措辞一旦分叉，用户在 TUI 和终端里会看到互相矛盾的落点说明。
+      // 会话 id 显式透传：CLI 缺省是「最近写入的会话」，而 TUI 要的是当前这个。
+      const { runLogsCLI } = await import('../diagnostics/logs-cli.js')
+      const { output } = runLogsCLI(
+        ['--session', currentSessionId, ...parts.slice(1)],
+        { cwd: agent.cwd },
+      )
+      const isOpen = parts[1]?.toLowerCase() === 'open'
+      const hint = isOpen ? '' : '\n\n用 /logs open 打开会话目录，/logs open desktop 打开 sidecar 日志目录。'
+      pushStatic(createLogEntry({ type: 'system', content: output + hint }))
       setIsStreaming(false)
       return true
     },
@@ -3883,6 +3906,43 @@ export function registerTuiSlashCommands(app: TuiApp, ctx: BootstrapContext): vo
       app.startConnect()
       return true
     },
+  })
+
+  // /config —— 设置面板。配置读写就在这一层做（同 /mirror 的先例），app.ts 只拿
+  // 一个纯状态机和一个落盘闭包，不引 config manager。
+  const openSettingsPanel = (): boolean => {
+    const flow = new SettingsFlow(loadSettingsDraft(), loadSettingsEnv())
+    app.startSettings(flow, request => saveSettings(request, {
+      // 审批模式是唯一要同步到「正在跑的会话」的字段：落盘之外还得改 agent
+      // 与 badge，否则用户看着面板改了、当前会话仍按旧模式放行。
+      onApprovalChange: (mode: string) => {
+        try {
+          ctx.agent.setApprovalMode(mode as Parameters<typeof ctx.agent.setApprovalMode>[0])
+          app.setApprovalMode(mode as Parameters<typeof app.setApprovalMode>[0])
+          persistApprovalDefault(mode)
+          return true
+        } catch {
+          return false
+        }
+      },
+    }))
+    return true
+  }
+
+  register("/config", {
+    description: "设置面板（子代理路由 / 审查子代理 / 识图模型 / 基础项）",
+    immediate: true,
+    handler: openSettingsPanel,
+  })
+  register("/settings", {
+    description: "设置面板（同 /config）",
+    immediate: true,
+    handler: openSettingsPanel,
+  })
+  register("/setup", {
+    description: "设置面板（同 /config）",
+    immediate: true,
+    handler: openSettingsPanel,
   })
 
   register("/theme", {

@@ -36,18 +36,25 @@ const colOf = (line: string, ch: string, cal: { ambiguousAsWide?: boolean } = {}
 /** 框体行（剥掉首尾呼吸空行）。 */
 const boxOf = (lines: string[]) => lines.slice(1, -1)
 
+/**
+ * 框高契约。刻意增删首屏行时只改这里 —— 其余断言一律用相对位置
+ * （`at(-1)` / `slice(1, -1)`），别再把行号散写进各个用例。
+ */
+const BOX_LINES = 10
+const TOTAL_LINES = BOX_LINES + 2 // 首尾各一行呼吸空行
+
 // ── 结构契约 ────────────────────────────────────────────────────────
 
-test('星阁定稿：9 行框体 + 首尾呼吸空行 = 11 行', () => {
+test(`星阁定稿：${BOX_LINES} 行框体 + 首尾呼吸空行 = ${TOTAL_LINES} 行`, () => {
   const lines = render()
-  assert.equal(lines.length, 11, `框 9 行加首尾空行共 11 行，实得 ${lines.length}`)
+  assert.equal(lines.length, TOTAL_LINES, `框 ${BOX_LINES} 行加首尾空行共 ${TOTAL_LINES} 行，实得 ${lines.length}`)
   assert.equal(lines[0], '', '首行留空，清屏后不贴顶边')
-  assert.equal(lines[10], '', '末行留空，底框不与输入框顶框粘连')
+  assert.equal(lines.at(-1), '', '末行留空，底框不与输入框顶框粘连')
   const box = boxOf(lines)
-  assert.equal(box.length, 9)
+  assert.equal(box.length, BOX_LINES)
   assert.ok(strip(box[0]!).startsWith('╭'), '框首行是顶框')
-  assert.ok(strip(box[8]!).startsWith('╰'), '框末行是底框')
-  for (const line of box.slice(1, 8)) {
+  assert.ok(strip(box.at(-1)!).startsWith('╰'), '框末行是底框')
+  for (const line of box.slice(1, -1)) {
     assert.ok(strip(line).startsWith('│ ') && strip(line).endsWith(' │'), `内容行两侧有竖边线: "${strip(line)}"`)
   }
 })
@@ -70,7 +77,7 @@ test('底框与 app.ts 输入框底边同构（tl/bl + h×(inner+2) + tr/br）',
   const chars = boxCharsFor('thin')
   const inner = boxInnerWidth(cols)
   const box = boxOf(render({ columns: cols }))
-  assert.equal(strip(box[8]!), `${chars.bl}${chars.h.repeat(inner + 2)}${chars.br}`)
+  assert.equal(strip(box.at(-1)!), `${chars.bl}${chars.h.repeat(inner + 2)}${chars.br}`)
 })
 
 // ── 北斗 ────────────────────────────────────────────────────────────
@@ -202,14 +209,14 @@ test('矮终端（放不下星阁 + 输入框）退单行', () => {
 
 test('窄终端（< 48 列）退单行——框内挤不下正文时单行更诚实', () => {
   assert.equal(render({ columns: 47 }).length, 1)
-  assert.equal(render({ columns: 48 }).length, 11, '48 列是星阁下限')
+  assert.equal(render({ columns: 48 }).length, TOTAL_LINES, '48 列是星阁下限')
 })
 
 test('未提供 rows 时按完整星阁渲染（向后兼容）', () => {
   const lines = formatWelcome({
     modelName: 'm', cwd: '/x', sessionId: 'abcdefgh', priorMsgCount: 0, columns: 100,
   }, theme)
-  assert.equal(lines.length, 11)
+  assert.equal(lines.length, TOTAL_LINES)
 })
 
 test('ASCII 降级：框线与星形同时退到 ASCII，斗身仍收口成勺', () => {
@@ -217,7 +224,7 @@ test('ASCII 降级：框线与星形同时退到 ASCII，斗身仍收口成勺',
   try {
     process.env.RIVET_ASCII_UI = '1'
     const box = boxOf(render({ columns: 80 }))
-    assert.equal(box.length, 9)
+    assert.equal(box.length, BOX_LINES)
     assert.ok(strip(box[0]!).startsWith('+-'), '顶框走 ASCII')
     assert.ok(!/[✦✧∙╭╮╰╯│─]/.test(strip(box[1]!) + strip(box[2]!)), '星图不留 Unicode 字形')
     assert.ok(strip(box[2]!).includes('\\') && strip(box[2]!).includes('/'), 'ASCII 斗身用 \\ / 收口')

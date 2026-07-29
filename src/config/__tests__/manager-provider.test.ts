@@ -94,6 +94,47 @@ describe('provider config mutations', () => {
     assert.equal(provider.capabilities.prefixCache, 'none')
   })
 
+  // The desktop Settings edit form submits only {id, alias, contextWindow,
+  // maxTokens}. Whole-object replacement used to wipe everything else, and all
+  // three losses are silent (images dropped / tier guessed from the name / cost
+  // reads zero). A model absent from any preset isolates the merge from the
+  // preset backfill, which would otherwise refill the fields on load.
+  it('merges a partial model update instead of replacing the stored entry', () => {
+    upsertProviderModel('deepseek', {
+      id: 'house-model',
+      contextWindow: 200000,
+      maxTokens: 32000,
+      supportsVision: true,
+      tier: 'strong',
+      pricing: { input: 1, output: 2 },
+      reasoningEffort: 'high',
+    })
+    setupProvider({ providerName: 'deepseek', model: { id: 'house-model', contextWindow: 200000, maxTokens: 64000 } })
+    const model = loadConfig().provider.providers.deepseek!.models.find(m => m.id === 'house-model')!
+    assert.equal(model.maxTokens, 64000, 'the edit itself must land')
+    assert.equal(model.supportsVision, true)
+    assert.equal(model.tier, 'strong')
+    assert.deepEqual(model.pricing, { input: 1, output: 2 })
+    assert.equal(model.reasoningEffort, 'high')
+  })
+
+  it('merges partial updates on the upsert path too', () => {
+    upsertProviderModel('deepseek', { id: 'house-2', contextWindow: 128000, maxTokens: 8000, supportsVision: true, tier: 'cheap' })
+    upsertProviderModel('deepseek', { id: 'house-2', contextWindow: 128000, maxTokens: 16000 })
+    const model = loadConfig().provider.providers.deepseek!.models.find(m => m.id === 'house-2')!
+    assert.equal(model.maxTokens, 16000)
+    assert.equal(model.supportsVision, true)
+    assert.equal(model.tier, 'cheap')
+  })
+
+  it('lets an explicit value override the stored one (merge is not one-way)', () => {
+    upsertProviderModel('deepseek', { id: 'house-3', contextWindow: 128000, maxTokens: 8000, supportsVision: true, tier: 'strong' })
+    upsertProviderModel('deepseek', { id: 'house-3', contextWindow: 128000, maxTokens: 8000, supportsVision: false, tier: 'cheap' })
+    const model = loadConfig().provider.providers.deepseek!.models.find(m => m.id === 'house-3')!
+    assert.equal(model.supportsVision, false)
+    assert.equal(model.tier, 'cheap')
+  })
+
   it('setupCustomProvider rejects an invalid base URL', () => {
     assert.throws(() => setupCustomProvider({
       providerName: 'custom-bad',

@@ -5,8 +5,19 @@ import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 export interface ScopeMaterializeResult {
   /** Relative file paths copied from the base repo into the worker worktree. */
   materialized: string[]
-  /** Original scope entries that are outside the repo or missing from both trees. */
+  /**
+   * Scope entries that are outside the repo (path escape / absolute path
+   * resolving outside the base). These are genuinely unreachable and should
+   * cause a worker block.
+   */
   missing: string[]
+  /**
+   * Valid relative paths whose files don't yet exist in the base repo.
+   * The worker is expected to CREATE these files — not read them — so
+   * consumers should NOT treat these as errors (see T1 fix: the old code
+   * lumped these into `missing` and killed all new-file patcher tasks).
+   */
+  toBeCreated: string[]
 }
 
 function normalizeScopePath(baseCwd: string, filePath: string): string | null {
@@ -75,6 +86,7 @@ export function materializeScope(
 ): ScopeMaterializeResult {
   const materialized: string[] = []
   const missing: string[] = []
+  const toBeCreated: string[] = []
 
   for (const filePath of scopeFiles) {
     const relPath = normalizeScopePath(baseCwd, filePath)
@@ -88,7 +100,11 @@ export function materializeScope(
 
     const basePath = join(baseCwd, relPath)
     if (!existsSync(basePath)) {
-      missing.push(filePath)
+      // Valid repo-relative path but file doesn't exist yet — worker is
+      // expected to CREATE it (e.g. new source file in a patcher task).
+      // Do NOT block: the old behaviour lumped these into `missing` and
+      // killed every new-file-creating delegation (T1 fix, 2026-07-29).
+      toBeCreated.push(relPath)
       continue
     }
 
@@ -98,5 +114,5 @@ export function materializeScope(
     materialized.push(relPath)
   }
 
-  return { materialized, missing }
+  return { materialized, missing, toBeCreated }
 }

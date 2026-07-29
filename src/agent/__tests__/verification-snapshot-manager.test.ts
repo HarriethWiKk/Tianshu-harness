@@ -36,7 +36,7 @@ function fakeSnapshotFactory(path: string) {
     builds: 1,
     refreshes: 0,
     destroyed: false,
-    async refresh() { this.refreshes++; return { appliedDiff: true, materialized: [], missing: [] } },
+    async refresh() { this.refreshes++; return { appliedDiff: true, materialized: [], missing: [], toBeCreated: [] } },
     destroy() { this.destroyed = true },
   }
   return snap

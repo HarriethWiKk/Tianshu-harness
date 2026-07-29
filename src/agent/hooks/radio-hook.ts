@@ -85,7 +85,6 @@ function buildStarPhaseContext(
     isWriting: isWritingTool(tool.name),
     isRunningTests: isTestRunnerTool(tool.name),
     isFinalTurn: false, // Not determinable from single postTool hook
-    shouldEscalate: ctx.snapshot.strategy?.shouldEscalate ?? false,
     hasEnteredHighComplexity,
   }
 }

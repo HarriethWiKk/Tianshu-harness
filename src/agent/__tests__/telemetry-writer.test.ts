@@ -4,6 +4,7 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { createTelemetryWriter, VITALS_LITE_KIND, COGNITIVE_FRAME_LITE_KIND, ADVISORY_OUTCOME_KIND, ADVISORY_HOLDOUT_KIND } from '../telemetry-writer.js'
+import { isTuiPerfEnabled } from '../../tui/engine/perf-monitor.js'
 import type { PerceptionTelemetrySnapshot } from '../perception.js'
 import { buildTelemetrySnapshot } from '../perception.js'
 
@@ -213,5 +214,47 @@ describe('createTelemetryWriter — lite mode (W5)', () => {
     } finally {
       delete process.env['RIVET_TELEMETRY_LITE']
     }
+  })
+})
+
+// RIVET_DEBUG_TELEMETRY 的两侧语义：遥测通道按真值判断放行全量，而 TUI perf
+// 监视器只认字面 '1'。这个差异是有用的（能开全量语料而不常驻 perf 那行 UI），
+// 但只要有一侧被"顺手统一"成另一种写法，另一侧就静默改变行为——本机默认值就是
+// 靠这个差异设成 full 的。两条一起钉住。
+describe('RIVET_DEBUG_TELEMETRY 的取值语义', () => {
+  it('任意非空值都开全量遥测，不限于 "1"', async () => {
+    const prevDebug = process.env['RIVET_DEBUG_TELEMETRY']
+    const prevLite = process.env['RIVET_TELEMETRY_LITE']
+    // lite 关掉，这样 full 通道是唯一放行来源，避免用 lite 白名单蒙对。
+    process.env['RIVET_TELEMETRY_LITE'] = '0'
+    try {
+      for (const value of ['1', 'full', 'true', 'yes']) {
+        process.env['RIVET_DEBUG_TELEMETRY'] = value
+        const dir = mkdtempSync(join(tmpdir(), 'rivet-telemetry-truthy-'))
+        try {
+          const writer = createTelemetryWriter(dir)
+          // 非 lite 白名单的 kind：只有 full 打开时才落盘。
+          writer.write({ kind: 'cognitive-frame', turn: 1 } as never)
+          await writer.flush()
+          const body = readFileSync(join(dir, '.rivet', 'sensorium.jsonl'), 'utf-8')
+          assert.match(body, /cognitive-frame/, `值 ${value} 未开启全量遥测`)
+        } finally {
+          rmSync(dir, { recursive: true, force: true })
+        }
+      }
+    } finally {
+      if (prevDebug === undefined) delete process.env['RIVET_DEBUG_TELEMETRY']
+      else process.env['RIVET_DEBUG_TELEMETRY'] = prevDebug
+      if (prevLite === undefined) delete process.env['RIVET_TELEMETRY_LITE']
+      else process.env['RIVET_TELEMETRY_LITE'] = prevLite
+    }
+  })
+
+  it('TUI perf 监视器只认字面 "1" —— full 不该拉起 perf 那行 UI', () => {
+    assert.equal(isTuiPerfEnabled([], { RIVET_DEBUG_TELEMETRY: '1' }), true)
+    assert.equal(isTuiPerfEnabled([], { RIVET_DEBUG_TELEMETRY: 'full' }), false)
+    assert.equal(isTuiPerfEnabled([], {}), false)
+    // 显式开关不受影响。
+    assert.equal(isTuiPerfEnabled(['--debug-perf'], {}), true)
   })
 })

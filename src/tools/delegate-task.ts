@@ -159,6 +159,9 @@ export function createDelegateTaskTool(
         delegationDepth: params.delegationDepth ?? 0,
         sessionTurn: params.sessionTurnCount,
         onActivity,
+        // 嵌套委派透传：本 worker 再派 sub-worker 时，sub-worker 的活动
+        // （coordinator 已盖 parentWorkerId）直通同一条 UI 通道。
+        onNestedActivity: params.onWorkerActivity,
         resumeWorkOrderId: parsed.data.resume,
         budget: toBudgetOverride(parsed.data),
       }, params.abortSignal)

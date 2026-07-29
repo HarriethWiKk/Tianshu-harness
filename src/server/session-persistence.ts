@@ -29,8 +29,9 @@ import { open, readFile } from 'node:fs/promises'
 import { setImmediate as yieldToLoop } from 'node:timers/promises'
 import { join } from 'node:path'
 import { cpuPool } from '../workers/cpu-pool.js'
-import { parseEventsJsonlRaw } from '../workers/cpu-tasks.js'
+import { parseEventsJsonlRaw, parseEventsTailRaw } from '../workers/cpu-tasks.js'
 import type {
+  EventsTail,
   PersistedSession,
   SessionEvent,
   SessionPersistenceAdapter,
@@ -300,6 +301,39 @@ export class FileSessionPersistence implements SessionPersistenceAdapter {
       return (await cpuPool.run('parseEventsJsonlRaw', [text])) as SessionEvent[]
     } catch {
       return chunkedParseEvents(text)
+    }
+  }
+
+  /**
+   * 首开会话的尾部读——只把内存环留得下的部分搬过线程边界。
+   *
+   * loadEventsAsync 会把整本日志的解析结果回传，调用方随即按 maxEvents 截尾丢掉
+   * 其余。parse 在 worker 里不占主线程，但 structured clone 的成本与条数成正比
+   * （实测 3.56 MB / 43,717 条：全量回传 139ms，尾部 5,000 条 14ms），那份搬运
+   * 是纯浪费。截断挪进 worker 后，代价与日志长度解耦、只与环容量相关。
+   *
+   * 被截掉的头部仍有两样东西要带出来：磁盘最早 seq（前端据此判断还有没有更早的
+   * 历史）和全量 artifact id（去重集不完整会让旧 artifact 重放时被重新公告）。
+   */
+  async loadEventsTailAsync(id: string, maxEvents: number): Promise<EventsTail> {
+    const empty: EventsTail = { events: [], diskFirstSeq: 0, lastSeq: 0, artifactIds: [], total: 0 }
+    this.flushSession(id)
+    const file = join(this.dir(id), 'events.jsonl')
+    let text: string
+    try {
+      text = await readFile(file, 'utf8')
+    } catch {
+      return empty
+    }
+    if (!text) return empty
+    // RawSessionEvent.type 是宽 string（worker 侧不依赖事件类型联合），在此收窄，
+    // 与 loadEventsAsync 的边界处理一致。
+    if (text.length < 256 * 1024) return parseEventsTailRaw(text, maxEvents) as EventsTail
+    try {
+      return (await cpuPool.run('parseEventsTailRaw', [text, maxEvents])) as EventsTail
+    } catch {
+      // pool 不可用：分批 parse（批间让出事件循环），再在主线程截尾。
+      return tailOf(await chunkedParseEvents(text), maxEvents)
     }
   }
 
@@ -680,6 +714,25 @@ async function chunkedParseEvents(text: string): Promise<SessionEvent[]> {
   }
   events.sort((a, b) => a.seq - b.seq)
   return events
+}
+
+/** 把一份全量解析结果收成尾部形状——pool 不可用时的兜底路径复用，
+ *  保持与 worker 侧 parseEventsTailRaw 完全一致的语义。 */
+function tailOf(all: SessionEvent[], maxEvents: number): EventsTail {
+  if (all.length === 0) {
+    return { events: [], diskFirstSeq: 0, lastSeq: 0, artifactIds: [], total: 0 }
+  }
+  const artifactIds: string[] = []
+  for (const e of all) {
+    if (e.type === 'artifact') artifactIds.push(String(e.data.id))
+  }
+  return {
+    events: all.length > maxEvents ? all.slice(all.length - maxEvents) : all,
+    diskFirstSeq: all[0]!.seq,
+    lastSeq: all[all.length - 1]!.seq,
+    artifactIds,
+    total: all.length,
+  }
 }
 
 /** Provider-safe image MIMEs ↔ file extensions (single source of truth). */

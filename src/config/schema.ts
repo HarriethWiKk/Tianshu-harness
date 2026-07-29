@@ -344,6 +344,13 @@ export const agentSchema = z.object({
       browser: z.boolean().default(false),
     }).default({}),
   }).default({}),
+  /** 交付行为控制。 */
+  delivery: z.object({
+    /** 任务完成后是否自动执行 git commit。默认 true（向后兼容）。
+     *  设为 false 后，deliver_task 仍会运行门禁和审查，但不会实际提交——
+     *  用户需手动审查变更后自行 git commit。 */
+    autoCommit: z.boolean().default(true),
+  }).default({}),
 })
 
 export const compactSchema = z.object({

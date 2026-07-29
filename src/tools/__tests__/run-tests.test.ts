@@ -130,6 +130,30 @@ describe('mixed', () => {
     assert.equal(result.verification!.command, 'tsx --test src/example.test.ts')
   })
 
+  // 2026-07-27 实测：filter='edit.test' 被判「无法解析为 Node 测试文件」，
+  // 而 src/tools/__tests__/edit.test.ts 确实存在。根因是解析用的 glob 把
+  // filter 包进 `*<filter>*.test.<ext>`——filter 自带 .test 时按构造必然 0 命中。
+  // 同一缺陷让工具自己文档里的例子 filter="loop.test.ts" 也解析不出来。
+  for (const filter of ['example.test', 'example.test.ts', 'example']) {
+    it(`resolves filter=${JSON.stringify(filter)} to the real test file`, async () => {
+      const result = await RUN_TESTS_TOOL.execute(makeParams({ filter }, passingDir))
+
+      assert.equal(result.isError, false, `filter 应解析到 src/example.test.ts，实得：${result.content}`)
+      assert.equal(result.verification!.command, 'tsx --test src/example.test.ts')
+      assert.equal(result.verification!.scope, 'targeted')
+    })
+  }
+
+  it('still blocks a filter that matches no test file', async () => {
+    // 保住 fail-loud：filter 指向不存在的测试（实测 'star-genesis' 就是这种）
+    // 必须受阻并给出指引，不能悄悄退化成跑全量。
+    const result = await RUN_TESTS_TOOL.execute(makeParams({ filter: 'no-such-suite' }, passingDir))
+
+    assert.equal(result.isError, true)
+    assert.ok(result.verification)
+    assert.equal(result.verification!.scope, 'targeted')
+  })
+
   it('runs targeted tsx tests without npx npm-command ambiguity', async () => {
     const result = await RUN_TESTS_TOOL.execute(
       makeParams({ filter: 'src/example.test.ts' }, passingDir),

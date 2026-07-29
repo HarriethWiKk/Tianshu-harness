@@ -505,6 +505,23 @@ export interface StorageReport {
 }
 
 /**
+ * 尾部读的回传形状：`events` 已按内存环容量截断，其余字段承载被截头部里
+ * 仍然需要的信息，让调用方不必为了它们索取全量。
+ */
+export interface EventsTail {
+  /** 尾部 maxEvents 条（日志更短时即全部）。 */
+  events: SessionEvent[]
+  /** 磁盘日志最早 seq（空日志为 0）。 */
+  diskFirstSeq: number
+  /** 磁盘日志最大 seq（空日志为 0）。 */
+  lastSeq: number
+  /** 全量日志出现过的 artifact id——去重集不完整会让旧 artifact 被重新公告。 */
+  artifactIds: string[]
+  /** 全量事件数（用于区分空日志与「有日志但全是坏行」）。 */
+  total: number
+}
+
+/**
  * Durable backing store for sessions (N1). Records are snapshotted; events are
  * append-only. Implementations must tolerate a corrupt trailing event line
  * (partial write) on load — never throw, just drop it.
@@ -533,6 +550,15 @@ export interface SessionPersistenceAdapter {
    * `loadEvents` when absent.
    */
   loadEventsAsync?(sessionId: string): Promise<SessionEvent[]>
+  /**
+   * 首开会话的尾部读（optional）。语义同 loadEventsAsync，但只回传内存环留得下
+   * 的 maxEvents 条——parse 在 worker 里不占主线程，跨线程搬运却与条数成正比，
+   * 而调用方拿到全量后本来就要丢掉环外的部分。缺失时退回 loadEventsAsync。
+   *
+   * 被截头部里仍需带出的两样：`diskFirstSeq`（前端判断有无更早历史）与
+   * `artifactIds`（全量去重集，缺了会让旧 artifact 重放时被重新公告）。
+   */
+  loadEventsTailAsync?(sessionId: string, maxEvents: number): Promise<EventsTail>
   /**
    * 稀疏索引区间读（optional，冷通道分页加速）：返回 seq < before 的尾部
    * 窗口（至少 minCount 条，或到日志开头）。实现方只读覆盖窗口的字节区间，
@@ -1311,6 +1337,16 @@ export class RuntimeSessionManager {
     session.events = evs.length > this.maxEvents ? evs.slice(evs.length - this.maxEvents) : evs
   }
 
+  /** adoptLoadedEvents 的尾部版：截断已在读取侧完成，被截头部的信息由
+   *  diskFirstSeq / artifactIds 带出，语义与全量路径逐字对齐。 */
+  private adoptLoadedTail(session: InternalSession, tail: EventsTail): void {
+    session.knownArtifacts = new Set(tail.artifactIds)
+    if (tail.total > 0) session.diskFirstSeq = tail.diskFirstSeq
+    const maxSeq = tail.total > 0 ? tail.lastSeq : session.record.lastSeq
+    session.seq = Math.max(session.seq, maxSeq)
+    session.events = tail.events
+  }
+
   /**
    * Async twin of ensureEvents for the reconnect-replay entry points. Uses the
    * adapter's non-blocking `loadEventsAsync` when available (async file read +
@@ -1323,23 +1359,32 @@ export class RuntimeSessionManager {
    */
   private async ensureEventsAsync(session: InternalSession): Promise<void> {
     if (!session.eventsLoaded) {
+      // 尾部读优先：只搬环内那部分过线程边界，代价与日志长度解耦。
+      const tailLoader = this.persistence?.loadEventsTailAsync
       const asyncLoader = this.persistence?.loadEventsAsync
-      if (!asyncLoader) {
+      if (!tailLoader && !asyncLoader) {
         this.ensureEvents(session)
         return
       }
       if (!session.eventsLoadPromise) {
         session.eventsLoadPromise = (async () => {
-          let evs: SessionEvent[]
+          let tail: Awaited<ReturnType<NonNullable<typeof tailLoader>>> | undefined
+          let evs: SessionEvent[] = []
           let loadError: string | undefined
           try {
-            evs = await asyncLoader.call(this.persistence, session.record.id)
+            if (tailLoader) {
+              tail = await tailLoader.call(this.persistence, session.record.id, this.maxEvents)
+            } else {
+              evs = await asyncLoader!.call(this.persistence, session.record.id)
+            }
           } catch (err) {
+            tail = undefined
             evs = []
             loadError = redactText((err as Error)?.message ?? String(err))
           }
           if (session.eventsLoaded) return // sync load won the race — keep it
-          this.adoptLoadedEvents(session, evs)
+          if (tail) this.adoptLoadedTail(session, tail)
+          else this.adoptLoadedEvents(session, evs)
           session.eventsLoaded = true
           if (loadError !== undefined) {
             this.append(session, 'error', {
@@ -1495,8 +1540,11 @@ export class RuntimeSessionManager {
       if (typeof line === 'string' && line) activity.push(line.slice(0, 300))
     }
     const result = loadPersistedResult(workerId)
-    const record = loadWorkerSession(workerId)
-    const messages = record?.messages ?? []
+    // 运行中优先读内存活转录（coordinator per-order 注册）——saveWorkerSession
+    // 只在终态落盘，没有这条通道运行中的转录永远是空/陈旧的上一轮存档。
+    const liveMessages = this.coordinatorBySession.get(id)?.()?.getLiveWorkerMessages(workerId)
+    const record = liveMessages && liveMessages.length > 0 ? null : loadWorkerSession(workerId)
+    const messages = liveMessages && liveMessages.length > 0 ? liveMessages : (record?.messages ?? [])
     const keep = full ? messages : messages.slice(-50)
     const textCap = full ? 4000 : 800
     const transcript = keep.map((m: OaiMessage) => ({
@@ -4087,6 +4135,8 @@ export class RuntimeSessionManager {
     a: {
       workOrderId: string
       parentToolId?: string
+      /** 嵌套委派的父 worker order id（顶层委派缺省）。 */
+      parentWorkerId?: string
       profile?: string
       authority?: string
       /** Why this authority was chosen (from DelegationActivity.authorityReason). */
@@ -4122,6 +4172,9 @@ export class RuntimeSessionManager {
     this.append(session, 'delegation', {
       workerId: a.workOrderId,
       parentId: a.parentToolId,
+      // 嵌套委派的真实父 worker（parentId 是工具调用 id，只够挂到工具卡下；
+      // 层级树渲染要靠这个字段）。
+      parentWorkerId: a.parentWorkerId,
       profile: a.profile,
       // authority 与命中理由一并透传（此前 authority 接收后未转发，桌面端拿不到）；
       // 桌面舰队面板显示 worker 星域/理由时直接可用。

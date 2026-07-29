@@ -3,7 +3,7 @@
 > 本文件由 `scripts/docs-index.ts` 自动生成（`npm run docs:index`），请勿手工编辑。
 > 文档规范见 [README.md](README.md)；思维导图见 [MINDMAP.md](MINDMAP.md)（markmap 渲染）。
 
-共 994 篇，其中 9 篇带 frontmatter。
+共 1005 篇，其中 15 篇带 frontmatter。
 
 ## 概览
 
@@ -12,14 +12,14 @@
 | `plan` | 执行计划 | 345 |
 | `spec` | 事前规格 | 209 |
 | `design` | 技术设计 | 52 |
-| `analysis` | 分析复盘 | 167 |
+| `analysis` | 分析复盘 | 172 |
 | `research` | 外部调研 | 18 |
-| `changelog` | 变更记录 | 39 |
+| `changelog` | 变更记录 | 41 |
 | `issue` | 问题追踪 | 32 |
-| `release` | 版本发布 | 18 |
-| `guide` | 手册指南 | 13 |
+| `release` | 版本发布 | 20 |
+| `guide` | 手册指南 | 14 |
 | `reference` | 参考资料 | 49 |
-| `unclassified` | 未分类 | 52 |
+| `unclassified` | 未分类 | 53 |
 
 ## plan — 执行计划（345）
 
@@ -642,10 +642,15 @@
 | — | [将星机制（Star-General Mechanism）实现说明](design/star-general-mechanism.md) | — |
 | — | [Verification Snapshot Worktree (VSW)](design/verification-snapshot-worktree.md) | — |
 
-## analysis — 分析复盘（167）
+## analysis — 分析复盘（172）
 
 | 日期 | 文档 | 状态 |
 |------|------|------|
+| 2026-07-29 | [Team 模式端到端实测：复现手册与入口层缺陷归因](analysis/2026-07-29-team-mode-e2e-repro-and-gaps.md) | accepted |
+| 2026-07-29 | [桌面端「设置页 / 新建会话几秒空白」归因与混淆器成本核算](analysis/2026-07-29-桌面端加载延迟归因.md) | active |
+| 2026-07-28 | [2026-07-28 桌面端「signature verification failed」签名错配归因](analysis/2026-07-28-desktop-update-signature-mismatch.md) | — |
+| 2026-07-28 | [第二轮指标监测 —— 闭第一轮留下的三条待数据闭环](analysis/2026-07-28-第二轮指标监测.md) | draft |
+| 2026-07-28 | [阈值与分布脱钩 —— 按聚合指标改传感器的失效模式](analysis/2026-07-28-阈值与分布脱钩.md) | draft |
 | 2026-07-25 | [卦象阶段教义层 —— Phase −1 证据档案](analysis/2026-07-25-hexagram-stage-doctrine-evidence.md) | — |
 | 2026-07-17 | [Grok Build 对标分析：可借鉴清单](analysis/2026-07-17-grok-build-benchmark-analysis.md) | — |
 | 2026-07-17 | [案件复盘：TUI 渲染三连击——对账式攻坚的一次完整实战](analysis/2026-07-17-tui-render-attack-cases.md) | — |
@@ -837,10 +842,12 @@
 | 2026-05-27 | [Outlines Index：渐进式披露文档给 AI Agent 的方法](research/2026-05-27-outlines-index-progressive-disclosure.md) | — |
 | — | [桌面端渲染调度基线（渲染调度专项 Wave 0）](research/2026-07-desktop-render-baseline.md) | — |
 
-## changelog — 变更记录（39）
+## changelog — 变更记录（41）
 
 | 日期 | 文档 | 状态 |
 |------|------|------|
+| 2026-07-29 | [2026-07-29 TUI 设置面板 /config](changelog/2026-07-29-tui-settings-panel.md) | done |
+| 2026-07-29 | [2026-07-29 视觉通道诚实性修复 + 测试入口挂死护栏补齐](changelog/2026-07-29-vision-channel-honesty-and-test-entry-hardening.md) | done |
 | 2026-07-26 | [2026-07-26 桌面会话体验闭环 + web 整站抓取](changelog/2026-07-26-desktop-session-menus-and-web-crawl.md) | — |
 | 2026-07-26 | [前端视觉验证闭环复盘（2026-07-26）——从一次性脚本到 browser_debug 内建能力](changelog/2026-07-26-frontend-visual-verification-loop.md) | — |
 | 2026-07-26 | [2026-07-26 GPU 硬件加速状态展示（B 方案：Rust 原生探测）](changelog/2026-07-26-gpu-acceleration-status-display.md) | — |
@@ -918,12 +925,14 @@
 | — | [TUI: 消息重复渲染 + 流式不停滚屏](known-issues/tui-duplicate-render-and-scroll.md) | — |
 | — | [TUI: Assistant Message "Flashes" After Streaming Completes](known-issues/tui-message-flash.md) | — |
 
-## release — 版本发布（18）
+## release — 版本发布（20）
 
 | 日期 | 文档 | 状态 |
 |------|------|------|
 | 2026-07-28 | [v2.23.0 迭代记录](releases/v2.23.0.md) | — |
 | 2026-07-28 | [🌟 v2.24.0 — 创世碑文 · 里程碑预览版](releases/v2.24.0.md) | — |
+| 2026-07-28 | [v2.24.2 迭代记录](releases/v2.24.2.md) | — |
+| 2026-07-28 | [v2.24.3 迭代记录](releases/v2.24.3.md) | — |
 | 2026-07-27 | [v2.24.1 迭代记录](releases/v2.24.1.md) | — |
 | 2026-07-26 | [v2.22.1 迭代记录](releases/v2.22.1.md) | — |
 | 2026-07-24 | [v2.21.0 迭代记录](releases/v2.21.0.md) | — |
@@ -941,7 +950,7 @@
 | 2026-06-07 | [v2.10.0 迭代记录](releases/v2.10.0-changelog.md) | — |
 | 2026-06-07 | [main 分支合并前版本快照](releases/v2.9.2-pre-merge-snapshot.md) | — |
 
-## guide — 手册指南（13）
+## guide — 手册指南（14）
 
 | 日期 | 文档 | 状态 |
 |------|------|------|
@@ -957,6 +966,7 @@
 | — | [前缀档位（prompt.profile）](user-guide-prompt-profile.md) | — |
 | — | [Provider 配置用户手册](user-guide-provider-config.md) | — |
 | — | [天枢沙箱与权限模型](user-guide-sandbox-permissions.md) | — |
+| — | [识图能力用户手册（视觉通道）](user-guide-vision.md) | — |
 | — | [Rivet 用户手册](user-guide.md) | — |
 
 ## reference — 参考资料（49）
@@ -1013,7 +1023,7 @@
 | — | [天璇 · Opus 4.6 · 领航星](stars/tianxuan-opus-4.6.md) | — |
 | — | [Stability Brief Index](superpowers/briefs/INDEX.md) | — |
 
-## unclassified — 未分类（52）
+## unclassified — 未分类（53）
 
 | 日期 | 文档 | 状态 |
 |------|------|------|
@@ -1066,6 +1076,7 @@
 | — | [天梁提示词](天梁提示词.md) | — |
 | — | [审查子代理 max-turns 耗尽与首次大 read 诊断](审查子代理max-turns耗尽与大read诊断.md) | — |
 | — | [天枢桌面端更新镜像部署技术实录](更新镜像部署技术实录.md) | — |
+| — | [电网作业安全现场智能管控——人工智能统推模块模型应用情况报告（初稿）](电网作业安全现场智能管控-AI模型应用情况报告.md) | — |
 | — | [天枢第一轮指标监测报告](监测报告-2026-07-21-第一轮指标监测.md) | — |
 | — | [简历 — 天枢项目经历与技能总结](简历-天枢项目经历.md) | — |
 | — | [缓存phase 5前收束阶段 的测试验证](缓存phase 5前收束阶段 的测试验证.md) | — |

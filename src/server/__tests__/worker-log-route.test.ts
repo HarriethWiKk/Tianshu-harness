@@ -92,4 +92,52 @@ describe('getWorkerLog', () => {
     assert.deepEqual(log.transcript, [])
     assert.deepEqual(log.activity, [])
   })
+
+  it('运行中 worker 优先读 coordinator 活转录，陈旧落盘存档被忽略', async () => {
+    const manager = makeManager()
+    const id = manager.createSession({}).id
+    // 同 order id 上一轮 resume 的陈旧存档——活快照在场时不得回落到它。
+    writeFileSync(join(dir, 'subagents', 'wo_live.session.jsonl'), JSON.stringify({
+      workOrderId: 'wo_live',
+      profile: 'code_scout',
+      objective: 'x',
+      messages: [{ role: 'user', content: 'stale previous run' }],
+      savedAt: 1,
+    }))
+    const live = [
+      { role: 'user', content: 'live objective' },
+      { role: 'assistant', content: 'working on it right now' },
+    ]
+    manager.setCoordinatorRef(id, () => ({
+      getLiveWorkerMessages: (wid: string) => (wid === 'wo_live' ? live : undefined),
+    }) as never)
+
+    const log = await manager.getWorkerLog(id, 'wo_live')
+    assert.ok(log)
+    assert.equal(log.transcript.length, 2)
+    assert.equal(log.transcript[1]?.text, 'working on it right now')
+    assert.ok(!log.transcript.some(m => m.text.includes('stale')), '不含陈旧存档内容')
+    assert.equal(log.savedAt, null, '活快照不是落盘记录,savedAt 为 null')
+  })
+
+  it('coordinator 在场但该 worker 已终态(无活快照) → 回落到落盘存档', async () => {
+    const manager = makeManager()
+    const id = manager.createSession({}).id
+    writeFileSync(join(dir, 'subagents', 'wo_done.session.jsonl'), JSON.stringify({
+      workOrderId: 'wo_done',
+      profile: 'reviewer',
+      objective: 'y',
+      messages: [{ role: 'assistant', content: 'persisted verdict' }],
+      savedAt: 456,
+    }))
+    manager.setCoordinatorRef(id, () => ({
+      getLiveWorkerMessages: () => undefined,
+    }) as never)
+
+    const log = await manager.getWorkerLog(id, 'wo_done')
+    assert.ok(log)
+    assert.equal(log.transcript.length, 1)
+    assert.equal(log.transcript[0]?.text, 'persisted verdict')
+    assert.equal(log.savedAt, 456)
+  })
 })

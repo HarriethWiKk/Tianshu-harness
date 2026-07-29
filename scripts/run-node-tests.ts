@@ -1,8 +1,9 @@
 import { spawn } from 'node:child_process'
 import { glob, mkdir } from 'node:fs/promises'
 import { mkdtempSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { constants, tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { nodeTestFlags, resolveTestTimeoutMs } from './test-runner-flags.js'
 
 const args = process.argv.slice(2)
 const includeTui = !args.includes('--exclude-tui')
@@ -36,9 +37,16 @@ function resolveTestTmp(): string {
 const PROJECT_TMP = resolveTestTmp()
 await mkdir(PROJECT_TMP, { recursive: true })
 
+// `scripts/` 也要收：打包裁剪（wasm 白名单 / typescript 瘦身 / 外来平台包过滤）与
+// 遥测探针的测试都住在那儿。曾经只 glob `src/`，那 4 个文件写了却从不执行——
+// 裁剪逻辑错了会直接毁发布产物，恰恰是最需要门禁的一类。
+const TEST_GLOBS = ['src/**/*.test.ts', 'scripts/**/*.test.ts']
+
 const files: string[] = []
-for await (const file of glob('src/**/*.test.ts')) {
+for await (const file of glob(TEST_GLOBS)) {
   const normalized = file.replace(/\\/g, '/')
+  // scripts/cloudflare-update-worker 等嵌套包一旦 npm install 就会带进 node_modules
+  if (normalized.includes('/node_modules/')) continue
   const isIntegration = normalized.includes('/integration/')
   if (integrationOnly && !isIntegration) continue
   if (unitOnly && isIntegration) continue
@@ -68,7 +76,10 @@ const testEnv = {
   GIT_CEILING_DIRECTORIES: PROJECT_TMP,
 }
 
-const NODE_FLAGS = ['--import', 'tsx', '--test-force-exit', '--test']
+// 超时上限是防「电脑卡死」的关键：Node 不设 --test-timeout 就是 Infinity，任一测试
+// 卡住整个批次进程就永久挂着，被遗弃的整跑会一直占 CPU 直到手动清理。曾攒下 4 个
+// 跑满一天多的僵留进程，机器 15 分钟负载均值 76。详见 test-runner-flags.ts。
+const NODE_FLAGS = nodeTestFlags(resolveTestTimeoutMs(process.env.RIVET_TEST_TIMEOUT))
 
 // Windows caps a process command line at ~32767 chars; passing all ~900 test
 // files at once overflows it (ENAMETOOLONG). Chunk the file list by cumulative
@@ -95,6 +106,28 @@ function batchFiles(all: string[]): string[][] {
   return batches
 }
 
+let activeChild: ReturnType<typeof spawn> | null = null
+let shuttingDown = false
+
+// 被中断时必须带走子进程。此前 runner 没装信号处理：Ctrl-C / 终端关闭 / 工具取消
+// 打断后，批次子进程会被 reparent 到 init 继续跑——实测捡到 4 个 PPID=1、跑满一天多
+// 的僵留进程，合计吃掉约 50% CPU。转发信号，不留孤儿。
+for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
+  process.on(sig, () => {
+    if (shuttingDown) return
+    shuttingDown = true
+    const child = activeChild
+    if (child === null) process.exit(128 + (constants.signals[sig] ?? 15))
+    child.kill(sig)
+    // 子进程可能已卡死不响应优雅退出，给宽限后硬杀 —— 否则 runner 自己也挂在这儿，
+    // 又变成一个僵留进程。unref 让它不拦正常退出。
+    setTimeout(() => {
+      activeChild?.kill('SIGKILL')
+      process.exit(128 + (constants.signals[sig] ?? 15))
+    }, 5_000).unref()
+  })
+}
+
 function runBatch(batch: string[]): Promise<number> {
   return new Promise(resolve => {
     const child = spawn(process.execPath, [...NODE_FLAGS, ...batch], {
@@ -102,15 +135,20 @@ function runBatch(batch: string[]): Promise<number> {
       shell: false,
       env: testEnv,
     })
+    activeChild = child
     child.on('exit', (code, signal) => {
+      activeChild = null
       if (signal) {
-        process.kill(process.pid, signal)
+        // 用 128+signum 表达「被信号带走」。不要把信号重放到自己身上——装了处理器后
+        // 重放只会回到处理器，runner 反而卡住不退。
+        resolve(128 + (constants.signals[signal] ?? 15))
         return
       }
       resolve(code ?? 1)
     })
     child.on('error', err => {
       console.error(err)
+      activeChild = null
       resolve(1)
     })
   })
@@ -123,6 +161,7 @@ if (batches.length > 1) {
 
 let worstExit = 0
 for (const batch of batches) {
+  if (shuttingDown) break
   const code = await runBatch(batch)
   if (code !== 0) worstExit = code
 }

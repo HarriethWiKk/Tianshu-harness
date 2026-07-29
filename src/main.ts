@@ -95,6 +95,8 @@ const requestedProvider = providerArgIdx >= 0 ? args[providerArgIdx + 1] : undef
 //   --resume / -r (bare)         → open the session picker after the TUI starts
 //   --new                        → force a brand-new session
 //   --list / `rivet sessions`    → print the session list and exit
+// 排查入口（不启动 TUI）：`rivet logs` 列出会话/缓存/六维/桌面日志的落点，
+// `rivet logs --json` 输出结构化清单便于上报 issue。
 // Resolution + env signalling happens in main() before bootstrap so that
 // getOrCreateSessionId picks it up regardless of call order.
 const sessionCliArgs = parseSessionCliArgs(args)
@@ -230,6 +232,18 @@ async function main() {
   // rivet sessions / rivet --list — print the session list and exit
   if (args[0] === 'sessions' || args.includes('--list')) {
     process.stdout.write(SessionPersist.formatSessionList(process.cwd()) + '\n')
+    return
+  }
+
+  // rivet logs [open [desktop]] [--session <id>] [--json]
+  // 日志落点排查。刻意放在 TTY 门与 bootstrap 之前：TUI 起不来（sidecar 崩、
+  // 配置坏、非 TTY 管道里）恰恰是最需要知道日志在哪的时候，这条路径不初始化
+  // agent、不读配置、不联网。
+  if (args[0] === 'logs') {
+    const { runLogsCLI } = await import('./diagnostics/logs-cli.js')
+    const { output, exitCode } = runLogsCLI(args.slice(1), { cwd: process.cwd() })
+    ;(exitCode === 0 ? process.stdout : process.stderr).write(output + '\n')
+    if (exitCode !== 0) process.exit(exitCode)
     return
   }
 

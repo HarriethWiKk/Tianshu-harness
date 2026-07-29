@@ -92,6 +92,15 @@ export interface WorkerSessionConfig {
    *  worker 的 AgentLoop 在工具回合结算时调用，把用户直达消息以
    *  [User guidance] 形态注入 tool_result（与主会话 steer 同一机制）。 */
   onSteerDrain?: () => string | null
+  /** 运行中转录快照通道 — session 建好后上报一次消息 getter。coordinator 把它
+   *  注册进 per-order 表，服务端 getWorkerLog 借此在 saveWorkerSession 终态
+   *  落盘之前就能读到活转录（续跑/重试每次新 session 会再上报、覆盖旧 getter）。 */
+  onSessionReady?: (getMessages: () => readonly import('../api/oai-types.js').OaiMessage[]) => void
+  /** 嵌套委派上行通道 — 本 worker 自己再调 delegate_task/delegate_batch 时，
+   *  sub-worker 的 DelegationActivity 经 worker AgentLoop 的
+   *  onDelegationActivity 回调流到这里。不接就是历史行为：嵌套 worker 对
+   *  UI 完全不可见。coordinator 注入时会盖 parentWorkerId 戳（本 order id）。 */
+  onNestedDelegation?: (activity: import('../tools/types.js').DelegationActivity) => void
   /** Resume from a previous checkpoint — inject partial results as context so
    *  the worker doesn't redo completed work. Especially valuable for multi-turn
    *  Flash workers (test_scaffolder generating multiple files). */
@@ -234,6 +243,7 @@ async function runOnce(
   transcript: WorkerTranscript,
   onActivity?: (kind: WorkerActivityKind, detail?: string) => void,
   onSteerDrain?: () => string | null,
+  onDelegationActivity?: (activity: import('../tools/types.js').DelegationActivity) => void,
 ): Promise<string> {
   let text = ''
   // AgentLoop.run never rethrows stream errors — it reports them via onError
@@ -280,6 +290,9 @@ async function runOnce(
     },
     // WC: 输入直达 — drain coordinator 注入的 per-order steer 队列
     onSteerDrain: onSteerDrain ? () => onSteerDrain() : undefined,
+    // 嵌套委派：worker 自己派的 sub-worker 活动上行（tool-pipeline 只在此回调
+    // 存在时才给 delegate 工具接 onWorkerActivity——不接嵌套 worker 就不可见）。
+    onDelegationActivity,
     onError: (error) => {
       transcript.errors.push(error.message)
       streamError = error
@@ -451,10 +464,11 @@ export async function runOnceWithTransientRetry(
   transcript: WorkerTranscript,
   onActivity?: (kind: WorkerActivityKind, detail?: string) => void,
   onSteerDrain?: () => string | null,
+  onDelegationActivity?: (activity: import('../tools/types.js').DelegationActivity) => void,
 ): Promise<string> {
   for (let attempt = 0; attempt <= MAX_TRANSIENT_RETRIES; attempt++) {
     try {
-      return await runOnce(agent, prompt, transcript, onActivity, onSteerDrain)
+      return await runOnce(agent, prompt, transcript, onActivity, onSteerDrain, onDelegationActivity)
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
       const classified = classifyFailure(message)
@@ -506,6 +520,7 @@ export async function runWorkerSession(config: WorkerSessionConfig): Promise<Wor
   if (config.priorMessages && config.priorMessages.length > 0) {
     session.replaceMessages([...config.priorMessages])
   }
+  config.onSessionReady?.(() => session.getMessages())
   const agent = new AgentLoop({
     client: config.client,
     promptEngine: config.promptEngine,
@@ -595,7 +610,7 @@ export async function runWorkerSession(config: WorkerSessionConfig): Promise<Wor
 
   try {
     const transcript = emptyTranscript()
-    let latestText = await runOnceWithTransientRetry(agent, prompt, transcript, config.onActivity, steerDrain)
+    let latestText = await runOnceWithTransientRetry(agent, prompt, transcript, config.onActivity, steerDrain, config.onNestedDelegation)
     mbox?.progress(1, config.order.budget.maxRetries + 1, 'initial run')
 
     // Max-turns 熔断闸门：初始 run 被 maxTurns 切断时绝不进修复梯——
@@ -740,7 +755,7 @@ export async function runWorkerSession(config: WorkerSessionConfig): Promise<Wor
           }
           // json-mode repair produced nothing (stream error) → fall through to AgentLoop repair
         }
-        latestText = await runOnceWithTransientRetry(agent, buildWorkerRepairPrompt(config.order, latestText, message), transcript, config.onActivity, steerDrain)
+        latestText = await runOnceWithTransientRetry(agent, buildWorkerRepairPrompt(config.order, latestText, message), transcript, config.onActivity, steerDrain, config.onNestedDelegation)
       }
     }
 

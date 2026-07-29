@@ -250,12 +250,12 @@ function patcherObjective(change: ChangeSet, verifier: VerifierResult): string {
 type InspectorStance = 'dataflow' | 'pathBoundary' | 'wiring' | 'methodology'
 
 const WIRING_INSPECTOR_METHOD = [
-  '方法（逐项执行，每项附 file:line 证据）：',
-  '1. 入口锚点闭环：首先识别目标项目的真实生产入口——package.json 的 bin/main/start 脚本、服务启动文件、CLI 入口、或框架约定入口（next/vite/django 的 app 根）。然后从入口经组合根（bootstrap/DI 容器/路由注册/构造函数及参数链）逐跳正向追踪到每个改动符号。仅在废弃/平行入口、示例代码、脚本或测试中找到的挂点**不构成**闭环证据；多入口项目（CLI+server、新旧 UI 并存）必须确认挂点位于本次改动实际影响的那条入口链上。从活入口到改动点找不到正向路径 = 断线，上报 HIGH。',
-  '2. 对 diff 中每个新增参数/字段/setter/配置标志：找到**所有**调用点——优先用 ast_grep 做结构匹配（如 `$OBJ.$FIELD` 或 `$PROP(...)`），非语法目标回退到 grep。零调用方传值/读取 = 死接线，上报。',
-  '3. 对每个门控/过滤条件：枚举真实运行时输入形状（相对 vs 绝对路径、可选字段缺失、空集合），估算通过率——~0% = 静默关闭功能，~100% = 无效门控。',
-  '4. 对每个声称目标（减少噪音/缩减调用/加速）：构造改前/改后场景，验证指标确实朝声称方向移动。',
-  '5. 对被移除的调用点：检查遗留的生产者/setter/字段是否也被移除或仍有活着的消费者。',
+  '方法（逐项，附 file:line）：',
+  '1. 从生产入口正向追闭环：入口→组合根→改动点。测试/脚本中的挂点不算。断线=HIGH。',
+  '2. 新增参数/字段/setter→grep 所有调用方。零调用方传值/读取=死接线。',
+  '3. 门控条件→枚举真实输入形状(空集合/可选字段缺失/自由文本)→估算通过率。~0%或~100%均无效。',
+  '4. 改动声称目标→构造改前/改后场景验证指标确实朝声称方向移动。',
+  '5. 被移除调用点→检查遗留生产者/setter/字段是否也有活消费者。',
 ].join('\n')
 
 const SILENCE_INSPECTOR_METHOD = [

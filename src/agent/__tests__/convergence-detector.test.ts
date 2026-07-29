@@ -1790,7 +1790,46 @@ describe('evaluateConvergence', () => {
       )
     }
 
-    it('productive-stagnation variant asks for assertion verification, not conclusions', () => {
+    // 距上次产出 N 步的只读尾巴。诊断态的停滞门槛是 3×window(6)=18，
+    // build 态是 2×=12——两个门槛之间的区间正是"右移一档"多给的耐心。
+    function readsAfterEdit(distance: number) {
+      return makeHistory([
+        { tool: 'edit_file', target: 'a.ts' },
+        ...Array.from({ length: distance }, () => ({ tool: 'read_file', target: 'same.ts' })),
+      ])
+    }
+
+    it('W3 停滞文案对诊断态可达：远离上次产出时给核实型收束', () => {
+      const result = evaluateConvergence(baseInput({
+        turn: 16,
+        phaseClass: 'explore',
+        recentToolHistory: readsAfterEdit(19),
+        activityMode: 'diagnostic',
+      }))
+      assert.ok(result.level >= 2, `expected L2+, got L${result.level}`)
+      // 这句只在 productive-stagnation 的诊断分支里出现；通用诊断文案说的是
+      // "排查进度信号偏弱"。断在这里才能证明走的是 W3 那条，而非碰巧同含"核实"。
+      assert.ok(result.injectedMessage?.includes('如果信息已足够，请核实后收束'),
+        `必须命中 productive-stagnation 的诊断变体，实得: ${result.injectedMessage?.slice(0, 200)}`)
+      assert.ok(!result.injectedMessage?.includes('直接编辑或测试'),
+        '诊断态不得被催去改代码')
+    })
+
+    it('右移一档：build 态已算停滞的距离，诊断态还在耐心带内', () => {
+      const history = readsAfterEdit(13) // ≥ build 的 12，< 诊断的 18
+      const diagnostic = evaluateConvergence(baseInput({
+        turn: 16, phaseClass: 'explore', recentToolHistory: history, activityMode: 'diagnostic',
+      }))
+      const build = evaluateConvergence(baseInput({
+        turn: 16, phaseClass: 'explore', recentToolHistory: history, activityMode: 'build',
+      }))
+      assert.ok(build.injectedMessage?.includes('没有任何编辑、测试或提交'),
+        `build 态该在此距离报停滞，实得: ${build.injectedMessage?.slice(0, 120)}`)
+      assert.equal(diagnostic.injectedMessage?.includes('如果信息已足够，请核实后收束'), false,
+        '同距离下诊断态不该报停滞——否则右移一档没生效')
+    })
+
+    it('通用诊断收敛文案（非停滞路径）同样要求标注未核实', () => {
       const result = evaluateConvergence(baseInput({
         turn: 16,
         phaseClass: 'explore',
@@ -1805,6 +1844,10 @@ describe('evaluateConvergence', () => {
         'diagnostic copy must require marking unverified claims')
       assert.ok(!result.injectedMessage.includes('直接编辑或测试'),
         'diagnostic copy must not push edits')
+      // 全程无产出工具 → 距离为 Infinity → 停滞判据被 infinity guard 跳过。
+      // 钉住走的是哪条，否则本用例会像 c74fa263 之后那样静默换分支还照样绿。
+      assert.equal(result.injectedMessage.includes('如果信息已足够，请核实后收束'), false,
+        '本用例覆盖的是通用诊断文案，不是 productive-stagnation 变体')
     })
 
     it('build mode keeps the original productive-stagnation copy', () => {

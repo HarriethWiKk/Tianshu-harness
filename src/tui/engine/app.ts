@@ -104,6 +104,8 @@ import { renderPager, renderStarmap, renderCommandPalette, renderChronicle, rend
 import type { PagerData, StarmapData, PaletteData, ChronicleData, TasksData, TasksGroup, TasksWorkerRow, DomainPickerData, ModelPickerData, ThemePickerData, ChoicePanelData, PlanPickerData, ChoiceEntry, ConnectOverlayData, InitOverlayData } from '../format/overlay.js'
 import { ConnectFlow, type ConnectCommit, type ConnectStepResult } from '../connect-flow.js'
 import { InitFlow, probeInitFlowInput, type InitCommit, type InitStepResult } from '../init-flow.js'
+import { renderSettings } from '../format/settings.js'
+import type { SettingsFlow, SettingsSaveRequest, SettingsSaveResult, SettingsView } from '../settings-flow.js'
 import { parseScrollbackTranscript, searchTranscript, findNextMatch, findPrevMatch } from '../scrollback-transcript.js'
 import { renderCockpit } from '../format/cockpit.js'
 import type { CockpitSnapshot, Panel } from '../cockpit/types.js'
@@ -368,6 +370,17 @@ export class TuiApp {
   /** /init 交互式初始化向导：无头状态机 + 当前步校验错误。 */
   private initFlow?: InitFlow
   private initError?: string
+  /**
+   * /config 设置面板：无头状态机 + 落盘通道。
+   *
+   * 落盘函数由 slash-commands 注入（同 /mirror 的先例——TUI 层直接调 config
+   * setter），app.ts 因此不依赖 config manager，也不占用 registerOverlays
+   * 那 14 个位置参数的第 15 位。
+   */
+  private settingsFlow?: SettingsFlow
+  private settingsSave?: (request: SettingsSaveRequest) => SettingsSaveResult
+  /** 面板关闭时回放到 scrollback 的保存结果（面板内的 status 行会随 alt-screen 消失）。 */
+  private settingsNotice?: string
   /** W-B4: approval + intent pending state manager */
   private approvalIntentController = new ApprovalIntentController()
   /** 并行子代理舰队读模型（由 onDelegationActivity 事件流驱动） */
@@ -774,6 +787,13 @@ export class TuiApp {
           this.connectError = undefined
           this.overlay.rerender()
         }
+        return
+      }
+      // Settings panel editing a text field → paste into its buffer (proxy URL,
+      // vision prompt), not the main input box.
+      if (this.overlay.activeId() === 'settings' && this.settingsFlow?.isTextEditing()) {
+        this.settingsFlow.typeChar(text.replaceAll('\n', ' '))
+        this.overlay.rerender()
         return
       }
       // Other overlays active → don't paste into main input
@@ -1503,6 +1523,7 @@ export class TuiApp {
       case 'chronicle':
       case 'connect':
       case 'init':
+      case 'settings':
       case 'jobs': {
         // 复位导航状态，避免上次的翻页/选中残留到新 overlay
         this.overlayController.resetNav()
@@ -1594,6 +1615,20 @@ export class TuiApp {
     this.connectError = undefined
     this.input.setMode('input')
     this.activateOverlay('connect')
+  }
+
+  /**
+   * 打开 /config 设置面板。
+   *
+   * flow 每次开面板都新建（由调用方读盘构造），所以光标和 draft 天然是新的——
+   * 不需要把光标塞进 overlayNav 再靠 resetNav 清理。
+   */
+  startSettings(flow: SettingsFlow, save: (request: SettingsSaveRequest) => SettingsSaveResult): void {
+    this.settingsFlow = flow
+    this.settingsSave = save
+    this.settingsNotice = undefined
+    this.input.setMode('input')
+    this.activateOverlay('settings')
   }
 
   /** 打开 /init 交互式项目初始化向导（verify 声明 / skills / hooks 脚手架）。 */
@@ -1818,6 +1853,50 @@ export class TuiApp {
     const exec = this.overlayController.getConnectExec()
     this.connectFlow = undefined
     exec?.(result.commit, result.summary)
+    this.deactivateOverlay()
+  }
+
+  /** settings overlay 渲染数据（由 registerOverlays 的 render 闭包读取）。 */
+  getSettingsOverlayData(): SettingsView {
+    return this.settingsFlow?.view() ?? {
+      mode: 'browse',
+      focus: 'categories',
+      categories: [],
+      categoryIndex: 0,
+      fields: [],
+      fieldIndex: 0,
+      dirtyBlocks: [],
+    }
+  }
+
+  /** S 键：把脏块交给落盘通道，结果回灌 flow（面板内显示，关闭时进 scrollback）。 */
+  private commitSettingsSave(): void {
+    const flow = this.settingsFlow
+    if (!flow) return
+    const request = flow.saveRequest()
+    if (request.blocks.length === 0) {
+      flow.commitSaved({ saved: [], errors: [] })
+      this.overlay.rerender()
+      return
+    }
+    const result = this.settingsSave
+      ? this.settingsSave(request)
+      : { saved: [], errors: ['设置落盘通道未接线'] }
+    flow.commitSaved(result)
+    const parts: string[] = []
+    if (result.saved.length > 0) parts.push(`✓ 设置已保存：${result.saved.join(', ')}（除审批模式外均下次会话生效）`)
+    if (result.errors.length > 0) parts.push(`⚠ 设置保存失败：${result.errors.join('；')}`)
+    this.settingsNotice = parts.join('\n')
+    this.overlay.rerender()
+  }
+
+  private closeSettings(): void {
+    const notice = this.settingsNotice
+    this.settingsFlow = undefined
+    this.settingsSave = undefined
+    this.settingsNotice = undefined
+    // 先入 scrollback 再退 overlay：退出重绘是最后一次写，顺序反了会留幽灵帧。
+    if (notice) this.commitStatic(notice)
     this.deactivateOverlay()
   }
 
@@ -2069,6 +2148,37 @@ export class TuiApp {
       if (key.name === 'return') { this.advanceConnect(this.connectFlow.submitInput(this.connectInput)); return true }
       if (key.name === 'backspace') { this.connectInput = this.connectInput.slice(0, -1); this.connectError = undefined; this.overlay.rerender(); return true }
       if (this.isPrintableKey(key)) { this.connectInput += key.char; this.connectError = undefined; this.overlay.rerender(); return true }
+      return true
+    }
+
+    // Settings panel — stateful two-column overlay. Handled before the generic
+    // q-close because 'q' / 's' are legitimate characters while a text field is
+    // being edited.
+    if (id === 'settings' && this.settingsFlow) {
+      const flow = this.settingsFlow
+      const editing = flow.isTextEditing()
+      if (key.name === 'escape') {
+        if (flow.cancel() === 'closed') this.closeSettings()
+        else this.overlay.rerender()
+        return true
+      }
+      if (key.name === 'return') {
+        if (flow.isConfirmingDiscard()) { flow.confirmDiscard(); this.closeSettings(); return true }
+        flow.activate()
+        this.overlay.rerender()
+        return true
+      }
+      if (key.name === 'up') { flow.moveUp(); this.overlay.rerender(); return true }
+      if (key.name === 'down') { flow.moveDown(); this.overlay.rerender(); return true }
+      if (editing) {
+        if (key.name === 'backspace') { flow.backspace(); this.overlay.rerender(); return true }
+        if (key.ctrl && c === 'u') { flow.clearBuffer(); this.overlay.rerender(); return true }
+        if (this.isPrintableKey(key)) { flow.typeChar(key.char); this.overlay.rerender(); return true }
+        return true
+      }
+      if (key.name === 'left' || (key.name === 'tab' && key.shift)) { flow.focusCategories(); this.overlay.rerender(); return true }
+      if (key.name === 'right' || (key.name === 'tab' && !key.shift)) { flow.focusFields(); this.overlay.rerender(); return true }
+      if (c === 's') { this.commitSettingsSave(); return true }
       return true
     }
 
@@ -4634,28 +4744,46 @@ export class TuiApp {
     let lines: LiveRegionLine[] = []
     lines = []
 
-    // 1. Spinner 状态行（⠋ Thinking… (12s · esc to interrupt)），10s 无 token 变琥珀
+    // 1. Spinner 状态行（⠋ Thinking… (12s · esc to interrupt)），10s 无 token 变琥珀。
+    //    审批挂起时如实显示「等待审批 <tool> · Ns」——等待的是用户决定，不是模型。
+    const approvalWaiting = this.approvalIntentController.approvalPending
     const stalled = this.streamRenderController.lastActivityMs > 0 && Date.now() - this.streamRenderController.lastActivityMs > 10_000
     const spinnerLine = formatSpinnerStatus({
       tick: this.streamRenderController.tick,
       phase: this.state.phase,
       elapsedMs: Date.now() - this.state.turnStartMs,
-      stalled,
+      stalled: stalled && !approvalWaiting,
+      ...(approvalWaiting ? {
+        approvalWait: { toolName: approvalWaiting.name, waitMs: Date.now() - approvalWaiting.startMs },
+      } : {}),
     }, this.theme)
     if (spinnerLine) {
       // spinner 行含 …/·（East-Asian Ambiguous），CJK 终端按 2 列渲染 → 长行会折行而
       // rowsForLine 低估 → 重影。clampLine 用 wide 上界截断到 columns-1，保证不折行。
       lines.push({ text: this.clampLine(spinnerLine) })
       // 分档等待提示：spinner 只说「还在转」，这行说「卡在哪个阶段、多久了、能做什么」。
-      const silentMs = this.streamRenderController.lastActivityMs > 0
-        ? Date.now() - this.streamRenderController.lastActivityMs
-        : 0
-      const stale = silentMs > 0 ? getPhaseStaleMessage(this.state.phase, silentMs) : null
-      if (stale) {
-        const staleColor = stale.level === 'action' ? this.theme.error
-          : stale.level === 'warn' ? this.theme.warning
-          : this.theme.muted
-        lines.push({ text: this.clampLine(color(`  ${stale.message}`, staleColor)) })
+      // 审批挂起时必须换成审批专属口径——原分档到 action 档会说「No response —
+      // Ctrl+C to interrupt」，明明在等用户按 y/n 却引导用户杀会话（2d8b67ca 事故
+      // 的观感来源：审批 await 无超时 + 看门狗 disarm，卡住的表象=失去响应）。
+      if (approvalWaiting) {
+        const waitMs = Date.now() - approvalWaiting.startMs
+        if (waitMs >= 60_000) {
+          lines.push({ text: this.clampLine(color(
+            `  审批等待不会超时 — 会话已暂停，等你决定（Enter/y 批准 · Esc/n 拒绝）`,
+            this.theme.muted,
+          )) })
+        }
+      } else {
+        const silentMs = this.streamRenderController.lastActivityMs > 0
+          ? Date.now() - this.streamRenderController.lastActivityMs
+          : 0
+        const stale = silentMs > 0 ? getPhaseStaleMessage(this.state.phase, silentMs) : null
+        if (stale) {
+          const staleColor = stale.level === 'action' ? this.theme.error
+            : stale.level === 'warn' ? this.theme.warning
+            : this.theme.muted
+          lines.push({ text: this.clampLine(color(`  ${stale.message}`, staleColor)) })
+        }
       }
     }
 
@@ -5239,7 +5367,7 @@ export class TuiApp {
       })
     }
     return new Promise((resolve) => {
-      this.approvalIntentController.approvalPending = { id, name, input, resolve }
+      this.approvalIntentController.approvalPending = { id, name, input, resolve, startMs: Date.now() }
       // 上一条待批项的风险结论绝不能留给下一条——那是最危险的一类误导。
       this.approvalIntentController.resetRiskExplanation()
       this.input.setMode('approval')
@@ -5650,6 +5778,11 @@ export class TuiApp {
     // Init Wizard — /init 交互式项目初始化；数据来自 app 持有的 InitFlow。
     this.overlay.register('init', {
       render: (_w, _h) => renderInitFlow(this.getInitOverlayData(), this.columns, this.rows, this.theme),
+    })
+
+    // Settings — /config 设置面板；数据来自 app 持有的 SettingsFlow。
+    this.overlay.register('settings', {
+      render: (_w, _h) => renderSettings(this.getSettingsOverlayData(), this.columns, this.rows, this.theme),
     })
   }
 }

@@ -1,6 +1,7 @@
 import type { OaiMessage } from '../api/oai-types.js'
 import { KEEP_RECENT_MESSAGES, CACHE_ANCHOR_MESSAGES, compactThresholds } from './constants.js'
 import { groupIntoRoundsOai } from '../context/rounds.js'
+import { estimateImageTokens } from '../context/image-tokens.js'
 import { collapseToolResult } from './context-collapse.js'
 import { ARTIFACT_MARKER_REGEX } from './recovery-ref.js'
 
@@ -78,16 +79,17 @@ export function estimateOaiMessageTokens(msg: OaiMessage): number {
       + (msg.tool_calls ? JSON.stringify(msg.tool_calls) : '')
       + (msg.reasoning_content ?? '')
   } else if (msg.role === 'user' && Array.isArray(msg.content)) {
-    // Multimodal user message (vision): count text parts + fixed cost per image.
+    // Multimodal user message (vision): text parts + per-image tile cost.
+    // 按真实尺寸分块（image-tokens.ts），不按张数——一张 1280×800 视口图是 1105
+    // token，整页长图到 1785，旧的"每张 765"只对 1024 方图成立。base64 载荷本身
+    // 不计入文本 token：供应商单独编码它。
     let textLen = 0
-    let imageCount = 0
+    let imageTokens = 0
     for (const part of msg.content) {
       if (part.type === 'text') textLen += part.text.length
-      else imageCount++
+      else imageTokens += estimateImageTokens(part.image_url.url)
     }
-    // OpenAI uses ~765 tokens per image (low detail); base64 payload itself
-    // is not counted as text tokens — the provider encodes it separately.
-    return Math.ceil(textLen / 4) + imageCount * 765
+    return Math.ceil(textLen / 4) + imageTokens
   } else {
     content = msg.content as string
   }

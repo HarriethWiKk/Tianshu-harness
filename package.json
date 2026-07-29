@@ -1,6 +1,6 @@
 {
   "name": "tianshu-tui",
-  "version": "2.24.3",
+  "version": "2.25.0",
   "description": "Terminal coding agent optimized for DeepSeek V4 prefix cache",
   "license": "Apache-2.0",
   "type": "module",
@@ -48,7 +48,7 @@
     "test:unit": "tsx scripts/run-node-tests.ts --unit",
     "test:integration": "tsx scripts/run-node-tests.ts --integration",
     "test:fast": "tsx scripts/run-node-tests.ts --exclude-tui",
-    "test:desktop": "node --import ./desktop/scripts/test-alias-register.mjs --import tsx --test 'desktop/src/**/__tests__/*.test.ts'",
+    "test:desktop": "node --import ./desktop/scripts/test-alias-register.mjs --import tsx --test-force-exit --test-timeout=120000 --test 'desktop/src/**/__tests__/*.test.ts'",
     "test:incremental": "tsx scripts/test-incremental.ts",
     "cache:audit": "tsx src/cache/cache-audit-cli.ts",
     "prefix:budget": "tsx scripts/prefix-budget.ts",
@@ -56,7 +56,10 @@
     "diagnose:orphans": "tsx scripts/diagnose-tool-orphans.ts",
     "benchmark": "tsx scripts/run-benchmark.ts",
     "docs:index": "tsx scripts/docs-index.ts",
-    "docs:check": "tsx scripts/docs-index.ts --check"
+    "docs:check": "tsx scripts/docs-index.ts --check",
+    "probe:thresholds": "tsx scripts/telemetry-probes/threshold-coverage.ts",
+    "probe:test": "tsx scripts/run-node-tests.ts scripts/telemetry-probes",
+    "probe:typecheck": "tsc --noEmit -p scripts/telemetry-probes/tsconfig.json"
   },
   "dependencies": {
     "@ast-grep/lang-json": "^0.0.7",

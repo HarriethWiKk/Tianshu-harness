@@ -397,6 +397,22 @@ function buildCompactClient(
 }
 
 /**
+ * 已报过的桥失效原因——这个函数每次建 agent 都跑（每会话 + 每次 switchModel 重建），
+ * 不去重会把同一条配置错误刷满日志。
+ */
+const warnedVisionBridge = new Set<string>()
+
+/** 配了桥但用不上时点名原因。「没配」和「配了但起不来」表现完全相同（图照样被丢），
+ *  沉默降级会让人以为配置生效了——这类不可见失败前面刚在截图路径上咬过一次。 */
+function warnVisionBridge(key: string, reason: string): undefined {
+  if (!warnedVisionBridge.has(key)) {
+    warnedVisionBridge.add(key)
+    console.warn(`[vision] 识图桥未启用：${reason}（图片仍会被丢弃）`)
+  }
+  return undefined
+}
+
+/**
  * Build the dedicated vision bridge StreamClient from agent.visionModel.
  * Returns undefined when unconfigured/invalid/credentials missing — the primary
  * model simply won't see images (same as before vision bridge existed).
@@ -406,23 +422,35 @@ function buildVisionClient(
 ): { client: import('../api/stream-client.js').StreamClient; prompt?: string; maxTokens: number } | undefined {
   const vm = input.visionModel
   if (!vm) return undefined
+  const ref = `${vm.provider}/${vm.model}`
   const prov = input.allProviders?.[vm.provider]
-  if (!prov) return undefined
+  if (!prov) return warnVisionBridge(`prov:${ref}`, `provider "${vm.provider}" 不在已配置的 provider 列表里`)
   const spec = prov.models.find(m => m.id === vm.model || m.alias === vm.model)
-  if (!spec) return undefined
+  if (!spec) return warnVisionBridge(`model:${ref}`, `provider "${vm.provider}" 下没有模型 "${vm.model}"`)
+  // 不拦：手改配置可以指一个非视觉模型，那时桥能连上但描述必然是瞎猜。
+  if (!spec.supportsVision) {
+    warnVisionBridge(`novision:${ref}`, `${ref} 未声明视觉能力，描述结果不可信——桌面端 Settings → Integrations 的下拉只列声明了视觉能力的模型`)
+  }
 
   let apiKey = ''
   let auth: AuthProvider | undefined
   try {
     if (prov.auth?.type === 'oauth') {
       auth = prov.name === input.provider.name ? input.auth : createAuthProvider(prov.auth, process.env)
-      if (!auth?.isAuthenticated()) return undefined
+      if (!auth?.isAuthenticated()) return warnVisionBridge(`oauth:${ref}`, `${vm.provider} 未完成 OAuth 登录`)
     } else {
       apiKey = resolveApiKey(prov)
-      if (!apiKey) return undefined
+      if (!apiKey) return warnVisionBridge(`key:${ref}`, `${vm.provider} 的 API key 为空`)
     }
   } catch {
-    return undefined
+    // resolveApiKey 拿不到 key 就抛。最常见的成因不是"没有 key"而是"key 只存在环境变量里，
+    // 而这个进程没继承到它"——GUI/Dock 启动的桌面端拿不到 shell profile 里的变量，
+    // 且 config.env 那套解析只作用于命令执行，不改 process.env。
+    return warnVisionBridge(
+      `key:${ref}`,
+      `取不到 ${vm.provider} 的 API key（${prov.apiKeyEnv ?? `${prov.name.toUpperCase()}_API_KEY`} 未传入本进程？`
+        + '改用 Settings → Providers 把 key 存进配置，就不依赖启动方式了）',
+    )
   }
 
   const caps = resolveCapabilities(prov.name, prov.capabilities)

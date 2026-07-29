@@ -215,25 +215,31 @@ export async function createWorktreeAsync(cwd: string, sessionId: string, branch
  * Create a detached worktree at `wtPath` checked out to `commitish`.
  * The parent directory of wtPath is created if needed. Throws on git failure.
  * Used by VSW to materialize an isolated tree at baseline.head.
+ *
+ * 传 `sessionId` 会写下 owner marker，这是快照能被 `reapOrphanSnapshots` 回收的**前提**：
+ * 回收器读不到 marker 就走 fail-safe 保留分支，永远不动这个目录。此前两个变体都不写
+ * marker，`.rivet/vsw/` 因此积到 33 个快照、1.9 GB，最老的存活三周。
  */
-export function createWorktreeAt(cwd: string, wtPath: string, commitish: string): CreatedWorktree {
+export function createWorktreeAt(cwd: string, wtPath: string, commitish: string, sessionId?: string): CreatedWorktree {
   mkdirSync(dirname(wtPath), { recursive: true })
   const result = git(cwd, buildDetachedWorktreeArgs(wtPath, commitish))
   if (!result.ok) {
     try { rmSync(wtPath, { recursive: true, force: true }) } catch {}
     throw new Error(`failed to create detached git worktree at ${wtPath} for ${commitish}`)
   }
+  if (sessionId !== undefined) writeOwnerMarker(wtPath, sessionId)
   return { path: wtPath, branch: '(detached)' }
 }
 
-/** Async createWorktreeAt — same contract, event loop stays free during checkout. */
-export async function createWorktreeAtAsync(cwd: string, wtPath: string, commitish: string): Promise<CreatedWorktree> {
+/** Async createWorktreeAt — same contract (including the owner marker), event loop stays free during checkout. */
+export async function createWorktreeAtAsync(cwd: string, wtPath: string, commitish: string, sessionId?: string): Promise<CreatedWorktree> {
   mkdirSync(dirname(wtPath), { recursive: true })
   const result = await gitAsync(cwd, buildDetachedWorktreeArgs(wtPath, commitish))
   if (!result.ok) {
     try { rmSync(wtPath, { recursive: true, force: true }) } catch {}
     throw new Error(`failed to create detached git worktree at ${wtPath} for ${commitish}`)
   }
+  if (sessionId !== undefined) writeOwnerMarker(wtPath, sessionId)
   return { path: wtPath, branch: '(detached)' }
 }
 

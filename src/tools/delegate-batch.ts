@@ -246,6 +246,8 @@ export function createDelegateBatchTool(
         delegationDepth: params.delegationDepth ?? 0,
         sessionTurn: params.sessionTurnCount,
         onActivity: streamActivity,
+        // 嵌套委派透传：sub-worker 活动（coordinator 已盖 parentWorkerId）直通 UI 通道。
+        onNestedActivity: params.onWorkerActivity,
         resumeWorkOrderId: t.resume,
         budget: toBudgetOverride(t),
         }

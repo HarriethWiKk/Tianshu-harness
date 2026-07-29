@@ -21,7 +21,7 @@ import { createOwnershipLedger } from '../agent/ownership-ledger.js'
 import { createWorktreeBaseline } from '../agent/worktree-baseline.js'
 import { captureGitBaseline, createInteractiveToolRegistry, createAgentRuntime, type RuntimeRefs } from '../bootstrap.js'
 import { TodoStore } from '../tools/todo-store.js'
-import { applyConfiguredPathGrants, applyDefaultDependencyReadGrants, loadPersistedGrants } from '../tools/path-grants.js'
+import { applyConfiguredPathGrants, applyDefaultDependencyReadGrants, applyRivetRuntimeReadGrants, loadPersistedGrants } from '../tools/path-grants.js'
 import { loadProjectSkills } from '../skills/skill-loader.js'
 import { createMemoryTool } from '../tools/memory.js'
 import { DomainKnowledgeStore } from '../agent/domain-knowledge-store.js'
@@ -46,6 +46,9 @@ import { persistCouncilRoutingShadow } from '../agent/council/council-routing.js
 import type { PlanItem } from '../agent/council/council-plan.js'
 import type { CouncilPanelModel } from '../tui/council-panel-model.js'
 import type { McpManager } from '../mcp/manager.js'
+import { findProjectConfig } from '../config/manager.js'
+import type { Config } from '../config/schema.js'
+import { readFileSync } from 'node:fs'
 import {
   type ServeContext,
   type ResolvedModelSpec,
@@ -274,6 +277,7 @@ function buildSessionStores(
   loadPersistedGrants(cwd)
   applyConfiguredPathGrants(ctx.config.agent.permissions)
   applyDefaultDependencyReadGrants()
+  applyRivetRuntimeReadGrants()
   // Load skills into the shared registry (same as CLI bootstrap). Without this,
   // skillRegistry.list() returns empty and the desktop PlusMenu shows no skills.
   loadProjectSkills(cwd, { importFromClaude: ctx.config.skills?.importFromClaude })
@@ -367,6 +371,54 @@ function buildSessionStores(
 }
 
 /**
+ * Merge project-level .rivet-config.json agent block into the startup config.
+ * Only agent fields are merged — provider/model/auth stay on the startup snapshot
+ * (the sidecar may have been started unconfigured, and the key was set later via
+ * Settings). toolGating is deep-merged so project config can add extraCore without
+ * clobbering the startup snapshot's other gating fields (enabled, disabledTools).
+ *
+ * Only reads the project config FILE (if it exists) — does NOT call loadConfig()
+ * which merges user-level + defaults, which would clobber the startup snapshot
+ * with unrelated user settings.
+ *
+ * Exported for testing. Malformed project config returns the unmodified startup
+ * config.
+ */
+export function mergeProjectAgentConfig(
+  startupConfig: Config,
+  cwd: string,
+): Config {
+  try {
+    const projectPath = findProjectConfig(cwd)
+    if (!projectPath) return startupConfig
+    const raw = JSON.parse(readFileSync(projectPath, 'utf-8')) as Record<string, unknown>
+    const agent = raw?.agent
+    if (!agent || typeof agent !== 'object' || Array.isArray(agent)) return startupConfig
+    const projectAgent = agent as Record<string, unknown>
+    const projectTG = projectAgent.toolGating
+    const projectToolGating =
+      projectTG && typeof projectTG === 'object' && !Array.isArray(projectTG)
+        ? (projectTG as Record<string, unknown>)
+        : undefined
+    return {
+      ...startupConfig,
+      agent: {
+        ...startupConfig.agent,
+        ...projectAgent,
+        ...(projectToolGating ? {
+          toolGating: {
+            ...startupConfig.agent?.toolGating,
+            ...projectToolGating,
+          },
+        } : {}),
+      },
+    }
+  } catch {
+    return startupConfig
+  }
+}
+
+/**
  * Assemble an AgentLoop from prebuilt session stores + a resolved model spec.
  * Reusing `stores.session` across calls is what lets switchModel hot-swap the
  * model while keeping the conversation history intact.
@@ -399,11 +451,13 @@ function assembleAgentLoop(
   // 过 registry，但 switchModel 重建路径需要在每次调用都确保 refs 同步）。
   if (registry) stores.refs.sessionRegistry = registry
 
+  const mergedConfig = mergeProjectAgentConfig(ctx.config, cwd)
+
   const { agent } = createAgentRuntime({
     provider: spec.provider,
     apiKey: spec.apiKey,
     auth: spec.auth,
-    config: ctx.config,
+    config: mergedConfig,
     sessionId,
     cwd,
     toolRegistry: stores.toolRegistry,

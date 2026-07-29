@@ -178,6 +178,9 @@ export const DEFAULT_CONFIG: Config = {
         browser: false,
       },
     },
+    delivery: {
+      autoCommit: true,
+    },
   },
   compact: {
     enabled: true,

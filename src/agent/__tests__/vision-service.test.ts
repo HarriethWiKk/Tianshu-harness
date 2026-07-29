@@ -61,3 +61,76 @@ test('describeImages propagates errors', async () => {
   }
   await assert.rejects(describeImages(client, ['data:image/png;base64,abc']), /vision model failed/)
 })
+
+/**
+ * 真实客户端契约：openai-client（MiniMax/GLM/DeepSeek 等全部 openai 协议 provider 走它）
+ * 既逐段发 onTextDelta，又在收流结束时用 onContentBlock 把**同一段完整文本**再发一次。
+ * 上面那些用例只调 onTextDelta，所以从没碰到这条路——描述被完整复制一遍的 bug 就是这么
+ * 活下来的（实测 MiniMax-M3 一张截图返回 3516 字，一半是复本）。
+ */
+function makeRealisticClient(text: string, opts: { deltas?: boolean; block?: boolean } = {}): StreamClient {
+  const { deltas = true, block = true } = opts
+  return {
+    async stream(_request, callbacks) {
+      if (deltas) {
+        for (let i = 0; i < text.length; i += 7) callbacks.onTextDelta(text.slice(i, i + 7))
+      }
+      if (block) callbacks.onContentBlock({ type: 'text', text })
+      callbacks.onStopReason('stop', {})
+    },
+  }
+}
+
+test('describeImages 不把增量和终值块拼成两遍', async () => {
+  const desc = '这是一个发布说明弹窗，标题 v2.24.3，右下角有 Got it 按钮。'
+  const client = makeRealisticClient(desc)
+  const result = await describeImages(client, ['data:image/png;base64,abc'])
+  assert.equal(result, desc)
+})
+
+test('describeImages 在只有增量、没有终值块时退回增量拼接', async () => {
+  const desc = 'streamed only'
+  const client = makeRealisticClient(desc, { block: false })
+  assert.equal(await describeImages(client, ['data:image/png;base64,abc']), desc)
+})
+
+test('describeImages 在只有终值块、没有增量时也拿到文本', async () => {
+  const desc = 'block only'
+  const client = makeRealisticClient(desc, { deltas: false })
+  assert.equal(await describeImages(client, ['data:image/png;base64,abc']), desc)
+})
+
+test('describeImages 拼接多个终值文本块（codex 逐 part 发）', async () => {
+  const client: StreamClient = {
+    async stream(_request, callbacks) {
+      callbacks.onContentBlock({ type: 'text', text: '第一段。' })
+      callbacks.onContentBlock({ type: 'text', text: '第二段。' })
+      callbacks.onStopReason('stop', {})
+    },
+  }
+  assert.equal(await describeImages(client, ['data:image/png;base64,abc']), '第一段。第二段。')
+})
+
+test('describeImages 截断标记只追加一次，且不因去重丢掉', async () => {
+  const client: StreamClient = {
+    async stream(_request, callbacks) {
+      callbacks.onTextDelta('描述被切断了')
+      callbacks.onContentBlock({ type: 'text', text: '描述被切断了' })
+      callbacks.onStopReason('length', {})
+    },
+  }
+  const result = await describeImages(client, ['data:image/png;base64,abc'])
+  assert.equal(result, '描述被切断了\n[图片描述被截断]')
+})
+
+test('describeImages 忽略 thinking 块，不把推理当描述', async () => {
+  const client: StreamClient = {
+    async stream(_request, callbacks) {
+      callbacks.onThinkingDelta('让我想想这张图……')
+      callbacks.onContentBlock({ type: 'thinking', thinking: '让我想想这张图……' })
+      callbacks.onContentBlock({ type: 'text', text: '一只猫。' })
+      callbacks.onStopReason('stop', {})
+    },
+  }
+  assert.equal(await describeImages(client, ['data:image/png;base64,abc']), '一只猫。')
+})

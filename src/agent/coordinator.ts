@@ -2,6 +2,7 @@ import type { ModelCapabilityCard, CapabilityTask } from '../model/capability.js
 import { recommendModelForTask } from '../model/capability.js'
 import type { ProviderConfig } from '../config/schema.js'
 import { filterToolRegistry, ToolRegistry } from '../tools/registry.js'
+import type { DelegationActivity } from '../tools/types.js'
 import { ProviderHealthTracker } from './provider-health.js'
 import { mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, statSync, unlinkSync } from 'node:fs'
 import { join } from 'node:path'
@@ -179,6 +180,11 @@ export interface DelegationRequest {
    *  text/thinking/tool event so the calling tool can stream live progress
    *  into the UI tool card. NOT serialized into the WorkOrder. */
   onActivity?: (event: WorkerActivityEvent) => void
+  /** 嵌套委派上行（已映射的 DelegationActivity 透传通道）：本次派发的 worker
+   *  自己再派 sub-worker 时，sub-worker 的活动事件经此回传调用方（通常直通
+   *  params.onWorkerActivity → 会话事件流）。coordinator 转发前会把
+   *  parentWorkerId 盖为本 order id，UI 据此渲染真实委派层级。NOT serialized. */
+  onNestedActivity?: (activity: DelegationActivity) => void
   /** Work order IDs this task depends on — propagated to WorkOrder.dependencies. */
   dependencies?: string[]
   /** Logical group identifier for related tasks (e.g. team wave). */
@@ -646,6 +652,13 @@ export class DelegationCoordinator {
   private readonly liveness: WorkerLiveness
   /** A4: per-order controllers so a stall sweep aborts only the wedged worker. */
   private readonly orderControllers = new Map<string, AbortController>()
+  /** 运行中转录快照 — per-order 活消息 getter（worker session 建好时经
+   *  onSessionReady 注册；续跑/重试的新 session 覆盖旧 getter）。终态清除，
+   *  读方回落到 saveWorkerSession 的落盘记录。 */
+  private readonly liveMessages = new Map<string, () => readonly OaiMessage[]>()
+  /** 嵌套委派上行 — per-order DelegationActivity 透传（callbacks don't survive
+   *  zod parsing，与 activityUpstream 同款 side table）。 */
+  private readonly nestedUpstream = new Map<string, (activity: DelegationActivity) => void>()
   /** T9 P3: per-order real-time activity upstream (request callback survives
    *  the zod request→order conversion via this side table). */
   private readonly activityUpstream = new Map<string, (event: WorkerActivityEvent) => void>()
@@ -766,6 +779,8 @@ export class DelegationCoordinator {
       try { controller.abort() } catch { /* ignore */ }
     }
     this.orderControllers.clear()
+    this.liveMessages.clear()
+    this.nestedUpstream.clear()
     this.activityUpstream.clear()
     this.resumeMessages.clear()
     this.resumeCheckpoints.clear()
@@ -807,6 +822,21 @@ export class DelegationCoordinator {
   /** 指定 order 当前是否在跑（TUI 判断直达通道可用性）。 */
   isWorkerRunning(workOrderId: string): boolean {
     return this.orderControllers.has(workOrderId)
+  }
+
+  /**
+   * 运行中 worker 的内存转录快照（服务端 getWorkerLog 优先于落盘记录消费）。
+   * 终态/未知 order 返回 undefined——读方回落到 loadWorkerSession。
+   * getter 抛错按无快照处理：转录可观测性绝不能反噬派发主路径。
+   */
+  getLiveWorkerMessages(workOrderId: string): readonly OaiMessage[] | undefined {
+    const getMessages = this.liveMessages.get(workOrderId)
+    if (!getMessages) return undefined
+    try {
+      return getMessages()
+    } catch {
+      return undefined
+    }
   }
 
   /** 任意 worker（前台批次或后台 run）仍在跑时为 true —— /cd 借此拒绝
@@ -1333,6 +1363,7 @@ export class DelegationCoordinator {
 
       // T9 P3: callbacks don't survive zod parsing — stash by order id.
       if (request.onActivity) this.activityUpstream.set(order.id, request.onActivity)
+      if (request.onNestedActivity) this.nestedUpstream.set(order.id, request.onNestedActivity)
       // Session resume: load prior messages from disk so the worker continues
       // from its previous context. Degrades to a fresh worker if no history.
       if (request.resumeWorkOrderId) {
@@ -1732,6 +1763,20 @@ export class DelegationCoordinator {
         })
       } catch { /* UI upstream must never break dispatch */ }
     }
+    // 运行中转录快照：worker session 建好后注册活消息 getter（服务端
+    // getWorkerLog 优先读它，终态前的转录才可见）。
+    workerConfig.onSessionReady = (getMessages) => {
+      this.liveMessages.set(order.id, getMessages)
+    }
+    // 嵌套委派上行：本 worker 再派的 sub-worker 活动盖上 parentWorkerId 戳
+    // （更深层已盖过的保留——祖先只透传，父子关系以最近一层为准）后回传调用方。
+    workerConfig.onNestedDelegation = (activity) => {
+      const upstream = this.nestedUpstream.get(order.id)
+      if (!upstream) return
+      try {
+        upstream({ ...activity, parentWorkerId: activity.parentWorkerId ?? order.id })
+      } catch { /* UI upstream must never break dispatch */ }
+    }
     // WC: 输入直达 — worker 每个工具回合结算时 drain 本 order 的 steer 队列。
     workerConfig.onSteerDrain = () => {
       const q = this.steerQueues.get(order.id)
@@ -2115,6 +2160,9 @@ export class DelegationCoordinator {
             this.liveness.tick(order.id)
             upstreamActivity?.(kind, detail)
           }
+          // 升级重试是全新 config——转录快照与嵌套上行不接就在 Pro 重试段丢失。
+          upgradedConfig.onSessionReady = workerConfig.onSessionReady
+          upgradedConfig.onNestedDelegation = workerConfig.onNestedDelegation
           upgradedConfig.mailbox = this.mailbox
 
           // Re-register liveness for retry — leash derives from the UPGRADED
@@ -2271,6 +2319,8 @@ export class DelegationCoordinator {
       // A4: stop tracking — no false stall after completion/failure.
       this.liveness.unregister(order.id)
       this.orderControllers.delete(order.id)
+      this.liveMessages.delete(order.id)
+      this.nestedUpstream.delete(order.id)
       this.activityUpstream.delete(order.id)
       this.resumeMessages.delete(order.id)
       this.steerQueues.delete(order.id)
@@ -2475,6 +2525,7 @@ export class DelegationCoordinator {
         orders.push(order)
         // T9 P3: callbacks don't survive zod parsing — stash by order id.
         if (r.onActivity) this.activityUpstream.set(order.id, r.onActivity)
+        if (r.onNestedActivity) this.nestedUpstream.set(order.id, r.onNestedActivity)
         // Session resume: load prior messages (same side-table pattern as delegate()).
         if (r.resumeWorkOrderId) {
           const record = loadWorkerSession(r.resumeWorkOrderId)

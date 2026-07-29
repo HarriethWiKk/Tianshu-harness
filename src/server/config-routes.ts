@@ -58,6 +58,8 @@ import {
   setSearchConfig,
   getDefaultModelConfig,
   setDefaultModelConfig,
+  getDeliveryConfig,
+  setDeliveryConfig,
 } from '../config/manager.js'
 import { applyConfiguredPathGrants } from '../tools/path-grants.js'
 import { expandHome } from '../platform.js'
@@ -582,6 +584,24 @@ export function buildConfigRoutes(apiToken?: string): Record<string, RouteHandle
       try {
         const saved = setVisionModelConfig(config as Record<string, unknown> | null)
         return { status: 200, body: { ok: true, config: saved } }
+      } catch (err) {
+        return { status: 400, body: { error: (err as Error).message } }
+      }
+    }, apiToken),
+
+    // 交付不自动提交开关 — takes effect immediately (no restart needed;
+    // deliver_task reads config fresh each call via B1Context injection).
+    'GET /config/delivery': withAuth(() => {
+      return { status: 200, body: getDeliveryConfig() }
+    }, apiToken),
+
+    'PUT /config/delivery': withAuth((body) => {
+      const { autoCommit } = (body ?? {}) as { autoCommit?: unknown }
+      if (autoCommit === undefined) {
+        return { status: 400, body: { error: 'autoCommit is required (boolean)' } }
+      }
+      try {
+        return { status: 200, body: { ok: true, ...setDeliveryConfig({ autoCommit }) } }
       } catch (err) {
         return { status: 400, body: { error: (err as Error).message } }
       }

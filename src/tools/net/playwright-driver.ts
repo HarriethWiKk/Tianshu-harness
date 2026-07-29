@@ -25,8 +25,18 @@ export async function loadPlaywrightCore(): Promise<unknown> {
   const specifier = 'playwright-core'
   try {
     return await import(specifier)
-  } catch {
-    throw new Error(`未安装 playwright-core。请运行 npm i playwright-core。${PLAYWRIGHT_INSTALL_HINT}`)
+  } catch (err) {
+    // 模块解析失败 ≠ 浏览器没装。别在这条路径上给 `playwright install` 提示：
+    // 打包运行时最常见的成因是 dist/node_modules 暂存残缺（空目录反而遮蔽了仓库
+    // 里完整的包），提示装浏览器只会把排查引向错误方向。原始错误必须带上——
+    // 它含解析尝试过的具体路径，是唯一能直接指向成因的信息。
+    const msg = err instanceof Error ? err.message : String(err)
+    throw new Error(
+      '无法加载 playwright-core 模块（不是浏览器缺失）。' +
+        '仓库内开发：npm i playwright-core；打包/桌面端：检查 dist/node_modules/playwright-core 是否完整' +
+        '（`npm run build` 会清空 dist，需重跑 scripts/stage-runtime-deps.js）。' +
+        `\n（原始错误：${msg.split('\n')[0]}）`,
+    )
   }
 }
 
