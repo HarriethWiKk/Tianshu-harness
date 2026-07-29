@@ -1,19 +1,19 @@
 {
-  "version": "2.24.2",
+  "version": "2.25.0",
   "notes": "会话交接闭环 + 玻璃/主题修复 + TUI 输入优化 + README 大扩充",
-  "pub_date": "2026-07-28T05:06:45.534Z",
+  "pub_date": "2026-07-29T03:35:54.855Z",
   "platforms": {
-    "windows-x86_64": {
-      "url": "https://github.com/huiliyi37/Tianshu-Tui/releases/download/v2.24.2/Tianshu_2.24.2_x64-setup.exe",
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaDZmcFdBUytLR1laQlNDY2hlMVlUdjZya3NPWXh0STlqNG9EVi9sMmVpYnR5VFFHQ3BUK3ErWVRweVR0Y2pQU1BUdFY0S1RwVm5SZy9FQlVsRHlpOVBzNGtpbXZBWEE4PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg1MjA4MzI1CWZpbGU6VGlhbnNodV8yLjI0LjJfeDY0LXNldHVwLmV4ZQowRWo1TWtnZHQ5bTkzcDZsbjdYbmxOcEhaRkJIalJhY3MwazUxdDA3SG9ucVBIbWc3bEhxLzZ4bzljblVodnprbmFxN3dNQzBDcW9JVTZqQ29Oc3pDQT09Cg=="
-    },
     "darwin-aarch64": {
-      "url": "https://github.com/huiliyi37/Tianshu-Tui/releases/download/v2.24.2/Tianshu_2.24.2_aarch64.app.tar.gz",
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaDZmcFdBUytLR2IxVUpjVU1Md1pGbTlsRjVSZFZrL3Rma1BIRDBZdHJXeVlEZWttUndrTElPTkZIWDFUd0Q1NzczRzV4L0dSN1VRUkc0M0hQamhIWC9DVncvNktURVFVPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg1MjExNjk4CWZpbGU6VGlhbnNodS5hcHAudGFyLmd6CnpMRzhJRmFVcGRiTmFSdk5ldS9qU0JQYVRCMjdUMk8xQ3B3RUo5TGpuUmF0UkZNTk43QVRFV0MwcDV0eU5vbS8rcjdwOVZlTTRlZzNLU0lJUXpHSkR3PT0K"
+      "url": "https://github.com/huiliyi37/Tianshu-Tui/releases/download/v2.25.0/Tianshu_2.25.0_aarch64.app.tar.gz",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaDZmcFdBUytLR1NObmEyY2c0QjhvNTZIblFtNU1FeHRNbVV5WUkxV29lOUx4UitsK2tnWDZJcWJ0YjI3M2V0NGNCL3pMMkdJU1ViZisyRHFCOFhJN20yK2x6S1MxSmcwPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg1Mjk1ODEwCWZpbGU6VGlhbnNodS5hcHAudGFyLmd6Cm0wUXdGekduR2FjVFVWYnZkNnNOOTF0S2VKc3hsZkxSWnhUbmk5dGt4N1N0UStKQUNzT0RkWnpVNGFTczZQajhwM0J2TDcwTi9iaXZ1NlVybHRXbUN3PT0K"
     },
     "darwin-x86_64": {
-      "url": "https://github.com/huiliyi37/Tianshu-Tui/releases/download/v2.24.2/Tianshu_2.24.2_x64.app.tar.gz",
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaDZmcFdBUytLR1k1b0dlVGRjS0kyWE1oMzRXYmtQdFEwM2pyazZjdURxMmF5Y1lYR1ZGZWw4VUVtcVdTWHIrSlR1S00yTS9ub3d6R1F1K1UwQ2YrdElEdFcra3BPRFFzPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg1MjE1MTk4CWZpbGU6VGlhbnNodS5hcHAudGFyLmd6ClhxSmxsOVY1WXV4TVdyNWw4cWVMMUVhVnlaWTFzbXJsYlZqdHVVWTJQcjY4eVgrVGh5QUYzR2JTSnFGOWI2UUN4d0E3YkdOT3FMZkNaNXVGdW11QkFRPT0K"
+      "url": "https://github.com/huiliyi37/Tianshu-Tui/releases/download/v2.25.0/Tianshu_2.25.0_x64.app.tar.gz",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaDZmcFdBUytLR2NuR0JIek9QUmUrYTNBMGplcjF2bW5Ma2NnOERZWG9OZCtwbWl3cHhpVjVrVGxBd0lBS0ZEeU5aakNrV3d5enA1d2NRSWF3NDBnMHVVMXRrUllPclFzPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg1Mjk2MTUwCWZpbGU6VGlhbnNodS5hcHAudGFyLmd6CktpMUJLNThwSXRGblYvVkFhSUxkdW5obmc5Z3laUDRqcWdFcnRZSEVXZllMNk9JWThyUDkyM1p6U1R2bjVmKzJqR28wdFpCMmcvWjNtT0xNVyt1OUJRPT0K"
+    },
+    "windows-x86_64": {
+      "url": "https://github.com/huiliyi37/Tianshu-Tui/releases/download/v2.25.0/Tianshu_2.25.0_x64-setup.exe",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaDZmcFdBUytLR2FtNmU4MWRYQ2wwVWdRZERqMGlWSDBPU25LSnhnREFMTmFMYXJTZEJWMVZGcnVhWjdjOEl5TUFFci91cWwvYmtsdWNGZG5EUmI0ektXQm54TElLSWdVPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg1Mjk1Njg5CWZpbGU6VGlhbnNodV8yLjI1LjBfeDY0LXNldHVwLmV4ZQpFWW94WndLMjBYd1JTeDJONDF5QUNmcm9SUXMvblVEc3Q4UElOR2R3cWNjYmFsclBwTVVWWEVGampwWGJVNEZOK2xmek5QYVBYYzhFTjFENGlLN2JCQT09Cg=="
     }
   }
 }
