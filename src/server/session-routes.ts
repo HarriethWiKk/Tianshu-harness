@@ -823,6 +823,16 @@ export function buildSessionRoutes(
       return { status: 200, body: snap }
     }, apiToken),
 
+    // 识图桥真实状态：active/source/detail。桌面端据此显示准确提示，而非只凭
+    // config 有没有 visionModel 键去猜（"配了却报图片未发送"的显示层根因）。
+    // 依赖当前会话模型，故必须走活 agent。
+    'GET /sessions/:id/vision-bridge': withAuth((_body, params) => {
+      const agent = manager.getAgentForSession(params!.id!)
+      if (!agent) return { status: 404, body: { error: 'Session agent not built yet' } }
+      const status = agent.getVisionBridge?.() ?? { active: false, source: 'none' as const, detail: '状态不可用' }
+      return { status: 200, body: status }
+    }, apiToken),
+
     'GET /sessions/:id/insights': withAuth(async (_body, params) => {
       const id = params!.id!
       const rec = manager.getSession(id)

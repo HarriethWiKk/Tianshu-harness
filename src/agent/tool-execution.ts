@@ -77,6 +77,9 @@ export interface ToolExecutionDeps {
    *  Absent when no vision model is configured — then screenshots are dropped
    *  as before. Returns null when the description could not be produced. */
   describeToolImages?: (images: string[], signal?: AbortSignal) => Promise<string | null>
+  /** ask_image 查询句柄：据 imageId 从会话 ImageRegistry 取图并按主控视觉能力
+   *  返回原图转发 or 定向问答。Absent → ask_image 报视觉不可用。 */
+  visionAsk?: (imageId: string | undefined, question: string, signal?: AbortSignal) => Promise<import('../tools/types.js').VisionAskResult>
   recordToolHistory: (name: string, input: Record<string, unknown>, isError: boolean, content: string, errorClass?: ToolErrorClass, errorKind?: FailureClass) => void
   buildRuntimeSnapshot: (extra?: Partial<RuntimeHookSnapshot>) => RuntimeHookSnapshot
   requestThetaCheck: (reason: string) => void
@@ -267,6 +270,7 @@ export class ToolExecutionController {
       onPlanClosed: this.deps.onPlanClosed,
       onPlanSubmitted: this.deps.onPlanSubmitted,
       onAskUserQuestion: this.deps.onAskUserQuestion,
+      visionAsk: this.deps.visionAsk,
       assessDelivery: this.deps.assessDelivery,
       enterPlanMode: this.deps.enterPlanMode,
       exitPlanMode: this.deps.exitPlanMode,

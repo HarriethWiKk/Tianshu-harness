@@ -12,9 +12,14 @@
  * 解析 playwright-core 的类型。
  */
 
-export const PLAYWRIGHT_INSTALL_HINT =
-  'chromium 未安装。安装：npx playwright install chromium' +
+/** 手动安装命令（含国内镜像 env）——banner 的兜底行复用它，避免文案漂移。 */
+export const PLAYWRIGHT_MANUAL_INSTALL_HINT =
+  'npx playwright install chromium' +
   '（国内网络：PLAYWRIGHT_DOWNLOAD_HOST=https://registry.npmmirror.com/-/binary/playwright npx playwright install chromium）'
+
+export const PLAYWRIGHT_INSTALL_HINT =
+  'chromium 未安装。一键安装：rivet browser install（自动带国内镜像）。' +
+  `或手动：${PLAYWRIGHT_MANUAL_INSTALL_HINT}`
 
 /**
  * 动态 specifier（变量形式），避免 tsc/tsup 构建期静态解析。

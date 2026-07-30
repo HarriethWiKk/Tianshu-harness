@@ -167,4 +167,75 @@ describe('createAgentConfig', () => {
     const cfg = createAgentConfig({ ...baseInput, sessionMemoryBlock: 'memory block text' })
     assert.ok(cfg.promptEngine)
   })
+
+  // 视觉桥接接线回归：createMainAgentConfigInput 曾长期漏传 config.agent.visionModel，
+  // 导致 buildVisionClient 恒返回 undefined、桥接从不触发（"配了却报图片未发送"）。
+  // 这两条测试钉住 config → input → visionClient 这条线。
+  it('wires config.agent.visionModel through createMainAgentConfigInput', () => {
+    const input = createMainAgentConfigInput({
+      apiKey: 'test-key',
+      model: baseInput.model,
+      cwd: '/tmp/test',
+      config: {
+        ...testConfig,
+        agent: { ...testConfig.agent, visionModel: { provider: 'vprov', model: 'v-cap', maxTokens: 1024 } },
+      } as Pick<Config, 'agent' | 'compact'>,
+      sessionId: 'session-1',
+      toolDefinitions: [],
+      provider: testProvider,
+    })
+    assert.deepEqual(input.visionModel, { provider: 'vprov', model: 'v-cap', maxTokens: 1024 })
+  })
+
+  it('builds a visionClient when a text-only primary has a configured vision bridge', () => {
+    const visionProvider: ProviderConfig = {
+      ...testProvider,
+      name: 'vprov',
+      apiKey: 'vision-key',
+      models: [{ id: 'v-cap', contextWindow: 128000, maxTokens: 8192, supportsVision: true }],
+    }
+    const cfg = createAgentConfig({
+      ...baseInput,
+      // primary model is text-only (no supportsVision)
+      allProviders: { deepseek: testProvider, vprov: visionProvider },
+      visionModel: { provider: 'vprov', model: 'v-cap', maxTokens: 1024 },
+    })
+    assert.equal(cfg.supportsVision, false)
+    assert.ok(cfg.visionClient, 'visionClient must be built from the configured bridge')
+    assert.equal(cfg.visionModelMaxTokens, 1024)
+    assert.equal(cfg.visionBridge?.source, 'configured')
+    assert.equal(cfg.visionBridge?.active, true)
+  })
+
+  it('wraps primary+backup vision models when a fallback is configured', () => {
+    const vprov: ProviderConfig = {
+      ...testProvider, name: 'vprov', apiKey: 'k1',
+      models: [{ id: 'v-cap', contextWindow: 128000, maxTokens: 8192, supportsVision: true }],
+    }
+    const vprov2: ProviderConfig = {
+      ...testProvider, name: 'vprov2', apiKey: 'k2',
+      models: [{ id: 'v-cap2', contextWindow: 128000, maxTokens: 8192, supportsVision: true }],
+    }
+    const cfg = createAgentConfig({
+      ...baseInput,
+      allProviders: { deepseek: testProvider, vprov, vprov2 },
+      visionModel: { provider: 'vprov', model: 'v-cap', maxTokens: 1024, fallback: { provider: 'vprov2', model: 'v-cap2' } },
+    })
+    assert.ok(cfg.visionClient, 'dual bridge still yields a client')
+    assert.match(cfg.visionBridge?.detail ?? '', /vprov2\/v-cap2/, 'detail names the backup bridge')
+  })
+
+  it('auto-selects a vision bridge when text-only primary and none configured', () => {
+    const vprov: ProviderConfig = {
+      ...testProvider, name: 'minimax', apiKey: 'k',
+      models: [{ id: 'MiniMax-M3', contextWindow: 128000, maxTokens: 8192, supportsVision: true }],
+    }
+    const cfg = createAgentConfig({
+      ...baseInput,
+      allProviders: { deepseek: testProvider, minimax: vprov },
+      // no visionModel configured
+    })
+    assert.ok(cfg.visionClient, 'auto-selected bridge builds a client')
+    assert.equal(cfg.visionBridge?.source, 'auto')
+  })
 })

@@ -24,6 +24,7 @@ import { GIT_TOOL } from './git.js'
 import { GLOB_TOOL } from './glob.js'
 import { GREP_TOOL } from './grep.js'
 import { INSPECT_PROJECT_TOOL } from './inspect-project.js'
+import { ASK_IMAGE_TOOL } from './ask-image.js'
 import { LEAVE_MARK_TOOL } from './leave-mark.js'
 import { PLAN_SUBMIT_TOOL, PLAN_CLOSE_TOOL } from './plan.js'
 import { READ_FILE_TOOL } from './read-file.js'
@@ -137,6 +138,9 @@ export function createDefaultToolRegistry(extraTools: Tool[] = [], options: Defa
   registry.register(READ_SECTION_TOOL)
   if (presetIncludes(preset, 'file_info')) registry.register(FILE_INFO_TOOL)
   registry.register(REQUEST_PATH_ACCESS_TOOL)
+  // ask_image — 视觉副驾查询。始终注册（工具在无图/无桥时自降级），让主控在
+  // 用户发图后能就图追问；描述短，前缀缓存影响可忽略。
+  registry.register(ASK_IMAGE_TOOL)
   registry.register(SKILL_TOOL)
   // leave_mark — 星图里程碑。preset full 含；RIVET_LEAVE_MARK=1 强制开启。
   if (presetIncludes(preset, 'leave_mark') || process.env.RIVET_LEAVE_MARK === '1') {

@@ -693,6 +693,9 @@ export function buildManagedAgent(
     getEstimatedTokens: () => agent.session.getRealOccupancy(),
     getContextWindow: () => spec.model.contextWindow,
     getReasoningEffort: () => agent.getReasoningEffort(),
+    // 识图桥真实状态（供桌面端准确显示，而非只看 config 有没有 visionModel 键）。
+    // 依赖当前会话模型，故取活 agent 的 config 而非静态 config。
+    getVisionBridge: () => agent.config.visionBridge,
     // Cockpit snapshot for the desktop cockpit panel. Assembles the full
     // runtime state (safety/verify/context/model/advisory) via the pure
     // buildCockpitSnapshot function — same source the TUI uses (main.ts:706).

@@ -144,6 +144,19 @@ export interface AcceptanceItemInput {
   evidence?: string
 }
 
+/** ask_image → visionAsk 的结果。二选一：
+ *  - answer：text-only 主控经视觉桥得到的问题答案（工具直接把它作为 content 返回）。
+ *  - forwardImage：多模态主控可直接看的原图 data URL（工具作为 ToolResult.images 返回，
+ *    由 tool-execution 转发通道递给主控原生识图）。
+ *  error：图不存在/视觉不可用等，工具据此返回 isError。 */
+export interface VisionAskResult {
+  answer?: string
+  forwardImage?: string
+  error?: string
+  /** 命中描述缓存（观测/调试用）。 */
+  cached?: boolean
+}
+
 /**
  * VSW: a resolved snapshot plan attached to a verification tool call. Built by
  * the session-scoped verification-snapshot-manager from the §6 policy decision.
@@ -190,6 +203,15 @@ export interface ToolCallParams {
   /** T4: structured per-worker delegation updates (subagent panel). Optional —
    *  set by the tool pipeline; absent in non-server contexts (no-op). */
   onWorkerActivity?: (activity: DelegationActivity) => void
+  /** 视觉副驾查询句柄（ask_image 工具用）。据 imageId 从会话 ImageRegistry 取图后：
+   *  - 主控多模态 → 返回 { forwardImage } 原图，由 pipeline 转发给主控原生识图；
+   *  - 主控 text-only → 用 question 定向问视觉桥，返回 { answer } 文本（命中缓存零调用）。
+   *  absent（worker/无 registry/未配桥）→ ask_image 报"视觉不可用"。 */
+  visionAsk?: (
+    imageId: string | undefined,
+    question: string,
+    signal?: AbortSignal,
+  ) => Promise<VisionAskResult>
   /** Files this session/tool pipeline owns and may safely include in scoped write operations. */
   sessionModifiedFiles?: string[]
   /** Artifact store for persisting tool output — no global setter, always inject via params */

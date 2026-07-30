@@ -346,6 +346,8 @@ export interface ToolPipelineDeps {
   onPlanSubmitted?: (info: import('../tools/types.js').PlanSubmittedInfo) => void
   /** Notify the UI that the agent asked the user a question with selectable options. */
   onAskUserQuestion?: (info: import('../tools/types.js').AskUserQuestionInfo) => void
+  /** ask_image 查询句柄（会话 ImageRegistry + 视觉桥）。 */
+  visionAsk?: (imageId: string | undefined, question: string, signal?: AbortSignal) => Promise<import('../tools/types.js').VisionAskResult>
   /** Evidence-gated plan closure: assess the real delivery gate over owned/dirty files. */
   assessDelivery?: (dirtyFiles?: string[]) => import('./delivery-gate-v2.js').DeliveryGateResult
   /** 主动 plan mode：plan action=enter_mode → AgentLoop.enterPlanMode（仅主控有）。 */
@@ -748,6 +750,7 @@ export async function executeToolUse(
     onPlanClosed: deps.onPlanClosed,
     onPlanSubmitted: deps.onPlanSubmitted,
     onAskUserQuestion: deps.onAskUserQuestion,
+    visionAsk: deps.visionAsk,
     assessDelivery: deps.assessDelivery,
     enterPlanMode: deps.enterPlanMode,
     exitPlanMode: deps.exitPlanMode,

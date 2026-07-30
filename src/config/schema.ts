@@ -332,6 +332,12 @@ export const agentSchema = z.object({
     prompt: z.string().optional(),
     /** Max output tokens for the generated description. */
     maxTokens: z.number().int().positive().default(1024),
+    /** Optional backup vision model — used when the primary vision model errors
+     *  (5xx/timeout). Wrapped in a FallbackStreamClient. Same provider list. */
+    fallback: z.object({
+      provider: z.string(),
+      model: z.string(),
+    }).optional(),
   }).optional(),
   /** Greeting LLM: welcome page dynamic greeting feature toggle + model selection. */
   greeting: z.object({

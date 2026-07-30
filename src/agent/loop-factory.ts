@@ -1,6 +1,6 @@
 import type { AgentLoop } from './loop.js'
 import { TurnStreamController } from './turn-stream.js'
-import { describeImages } from './vision-service.js'
+import { describeImages, visionCacheKey } from './vision-service.js'
 import { TurnCompletionController } from './turn-completion.js'
 import { ToolExecutionController } from './tool-execution.js'
 import type { RuntimeHookSnapshot } from './runtime-hooks.js'
@@ -352,6 +352,38 @@ export function createToolExecutionController(self: AgentLoop): ToolExecutionCon
             signal,
           })
         : undefined,
+      // ask_image 查询句柄：从会话 ImageRegistry 取图 → 按主控视觉能力分派。
+      //  - 主控多模态 → 返回原图转发（pipeline 递给主控原生识图）。
+      //  - text-only → 用 question 定向问视觉桥，命中缓存零调用。
+      visionAsk: async (imageId, question, signal) => {
+        const img = self.imageRegistry.get(imageId)
+        if (!img) {
+          return { error: imageId ? `没有 id 为 ${imageId} 的图片` : '本会话没有可查询的图片' }
+        }
+        // 多模态主控：直接把原图递回去看，比经桥接更准。
+        if (self.config.supportsVision) {
+          return { forwardImage: img.dataUrl }
+        }
+        // text-only：需要视觉桥。
+        if (!self.config.visionClient) {
+          return { error: '未配置识图模型，无法就图片问答' }
+        }
+        const key = visionCacheKey(question)
+        const cached = self.imageRegistry.getCachedDescription(img.id, key)
+        if (cached !== undefined) return { answer: cached, cached: true }
+        try {
+          const answer = await describeImages(self.config.visionClient, [img.dataUrl], {
+            prompt: question, // 定向问题作为 prompt，得到针对性回答
+            maxTokens: self.config.visionModelMaxTokens,
+            signal,
+          })
+          if (!answer) return { error: '视觉模型返回空' }
+          self.imageRegistry.cacheDescription(img.id, key, answer)
+          return { answer }
+        } catch (err) {
+          return { error: (err as Error)?.message ?? String(err) }
+        }
+      },
       recordToolHistory: (name, input, isError, content, errorClass, errorKind) => self.recordToolHistory(name, input, isError, content, errorClass, errorKind),
       onLeaveMark: mark => self.captureLeaveMark(mark),
       onPlanSteps: steps => self.capturePlanSteps(steps),

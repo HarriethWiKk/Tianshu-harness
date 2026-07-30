@@ -235,6 +235,14 @@ export interface AgentConfig {
   visionModelPrompt?: string
   /** Max output tokens for the vision bridge description. */
   visionModelMaxTokens?: number
+  /** 识图桥真实状态（供 UI 显示准确提示，而非只看 config 有没有 visionModel 键）。
+   *  active=桥可用；source 区分显式配置 / 自动选择 / 无；reason 记未启用/降级原因。 */
+  visionBridge?: {
+    active: boolean
+    source: 'configured' | 'auto' | 'none'
+    /** 桥接生效或未生效的可读原因（configured/auto 时为选中的 provider/model；none 时为原因）。 */
+    detail?: string
+  }
   /** TDD gate config — controls whether edit tools are blocked when the model
    *  edits files without running tests. Parsed from RIVET_TDD_GATE env var.
    *  Default: enabled, enforce mode, threshold 3 edits. */

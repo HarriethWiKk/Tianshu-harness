@@ -104,7 +104,8 @@ import { modeForRecoveryTrigger, type ReliabilityDecision } from './reliability-
 import { ResourceSensor, type ResourceSensorSnapshot } from './resource-sensor.js'
 import { type PlanMethodology, type TaskContract, type TaskDepthLayer } from '../context/task-contract.js'
 import { StigmergyStore } from '../context/stigmergy.js'
-import { describeImages } from './vision-service.js'
+import { describeImages, visionCacheKey } from './vision-service.js'
+import { ImageRegistry } from './image-registry.js'
 import { createStanceTally } from './stance-tally.js'
 import { createVirtuePendingLedger, type VirtuePendingLedger, computeVirtueCredit } from './virtue-signals.js'
 import { createFailureJournal, type FailureJournal } from './failure-journal.js'
@@ -664,6 +665,9 @@ export class AgentLoop {
   _currentEffortShadow: EffortShadowRecord | null = null
   /** 逃生口运行时挂载的 EXTENDED 工具名（经 /tools enable 加入）。updateTools 时作为豁免传入。 */
   private readonly mountedExtras = new Set<string>()
+  /** 视觉副驾短期记忆：本会话用户/工具携带的图片按短 id 寄存，供 ask_image 反复追问。
+   *  纯内存、不进 prompt 历史、不落盘（见 image-registry.ts 的边界约束）。 */
+  readonly imageRegistry = new ImageRegistry()
 
   constructor(
     config: AgentConfig,
@@ -2073,19 +2077,49 @@ export class AgentLoop {
     try {
       await this.cancelIdleCompaction()
 
+      // 视觉副驾：先把本轮图片寄存进 registry（无论主控是否多模态），供 ask_image
+      // 反复追问。id 顺序与 images 顺序一致。纯内存、不进 prompt/落盘。
+      const registeredIds = images && images.length > 0 ? this.imageRegistry.register(images) : []
+
       // Vision bridge: when the primary model is text-only but a dedicated
       // multimodal model is configured, describe the images and prepend the
       // description to the user prompt so the primary model still receives
-      // the visual information.
+      // the visual information. 多模态主控则跳过桥接——images 照常进 oaiMessages 原生识图，
+      // 同时已寄存进 registry 供 ask_image 复用（v4 变多模态后自动走这条路）。
       if (images && images.length > 0 && !this.config.supportsVision && this.config.visionClient) {
-        const description = await describeImages(this.config.visionClient, images, {
-          prompt: this.config.visionModelPrompt,
-          maxTokens: this.config.visionModelMaxTokens,
-          signal: this.abortController.signal,
-        })
-        if (description) {
-          userInput = `[图片描述]\n${description}\n\n${userInput}`
+        // 桥接失败不得炸整轮：视觉模型超时/报错/返回空，都降级为一条可见提示，
+        // 让主控知道"有图但没读到"而非静默吞图或整轮 failed。原因落 debugLog。
+        // 缓存键必须按**原始** userInput 归类（与 describeImages 内部的模式判定同源）——
+        // userInput 下面会被 prepend 改写，故先算好键再改写。
+        const firstDescKey = visionCacheKey(undefined, this.config.visionModelPrompt, userInput)
+        try {
+          const description = await describeImages(this.config.visionClient, images, {
+            prompt: this.config.visionModelPrompt,
+            // 随图文本用于自动切通用/精确转写模式（用户没显式配 prompt 时）：
+            // "这个报错怎么回事[图]" → 精确 OCR 转写，避免泛泛描述丢掉报错行。
+            accompanyingText: userInput,
+            maxTokens: this.config.visionModelMaxTokens,
+            signal: this.abortController.signal,
+          })
+          if (description) {
+            userInput = `[图片描述]\n${description}\n\n${userInput}`
+            // 首描述写入首图缓存，供 ask_image 同角度追问命中零调用。
+            const firstId = registeredIds[0]
+            if (firstId) {
+              this.imageRegistry.cacheDescription(firstId, firstDescKey, description)
+            }
+          } else {
+            userInput = `[图片桥接提示] 用户发送了 ${images.length} 张图片，但识图模型返回空描述——`
+              + `请告知用户重发或检查识图模型配置。\n\n${userInput}`
+            debugLog('[vision] bridge returned empty description')
+          }
+        } catch (err) {
+          const reason = (err as Error)?.message ?? String(err)
+          userInput = `[图片桥接失败] 用户发送了 ${images.length} 张图片，但识图桥接出错（${reason}）——`
+            + `请告知用户识图暂不可用，可检查 agent.visionModel 配置或稍后重试。\n\n${userInput}`
+          debugLog(`[vision] bridge error: ${reason}`)
         }
+        // text-only 主控：图已转描述，从 prompt parts 去掉（原图仍在 registry 供二次看）。
         images = undefined
       }
 

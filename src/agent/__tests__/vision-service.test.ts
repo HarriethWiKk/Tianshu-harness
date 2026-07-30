@@ -6,7 +6,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import type { StreamClient, StreamCallbacks } from '../../api/stream-client.js'
 import type { OaiChatRequest } from '../../api/oai-types.js'
-import { describeImages } from '../vision-service.js'
+import { describeImages, selectVisionPrompt } from '../vision-service.js'
 
 function makeMockClient(text: string): StreamClient {
   return {
@@ -133,4 +133,37 @@ test('describeImages 忽略 thinking 块，不把推理当描述', async () => {
     },
   }
   assert.equal(await describeImages(client, ['data:image/png;base64,abc']), '一只猫。')
+})
+
+// ── 阶段5：模式自适应 prompt ─────────────────────────────────────
+test('selectVisionPrompt 显式配置 prompt 永远优先', () => {
+  assert.equal(selectVisionPrompt('自定义提示', '这个报错怎么回事'), '自定义提示')
+})
+
+test('selectVisionPrompt 命中报错/UI 关键词 → 精确转写模式', () => {
+  const p = selectVisionPrompt(undefined, '这个报错是什么意思')
+  assert.match(p, /逐字转写|一字不差|OCR/)
+})
+
+test('selectVisionPrompt 无 UI 关键词 → 通用结构化模式', () => {
+  const p = selectVisionPrompt(undefined, '这是我家的猫')
+  assert.match(p, /## 文字内容/)
+  assert.doesNotMatch(p, /一字不差/)
+})
+
+test('describeImages 据 accompanyingText 切精确模式', async () => {
+  let capturedPrompt = ''
+  const client: StreamClient = {
+    async stream(request, callbacks) {
+      const userMsg = request.messages.find(m => m.role === 'user')
+      const textPart = Array.isArray(userMsg?.content)
+        ? userMsg.content.find(p => p.type === 'text')
+        : undefined
+      capturedPrompt = textPart?.text ?? ''
+      callbacks.onContentBlock({ type: 'text', text: 'ok' })
+      callbacks.onStopReason('stop', {})
+    },
+  }
+  await describeImages(client, ['data:image/png;base64,abc'], { accompanyingText: '终端里这个 traceback' })
+  assert.match(capturedPrompt, /逐字转写|OCR/)
 })

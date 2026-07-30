@@ -486,6 +486,7 @@ export class TuiApp {
   private supportsVision = false
   /** 是否配置了独立的 vision bridge 模型（用于图片附件提示）。 */
   private visionBridgeEnabled = false
+  private visionBridgeSource?: 'configured' | 'auto' | 'none'
   /** 当前会话审批模式（继承自 agent config），供 worker pills badge */
   private _approvalMode: string = 'auto-safe'
   /**
@@ -1446,9 +1447,10 @@ export class TuiApp {
   }
 
   /** 设置当前主控模型的 vision 能力与桥接状态（用于图片附件提示）。 */
-  setVisionInfo(supportsVision: boolean, bridgeEnabled: boolean): void {
+  setVisionInfo(supportsVision: boolean, bridgeEnabled: boolean, bridgeSource?: 'configured' | 'auto' | 'none'): void {
     this.supportsVision = supportsVision
     this.visionBridgeEnabled = bridgeEnabled
+    this.visionBridgeSource = bridgeSource
   }
 
   /** 构建命令名谓词，供 resolveAppPromptInput 区分路径与命令。
@@ -3225,9 +3227,11 @@ export class TuiApp {
         imageNote = `\n${color(`📎 ${images.length} image${images.length > 1 ? 's' : ''} attached`, this.theme.muted)}`
         if (!this.supportsVision) {
           if (this.visionBridgeEnabled) {
-            imageNote += `\n${color('🖼 将使用配置的 vision 模型生成图片描述后发送', this.theme.muted)}`
+            // 提示反映真实桥接来源，而非未经验证的话术。桥接=图先经视觉模型转文字描述再发。
+            const src = this.visionBridgeSource === 'auto' ? '（自动选用的视觉模型）' : ''
+            imageNote += `\n${color(`🖼 主模型不识图，将经识图桥${src}生成图片描述后发送`, this.theme.muted)}`
           } else {
-            imageNote += `\n${color('⚠ 当前模型不支持识图，图片未发送。可在 .rivet-config.json 中配置 agent.visionModel 启用识图桥接。', this.theme.warning)}`
+            imageNote += `\n${color('⚠ 当前模型不支持识图，且无可用识图桥，图片未发送。请在 Settings → 识图模型 选一个视觉模型（或配置 agent.visionModel）。', this.theme.warning)}`
           }
         }
       }

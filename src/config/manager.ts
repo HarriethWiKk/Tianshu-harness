@@ -726,6 +726,10 @@ const visionModelConfigSchema = z.object({
   model: z.string().min(1),
   prompt: z.string().optional(),
   maxTokens: z.number().int().positive().default(1024),
+  fallback: z.object({
+    provider: z.string().min(1),
+    model: z.string().min(1),
+  }).optional(),
 })
 
 export interface VisionModelConfigSnapshot {
@@ -733,6 +737,7 @@ export interface VisionModelConfigSnapshot {
   model: string
   prompt?: string
   maxTokens: number
+  fallback?: { provider: string; model: string }
 }
 
 /** Snapshot of the optional vision bridge model for the desktop/TUI settings UI. */

@@ -44,12 +44,13 @@ describe('presetIncludes', () => {
 })
 
 describe('assembly counts per preset', () => {
-  it('minimal=28 / frontend=29 / full=47（完整装配口径）', () => {
-    assert.equal(totalCount('minimal'), 28)
-    assert.equal(totalCount('frontend'), 29)
+  it('minimal=29 / frontend=30 / full=48（完整装配口径）', () => {
+    assert.equal(totalCount('minimal'), 29)
+    assert.equal(totalCount('frontend'), 30)
     // 118d0505：monitor 工具（full 档专属）入注册表，full 44 → 45
     // B3：web_crawl/web_map（full 档专属）入注册表，full 45 → 47
-    assert.equal(totalCount('full'), 47)
+    // 视觉副驾：ask_image 无条件注册（各档 +1），28/29/47 → 29/30/48
+    assert.equal(totalCount('full'), 48)
   })
 
   it('kernel(default-registry) minimal 排除 ast_edit/inspect_project/related_tests/import_resource/leave_mark', () => {

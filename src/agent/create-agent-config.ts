@@ -75,6 +75,8 @@ export interface AgentConfigInput {
     model: string
     prompt?: string
     maxTokens: number
+    /** Optional backup vision model — failover when the primary errors. */
+    fallback?: { provider: string; model: string }
   }
   /** /cd: previous PromptEngine whose frozen snapshots the new one inherits.
    *  resume 场景传盘存 FrozenSnapshotData（<id>.frozen.json），同语义。 */
@@ -122,6 +124,10 @@ export function createMainAgentConfigInput(params: MainAgentConfigInputParams): 
     domainKeywordRouting: params.config.agent.domainKeywordRouting,
     defaultDomain: params.config.agent.defaultDomain,
     goalJudge: params.config.agent.goal?.judge,
+    // 视觉桥接配置：这条线曾长期断裂（builder 从不透传 → buildVisionClient 恒返回
+    // undefined → 桥接从不触发 → "配了却报图片未发送"）。visionModel 必须从 config
+    // 流到 input，桥接才建得起来。见 buildVisionClient / loop.ts 桥接点。
+    visionModel: params.config.agent.visionModel,
     auth: params.auth,
     habituationThreshold: params.habituationThreshold,
     permissions: params.config.agent.permissions as PermissionConfig,
@@ -139,7 +145,7 @@ export function createMainAgentConfigInput(params: MainAgentConfigInputParams): 
 
 export function createAgentConfig(input: AgentConfigInput): Pick<
   AgentConfig,
-  'client' | 'promptEngine' | 'contextWindow' | 'compact' | 'cwd' | 'blockPolicy' | 'providerProfile' | 'providerName' | 'compactionProfile' | 'primaryClient' | 'compactClient' | 'sessionId' | 'approvalMode' | 'autoReasoning' | 'reasoningFloor' | 'turnLevelThinking' | 'songlineEnabled' | 'hearthObserveEnabled' | 'crossSessionEnabled' | 'antiAnchoring' | 'intentRetrievalRouter' | 'llmSpeculation' | 'autoDelegateEnabled' | 'domainKeywordRouting' | 'defaultDomain' | 'goalJudge' | 'allProviders' | 'permissions' | 'toolGating' | 'prefixCacheStrategy' | 'supportsVision' | 'visionClient' | 'visionModelPrompt' | 'visionModelMaxTokens'
+  'client' | 'promptEngine' | 'contextWindow' | 'compact' | 'cwd' | 'blockPolicy' | 'providerProfile' | 'providerName' | 'compactionProfile' | 'primaryClient' | 'compactClient' | 'sessionId' | 'approvalMode' | 'autoReasoning' | 'reasoningFloor' | 'turnLevelThinking' | 'songlineEnabled' | 'hearthObserveEnabled' | 'crossSessionEnabled' | 'antiAnchoring' | 'intentRetrievalRouter' | 'llmSpeculation' | 'autoDelegateEnabled' | 'domainKeywordRouting' | 'defaultDomain' | 'goalJudge' | 'allProviders' | 'permissions' | 'toolGating' | 'prefixCacheStrategy' | 'supportsVision' | 'visionClient' | 'visionModelPrompt' | 'visionModelMaxTokens' | 'visionBridge'
 > {
   const { model, apiKey, cwd, provider } = input
   const capabilities = resolveCapabilities(provider.name, provider.capabilities)
@@ -259,7 +265,30 @@ export function createAgentConfig(input: AgentConfigInput): Pick<
     visionClient: visionBridge?.client,
     visionModelPrompt: visionBridge?.prompt,
     visionModelMaxTokens: visionBridge?.maxTokens,
+    visionBridge: deriveVisionBridgeStatus(model.supportsVision ?? false, visionBridge, input),
  }
+}
+
+/** 派生识图桥真实状态供 UI 显示——不再让 UI 只凭 config 有没有 visionModel 键去猜。 */
+function deriveVisionBridgeStatus(
+  primarySupportsVision: boolean,
+  bridge: VisionBridgeBuild | undefined,
+  input: AgentConfigInput,
+): AgentConfig['visionBridge'] {
+  if (primarySupportsVision) {
+    return { active: true, source: 'none', detail: '主模型原生支持识图，无需桥接' }
+  }
+  if (bridge) {
+    return {
+      active: true,
+      source: bridge.source,
+      detail: bridge.source === 'auto' ? `自动选用 ${bridge.ref}` : bridge.ref,
+    }
+  }
+  const detail = input.visionModel
+    ? `已配置 ${input.visionModel.provider}/${input.visionModel.model} 但桥接起不来（缺 key/模型不存在）`
+    : '未配置 agent.visionModel，且无可自动选用的视觉模型'
+  return { active: false, source: 'none', detail }
 }
 
 export function resolveFallbackModel(fp: ProviderConfig): ModelConfig {
@@ -412,16 +441,103 @@ function warnVisionBridge(key: string, reason: string): undefined {
   return undefined
 }
 
+interface VisionBridgeBuild {
+  client: import('../api/stream-client.js').StreamClient
+  prompt?: string
+  maxTokens: number
+  /** configured=用户显式指定；auto=未配但自动选了个可用视觉模型。 */
+  source: 'configured' | 'auto'
+  /** 选中的 provider/model，供 UI 显示。 */
+  ref: string
+}
+
 /**
- * Build the dedicated vision bridge StreamClient from agent.visionModel.
- * Returns undefined when unconfigured/invalid/credentials missing — the primary
- * model simply won't see images (same as before vision bridge existed).
+ * Try to build a vision StreamClient from one (provider, modelSpec) pair.
+ * Returns the client or an error reason string (never throws).
  */
-function buildVisionClient(
+function tryBuildVisionClientFrom(
   input: AgentConfigInput,
-): { client: import('../api/stream-client.js').StreamClient; prompt?: string; maxTokens: number } | undefined {
+  prov: ProviderConfig,
+  spec: ModelConfig,
+  requestedMaxTokens: number,
+): { client: import('../api/stream-client.js').StreamClient; maxTokens: number } | { error: string } {
+  let apiKey = ''
+  let auth: AuthProvider | undefined
+  try {
+    if (prov.auth?.type === 'oauth') {
+      auth = prov.name === input.provider.name ? input.auth : createAuthProvider(prov.auth, process.env)
+      if (!auth?.isAuthenticated()) return { error: `${prov.name} 未完成 OAuth 登录` }
+    } else {
+      apiKey = resolveApiKey(prov)
+      if (!apiKey) return { error: `${prov.name} 的 API key 为空` }
+    }
+  } catch {
+    // resolveApiKey 拿不到 key 就抛。最常见的成因不是"没有 key"而是"key 只存在环境变量里，
+    // 而这个进程没继承到它"——GUI/Dock 启动的桌面端拿不到 shell profile 里的变量，
+    // 且 config.env 那套解析只作用于命令执行，不改 process.env。
+    return {
+      error: `取不到 ${prov.name} 的 API key（${prov.apiKeyEnv ?? `${prov.name.toUpperCase()}_API_KEY`} 未传入本进程？`
+        + '改用 Settings → Providers 把 key 存进配置，就不依赖启动方式了）',
+    }
+  }
+  const caps = resolveCapabilities(prov.name, prov.capabilities)
+  const maxTokens = Math.min(requestedMaxTokens, spec.maxTokens)
+  const client = createProviderClient(prov, caps, {
+    apiKey,
+    model: spec.id,
+    reasoningEffort: spec.reasoningEffort,
+    maxTokens,
+    auth,
+    sessionId: input.sessionId,
+  })
+  return { client, maxTokens }
+}
+
+/**
+ * Auto-select a default vision bridge when the user hasn't configured one but the
+ * primary model is text-only. Picks the first vision-capable model that has usable
+ * credentials, priority: same provider as the primary > minimax > glm > others.
+ * Returns undefined when nothing is available (维持现状：图片会被丢弃 + warn 在别处补）。
+ */
+function autoSelectVisionBridge(input: AgentConfigInput): VisionBridgeBuild | undefined {
+  const providers = input.allProviders
+  if (!providers) return undefined
+  const PRIORITY = [input.provider.name, 'minimax', 'glm']
+  const rank = (name: string): number => {
+    const i = PRIORITY.indexOf(name)
+    return i === -1 ? PRIORITY.length + 1 : i
+  }
+  const candidates: Array<{ prov: ProviderConfig; spec: ModelConfig }> = []
+  for (const prov of Object.values(providers)) {
+    for (const spec of prov.models) {
+      if (spec.supportsVision) candidates.push({ prov, spec })
+    }
+  }
+  candidates.sort((a, b) => rank(a.prov.name) - rank(b.prov.name))
+  for (const { prov, spec } of candidates) {
+    const built = tryBuildVisionClientFrom(input, prov, spec, 1024)
+    if ('client' in built) {
+      const ref = `${prov.name}/${spec.id}`
+      console.warn(`[vision] 自动启用识图桥：${ref}（未显式配置 agent.visionModel，已选一个可用视觉模型）`)
+      return { client: built.client, prompt: undefined, maxTokens: built.maxTokens, source: 'auto', ref }
+    }
+    // 有 key 问题的候选跳过，继续找下一个——自动路径不刷 warn（显式路径才点名）。
+  }
+  return undefined
+}
+
+/**
+ * Build the dedicated vision bridge StreamClient.
+ * 1) 显式 agent.visionModel 优先——配了就用它，起不来则点名原因（不静默降级）。
+ * 2) 未显式配置但主模型 text-only → 自动选一个可用视觉模型做默认桥（开箱即用）。
+ * 返回 undefined 表示无桥可用（主模型照旧看不到图）。
+ */
+function buildVisionClient(input: AgentConfigInput): VisionBridgeBuild | undefined {
   const vm = input.visionModel
-  if (!vm) return undefined
+  if (!vm) {
+    // 主模型自身支持视觉时无需桥；否则尝试自动选。
+    return autoSelectVisionBridge(input)
+  }
   const ref = `${vm.provider}/${vm.model}`
   const prov = input.allProviders?.[vm.provider]
   if (!prov) return warnVisionBridge(`prov:${ref}`, `provider "${vm.provider}" 不在已配置的 provider 列表里`)
@@ -432,36 +548,29 @@ function buildVisionClient(
     warnVisionBridge(`novision:${ref}`, `${ref} 未声明视觉能力，描述结果不可信——桌面端 Settings → Integrations 的下拉只列声明了视觉能力的模型`)
   }
 
-  let apiKey = ''
-  let auth: AuthProvider | undefined
-  try {
-    if (prov.auth?.type === 'oauth') {
-      auth = prov.name === input.provider.name ? input.auth : createAuthProvider(prov.auth, process.env)
-      if (!auth?.isAuthenticated()) return warnVisionBridge(`oauth:${ref}`, `${vm.provider} 未完成 OAuth 登录`)
-    } else {
-      apiKey = resolveApiKey(prov)
-      if (!apiKey) return warnVisionBridge(`key:${ref}`, `${vm.provider} 的 API key 为空`)
-    }
-  } catch {
-    // resolveApiKey 拿不到 key 就抛。最常见的成因不是"没有 key"而是"key 只存在环境变量里，
-    // 而这个进程没继承到它"——GUI/Dock 启动的桌面端拿不到 shell profile 里的变量，
-    // 且 config.env 那套解析只作用于命令执行，不改 process.env。
-    return warnVisionBridge(
-      `key:${ref}`,
-      `取不到 ${vm.provider} 的 API key（${prov.apiKeyEnv ?? `${prov.name.toUpperCase()}_API_KEY`} 未传入本进程？`
-        + '改用 Settings → Providers 把 key 存进配置，就不依赖启动方式了）',
-    )
-  }
+  const built = tryBuildVisionClientFrom(input, prov, spec, vm.maxTokens)
+  if ('error' in built) return warnVisionBridge(`key:${ref}`, built.error)
 
-  const caps = resolveCapabilities(prov.name, prov.capabilities)
-  const maxTokens = Math.min(vm.maxTokens, spec.maxTokens)
-  const client = createProviderClient(prov, caps, {
-    apiKey,
-    model: spec.id,
-    reasoningEffort: spec.reasoningEffort,
-    maxTokens,
-    auth,
-    sessionId: input.sessionId,
-  })
-  return { client, prompt: vm.prompt, maxTokens }
+  // 主/备双桥：备桥可解析时，用 FallbackStreamClient 包一层——主视觉模型 5xx/超时
+  // 自动切备。备桥起不来（缺 key/模型不存在）不致命，仅点名，降级为单桥。
+  let client = built.client
+  let refLabel = ref
+  const fb = vm.fallback
+  if (fb) {
+    const fbRef = `${fb.provider}/${fb.model}`
+    const fbProv = input.allProviders?.[fb.provider]
+    const fbSpec = fbProv?.models.find(m => m.id === fb.model || m.alias === fb.model)
+    if (!fbProv || !fbSpec) {
+      warnVisionBridge(`fbmodel:${fbRef}`, `备用识图模型 ${fbRef} 不存在，降级为单桥`)
+    } else {
+      const fbBuilt = tryBuildVisionClientFrom(input, fbProv, fbSpec, vm.maxTokens)
+      if ('error' in fbBuilt) {
+        warnVisionBridge(`fbkey:${fbRef}`, `备用识图桥 ${fbRef} 起不来：${fbBuilt.error}，降级为单桥`)
+      } else {
+        client = new FallbackStreamClient(built.client, ref, [{ name: fbRef, create: () => fbBuilt.client }])
+        refLabel = `${ref} → ${fbRef}`
+      }
+    }
+  }
+  return { client, prompt: vm.prompt, maxTokens: built.maxTokens, source: 'configured', ref: refLabel }
 }

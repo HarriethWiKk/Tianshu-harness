@@ -235,6 +235,16 @@ async function main() {
     return
   }
 
+  // rivet browser [status|install [--no-mirror]] — chromium 就绪检查 / 一键安装。
+  // 放在 TTY 门与 bootstrap 之前：装浏览器不需要 agent/配置/联网到模型，且新用户
+  // 最可能在 TUI 起来前就想先把浏览器备好。
+  if (args[0] === 'browser') {
+    const { runBrowserCLI } = await import('./cli/browser-cli.js')
+    const code = await runBrowserCLI(args.slice(1))
+    if (code !== 0) process.exit(code)
+    return
+  }
+
   // rivet logs [open [desktop]] [--session <id>] [--json]
   // 日志落点排查。刻意放在 TTY 门与 bootstrap 之前：TUI 起不来（sidecar 崩、
   // 配置坏、非 TTY 管道里）恰恰是最需要知道日志在哪的时候，这条路径不初始化
@@ -1528,6 +1538,7 @@ async function main() {
   app.setVisionInfo(
     ctx!.agent.config.supportsVision ?? false,
     !!ctx!.agent.config.visionClient,
+    ctx!.agent.config.visionBridge?.source,
   )
 
   // ── Wire agent → TuiApp ──────────────────────────────────────
@@ -1845,6 +1856,22 @@ async function main() {
       if (banner) app?.commitStatic(banner)
     } catch {
       // fail-open: 环境探测失败不打扰用户
+    }
+  })()
+
+  // 浏览器体检：仅当工具集含 browser_debug(frontend/full preset)时才查——纯 CLI
+  // 用户(minimal)不需要 chromium，不该每次启动被浏览器提示打扰。缺失则给一键
+  // 安装入口。异步、失败静默、不阻塞启动(同 git banner 姿态)。
+  void (async () => {
+    try {
+      const { resolveToolPreset } = await import('./tools/tool-preset.js')
+      if (!presetIncludes(resolveToolPreset(process.cwd()), 'browser_debug')) return
+      const { probeChromium, formatBrowserMissingBanner } = await import('./tools/net/browser-readiness.js')
+      const probe = await probeChromium()
+      const banner = formatBrowserMissingBanner(probe)
+      if (banner) app?.commitStatic(banner)
+    } catch {
+      // fail-open: 浏览器探测失败不打扰用户
     }
   })()
 
