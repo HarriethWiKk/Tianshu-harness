@@ -39,6 +39,7 @@ import { createTodoReminderHook } from './hooks/todo-reminder-hook.js'
 import { createBackgroundJobsHook } from './hooks/background-jobs-hook.js'
 import { createMonitorHook } from './hooks/monitor-hook.js'
 import { createEditToolAdvisoryHook } from './hooks/edit-tool-advisory-hook.js'
+import { createSecurityPatternHook } from './hooks/security-pattern-hook.js'
 import { createEditFailureRecoveryHook } from './hooks/edit-failure-recovery-hook.js'
 import { createLossyObservationHook } from './hooks/lossy-observation-hook.js'
 import { createCompactionAmnesiaHook, type CompactionAmnesiaHookDeps } from './hooks/compaction-amnesia-hook.js'
@@ -557,6 +558,15 @@ export function createDefaultRuntimeHooks(deps: RuntimeHookDeps): RuntimeHook[] 
   // Gated by RIVET_EDIT_SMART_ROUTING (default on; set to '0' to disable).
   if (deps.advisoryBus && process.env.RIVET_EDIT_SMART_ROUTING !== '0') {
     hooks.push(createEditToolAdvisoryHook({ advisoryBus: deps.advisoryBus }))
+  }
+
+  // Security-Pattern: postTool hook — 移植自官方 security-guidance 插件的
+  // PostToolUse 层。写操作后正则扫描 25 条已知危险模式（命令注入、反序列化
+  // RCE、XSS、eval、弱加密、TLS 校验关闭、XXE 等），命中经 AdvisoryBus 注入
+  // 中文告警。零成本零延迟（纯正则不调 API），命中才注入（缓存安全）。
+  // Opt-in：默认关，需 RIVET_SECURITY_GUIDANCE=1 显式启用。
+  if (deps.advisoryBus && process.env.RIVET_SECURITY_GUIDANCE === '1') {
+    hooks.push(createSecurityPatternHook({ advisoryBus: deps.advisoryBus }))
   }
 
   // Edit-Failure Recovery: postTool hook — detects consecutive edit failures
