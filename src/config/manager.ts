@@ -8,6 +8,7 @@ import { userConfigPath } from './paths.js'
 import { cloneProviderPreset, findPresetModel, isProviderPresetKey, type ProviderPresetKey } from './provider-presets.js'
 import { backfillPresetModelFields } from './preset-model-backfill.js'
 import { invalidateToolPreset } from '../tools/tool-preset.js'
+import { formatProviderCard, formatSuccess, formatError, formatMcpServerList, type FormatOpts } from './cli-format.js'
 
 const APPROVAL_MODES = ['auto-safe', 'manual', 'auto-accept', 'dangerously-skip-permissions'] as const
 type ApprovalModeConfig = typeof APPROVAL_MODES[number]
@@ -759,6 +760,44 @@ export function setVisionModelConfig(
   return parsed
 }
 
+// --- Greeting LLM configuration (welcome page dynamic greeting) ---
+
+const greetingConfigSchema = z.object({
+  enabled: z.boolean(),
+  model: z.string().min(1),
+})
+
+export interface GreetingConfigSnapshot {
+  enabled: boolean
+  model: string
+}
+
+/** Snapshot of the greeting LLM config for the desktop/TUI settings UI.
+ *  Falls back to defaults ({ enabled: true, model: 'deepseek-v4-flash' })
+ *  when no user config is present. */
+export function getGreetingConfig(): GreetingConfigSnapshot {
+  return loadConfig().agent.greeting ?? { enabled: true, model: 'deepseek-v4-flash' }
+}
+
+/**
+ * Persist the greeting LLM config to the user global config.
+ * Pass `null` to reset to defaults.
+ */
+export function setGreetingConfig(
+  input: { enabled?: unknown; model?: unknown } | null,
+): GreetingConfigSnapshot | null {
+  const cfg = loadConfig()
+  if (input === null) {
+    delete (cfg.agent as Record<string, unknown>).greeting
+    saveConfig(cfg)
+    return null
+  }
+  const parsed = greetingConfigSchema.parse(input)
+  cfg.agent.greeting = parsed
+  saveConfig(cfg)
+  return parsed
+}
+
 /** Snapshot of the mirror configuration block. */
 export function getMirrorConfig(): MirrorsConfig {
   return loadConfig().mirrors
@@ -1164,6 +1203,8 @@ Examples:
 
 export async function runConfigCLI(args: string[], io: ConfigCliIO = {}): Promise<void> {
   const cmd = args[0]
+  const useColor = io.isTTY ?? (process.stdout.isTTY ?? false)
+  const fmtOpts: FormatOpts = { useColor, width: 80 }
   try {
     if (!cmd) {
       const isTTY = io.isTTY ?? process.stdin.isTTY
@@ -1184,17 +1225,21 @@ export async function runConfigCLI(args: string[], io: ConfigCliIO = {}): Promis
         cliOut(io, JSON.stringify(loadConfig(), null, 2))
         break
 
-      case 'providers':
-        cliOut(io, 'Providers:')
-        for (const [name, p] of Object.entries(loadConfig().provider.providers)) {
-          const marker = name === loadConfig().provider.default ? ' (default)' : ''
-          const keyStatus = getApiKeyStatus(name)
-          cliOut(io, `  ${name}${marker}`)
-          cliOut(io, `    baseUrl: ${p.baseUrl}`)
-          cliOut(io, `    apiKey: ${keyStatus.source === 'inline' ? keyStatus.ref : keyStatus.source === 'env' ? `${keyStatus.ref}` : '(not set)'}`)
-          cliOut(io, `    models: ${p.models.map(m => m.alias ?? m.id).join(', ')}`)
+      case 'providers': {
+        const cfg = loadConfig()
+        const providerMap = cfg.provider.providers
+        const defaultName = cfg.provider.default
+        const entries = Object.entries(providerMap)
+        if (entries.length === 0) {
+          cliOut(io, 'No providers configured.')
+        } else {
+          for (const [name, p] of entries) {
+            const keyStatus = getApiKeyStatus(name)
+            cliOut(io, formatProviderCard(name, p, keyStatus, name === defaultName, fmtOpts))
+          }
         }
         break
+      }
 
       case 'setup': {
         const providerName = args[1]
@@ -1235,7 +1280,7 @@ export async function runConfigCLI(args: string[], io: ConfigCliIO = {}): Promis
           model,
           makeDefault: hasFlag(args, '--default'),
         })
-        cliOut(io, `Provider ${providerName} configured${hasFlag(args, '--default') ? ' and set as default' : ''}`)
+        cliOut(io, formatSuccess(`Provider ${providerName} configured${hasFlag(args, '--default') ? ' and set as default' : ''}`, fmtOpts))
         break
       }
 
@@ -1248,7 +1293,7 @@ export async function runConfigCLI(args: string[], io: ConfigCliIO = {}): Promis
           return
         }
         updateProviderBaseUrl(providerName, baseUrl)
-        cliOut(io, `Base URL set for ${providerName}: ${baseUrl}`)
+        cliOut(io, formatSuccess(`Base URL set for ${providerName}: ${baseUrl}`, fmtOpts))
         break
       }
 
@@ -1277,7 +1322,7 @@ export async function runConfigCLI(args: string[], io: ConfigCliIO = {}): Promis
           cliOut(io, `Warning: unknown model "${modelId}" — defaulting context window to 128000. Pass an explicit context-window (compaction thresholds depend on it).`)
         }
         upsertProviderModel(providerName, model, { preferred: true })
-        cliOut(io, `Preferred model for ${providerName} set to ${modelId}`)
+        cliOut(io, formatSuccess(`Preferred model for ${providerName} set to ${modelId}`, fmtOpts))
         break
       }
 
@@ -1290,7 +1335,7 @@ export async function runConfigCLI(args: string[], io: ConfigCliIO = {}): Promis
           return
         }
         setApiKey(providerName, key)
-        cliOut(io, `API key set for ${providerName}`)
+        cliOut(io, formatSuccess(`API key set for ${providerName}`, fmtOpts))
         break
       }
 
@@ -1303,7 +1348,7 @@ export async function runConfigCLI(args: string[], io: ConfigCliIO = {}): Promis
           return
         }
         setApiKeyEnv(providerName, envVar)
-        cliOut(io, `API key source set to ${envVar} for ${providerName}`)
+        cliOut(io, formatSuccess(`API key source set to ${envVar} for ${providerName}`, fmtOpts))
         break
       }
 
@@ -1315,7 +1360,7 @@ export async function runConfigCLI(args: string[], io: ConfigCliIO = {}): Promis
           return
         }
         setDefaultProvider(providerName)
-        cliOut(io, `Default provider set to ${providerName}`)
+        cliOut(io, formatSuccess(`Default provider set to ${providerName}`, fmtOpts))
         break
       }
 
@@ -1327,7 +1372,7 @@ export async function runConfigCLI(args: string[], io: ConfigCliIO = {}): Promis
           return
         }
         const saved = setApprovalMode(mode)
-        cliOut(io, `Approval mode set to ${saved}`)
+        cliOut(io, formatSuccess(`Approval mode set to ${saved}`, fmtOpts))
         break
       }
 
@@ -1342,7 +1387,7 @@ export async function runConfigCLI(args: string[], io: ConfigCliIO = {}): Promis
           return
         }
         addModel(providerName, { id: modelId, contextWindow, maxTokens })
-        cliOut(io, `Model ${modelId} added to ${providerName}`)
+        cliOut(io, formatSuccess(`Model ${modelId} added to ${providerName}`, fmtOpts))
         break
       }
 
@@ -1355,7 +1400,7 @@ export async function runConfigCLI(args: string[], io: ConfigCliIO = {}): Promis
           return
         }
         removeModel(providerName, modelId)
-        cliOut(io, `Model ${modelId} removed from ${providerName}`)
+        cliOut(io, formatSuccess(`Model ${modelId} removed from ${providerName}`, fmtOpts))
         break
       }
 
@@ -1364,17 +1409,7 @@ export async function runConfigCLI(args: string[], io: ConfigCliIO = {}): Promis
         if (subcmd === 'list') {
           const cfg = loadConfig()
           const servers = cfg.mcp?.servers ?? {}
-          const entries = Object.entries(servers)
-          if (entries.length === 0) {
-            cliOut(io, 'No MCP servers configured.')
-          } else {
-            cliOut(io, 'MCP servers:')
-            for (const [id, s] of entries) {
-              const type = s.command ? `stdio: ${s.command}` : `sse: ${s.url}`
-              const disabled = s.disabled ? ' (disabled)' : ''
-              cliOut(io, `  ${id}: ${type}${disabled}`)
-            }
-          }
+          cliOut(io, formatMcpServerList(servers, fmtOpts))
         } else if (subcmd === 'add-stdio') {
           const id = args[2]
           const command = args[3]
@@ -1387,7 +1422,7 @@ export async function runConfigCLI(args: string[], io: ConfigCliIO = {}): Promis
           const cfg = loadConfig()
           cfg.mcp.servers[id] = { command, args: cmdArgs.length > 0 ? cmdArgs : undefined }
           saveConfig(cfg)
-          cliOut(io, `MCP server "${id}" added (stdio: ${command} ${cmdArgs.join(' ')}). Restart Rivet to connect.`)
+          cliOut(io, formatSuccess(`MCP server "${id}" added (stdio: ${command} ${cmdArgs.join(' ')}). Restart Rivet to connect.`, fmtOpts))
         } else if (subcmd === 'add-sse') {
           const id = args[2]
           const url = args[3]
@@ -1399,7 +1434,7 @@ export async function runConfigCLI(args: string[], io: ConfigCliIO = {}): Promis
           const cfg = loadConfig()
           cfg.mcp.servers[id] = { url }
           saveConfig(cfg)
-          cliOut(io, `MCP server "${id}" added (sse: ${url}). Restart Rivet to connect.`)
+          cliOut(io, formatSuccess(`MCP server "${id}" added (sse: ${url}). Restart Rivet to connect.`, fmtOpts))
         } else if (subcmd === 'remove') {
           const id = args[2]
           if (!id) {
@@ -1415,7 +1450,7 @@ export async function runConfigCLI(args: string[], io: ConfigCliIO = {}): Promis
           }
           delete cfg.mcp.servers[id]
           saveConfig(cfg)
-          cliOut(io, `MCP server "${id}" removed. Restart Rivet to apply.`)
+          cliOut(io, formatSuccess(`MCP server "${id}" removed. Restart Rivet to apply.`, fmtOpts))
         } else if (subcmd === 'enable' || subcmd === 'disable') {
           const id = args[2]
           if (!id) {
@@ -1432,7 +1467,7 @@ export async function runConfigCLI(args: string[], io: ConfigCliIO = {}): Promis
           }
           server.disabled = subcmd === 'disable' ? true : undefined
           saveConfig(cfg)
-          cliOut(io, `MCP server "${id}" ${subcmd}d. Restart Rivet to apply.`)
+          cliOut(io, formatSuccess(`MCP server "${id}" ${subcmd}d. Restart Rivet to apply.`, fmtOpts))
         } else {
           cliOut(io, `MCP server management:
 
@@ -1459,7 +1494,7 @@ Examples:
         printConfigHelp(io)
     }
   } catch (err) {
-    cliErr(io, `Error: ${(err as Error).message}`)
+    cliErr(io, formatError(`Error: ${(err as Error).message}`, fmtOpts))
     cliExit(io, 1)
   }
 }
