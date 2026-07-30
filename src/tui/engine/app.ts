@@ -2146,7 +2146,13 @@ export class TuiApp {
       }
       // input step
       if (key.name === 'return') { this.advanceConnect(this.connectFlow.submitInput(this.connectInput)); return true }
-      if (key.name === 'backspace') { this.connectInput = this.connectInput.slice(0, -1); this.connectError = undefined; this.overlay.rerender(); return true }
+      // Backspace has two encodings: \x7f → 'backspace', \x08 → 'ctrl_h'.
+      // Matching both (mirroring InputLine.handleKey) keeps delete working on
+      // terminals/SSH sessions whose backspace emits BS (\x08) — otherwise the
+      // key is swallowed by the trailing `return true` and the user can type
+      // but not erase.
+      if (key.name === 'backspace' || key.name === 'ctrl_h') { this.connectInput = this.connectInput.slice(0, -1); this.connectError = undefined; this.overlay.rerender(); return true }
+      if (key.ctrl && c === 'u') { this.connectInput = ''; this.connectError = undefined; this.overlay.rerender(); return true }
       if (this.isPrintableKey(key)) { this.connectInput += key.char; this.connectError = undefined; this.overlay.rerender(); return true }
       return true
     }
@@ -2171,7 +2177,9 @@ export class TuiApp {
       if (key.name === 'up') { flow.moveUp(); this.overlay.rerender(); return true }
       if (key.name === 'down') { flow.moveDown(); this.overlay.rerender(); return true }
       if (editing) {
-        if (key.name === 'backspace') { flow.backspace(); this.overlay.rerender(); return true }
+        // backspace (\x7f) and ctrl_h (\x08) are the same delete on different
+        // terminal backspace encodings — handle both, like InputLine.
+        if (key.name === 'backspace' || key.name === 'ctrl_h') { flow.backspace(); this.overlay.rerender(); return true }
         if (key.ctrl && c === 'u') { flow.clearBuffer(); this.overlay.rerender(); return true }
         if (this.isPrintableKey(key)) { flow.typeChar(key.char); this.overlay.rerender(); return true }
         return true
@@ -2816,7 +2824,7 @@ export class TuiApp {
           this.deactivateOverlay()
           return true
         }
-        if (key.name === 'backspace') {
+        if (key.name === 'backspace' || key.name === 'ctrl_h') {
           this.choicePanelInputBuffer = this.choicePanelInputBuffer.slice(0, -1)
           this.overlay.rerender()
           return true

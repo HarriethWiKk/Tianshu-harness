@@ -178,6 +178,10 @@ export const DEFAULT_CONFIG: Config = {
         browser: false,
       },
     },
+    greeting: {
+      enabled: true,
+      model: 'deepseek-v4-flash',
+    },
     delivery: {
       autoCommit: true,
     },

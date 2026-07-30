@@ -7,7 +7,10 @@ interface GitResult {
 }
 
 function git(cwd: string, args: string[]): GitResult {
-  const result = spawnGitSync(args, {
+  // `-c core.quotePath=false` emits non-ASCII file paths verbatim instead of
+  // octal-escaping them, so worker diff headers stay readable. (spawnGitSync
+  // already decodes stdout as UTF-8; this only guards the path escaping.)
+  const result = spawnGitSync(['-c', 'core.quotePath=false', ...args], {
     cwd,
     encoding: 'utf-8',
     stdio: ['ignore', 'pipe', 'pipe'],

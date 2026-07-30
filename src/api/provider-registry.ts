@@ -137,6 +137,7 @@ export const PROVIDER_REGISTRY: Record<string, ProviderEntry> = {
     '认证使用 CC_SWITCH_PROXY_API_KEY 环境变量',
     '模型名透传——可用模型取决于 cc-switch 侧配置',
     '⚠️ 预设模型列表为种子，使用前确认模型名与 cc-switch 侧一致，否则会 4xx',
+    '支持 reasoning_effort（OpenAI 格式），Rectifier 层翻译为上游原生推理格式',
   ]),
 }
 

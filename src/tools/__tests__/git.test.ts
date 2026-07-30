@@ -323,6 +323,28 @@ describe('getWorkingTreeFiles / getFileDiff (desktop changes tab)', () => {
     await assert.rejects(() => getFileAtBase(TMP2, '../outside.txt'), /无效文件路径/)
   })
 
+  // Regression (Windows mojibake, 2026-07-29): the desktop "Changes" tab diffs
+  // a UTF-8 file with CJK comments. git output bytes mirror the source (modern
+  // git defaults to UTF-8), so the Chinese must survive verbatim — NOT be
+  // misjudged as GBK and turned to gibberish by a chunk-boundary GBK probe.
+  it('keeps UTF-8 CJK comments intact in getFileDiff (no GBK mojibake)', async () => {
+    writeFileSync(join(TMP2, 'strategy.js'), '// 依赖 get_stock_list 获取股票列表\nconst limit_up = 1\n')
+    const diff = await getFileDiff(TMP2, 'strategy.js')
+    assert.ok(
+      diff.includes('// 依赖 get_stock_list 获取股票列表'),
+      `CJK comment mojibake'd in getFileDiff:\n${diff}`,
+    )
+  })
+
+  // core.quotePath=false must keep non-ASCII paths verbatim so the desktop
+  // diff parser can anchor line comments on the right file.
+  it('keeps non-ASCII file paths unescaped in getFileDiff headers', async () => {
+    mkdirSync(join(TMP2, '策略'), { recursive: true })
+    writeFileSync(join(TMP2, '策略', '涨停.js'), 'export const up = 1\n')
+    const diff = await getFileDiff(TMP2, '策略/涨停.js')
+    assert.ok(diff.includes('策略/涨停.js'), `non-ASCII path escaped:\n${diff}`)
+  })
+
   it('falls back to HEAD for a malicious or malformed base ref', async () => {
     writeFileSync(join(TMP2, 'base.txt'), 'base changed\n')
     const diff = await getFileDiff(TMP2, 'base.txt', '--output=/tmp/evil')

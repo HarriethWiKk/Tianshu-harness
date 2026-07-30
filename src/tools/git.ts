@@ -5,7 +5,6 @@ import type { Tool, ToolCallParams } from './types.js'
 import { auditCommitTagScope } from './commit-audit.js'
 import { createWorkspaceGuard } from '../agent/workspace-guard.js'
 import { killProcessTree } from './process-kill.js'
-import { WinStreamDecoder } from '../platform.js'
 
 const ACTIONS = ['status', 'diff_summary', 'commit', 'log', 'log_graph', 'stash', 'stash_pop'] as const
 type GitAction = (typeof ACTIONS)[number]
@@ -23,7 +22,13 @@ const FORCE_KILL_DELAY = 3_000
  */
 async function runGit(args: string[], cwd: string, abortSignal?: AbortSignal): Promise<string> {
   return new Promise((resolve, reject) => {
-    const child = spawnGit(args, {
+    // Prefix every git invocation with `-c core.quotePath=false` so non-ASCII
+    // file paths in diff/status/log output are emitted verbatim instead of
+    // octal-escaped. UTF-8 (rather than WinStreamDecoder's GBK auto-detection)
+    // is forced below because git output bytes always mirror the source file
+    // (modern git defaults to UTF-8) — a GBK probe only risks misjudging the
+    // whole stream when a chunk boundary splits a multibyte character.
+    const child = spawnGit(['-c', 'core.quotePath=false', ...args], {
       cwd,
       stdio: ['ignore', 'pipe', 'pipe'],
       // detached: true breaks stdio pipes on Windows — see bash.ts fix for details.
@@ -64,17 +69,23 @@ async function runGit(args: string[], cwd: string, abortSignal?: AbortSignal): P
       abortSignal.addEventListener('abort', onAbort, { once: true })
     }
 
-    const stdoutDecoder = new WinStreamDecoder()
-    const stderrDecoder = new WinStreamDecoder()
+    // git output is always UTF-8 (mirrors the source file; modern git defaults
+    // to UTF-8). Decode it directly instead of WinStreamDecoder's GBK probe,
+    // which misjudges the whole stream when the first chunk splits a multibyte
+    // CJK character and turns diff bodies to mojibake on Windows. { stream: true }
+    // holds an incomplete trailing sequence across chunks, so a split
+    // multibyte boundary is never lost.
+    const stdoutDecoder = new TextDecoder('utf-8')
+    const stderrDecoder = new TextDecoder('utf-8')
 
-    child.stdout!.on('data', (data: Buffer) => { stdout += stdoutDecoder.write(data) })
-    child.stderr!.on('data', (data: Buffer) => { stderr += stderrDecoder.write(data) })
+    child.stdout!.on('data', (data: Buffer) => { stdout += stdoutDecoder.decode(data, { stream: true }) })
+    child.stderr!.on('data', (data: Buffer) => { stderr += stderrDecoder.decode(data, { stream: true }) })
 
     child.on('close', (code) => {
       if (settled) return
       if (abortSignal) abortSignal.removeEventListener('abort', onAbort)
-      stdout += stdoutDecoder.end()
-      stderr += stderrDecoder.end()
+      stdout += stdoutDecoder.decode()
+      stderr += stderrDecoder.decode()
       if (code !== 0) {
         const err = new Error((stderr || '').trim() || `git 以状态码 ${code} 退出`)
         const gitErr = err as GitExitError

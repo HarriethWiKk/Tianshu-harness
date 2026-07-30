@@ -18,6 +18,7 @@ import { buildSessionRoutes } from './session-routes.js'
 import { buildMissionRoutes } from './mission-routes.js'
 import { MissionStore } from './mission-store.js'
 import { buildHealthRoute } from './health-route.js'
+import { buildGreetingRoute } from './greeting-route.js'
 import { LoopHealthMonitor } from './loop-health.js'
 import { buildScheduleRoutes } from './schedule-routes.js'
 import { buildTaskRoutes } from './task-routes.js'
@@ -33,7 +34,7 @@ import { CronLock } from './cron-lock.js'
 import { TaskRegistry } from './task-registry.js'
 import { JsonTaskStore } from './task-store.js'
 import { SessionRuntimePool } from './session-runtime-pool.js'
-import { loadConfig } from '../config/manager.js'
+import { loadConfig, getGreetingConfig } from '../config/manager.js'
 import { isProFeatureEnabled } from '../config/pro-license.js'
 import { setTargetConventions, applyConfiguredGitBashPath } from '../platform.js'
 import { resolveApiKey } from '../api/factory.js'
@@ -663,6 +664,17 @@ export async function runServe(opts: RunServeOptions = {}): Promise<RunningServe
     () => resolveServeContext().configured,
     () => loopHealth.snapshot(),
     ),
+  )
+
+  // Greeting route: algorithm templates + flash LLM for the desktop welcome page.
+  // Prefers the deepseek provider for flash model support; degrades to default provider + templates.
+  // Reads greeting config (enabled/model) from user settings at request time.
+  const deepseekProvider = ctx.config.provider.providers.deepseek
+  const greetingBaseUrl = deepseekProvider?.baseUrl ?? ctx.provider.baseUrl
+  const greetingApiKey = deepseekProvider?.apiKey ?? ctx.apiKey
+  Object.assign(
+    routes,
+    buildGreetingRoute(greetingBaseUrl, greetingApiKey, () => getGreetingConfig()),
   )
 
   // N3: async orchestration — cron scheduler → task registry → runtime pool that

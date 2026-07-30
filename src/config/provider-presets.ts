@@ -360,7 +360,8 @@ export const PROVIDER_PRESETS: Record<ProviderPresetKey, ProviderPreset> = {
         prefixCache: 'none',
         prefixCompletion: false,
       },
-      thinking: 'disabled',
+      // cc-switch 入口层透传 reasoning_effort，Rectifier 翻译为上游原生格式
+      thinking: 'enabled',
       maxTokens: 128000,
       models: [
         {
@@ -376,7 +377,7 @@ export const PROVIDER_PRESETS: Record<ProviderPresetKey, ProviderPreset> = {
           alias: 'cc-sonnet',
           contextWindow: 1_000_000,
           maxTokens: 128000,
-          reasoningEffort: 'max',
+          reasoningEffort: 'high',
           tier: 'strong',
         },
         {
@@ -409,7 +410,7 @@ export const PROVIDER_PRESETS: Record<ProviderPresetKey, ProviderPreset> = {
           alias: 'cc-gpt55',
           contextWindow: 200_000,
           maxTokens: 128_000,
-          reasoningEffort: 'max',
+          reasoningEffort: 'high',
           tier: 'strong',
         },
       ],

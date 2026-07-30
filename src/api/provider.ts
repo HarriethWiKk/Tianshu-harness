@@ -189,10 +189,11 @@ export const WELL_KNOWN_DEFAULTS: Record<string, ProviderCapabilities> = {
     mapUsage: mapDeepSeekUsage,
   },
   ccswitch: {
-    // cc-switch 是 OpenAI 兼容代理，透传 reasoning_effort 参数。
-    // 后端模型不认识时按 OpenAI 兼容约定静默忽略（降级）。
-    supportsThinking: false,
-    thinkingFormat: 'none',
+    // cc-switch 是 OpenAI 兼容代理，入口层透传 reasoning_effort；
+    // 其 Rectifier 翻译层会将 OpenAI 格式转为 Claude/DeepSeek 等上游原生格式。
+    // 后端模型不认识 reasoning_effort 时按 OpenAI 兼容约定静默忽略（降级）。
+    supportsThinking: true,
+    thinkingFormat: 'openai',
     supportsCacheControl: false,
     stripParams: ['top_k', 'metadata', 'service_tier', 'cache_control'],
     hasToolJsonInContentBug: false,

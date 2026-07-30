@@ -333,6 +333,13 @@ export const agentSchema = z.object({
     /** Max output tokens for the generated description. */
     maxTokens: z.number().int().positive().default(1024),
   }).optional(),
+  /** Greeting LLM: welcome page dynamic greeting feature toggle + model selection. */
+  greeting: z.object({
+    /** When false, all greeting LLM calls are skipped (algorithm templates only). */
+    enabled: z.boolean(),
+    /** Model ID for greeting generation (e.g. deepseek-v4-flash). */
+    model: z.string(),
+  }).optional(),
   /** Goal autonomy (/goal & --goal) completion judge. */
   goal: z.object({
     judge: z.object({

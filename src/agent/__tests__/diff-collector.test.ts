@@ -95,4 +95,23 @@ describe('diff-collector', () => {
     assert.equal(artifact.title, 'Patch (empty)')
     assert.equal(artifact.content, '(empty diff)')
   })
+
+  // Regression: CJK comments in the diff body must survive as UTF-8, not be
+  // mojibake'd by a chunk-boundary GBK misjudgement. git output bytes mirror
+  // the source file (modern git defaults to UTF-8), so the diff should carry
+  // the original Chinese characters verbatim.
+  it('keeps UTF-8 CJK comments intact in the diff body', () => {
+    writeFileSync(join(repoDir, 'src', '中文注释.js'), '// 依赖 get_stock_list 获取股票列表\nconst x = 1\n')
+    const diff = collectDiff(repoDir, repoDir, 'main')
+    assert.ok(diff.includes('// 依赖 get_stock_list 获取股票列表'), `CJK comment mojibake'd:\n${diff}`)
+  })
+
+  // Regression: non-ASCII file paths must appear verbatim (core.quotePath=false),
+  // not octal-escaped, so the desktop diff parser can anchor line comments.
+  it('keeps non-ASCII file paths unescaped in diff headers', () => {
+    mkdirSync(join(repoDir, '策略'), { recursive: true })
+    writeFileSync(join(repoDir, '策略', '涨停.js'), 'export const up = 1\n')
+    const diff = collectDiff(repoDir, repoDir, 'main')
+    assert.ok(diff.includes('策略/涨停.js'), `non-ASCII path escaped:\n${diff}`)
+  })
 })

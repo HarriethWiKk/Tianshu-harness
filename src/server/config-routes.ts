@@ -50,6 +50,8 @@ import {
   setPermissionDirs,
   getVisionModelConfig,
   setVisionModelConfig,
+  getGreetingConfig,
+  setGreetingConfig,
   getDefaultDomainConfig,
   setDefaultDomainConfig,
   getFetchConfig,
@@ -583,6 +585,21 @@ export function buildConfigRoutes(apiToken?: string): Record<string, RouteHandle
       const { config } = (body ?? {}) as { config?: unknown }
       try {
         const saved = setVisionModelConfig(config as Record<string, unknown> | null)
+        return { status: 200, body: { ok: true, config: saved } }
+      } catch (err) {
+        return { status: 400, body: { error: (err as Error).message } }
+      }
+    }, apiToken),
+
+    // Greeting LLM: welcome page dynamic greeting toggle + model selection.
+    'GET /config/greeting': withAuth(() => {
+      return { status: 200, body: { config: getGreetingConfig() } }
+    }, apiToken),
+
+    'PUT /config/greeting': withAuth((body) => {
+      const { config } = (body ?? {}) as { config?: unknown }
+      try {
+        const saved = setGreetingConfig(config as Record<string, unknown> | null)
         return { status: 200, body: { ok: true, config: saved } }
       } catch (err) {
         return { status: 400, body: { error: (err as Error).message } }
