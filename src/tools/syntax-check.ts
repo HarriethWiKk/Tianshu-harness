@@ -370,7 +370,9 @@ export async function checkSyntax(filePath: string, content: string): Promise<Sy
   // ── Python: AST parse via system python3 ──
   if (ext === '.py') {
     if (content.length > EXTERNAL_PARSE_SIZE_LIMIT) return OK
-    const result = await checkPythonSyntax(content)
+    // 净化孤立 surrogate 后再送子进程:让含 surrogate 的文件仍能拿到真实 AST
+    // 反馈,而非因跨进程编码失败直接 degrade。净化只作用于校验副本,不改写盘。
+    const result = await checkPythonSyntax(replaceLoneSurrogates(content))
     if (result.error) {
       const message = `⚠️ Python syntax error:\n${result.error}\n\nThe file was written but will fail to import/execute.`
       return { warning: message, fatal: message }
@@ -468,6 +470,57 @@ interface PythonSyntaxResult {
   error?: string
 }
 
+/**
+ * 判定 Python 子进程的 stderr 是否为「校验器基础设施失败」而非用户代码语法错误。
+ *
+ * 背景（其他用户 07-30 反馈）:Windows 中文环境写 .py 文件时,内容含孤立
+ * surrogate（如 \udc80,GBK→UTF-8 转换残留）会让 python 在读 stdin / compile
+ * 阶段抛 UnicodeEncodeError/UnicodeDecodeError——这是跨进程编码问题,不是用户
+ * 代码的 SyntaxError。此前 close handler 对所有非零退出一律判 fatal,导致这类
+ * IO 失败伪装成语法错误 → 触发回滚 + "请修复内容后重试"（用户根本无从修）。
+ *
+ * 与模块既有契约一致:missing-interpreter / spawn-error / timeout 都豁免为
+ * degrade,编码失败同属基础设施失败,理应一并豁免。真正的 SyntaxError /
+ * IndentationError / TabError 不含这些编码标记,仍正常判 fatal（不削弱检测）。
+ *
+ * 导出供单测:真实子进程难以稳定复现 surrogate 崩溃（Node 写 stdin 会把孤立
+ * surrogate 转 U+FFFD），把分类决策抽成纯函数才能可靠测试。
+ */
+export function isPythonInfraFailure(stderr: string): boolean {
+  return /UnicodeEncodeError|UnicodeDecodeError|codec can't (?:en|de)code|surrogates not allowed/i.test(stderr)
+}
+
+/**
+ * 把孤立 surrogate（未配对的 high/low）替换为 U+FFFD,合法 surrogate pair（如
+ * emoji、CJK 扩展区）原样保留。用于 Python 校验前净化传给子进程的内容副本,
+ * 使含孤立 surrogate 的文件仍能拿到真实 AST 反馈,而不是直接 degrade。
+ *
+ * 只作用于校验器副本——不改写盘内容（盘上是模型/用户的真实产物,层1 已保证
+ * 不因编码问题被误判 fatal）。逻辑与 utils/sanitize.ts 的 surrogate 处理一致,
+ * 但刻意不复用 sanitizeForJsonTransport（它还替换 C0/C1 控制符 + NFC 归一,
+ * 会改变实际内容,不适合「等价净化后送校验」——净化越窄,AST 反馈越忠于原文）。
+ */
+export function replaceLoneSurrogates(input: string): string {
+  let out = ''
+  for (let i = 0; i < input.length; i++) {
+    const cp = input.charCodeAt(i)
+    if (cp >= 0xD800 && cp <= 0xDBFF) {
+      const next = input.charCodeAt(i + 1)
+      if (next >= 0xDC00 && next <= 0xDFFF) {
+        out += input[i]! + input[i + 1]! // 合法 pair,两个都留
+        i++
+      } else {
+        out += '�' // 孤立 high surrogate
+      }
+    } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
+      out += '�' // 孤立 low surrogate
+    } else {
+      out += input[i]!
+    }
+  }
+  return out
+}
+
 /** Parse Python source via system python3 -c "import ast; ast.parse(...)".
  *  Returns {ok:true} on clean parse OR on any infrastructure failure (missing
  *  interpreter, spawn error, timeout kill) — those must NEVER masquerade as a
@@ -514,6 +567,11 @@ function checkPythonSyntax(content: string): Promise<PythonSyntaxResult> {
       child.on('close', (code) => {
         clearTimeout(timer)
         if (code === 0 || code === null) {
+          resolve({ ok: true })
+        } else if (isPythonInfraFailure(stderr)) {
+          // 编码类失败（UnicodeEncode/DecodeError）是校验器跨进程 IO 问题,
+          // 不是用户代码语法错误——degrade 为 OK,绝不触发回滚（与 timeout/
+          // missing-interpreter 豁免同语义）。真语法错误不含这些标记,走 else。
           resolve({ ok: true })
         } else {
           resolve({ ok: false, error: stderr.trim() || stdout.trim() || `${candidate.command} exited with code ${code}` })
