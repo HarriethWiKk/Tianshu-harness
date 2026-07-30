@@ -227,10 +227,11 @@ describe('write_file tool — blind-overwrite guard', () => {
     markObserved(file)
     const result = await WRITE_FILE_TOOL.execute(makeParams({
       file_path: file,
-      content: 'def foo():\n    return 1\n  bad_indent\n',
+      // 未闭合括号:tree-sitter 检出（缩进错误则被 tree-sitter 宽松放过,见 syntax-check 测试）
+      content: 'def foo():\n    return (1\n',
     }))
     assert.equal(result.isError, true)
-    assert.ok(result.content.includes('Python syntax error'), `Expected syntax error, got: ${result.content}`)
+    assert.ok(result.content.includes('Python 语法错误'), `Expected syntax error, got: ${result.content}`)
     assert.ok(result.content.includes('已自动回滚'), `Expected rollback note, got: ${result.content}`)
     assert.equal(readFileSync(file, 'utf-8'), original, 'File should be rolled back to original content')
   })

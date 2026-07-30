@@ -430,10 +430,11 @@ describe('edit_file tool', () => {
     const result = await EDIT_FILE_TOOL.execute(makeParams({
       file_path: filePath,
       old_string: '    return 1',
-      new_string: '    return 1\n  bad_indent',
+      // 未闭合括号:tree-sitter 检出（缩进错误被 tree-sitter 宽松放过）
+      new_string: '    return (1',
     }))
     assert.equal(result.isError, true)
-    assert.ok(result.content.includes('Python syntax error'), `Expected syntax error, got: ${result.content}`)
+    assert.ok(result.content.includes('Python 语法错误'), `Expected syntax error, got: ${result.content}`)
     assert.ok(result.content.includes('已自动回滚'), `Expected rollback note, got: ${result.content}`)
     assert.equal(readFileSync(filePath, 'utf-8'), original, 'File should be rolled back to original content')
   })

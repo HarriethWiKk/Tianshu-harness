@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { syntaxCheck, checkSyntax, isPythonInfraFailure, replaceLoneSurrogates, _resetEsbuildCacheForTest, _resetTsCacheForTest } from '../syntax-check.js'
+import { syntaxCheck, checkSyntax, _resetEsbuildCacheForTest, _resetTsCacheForTest, _resetPythonParserForTest } from '../syntax-check.js'
 
 describe('syntaxCheck', async () => {
   describe('CSS', async () => {
@@ -177,73 +177,54 @@ describe('syntaxCheck', async () => {
       assert.equal(await syntaxCheck('/a/script.py', 'def foo():\n    return 1\n'), null)
     })
 
-    it('flags Python indentation error', async () => {
-      const r = await syntaxCheck('/a/script.py', 'def foo():\n    return 1\n  bad\n')
-      assert.ok(r, 'should detect indentation error')
-      assert.match(r!, /IndentationError|syntax error/i)
-    })
+    // 注:CPython ast.parse 报 IndentationError 的用例在 tree-sitter 下宽松放过,
+    // 见下方 Python surrogate/差异 块的"缩进错误"用例。此处不再断言检出缩进错误。
 
     it('flags invalid Python syntax', async () => {
       const r = await syntaxCheck('/a/script.py', 'def foo(\n')
       assert.ok(r, 'should detect invalid syntax')
-      assert.match(r!, /SyntaxError|syntax error/i)
+      assert.match(r!, /语法错误|syntax error/i)
     })
 
-    it('does not produce a false fatal under an aggressive timeout (degrade to OK)', async () => {
-      // A 1ms budget almost always trips the hung-interpreter guard before
-      // python3 finishes. The guard must degrade to OK (null), never surface a
+    it('does not produce a false fatal under an aggressive parse timeout (degrade to OK)', async () => {
+      // A 1ms budget can trip the tree-sitter load timeout before the wasm
+      // parser is ready. The guard must degrade to OK (null), never surface a
       // spurious syntax error that would roll back a perfectly valid file.
-      const prev = process.env.RIVET_PY_SYNTAX_TIMEOUT
-      process.env.RIVET_PY_SYNTAX_TIMEOUT = '1'
+      const prev = process.env.RIVET_TS_PARSE_TIMEOUT
+      process.env.RIVET_TS_PARSE_TIMEOUT = '1'
+      // 清缓存,强制这次走 load 路径(否则命中已缓存的 parser,测不到超时 degrade)。
+      _resetPythonParserForTest()
       try {
         const r = await syntaxCheck('/a/script.py', 'def foo():\n    return 1\n')
         assert.equal(r, null)
       } finally {
-        if (prev === undefined) delete process.env.RIVET_PY_SYNTAX_TIMEOUT
-        else process.env.RIVET_PY_SYNTAX_TIMEOUT = prev
+        if (prev === undefined) delete process.env.RIVET_TS_PARSE_TIMEOUT
+        else process.env.RIVET_TS_PARSE_TIMEOUT = prev
+        _resetPythonParserForTest() // 复位,避免污染后续用例(1ms 超时缓存)
       }
     })
 
-    it('净化孤立 surrogate 后,含 surrogate 的合法 py 不误判 fatal', async () => {
-      // 用户 07-30 反馈:Windows 中文环境写含 \udc80 的 py 被误判语法错误 + 回滚。
-      // 净化后内容应能正常过 AST 校验（或 degrade），绝不返回 fatal。
+    it('含孤立 surrogate 的合法 py 不误判 fatal（tree-sitter 进程内无编码问题）', async () => {
+      // 用户 07-30 反馈:Windows 中文环境写含 \udc80 的 py 曾被误判语法错误 + 回滚。
+      // 进程内 tree-sitter 把 surrogate 当普通字符,天然不会崩,绝不返回 fatal。
       const content = 'x = "ab\uDC80cd"\nprint(x)\n'
       const r = await checkSyntax('/a/script.py', content)
       assert.equal(r.fatal, null, `含孤立 surrogate 的合法 py 不该判 fatal,got: ${r.fatal}`)
     })
-  })
 
-  describe('isPythonInfraFailure — 编码失败 vs 真语法错误分类', () => {
-    it('UnicodeEncodeError 判为 infra failure', () => {
-      assert.equal(isPythonInfraFailure("UnicodeEncodeError: 'utf-8' codec can't encode character '\\udc80'"), true)
+    it('tree-sitter 语法错误带行号', async () => {
+      // 第 2 行括号未闭合 → 错误信息应含行号
+      const r = await checkSyntax('/a/script.py', 'x = 1\ny = (1 + 2\n')
+      assert.ok(r.fatal !== null, 'unbalanced paren should be fatal')
+      assert.match(r.fatal!, /第 \d+ 行/, `错误信息应带行号,got: ${r.fatal}`)
     })
-    it('UnicodeDecodeError 判为 infra failure', () => {
-      assert.equal(isPythonInfraFailure("UnicodeDecodeError: 'utf-8' codec can't decode byte 0x80"), true)
-    })
-    it('surrogates not allowed 判为 infra failure', () => {
-      assert.equal(isPythonInfraFailure('ValueError: surrogates not allowed'), true)
-    })
-    it('真 SyntaxError 不判为 infra failure（不削弱检测）', () => {
-      assert.equal(isPythonInfraFailure('SyntaxError: invalid syntax'), false)
-    })
-    it('IndentationError 不判为 infra failure', () => {
-      assert.equal(isPythonInfraFailure('IndentationError: unexpected indent'), false)
-    })
-  })
 
-  describe('replaceLoneSurrogates', () => {
-    it('孤立 low surrogate → U+FFFD', () => {
-      assert.equal(replaceLoneSurrogates('ab\uDC80cd'), 'ab�cd')
-    })
-    it('孤立 high surrogate → U+FFFD', () => {
-      assert.equal(replaceLoneSurrogates('ab\uD800cd'), 'ab�cd')
-    })
-    it('合法 surrogate pair（emoji）原样保留', () => {
-      const emoji = '😀' // U+1F600 = D83D DE00
-      assert.equal(replaceLoneSurrogates(`x${emoji}y`), `x${emoji}y`)
-    })
-    it('无 surrogate 的普通字符串原样返回', () => {
-      assert.equal(replaceLoneSurrogates('def foo():\n    return 1\n'), 'def foo():\n    return 1\n')
+    it('缩进错误 tree-sitter 比 CPython 宽松（记录判定差异,不强行对齐）', async () => {
+      // tree-sitter 是容错解析器:CPython ast.parse 报 IndentationError 的
+      // 'def foo():\\n    return 1\\n  bad\\n' 在 tree-sitter 里 hasError=false。
+      // 对"写完即时结构校验"可接受(漏报优于误报回滚);关键是不产生 false fatal。
+      const r = await checkSyntax('/a/script.py', 'def foo():\n    return 1\n  bad\n')
+      assert.equal(r.fatal, null, '缩进错误在 tree-sitter 下不判 fatal(已知宽松,不误报)')
     })
   })
 

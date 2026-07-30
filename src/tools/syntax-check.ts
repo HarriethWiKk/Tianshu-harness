@@ -2,6 +2,8 @@ import { extname } from 'path'
 import { createRequire } from 'node:module'
 import { spawn } from 'node:child_process'
 import { getResolvedEnv } from './resolved-env.js'
+// web-tree-sitter 0.24.x: default import doubles as a namespace (Parser.SyntaxNode).
+import type Parser from 'web-tree-sitter'
 
 // esbuild ships a native binary, so it can't be inlined into the tsup bundle.
 // Load it lazily via require so a packaged sidecar without esbuild on disk
@@ -75,13 +77,13 @@ function getEsbuildLoadTimeoutMs(): number {
   return Number.isFinite(v) && v > 0 ? v : 3000
 }
 
-/** Timeout for the python3 AST parse child process. A hung interpreter (blocked
- *  import, stuck stdin, slow environment) would otherwise leave the promise
- *  unresolved and stall the whole turn. Override with RIVET_PY_SYNTAX_TIMEOUT
- *  (ms); set to 0/negative to fall back to the 5s default. Read lazily so the
- *  env override is honoured (and testable) without a module reload. */
-function getPySyntaxTimeoutMs(): number {
-  const v = Number.parseInt(process.env.RIVET_PY_SYNTAX_TIMEOUT ?? '', 10)
+/** Timeout for the tree-sitter Python parse (load + parse). Parsing is in-process
+ *  and normally sub-millisecond, but the first wasm load can be slow on some
+ *  environments; a short cap keeps a stuck load from stalling the turn (degrades
+ *  to OK, never a false fatal). Override with RIVET_TS_PARSE_TIMEOUT (ms); set to
+ *  0/negative to fall back to the 5s default. */
+function getTsParseTimeoutMs(): number {
+  const v = Number.parseInt(process.env.RIVET_TS_PARSE_TIMEOUT ?? '', 10)
   return Number.isFinite(v) && v > 0 ? v : 5000
 }
 
@@ -367,14 +369,15 @@ export async function checkSyntax(filePath: string, content: string): Promise<Sy
     }
   }
 
-  // ── Python: AST parse via system python3 ──
+  // ── Python: in-process tree-sitter parse ──
+  // 进程内 WASM 解析（无子进程 → 无跨进程编码问题，surrogate 不再触发误报；
+  // 不依赖系统 python；~毫秒级）。tree-sitter 是容错解析器，对缩进错误/空 body
+  // 等边界比 CPython ast.parse 宽松（可能漏报），对"写完即时结构校验"足够。
   if (ext === '.py') {
     if (content.length > EXTERNAL_PARSE_SIZE_LIMIT) return OK
-    // 净化孤立 surrogate 后再送子进程:让含 surrogate 的文件仍能拿到真实 AST
-    // 反馈,而非因跨进程编码失败直接 degrade。净化只作用于校验副本,不改写盘。
-    const result = await checkPythonSyntax(replaceLoneSurrogates(content))
+    const result = await checkPythonSyntaxTreeSitter(content)
     if (result.error) {
-      const message = `⚠️ Python syntax error:\n${result.error}\n\nThe file was written but will fail to import/execute.`
+      const message = `⚠️ Python 语法错误${result.line ? `（第 ${result.line} 行）` : ''}：${result.error}\n\n文件已写入但存在语法问题，运行时将失败。`
       return { warning: message, fatal: message }
     }
     return OK
@@ -465,135 +468,86 @@ export async function checkSyntax(filePath: string, content: string): Promise<Sy
   return OK
 }
 
-interface PythonSyntaxResult {
-  ok: boolean
-  error?: string
+export interface PythonSyntaxResult {
+  /** null = clean parse OR infrastructure degrade (never a false fatal). */
+  error: string | null
+  /** 1-based line of the first ERROR/MISSING node, when available. */
+  line?: number
+}
+
+// ── tree-sitter Python parser (lazy, in-process WASM) ──
+//
+// Replaces the former `spawn python3 -c "ast.parse(stdin)"` path. That path
+// had three structural weaknesses this eliminates: (1) cross-process encoding —
+// lone surrogates (\udc80, GBK→UTF-8 residue on Windows) crashed the child with
+// UnicodeEncodeError and were misreported as a syntax error → rollback; (2) a
+// hard dependency on a system python interpreter; (3) per-check process fork
+// cost. web-tree-sitter is pure WASM (already used by meridian-parser and listed
+// in tsup externals), so it degrades consistently across platforms.
+//
+// Reuses meridian-parser's proven load pattern (TreeSitter.init + Language.load
+// via require.resolve) but keeps its own cache to avoid coupling to the indexer
+// (parseFile returns heavyweight symbol/edge results + a 250-parse reset).
+
+let _tsPyPromise: Promise<Parser | null> | undefined
+
+async function loadPythonParser(): Promise<Parser | null> {
+  try {
+    const TreeSitter = (await import('web-tree-sitter')).default
+    await TreeSitter.init()
+    const parser = new TreeSitter()
+    const req = createRequire(import.meta.url)
+    const wasmPath = req.resolve('tree-sitter-wasms/out/tree-sitter-python.wasm')
+    const language = await TreeSitter.Language.load(wasmPath)
+    parser.setLanguage(language)
+    return parser
+  } catch {
+    return null // load failure → degrade (never a false fatal)
+  }
+}
+
+async function getPythonParser(): Promise<Parser | null> {
+  if (_tsPyPromise) return _tsPyPromise
+  _tsPyPromise = withTimeout(loadPythonParser(), 'tree-sitter python load', getTsParseTimeoutMs())
+    .catch(() => null)
+  return _tsPyPromise
+}
+
+/** Test-only: clear the tree-sitter python parser cache. */
+export function _resetPythonParserForTest(): void {
+  _tsPyPromise = undefined
+}
+
+/** Depth-first search for the first ERROR or MISSING node (the syntax error
+ *  location). Returns its 1-based line, or undefined if none found. */
+function firstErrorLine(node: Parser.SyntaxNode): number | undefined {
+  if (node.type === 'ERROR' || node.isMissing) return node.startPosition.row + 1
+  for (let i = 0; i < node.childCount; i++) {
+    const child = node.child(i)
+    if (!child) continue
+    const line = firstErrorLine(child)
+    if (line !== undefined) return line
+  }
+  return undefined
 }
 
 /**
- * 判定 Python 子进程的 stderr 是否为「校验器基础设施失败」而非用户代码语法错误。
- *
- * 背景（其他用户 07-30 反馈）:Windows 中文环境写 .py 文件时,内容含孤立
- * surrogate（如 \udc80,GBK→UTF-8 转换残留）会让 python 在读 stdin / compile
- * 阶段抛 UnicodeEncodeError/UnicodeDecodeError——这是跨进程编码问题,不是用户
- * 代码的 SyntaxError。此前 close handler 对所有非零退出一律判 fatal,导致这类
- * IO 失败伪装成语法错误 → 触发回滚 + "请修复内容后重试"（用户根本无从修）。
- *
- * 与模块既有契约一致:missing-interpreter / spawn-error / timeout 都豁免为
- * degrade,编码失败同属基础设施失败,理应一并豁免。真正的 SyntaxError /
- * IndentationError / TabError 不含这些编码标记,仍正常判 fatal（不削弱检测）。
- *
- * 导出供单测:真实子进程难以稳定复现 surrogate 崩溃（Node 写 stdin 会把孤立
- * surrogate 转 U+FFFD），把分类决策抽成纯函数才能可靠测试。
+ * Check Python syntax in-process via tree-sitter. Returns {error:null} on a
+ * clean parse OR on any infrastructure failure (parser load failed, parse threw)
+ * — those must NEVER masquerade as a fatal syntax error, since the caller rolls
+ * back the write on a non-null error. Only a genuine parse tree with error nodes
+ * is reported as an error.
  */
-export function isPythonInfraFailure(stderr: string): boolean {
-  return /UnicodeEncodeError|UnicodeDecodeError|codec can't (?:en|de)code|surrogates not allowed/i.test(stderr)
-}
-
-/**
- * 把孤立 surrogate（未配对的 high/low）替换为 U+FFFD,合法 surrogate pair（如
- * emoji、CJK 扩展区）原样保留。用于 Python 校验前净化传给子进程的内容副本,
- * 使含孤立 surrogate 的文件仍能拿到真实 AST 反馈,而不是直接 degrade。
- *
- * 只作用于校验器副本——不改写盘内容（盘上是模型/用户的真实产物,层1 已保证
- * 不因编码问题被误判 fatal）。逻辑与 utils/sanitize.ts 的 surrogate 处理一致,
- * 但刻意不复用 sanitizeForJsonTransport（它还替换 C0/C1 控制符 + NFC 归一,
- * 会改变实际内容,不适合「等价净化后送校验」——净化越窄,AST 反馈越忠于原文）。
- */
-export function replaceLoneSurrogates(input: string): string {
-  let out = ''
-  for (let i = 0; i < input.length; i++) {
-    const cp = input.charCodeAt(i)
-    if (cp >= 0xD800 && cp <= 0xDBFF) {
-      const next = input.charCodeAt(i + 1)
-      if (next >= 0xDC00 && next <= 0xDFFF) {
-        out += input[i]! + input[i + 1]! // 合法 pair,两个都留
-        i++
-      } else {
-        out += '�' // 孤立 high surrogate
-      }
-    } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
-      out += '�' // 孤立 low surrogate
-    } else {
-      out += input[i]!
-    }
+export async function checkPythonSyntaxTreeSitter(content: string): Promise<PythonSyntaxResult> {
+  const parser = await getPythonParser()
+  if (!parser) return { error: null } // degrade
+  try {
+    const tree = parser.parse(content)
+    if (!tree.rootNode.hasError) return { error: null }
+    const line = firstErrorLine(tree.rootNode)
+    return { error: '存在无法解析的语法结构（括号/引号未闭合、意外符号等）。', line }
+  } catch {
+    return { error: null } // parse threw → degrade
   }
-  return out
 }
 
-/** Parse Python source via system python3 -c "import ast; ast.parse(...)".
- *  Returns {ok:true} on clean parse OR on any infrastructure failure (missing
- *  interpreter, spawn error, timeout kill) — those must NEVER masquerade as a
- *  fatal syntax error, since the caller rolls back the write on `error`.
- *  Only a genuine non-zero exit with parser output is reported as {ok:false}.
- *  Uses a child process because there is no robust pure-JS Python parser in
- *  the dependency tree, and SWE-bench is overwhelmingly Python. */
-function checkPythonSyntax(content: string): Promise<PythonSyntaxResult> {
-  const isWin = process.platform === 'win32'
-  const candidates: Array<{ command: string; args: string[] }> = isWin
-    ? [
-        { command: 'py', args: ['-3', '-c', 'import ast,sys; ast.parse(sys.stdin.read())'] },
-        { command: 'python', args: ['-c', 'import ast,sys; ast.parse(sys.stdin.read())'] },
-        { command: 'python3', args: ['-c', 'import ast,sys; ast.parse(sys.stdin.read())'] },
-      ]
-    : [
-        { command: 'python3', args: ['-c', 'import ast,sys; ast.parse(sys.stdin.read())'] },
-        { command: 'python', args: ['-c', 'import ast,sys; ast.parse(sys.stdin.read())'] },
-      ]
-
-  async function tryCandidate(candidate: typeof candidates[number]): Promise<PythonSyntaxResult | null> {
-    return new Promise((resolve) => {
-      let child: ReturnType<typeof spawn>
-      try {
-        child = spawn(candidate.command, candidate.args, {
-          stdio: ['pipe', 'pipe', 'pipe'],
-          env: getResolvedEnv(),
-          windowsHide: true,
-        })
-      } catch {
-        resolve(null) // ENOENT — try next candidate
-        return
-      }
-
-      const timer = setTimeout(() => {
-        try { child.kill('SIGKILL') } catch { /* already exited */ }
-        resolve({ ok: true })
-      }, getPySyntaxTimeoutMs())
-
-      let stdout = ''
-      let stderr = ''
-      child.stdout?.on('data', (d: Buffer) => { stdout += d.toString() })
-      child.stderr?.on('data', (d: Buffer) => { stderr += d.toString() })
-      child.on('close', (code) => {
-        clearTimeout(timer)
-        if (code === 0 || code === null) {
-          resolve({ ok: true })
-        } else if (isPythonInfraFailure(stderr)) {
-          // 编码类失败（UnicodeEncode/DecodeError）是校验器跨进程 IO 问题,
-          // 不是用户代码语法错误——degrade 为 OK,绝不触发回滚（与 timeout/
-          // missing-interpreter 豁免同语义）。真语法错误不含这些标记,走 else。
-          resolve({ ok: true })
-        } else {
-          resolve({ ok: false, error: stderr.trim() || stdout.trim() || `${candidate.command} exited with code ${code}` })
-        }
-      })
-      child.on('error', () => {
-        clearTimeout(timer)
-        resolve(null) // ENOENT — try next candidate
-      })
-      try {
-        child.stdin?.write(content)
-        child.stdin?.end()
-      } catch { /* stdin closed early */ }
-    })
-  }
-
-  return (async () => {
-    for (const candidate of candidates) {
-      const result = await tryCandidate(candidate)
-      if (result !== null) return result
-    }
-    // All candidates failed — degrade to OK
-    return { ok: true }
-  })()
-}
