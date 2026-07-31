@@ -10,6 +10,10 @@
     "darwin-x86_64": {
       "url": "https://github.com/huiliyi37/Tianshu-Tui/releases/download/v2.26.0/Tianshu_2.26.0_x64.app.tar.gz",
       "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaDZmcFdBUytLR2NFWGJPZ3Vvcno3eEhPYnd6azcwUmhKTk5ZM0E0OVF3MEJaWloraVJCUy93VGcvK0lDb1BySkVlMktnRGxQRllxVUdvYnBWYmhTWGdBWjdlb2ZLMHdFPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg1NDYzNDcwCWZpbGU6VGlhbnNodS5hcHAudGFyLmd6Cit3SEc4dFV6U1BFd2RLVGZQM0ZpOU5BU2c3RWxXS0ExcW56dmFOeXN3S011WHJPSk9HTVZNbmpEUWMydTBTUU9QdlZZTE9kVlVVaCtlQm9zdElla0RnPT0K"
+    },
+    "windows-x86_64": {
+      "url": "https://github.com/huiliyi37/Tianshu-Tui/releases/download/v2.26.0/Tianshu_2.26.0_x64-setup.exe",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaDZmcFdBUytLR2RyYURXSVhzcE83cFl3OG1zdGZyc3lvQWxiK3NUd2FVcGdMZFZ3VjQrdE4xMEFGVll2SS9ETVViNHltUWJnUklwK0NNVXhGc0FNYlBrME9mR2YwWlFjPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg1NDY3ODM1CWZpbGU6VGlhbnNodV8yLjI2LjBfeDY0LXNldHVwLmV4ZQpmaTI3aGlKOE5Wc1BPRDNPMVZ1VFZuYWgrOEd2QlJNeU5JdFN4czZEUDU2TTdjNTF4VzNTcFZBczlWSTYwanl0NDNlWUUwSkhNZ0NDR1R6QTBtdmtCZz09Cg=="
     }
   }
 }
