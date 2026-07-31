@@ -1689,11 +1689,11 @@ async function main() {
   if (ctx.templatesPendingAgents && !args.includes('--dangerously-skip-permissions')) {
     // Detect git availability to advise first-run users. Git is optional (the
     // agent runs in-place without it), but unlocks worktree isolation, commit,
-    // diff review, and checkpoints. Mirrors the inline try/catch probe pattern
-    // used at main.ts:396 (gitBranch detection).
+    // diff review, and checkpoints. Use `git --version` — `git rev-parse
+    // --is-inside-work-tree` fails outside a repo even when git is installed.
     const gitAvailable = (() => {
       try {
-        execSync('git rev-parse --is-inside-work-tree', { cwd: process.cwd(), stdio: 'pipe' })
+        execSync('git --version', { cwd: process.cwd(), stdio: 'pipe' })
         return true
       } catch {
         return false
