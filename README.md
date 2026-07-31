@@ -61,6 +61,41 @@ npm run build      # 生成 dist/main.js
 npm start          # 或：node dist/main.js
 ```
 
+### 3. 启用 Shell 补全（可选）
+
+仓库自带 `completions/` 目录，覆盖 bash / zsh / fish / Windows PowerShell 四种 shell。按你的 shell 安装对应文件：
+
+**bash** —— 任选其一：
+
+```bash
+source /path/to/rivet.bash                                   # 追加到 ~/.bashrc
+cp completions/rivet.bash ~/.local/share/bash-completion/completions/rivet
+sudo cp completions/rivet.bash /usr/share/bash-completion/completions/rivet
+```
+
+**zsh** —— 把 `rivet.zsh` 以 `_rivet` 名字放入 `$fpath`：
+
+```bash
+mkdir -p ~/.zsh/completions
+cp completions/rivet.zsh ~/.zsh/completions/_rivet
+echo 'fpath=(~/.zsh/completions $fpath)' >> ~/.zshrc   # 需在 compinit 之前
+```
+
+**fish**：
+
+```bash
+mkdir -p ~/.config/fish/completions
+cp completions/rivet.fish ~/.config/fish/completions/rivet.fish
+```
+
+**Windows PowerShell** —— 在 `$PROFILE` 里 dot-source：
+
+```powershell
+Add-Content $PROFILE ". C:\path\to\rivet.ps1"
+```
+
+> 补全内容与 CLI 保持一致：顶层命令（`config` / `serve` / `sessions` / `browser` / `logs`）、全局 flags、`config` 全部子命令，以及从 `~/.rivet/config.json` 动态读取的 provider 名。
+
 ### 3. 配置 API Key（首次必做）
 
 ```bash
