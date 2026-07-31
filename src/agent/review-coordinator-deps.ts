@@ -123,8 +123,14 @@ function verificationEvidence(result: WorkerResult): string | undefined {
   return `ran: ${v.command} → ${v.status} (${v.passed} passed, ${v.failed} failed, ${v.skipped} skipped)`
 }
 
-function formatFinding(finding: WorkerFinding): string {
-  return `${finding.claim} — ${finding.evidence}`
+export function formatFinding(finding: WorkerFinding): string {
+  const prefix = finding.evidenceKind === 'firsthand' ? '[一手] '
+    : finding.evidenceKind === 'inferred' ? '[转述] '
+    : ''
+  const refs = finding.evidenceRefs && finding.evidenceRefs.length > 0
+    ? ` (${finding.evidenceRefs.join(', ')})`
+    : ''
+  return `${prefix}${finding.claim} — ${finding.evidence}${refs}`
 }
 
 function summarizeResult(result: WorkerResult): string {

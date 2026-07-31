@@ -125,12 +125,18 @@ export function validateTaskDependencies(tasks: TeamTask[]): DependencyDiagnosti
   return { dangling, cycles }
 }
 
-/** Check if a file is a test file for a given source file. */
+/** Check if a file is a test file for a given source file.
+ *  Extension-agnostic (T5 同族修复, 2026-07-30): the old version only knew
+ *  .ts/.tsx, so .mjs/.js source+test pairs never bound and raced in the same
+ *  wave as two independent write shards. */
 function isTestFor(testFile: string, sourceFile: string): boolean {
   // src/agent/foo.ts → src/agent/__tests__/foo.test.ts
   // src/agent/foo.ts → src/__tests__/foo.test.ts  (flatter layout)
-  const base = sourceFile.replace(/\.ts$/, '').replace(/\.tsx$/, '')
-  const testBase = testFile.replace(/\.test\.ts$/, '').replace(/\.test\.tsx$/, '').replace(/\/__tests__/, '')
+  // toolkit2/slug.mjs → toolkit2/slug.test.mjs
+  // Only a `.test.<ext>` suffix marks a test file; without it testBase keeps
+  // its extension and can never equal the extension-stripped source base.
+  const base = sourceFile.replace(/\.[^./\\]+$/, '')
+  const testBase = testFile.replace(/\.test\.[^./\\]+$/, '').replace(/\/__tests__/, '')
   return base === testBase
 }
 

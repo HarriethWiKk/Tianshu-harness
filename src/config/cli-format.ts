@@ -7,7 +7,7 @@
  * 在 useColor=false 也显式走纯文本分支）。
  */
 
-import { color, ANSI } from '../tui/engine/ansi.js'
+import { color } from '../tui/engine/ansi.js'
 import type { ProviderConfig } from './schema.js'
 import type { McpServerConfig } from '../mcp/config.js'
 
@@ -62,11 +62,6 @@ function dim(text: string, opts: FormatOpts): string {
   return c(text, MUTED_COLOR, opts, { dim: true })
 }
 
-function padRight(text: string, width: number): string {
-  const len = displayWidth(text)
-  if (len >= width) return text
-  return text + ' '.repeat(width - len)
-}
 
 /** 保守的显示宽度（不依赖完整 Unicode 宽度表，只处理常见情况）。 */
 function displayWidth(s: string): number {
@@ -87,12 +82,6 @@ function displayWidth(s: string): number {
   return w
 }
 
-/** 生成水平分隔线（宽度受限于可用宽度）。 */
-function hr(opts: FormatOpts, width?: number): string {
-  const w = Math.min(opts.width ?? 80, width ?? (opts.width ?? 80))
-  const b = box(opts)
-  return dim(b.h.repeat(Math.max(20, w)), opts)
-}
 
 // ── 格式化函数 ──
 

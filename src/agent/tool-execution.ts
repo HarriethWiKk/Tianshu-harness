@@ -80,6 +80,9 @@ export interface ToolExecutionDeps {
   /** ask_image 查询句柄：据 imageId 从会话 ImageRegistry 取图并按主控视觉能力
    *  返回原图转发 or 定向问答。Absent → ask_image 报视觉不可用。 */
   visionAsk?: (imageId: string | undefined, question: string, signal?: AbortSignal) => Promise<import('../tools/types.js').VisionAskResult>
+  /** 把工具截图寄存进会话 ImageRegistry，返回分配的 id（供 ask_image 追问）。
+   *  Absent（worker / 无 registry）→ 截图照旧只走描述通道，不可追问。 */
+  registerImages?: (images: string[]) => string[]
   recordToolHistory: (name: string, input: Record<string, unknown>, isError: boolean, content: string, errorClass?: ToolErrorClass, errorKind?: FailureClass) => void
   buildRuntimeSnapshot: (extra?: Partial<RuntimeHookSnapshot>) => RuntimeHookSnapshot
   requestThetaCheck: (reason: string) => void
@@ -618,9 +621,18 @@ export class ToolExecutionController {
     // flood the context with megapixel base64.
     if (pendingImages.length > 0) {
       const images = pendingImages.slice(-2)
+      // 寄存进会话 registry，这样 ask_image 能就**agent 自己截的图**追问，而不是只能
+      // 问用户手动附的图。少了这一步，「截图 → 逐字念出报错那一行」在浏览器验证闭环
+      // 里就断了（工具描述承诺可以问"本会话已发送的图片"，registry 里却没有它）。
+      // 纯内存 + LRU 上限，不进 oaiMessages / 不落盘。
+      const shotIds = this.deps.registerImages?.(images) ?? []
+      const askHint = shotIds.length > 0
+        ? ` Retained as ${shotIds.join(', ')} — use ask_image with that id to re-interrogate a specific detail.`
+        : ''
       if (this.deps.getSupportsVision?.() === true && this.deps.addUserMessageWithImages) {
         this.deps.addUserMessageWithImages(
-          '<system-reminder>Screenshot(s) from the tool call(s) above are attached. Use them to visually confirm UI state alongside any accessibility tree or DOM measurements; do not describe them back to the user unless asked.</system-reminder>',
+          '<system-reminder>Screenshot(s) from the tool call(s) above are attached. Use them to visually confirm UI state alongside any accessibility tree or DOM measurements; do not describe them back to the user unless asked.'
+          + `${askHint}</system-reminder>`,
           images,
         )
       } else if (this.deps.describeToolImages && !input.abortSignal.aborted) {
@@ -636,7 +648,8 @@ export class ToolExecutionController {
         } catch { /* bridge unavailable — fall through to text-only results */ }
         if (description) {
           this.deps.addUserMessageWithImages?.(
-            `<system-reminder>Screenshot(s) from the tool call(s) above, described by the configured vision model:\n${description}</system-reminder>`,
+            `<system-reminder>Screenshot(s) from the tool call(s) above, described by the configured vision model:\n${description}`
+            + `${askHint}</system-reminder>`,
             [],
           )
         }

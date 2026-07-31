@@ -36,7 +36,8 @@ Evidence quality checklist:
 - Every finding must cite a specific file:line reference
 - Report what you actually observed, not what you assume
 - If a search returns no results, report that explicitly — absence is evidence too
-- Distinguish "file does not exist" from "pattern not found in existing file"`,
+- Distinguish "file does not exist" from "pattern not found in existing file"
+- Set "evidenceKind" to "firsthand" when you personally read/grep/ran the command that produced this evidence. Set to "inferred" when the claim is based on deduction, pattern recognition, or assumption without direct observation. "firsthand" findings MUST include evidenceRefs (file:line or "cmd: exit=N")`,
 
   doc_scout: `## Documentation Scout Methodology
 
@@ -157,7 +158,7 @@ function buildReadOnlyResultShape(): string {
   "status": "passed | failed | blocked | escalated",
   "summary": "one sentence summary",
   "findings": [
-    { "claim": "evidence-backed claim", "evidence": "file path, command, or observed fact", "confidence": "low | medium | high" }
+    { "claim": "evidence-backed claim", "evidence": "file path, command, or observed fact", "confidence": "low | medium | high", "evidenceKind": "firsthand | inferred", "evidenceRefs": ["file:line", "cmd: exit=N"] }
   ],
   "artifacts": [
     { "kind": "note | patch | test_command | risk | question", "title": "short title", "content": "artifact content" }
@@ -176,7 +177,7 @@ function buildWriteResultShape(): string {
   "status": "passed | failed | blocked | escalated",
   "summary": "one sentence summary",
   "findings": [
-    { "claim": "evidence-backed claim", "evidence": "file path, command, or observed fact", "confidence": "low | medium | high" }
+    { "claim": "evidence-backed claim", "evidence": "file path, command, or observed fact", "confidence": "low | medium | high", "evidenceKind": "firsthand | inferred", "evidenceRefs": ["file:line", "cmd: exit=N"] }
   ],
   "artifacts": [
     { "kind": "note | patch | test_command | risk | question", "title": "short title", "content": "artifact content" }
@@ -439,6 +440,9 @@ function buildFailureNotice(results: readonly WorkerResult[]): string {
     `本次派发有 ${failed.length}/${results.length} 个 worker 没有完成。它们的 findings 只是半程产出，不足以当作交付依据——不要在汇报里把它们说成"已完成"。`,
     ...lines,
     ...(resumable ? ['带 "Resumable:" 的结果可以用 delegate_task({resume: "<workOrderId>"}) 接着干，它会带着上一轮的完整上下文继续。'] : []),
+    ...(failed.length >= 2 && failed.every(r => r.status === 'blocked')
+      ? ['多个 worker 被阻塞——如果任务是天然可并行的多维度（如前端+后端+审查），考虑用 galaxy 工具拆解为集群并行执行。']
+      : []),
     '</worker_dispatch_incomplete>',
   ].join('\n')
 }

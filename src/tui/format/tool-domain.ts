@@ -21,11 +21,12 @@ const TOOL_DOMAIN_MAP: Record<string, StarDomainId> = {
   delegate_task: 'tianji',
   delegate_batch: 'tianji',
   team_orchestrate: 'tianji',
+  galaxy: 'tianji',
 }
 
 /** 该工具是否归子代理编排域（天机）。 */
 export function isDelegationTool(name: string): boolean {
-  return name === 'delegate_task' || name === 'delegate_batch' || name === 'team_orchestrate'
+  return name === 'delegate_task' || name === 'delegate_batch' || name === 'team_orchestrate' || name === 'galaxy'
 }
 
 /** 返回工具对应星域 id；无映射返回 null。 */

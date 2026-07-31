@@ -52,6 +52,7 @@ import { TEAM_PANEL_UI_PREFIX } from '../tui/team-panel-model.js'
 import { COUNCIL_PANEL_UI_PREFIX } from '../tui/council-panel-model.js'
 import { containsRegisteredFrame } from '../tui/frame-codec.js'
 import { buildHandoffPrompt } from '../tui/handoff.js'
+import { handoffRecoveries } from '../agent/recovery-journal.js'
 import { getSessionDir } from '../agent/session-persist.js'
 import { WatchdogRecoveryPolicy } from '../agent/watchdog-recovery-policy.js'
 import { buildDomainPickerEntries, type DomainPickerEntry } from '../agent/domain-picker-entries.js'
@@ -2106,6 +2107,7 @@ export class RuntimeSessionManager {
         // 不依赖那个时序（懒构建/异常会话里可能尚无目录）。
         mkdirSync(dirname(pending.dest), { recursive: true })
         copyFileSync(pending.src, pending.dest)
+        handoffRecoveries(session.record.cwd, session.record.id)
         this.append(session, 'handoff_archived', {
           text: `✦ 交接文档已写入 ${pending.src} 并归档 ${pending.dest}——新会话将自动注入交接内容。`,
           src: pending.src,
@@ -5026,4 +5028,3 @@ function resolveDomainPersona(key: string | undefined): { glyph: string; accent:
   if (!d) return { glyph: '⚙', accent: 'primary' }
   return { glyph: d.uiPersona.glyph, accent: d.uiPersona.accent }
 }
-

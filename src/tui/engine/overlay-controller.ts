@@ -4,6 +4,7 @@ import type { RewindData, RewindFile, RewindMode } from '../format/rewind.js'
 import type { HistorySearchData } from '../format/history-search.js'
 import type { ConnectCommit } from '../connect-flow.js'
 import type { InitCommit } from '../init-flow.js'
+import type { CachePanelData, CachePeriod } from '../format/cache-panel.js'
 
 export interface OverlayNavState {
   pagerPage: number
@@ -33,6 +34,8 @@ export interface OverlayNavState {
   planPickerIndex: number
   connectIndex: number
   initIndex: number
+  /** `/cache` 面板的历史周期页签（←/→ 切换）。 */
+  cachePeriod: CachePeriod
   query: string
 }
 
@@ -52,6 +55,7 @@ export interface OverlayDataProviders {
   themePickerData?: () => ThemePickerData
   choicePanelData?: () => ChoicePanelData
   planPickerData?: () => PlanPickerData
+  cachePanelData?: () => CachePanelData
 }
 
 /**
@@ -60,7 +64,7 @@ export interface OverlayDataProviders {
  * TuiApp; this class only manages nav state / data providers / exec callbacks.
  */
 export class OverlayController {
-  private overlayNav: OverlayNavState = { pagerPage: 0, pagerMode: 'page', pagerSearchQuery: '', pagerSearchCurrent: 0, pagerSelectedMessage: 0, pagerVerbose: false, paletteIndex: 0, rewindIndex: 0, rewindPhase: 'list', rewindActionIndex: 0, historySearchIndex: 0, chronicleIndex: 0, tasksIndex: 0, tasksFilter: 'running', jobsIndex: 0, domainPickerIndex: 0, modelPickerIndex: 0, themePickerIndex: 0, choicePanelIndex: 0, planPickerIndex: 0, connectIndex: 0, initIndex: 0, query: '' }
+  private overlayNav: OverlayNavState = { pagerPage: 0, pagerMode: 'page', pagerSearchQuery: '', pagerSearchCurrent: 0, pagerSelectedMessage: 0, pagerVerbose: false, paletteIndex: 0, rewindIndex: 0, rewindPhase: 'list', rewindActionIndex: 0, historySearchIndex: 0, chronicleIndex: 0, tasksIndex: 0, tasksFilter: 'running', jobsIndex: 0, domainPickerIndex: 0, modelPickerIndex: 0, themePickerIndex: 0, choicePanelIndex: 0, planPickerIndex: 0, connectIndex: 0, initIndex: 0, cachePeriod: 'today', query: '' }
   private overlayData?: OverlayDataProviders
   private paletteExec?: (index: number) => void
   private rewindExec?: (messageIndex: number, mode: RewindMode) => void
@@ -81,7 +85,7 @@ export class OverlayController {
   /** Direct mutable access to nav state object */
   nav(): OverlayNavState { return this.overlayNav }
   resetNav(): void {
-    this.overlayNav = { pagerPage: 0, pagerMode: 'page' as const, pagerSearchQuery: '', pagerSearchCurrent: 0, pagerSelectedMessage: 0, pagerVerbose: false, paletteIndex: 0, rewindIndex: 0, rewindPhase: 'list' as const, rewindActionIndex: 0, historySearchIndex: 0, chronicleIndex: 0, tasksIndex: 0, tasksFilter: 'running' as const, jobsIndex: 0, domainPickerIndex: 0, modelPickerIndex: 0, themePickerIndex: 0, choicePanelIndex: 0, planPickerIndex: 0, connectIndex: 0, initIndex: 0, query: '' }
+    this.overlayNav = { pagerPage: 0, pagerMode: 'page' as const, pagerSearchQuery: '', pagerSearchCurrent: 0, pagerSelectedMessage: 0, pagerVerbose: false, paletteIndex: 0, rewindIndex: 0, rewindPhase: 'list' as const, rewindActionIndex: 0, historySearchIndex: 0, chronicleIndex: 0, tasksIndex: 0, tasksFilter: 'running' as const, jobsIndex: 0, domainPickerIndex: 0, modelPickerIndex: 0, themePickerIndex: 0, choicePanelIndex: 0, planPickerIndex: 0, connectIndex: 0, initIndex: 0, cachePeriod: 'today' as const, query: '' }
   }
 
   get pagerPage(): number { return this.overlayNav.pagerPage }

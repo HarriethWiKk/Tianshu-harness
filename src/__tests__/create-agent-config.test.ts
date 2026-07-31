@@ -31,6 +31,7 @@ const testConfig = {
     domainKeywordRouting: true,
     verificationSnapshot: 'auto',
     songlineEnabled: true,
+    securityGuidance: true,
     desktopTools: false,
     hearthObserveEnabled: false,
     crossSessionEnabled: true,
@@ -49,6 +50,7 @@ const testConfig = {
     banditPromotion: { modelTier: 'shadow', teamScheduler: 'shadow', modelRouting: 'shadow', effort: 'shadow', killSwitch: false },
     permissions: { allow: [], deny: [], bash: { allowlist: [], denylist: [] }, additionalReadDirs: [], additionalWriteDirs: [] },
     review: { profiles: {}, skipAuto: false, mechanicalFastPath: true },
+    visionAutoBridge: false,
     goal: { judge: { enabled: true, maxRuns: 3, browser: false } },
     delivery: { autoCommit: true },
   },
@@ -225,17 +227,53 @@ describe('createAgentConfig', () => {
     assert.match(cfg.visionBridge?.detail ?? '', /vprov2\/v-cap2/, 'detail names the backup bridge')
   })
 
-  it('auto-selects a vision bridge when text-only primary and none configured', () => {
-    const vprov: ProviderConfig = {
-      ...testProvider, name: 'minimax', apiKey: 'k',
-      models: [{ id: 'MiniMax-M3', contextWindow: 128000, maxTokens: 8192, supportsVision: true }],
-    }
+  // 自动选桥是 opt-in（2026-07-30 评审）：它会把用户的图片发给一个用户从未为此
+  // 选择过的 provider——成本与隐私决定不能由默认值代做。关着时只点名候选。
+  const minimaxProvider: ProviderConfig = {
+    ...testProvider, name: 'minimax', apiKey: 'k',
+    models: [{ id: 'MiniMax-M3', contextWindow: 128000, maxTokens: 8192, supportsVision: true }],
+  }
+
+  it('does NOT auto-select a vision bridge without the opt-in', () => {
     const cfg = createAgentConfig({
       ...baseInput,
-      allProviders: { deepseek: testProvider, minimax: vprov },
-      // no visionModel configured
+      allProviders: { deepseek: testProvider, minimax: minimaxProvider },
+      // no visionModel, no visionAutoBridge
     })
-    assert.ok(cfg.visionClient, 'auto-selected bridge builds a client')
+    assert.equal(cfg.visionClient, undefined, '默认不得静默把图片发给未选中的 provider')
+    assert.equal(cfg.visionBridge?.active, false)
+    assert.match(cfg.visionBridge?.detail ?? '', /minimax\/MiniMax-M3/, '候选必须被点名')
+    assert.match(cfg.visionBridge?.detail ?? '', /visionAutoBridge/, '必须告诉用户怎么启用')
+  })
+
+  it('auto-selects a vision bridge once visionAutoBridge is on', () => {
+    const cfg = createAgentConfig({
+      ...baseInput,
+      allProviders: { deepseek: testProvider, minimax: minimaxProvider },
+      visionAutoBridge: true,
+    })
+    assert.ok(cfg.visionClient, 'opt-in 后自动选桥应建出 client')
     assert.equal(cfg.visionBridge?.source, 'auto')
+  })
+
+  it('names no candidate when nothing declares vision support', () => {
+    const cfg = createAgentConfig({ ...baseInput, allProviders: { deepseek: testProvider } })
+    assert.equal(cfg.visionClient, undefined)
+    assert.match(cfg.visionBridge?.detail ?? '', /没有声明视觉能力的模型/)
+  })
+
+  // 主控自己能看图时不建桥：建了也永不使用（loop.ts 桥接点要求 !supportsVision），
+  // 只会白建一个 client 并在启动时报一行不实的「已启用识图桥」。
+  it('skips the bridge entirely when the primary model is multimodal', () => {
+    const cfg = createAgentConfig({
+      ...baseInput,
+      model: { ...baseInput.model, supportsVision: true },
+      allProviders: { deepseek: testProvider, minimax: minimaxProvider },
+      visionAutoBridge: true,
+    })
+    assert.equal(cfg.supportsVision, true)
+    assert.equal(cfg.visionClient, undefined, '多模态主控不该白建桥 client')
+    assert.equal(cfg.visionBridge?.active, true)
+    assert.match(cfg.visionBridge?.detail ?? '', /原生支持识图/)
   })
 })

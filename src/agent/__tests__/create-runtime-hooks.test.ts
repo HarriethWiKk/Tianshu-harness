@@ -2,6 +2,7 @@ import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import { RuntimeHookPipeline, createRuntimeHookContext } from '../runtime-hooks.js'
 import { createDefaultRuntimeHooks } from '../create-runtime-hooks.js'
+import type { AdvisoryBus } from '../advisory-bus.js'
 
 describe('createDefaultRuntimeHooks', () => {
   it('returns 8 hooks in the correct phase order without optional session-end deps', () => {
@@ -246,5 +247,66 @@ describe('createDefaultRuntimeHooks', () => {
     assert.equal(hooks.some(h => h.name === 'blind-exploration'), true)
     assert.equal(hooks.some(h => h.name === 'mcts-planning'), true)
     assert.equal(hooks.filter(h => h.phase === 'preTurn').some(h => h.name === 'mcts-planning'), true)
+  })
+
+  describe('security-pattern gate', () => {
+    function hooksWithBus(securityGuidance?: boolean): string[] {
+      const advisoryBus = { submit: () => {}, submitAll: () => {} } as unknown as AdvisoryBus
+      return createDefaultRuntimeHooks({
+        stigmergyDeposit: async () => {},
+        stigmergyQuery: async () => [],
+        getEvidenceState: () => ({ filesRead: new Set(), filesModified: new Set(), verifications: [], deliveryStatus: 'unverified', impactedFiles: new Set(), impactedTests: new Set() }),
+        setLoadedPheromones: () => {},
+        getThetaState: () => ({ interval: 7, lastCheckTurn: 0, toolCallCount: 0, lastThetaAt: 0, phase: 0, cycleCount: 0 }),
+        setThetaState: () => {},
+        getPredictionAccumulator: () => ({ history: [] }),
+        advisoryBus,
+        ...(securityGuidance === undefined ? {} : { securityGuidance }),
+      }).map(h => h.name)
+    }
+
+    it('默认注册（层1 零成本，与其他 advisory hook 同档）', () => {
+      const prev = process.env.RIVET_SECURITY_GUIDANCE
+      delete process.env.RIVET_SECURITY_GUIDANCE
+      try {
+        assert.ok(hooksWithBus().includes('security-pattern'))
+      } finally {
+        if (prev !== undefined) process.env.RIVET_SECURITY_GUIDANCE = prev
+      }
+    })
+
+    it('config agent.securityGuidance=false 关闭（桌面端唯一可行通道）', () => {
+      const prev = process.env.RIVET_SECURITY_GUIDANCE
+      delete process.env.RIVET_SECURITY_GUIDANCE
+      try {
+        assert.ok(!hooksWithBus(false).includes('security-pattern'))
+      } finally {
+        if (prev !== undefined) process.env.RIVET_SECURITY_GUIDANCE = prev
+      }
+    })
+
+    it('RIVET_SECURITY_GUIDANCE=0 关闭', () => {
+      const prev = process.env.RIVET_SECURITY_GUIDANCE
+      process.env.RIVET_SECURITY_GUIDANCE = '0'
+      try {
+        assert.ok(!hooksWithBus().includes('security-pattern'))
+      } finally {
+        if (prev === undefined) delete process.env.RIVET_SECURITY_GUIDANCE
+        else process.env.RIVET_SECURITY_GUIDANCE = prev
+      }
+    })
+
+    it('没有 advisoryBus 时不注册（无投递通道）', () => {
+      const hooks = createDefaultRuntimeHooks({
+        stigmergyDeposit: async () => {},
+        stigmergyQuery: async () => [],
+        getEvidenceState: () => ({ filesRead: new Set(), filesModified: new Set(), verifications: [], deliveryStatus: 'unverified', impactedFiles: new Set(), impactedTests: new Set() }),
+        setLoadedPheromones: () => {},
+        getThetaState: () => ({ interval: 7, lastCheckTurn: 0, toolCallCount: 0, lastThetaAt: 0, phase: 0, cycleCount: 0 }),
+        setThetaState: () => {},
+        getPredictionAccumulator: () => ({ history: [] }),
+      })
+      assert.ok(!hooks.some(h => h.name === 'security-pattern'))
+    })
   })
 })

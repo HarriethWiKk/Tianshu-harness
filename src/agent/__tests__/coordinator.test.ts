@@ -1,5 +1,8 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
+import { mkdtempSync, writeFileSync, rmSync, realpathSync } from 'node:fs'
+import { join } from 'node:path'
+import { tmpdir } from 'node:os'
 import type { StreamClient } from '../../api/stream-client.js'
 import { PromptEngine } from '../../prompt/engine.js'
 import { filterToolRegistry, ToolRegistry } from '../../tools/registry.js'
@@ -579,6 +582,54 @@ describe('DelegationCoordinator', () => {
     ])
 
     assert.deepEqual(capturedFloors.sort(), ['strong', undefined].sort(), 'tierFloor 必须进 WorkOrder（声明 strong 的席位不得被静默降档）')
+  })
+
+  it('delegateBatch 同批 worker 共享一个 PrewarmCache，且派发前已预热 scope.files（P0-1）', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'coord-prewarm-'))
+    writeFileSync(join(dir, 'a.txt'), 'alpha evidence')
+    writeFileSync(join(dir, 'b.txt'), 'beta evidence')
+    const seen: Array<unknown> = []
+    const coordinator = new DelegationCoordinator({
+      baseToolRegistry: makeRegistry(),
+      modelCards: cards,
+      maxWorkers: 2,
+      cwd: dir,
+      runtimeFactory: (order, card, workerRegistry) => ({
+        order,
+        client: {} as StreamClient,
+        promptEngine: new PromptEngine({ model: card.model, maxTokens: 1024, staticCtx: { tools: workerRegistry.getDefinitions() }, volatileCtx: { cwd: dir } }),
+        toolRegistry: workerRegistry,
+        cwd: dir,
+        maxTurns: 2,
+        contextWindow: card.contextWindow,
+        compact: { enabled: false, autoThreshold: 800_000, autoFloor: 500_000, model: 'flash' },
+      }),
+      runWorker: async config => {
+        seen.push(config.prewarm)
+        return {
+          result: resultFor(config.order.id),
+          transcript: { text: '', thinking: '', toolUses: [], toolResults: [], errors: [], repairAttempts: 0 },
+          session: { getTurnCount: () => 1 } as never,
+          usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+        }
+      },
+    })
+
+    await coordinator.delegateBatch([
+      { parentTurnId: 'batch:pw:0', objective: 'Inspect alpha file for routing seams.', kind: 'code_search', profile: 'code_scout', scope: { files: ['a.txt'] } },
+      { parentTurnId: 'batch:pw:1', objective: 'Inspect beta file for risk patterns.', kind: 'code_search', profile: 'code_scout', scope: { files: ['b.txt'] } },
+    ])
+
+    assert.equal(seen.length, 2)
+    assert.ok(seen[0], 'worker 必须拿到批级共享 prewarm 实例')
+    assert.equal(seen[0], seen[1], '同批两个 worker 必须共享同一个 PrewarmCache 实例')
+    const cache = seen[0] as import('../prewarm.js').PrewarmCache
+    // 派发前预热已把两个 scope 文件装进共享 cache（canonical 可能是 realpath）
+    const canonA = realpathSync(join(dir, 'a.txt'))
+    const canonB = realpathSync(join(dir, 'b.txt'))
+    assert.ok(cache.has(canonA) || cache.has(join(dir, 'a.txt')), 'a.txt 应在派发前被预热')
+    assert.ok(cache.has(canonB) || cache.has(join(dir, 'b.txt')), 'b.txt 应在派发前被预热')
+    rmSync(dir, { recursive: true, force: true })
   })
 
   it('A3: a dependent of a failed worker is reported as blocked, never silently dropped', async () => {

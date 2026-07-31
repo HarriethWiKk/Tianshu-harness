@@ -86,6 +86,13 @@ export function hasActionIntent(text: string): boolean {
   // 不再检测尾部 600 字符或尾句——这是已完成的汇报，不是悬空的行动承诺。
   if (DELIVERY_SIGNAL_RE.test(text)) return false
   const tail = text.length > 600 ? text.slice(-600) : text
+  // 问句收尾守卫：整轮以问句收尾 = 把控制权交还用户（请求决策/许可），不是
+  // 悬空的行动承诺——即便尾部同时出现承诺词与工具动词。此守卫原本只装在
+  // hasImperativeActionTail 上，承诺词路径漏了：ca63f970 实测「……或你指定某组
+  // 文件我来读……哪条？」被"我来"+"读"命中，注入 reminder 后模型被迫续跑，
+  // 用户视角凭空多出一轮。无论问的是方向（"哪条？"）还是许可（"要我跑吗？"），
+  // 正确行为都是等用户回答，不该被推着自答自干。
+  if (/[？?]$/.test(tail.trimEnd())) return false
   if (ACTION_PROMISE_PATTERN.test(tail) && TOOL_VERB_PATTERN.test(tail)) return true
   return hasImperativeActionTail(text)
 }
@@ -98,6 +105,8 @@ export function hasWriteActionIntent(text: string): boolean {
   if (!text) return false
   if (DELIVERY_SIGNAL_RE.test(text)) return false
   const tail = text.length > 600 ? text.slice(-600) : text
+  // 问句收尾守卫：同 hasActionIntent——收尾问句是在等用户，不是悬空写承诺。
+  if (/[？?]$/.test(tail.trimEnd())) return false
   if (ACTION_PROMISE_PATTERN.test(tail) && WRITE_VERB_PATTERN.test(tail)) return true
   return hasImperativeActionTail(text)
 }

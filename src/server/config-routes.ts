@@ -16,6 +16,10 @@
  *   POST   /config/computer-use/revoke      revoke an app's "always allow" grant ({ app })
  *   GET    /config/permission-dirs          Codex-style standing directory grants (read/write, exists probe)
  *   PUT    /config/permission-dirs          set standing directory grants; additions apply immediately
+ *   GET    /config/vision-model             vision bridge model (provider/model/prompt/maxTokens/fallback)
+ *   PUT    /config/vision-model             set/clear the vision bridge
+ *   GET    /config/vision-auto-bridge       auto-pick a vision bridge when unconfigured (opt-in)
+ *   PUT    /config/vision-auto-bridge       toggle the auto-bridge opt-in
  */
 import type { RouteHandler } from './index.js'
 import { isAuthorizedRequest } from './auth.js'
@@ -48,7 +52,9 @@ import {
   setPrDefaultsConfig,
   getPermissionDirs,
   setPermissionDirs,
+  getVisionAutoBridge,
   getVisionModelConfig,
+  setVisionAutoBridge,
   setVisionModelConfig,
   getGreetingConfig,
   setGreetingConfig,
@@ -591,6 +597,21 @@ export function buildConfigRoutes(apiToken?: string): Record<string, RouteHandle
       }
     }, apiToken),
 
+    // 未配 visionModel 时是否自动挑一个可用视觉模型做桥。默认关，因为开了就会把
+    // 用户的图片发给一个用户从未为此选择过的 provider——桌面端得能自己开关它，
+    // 否则单独部署桌面的用户只能去手改 config.json。
+    'GET /config/vision-auto-bridge': withAuth(() => {
+      return { status: 200, body: { enabled: getVisionAutoBridge() } }
+    }, apiToken),
+
+    'PUT /config/vision-auto-bridge': withAuth((body) => {
+      const { enabled } = (body ?? {}) as { enabled?: unknown }
+      if (typeof enabled !== 'boolean') {
+        return { status: 400, body: { error: 'enabled must be a boolean' } }
+      }
+      return { status: 200, body: { ok: true, enabled: setVisionAutoBridge(enabled) } }
+    }, apiToken),
+
     // Greeting LLM: welcome page dynamic greeting toggle + model selection.
     'GET /config/greeting': withAuth(() => {
       return { status: 200, body: { config: getGreetingConfig() } }
@@ -640,8 +661,9 @@ export function buildConfigRoutes(apiToken?: string): Record<string, RouteHandle
       const provider = cfg.provider.providers[cfg.provider.default]
       if (!provider) return { status: 200, body: { summary: null } }
       const apiKey = provider.apiKey ?? (provider.apiKeyEnv ? process.env[provider.apiKeyEnv] : undefined)
-      const summary = await getDeepSeekUserSummary(apiKey, provider.baseUrl)
-      return { status: 200, body: { summary } }
+      // failure/message 透出，桌面端才能区分「未登录」与「网络错」。
+      const result = await getDeepSeekUserSummary(apiKey, provider.baseUrl)
+      return { status: 200, body: { summary: result.data, failure: result.failure, message: result.message } }
     }, apiToken),
 
     // DeepSeek 平台成本明细：按模型按天的 token/cost。month=1-12, year=YYYY。
@@ -653,8 +675,8 @@ export function buildConfigRoutes(apiToken?: string): Record<string, RouteHandle
       const now = new Date()
       const month = Number(params?.month ?? now.getMonth() + 1)
       const year = Number(params?.year ?? now.getFullYear())
-      const cost = await getDeepSeekCostReport(apiKey, provider.baseUrl, month, year)
-      return { status: 200, body: { cost } }
+      const result = await getDeepSeekCostReport(apiKey, provider.baseUrl, month, year)
+      return { status: 200, body: { cost: result.data, failure: result.failure, message: result.message } }
     }, apiToken),
 
     // ── DeepSeek 平台网页登录（token + cookie 持久化） ────────────

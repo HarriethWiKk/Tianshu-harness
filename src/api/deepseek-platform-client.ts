@@ -6,11 +6,13 @@
  *   2. GET /api/v0/usage/cost?month=&year= — 按模型按天的成本明细
  *   3. GET /api/v0/usage/amount?month=     — 余额明细（赠送/充值分项）
  *
- * 鉴权：API Key（Authorization: Bearer），与 balance-client 同源。非 DeepSeek
- * provider 返回 null，调用方静默处理。
+ * 鉴权优先平台网页登录（~/.rivet/deepseek-platform-auth.json，桌面端 webview
+ * 持久化），回退 API Key（Authorization: Bearer）。三个查询都返回
+ * `PlatformResult`——`failure` 让 UI 区分「未登录」与「网络错」。
  *
  * 注意：cost_in_cents 单位是**分**（不是元），展示时需 /100。
  */
+import { fetchWithTimeout } from './fetch-timeout.js'
 
 // ── 响应类型（从 exe 逆向的 serde 结构） ──────────────────────────
 
@@ -78,7 +80,7 @@ function platformBaseUrl(baseUrl: string | undefined): string {
 }
 
 /** Load persisted platform auth (from webview login). Returns null if not logged in. */
-function loadPlatformAuth(): { token: string; cookies: string } | null {
+export function loadPlatformAuth(): { token: string; cookies: string } | null {
   try {
     // Must match the path resolution used by config-routes.ts (which writes
     // the file via rivetHome()). The previous implementation used
@@ -100,17 +102,44 @@ function loadPlatformAuth(): { token: string; cookies: string } | null {
   }
 }
 
+// ── 结果类型 ──────────────────────────────────────────────────────
+
+/**
+ * 失败原因。UI 需要区分「没登录」（引导用户去桌面端登录）与「网络/服务端错」
+ * （重试即可）——旧实现一律 `null`，两种情况在界面上无从分辨。
+ * - `no-credentials`：既无平台网页登录凭证，也无 DeepSeek API key
+ * - `unauthorized`：凭证过期/无效（HTTP 401/403，或平台 biz_code 40003）
+ * - `network`：连接失败或超时
+ * - `malformed`：HTTP 200 但响应不是预期结构
+ */
+export type PlatformFailure = 'no-credentials' | 'unauthorized' | 'network' | 'malformed'
+
+export interface PlatformResult<T> {
+  data: T | null
+  failure?: PlatformFailure
+  message?: string
+}
+
+function fail<T>(failure: PlatformFailure, message?: string): PlatformResult<T> {
+  return { data: null, failure, message }
+}
+
 // ── API 调用 ──────────────────────────────────────────────────────
 
-async function platformFetch<T>(
+/** 平台侧「未认证」应用层错误码：HTTP 200 但 biz_code 40003。 */
+const BIZ_CODE_UNAUTHORIZED = 40003
+
+async function platformFetch(
   path: string,
   apiKey: string | undefined,
   baseUrl: string | undefined,
   signal?: AbortSignal,
-): Promise<T | null> {
+): Promise<PlatformResult<unknown>> {
   // Auth priority: platform webview login (cookie+token) > API Key
   const platformAuth = loadPlatformAuth()
-  if (!platformAuth && (!apiKey || !isDeepSeekProvider(baseUrl))) return null
+  if (!platformAuth && (!apiKey || !isDeepSeekProvider(baseUrl))) {
+    return fail('no-credentials', 'DeepSeek 平台未登录，且无可用 API key')
+  }
 
   const url = `${platformBaseUrl(baseUrl)}${path}`
   const headers: Record<string, string> = { 'Content-Type': 'application/json' }
@@ -123,26 +152,42 @@ async function platformFetch<T>(
   headers['Origin'] = 'https://platform.deepseek.com'
   headers['Referer'] = 'https://platform.deepseek.com/usage'
 
+  let res: Response
   try {
-    const timeoutSignal = AbortSignal.timeout(10_000)
-    const combinedSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal
-    const res = await fetch(url, { headers, signal: combinedSignal })
-    if (!res.ok) return null
-    return (await res.json()) as T
-  } catch {
-    return null
+    res = await fetchWithTimeout(url, { headers, signal }, 10_000)
+  } catch (err) {
+    return fail('network', (err as Error).message)
+  }
+  if (res.status === 401 || res.status === 403) {
+    return fail('unauthorized', `平台返回 ${res.status}，凭证已失效`)
+  }
+  if (!res.ok) return fail('network', `平台返回 HTTP ${res.status}`)
+  try {
+    return { data: await res.json() }
+  } catch (err) {
+    return fail('malformed', (err as Error).message)
   }
 }
 
-/** 解嵌 { biz_code, biz_data: { biz_code, biz_data: <payload> } } 两层包装。 */
-function unwrap<T>(raw: unknown): T | null {
-  if (!raw || typeof raw !== 'object') return null
+/**
+ * 解嵌 { biz_code, biz_data: { biz_code, biz_data: <payload> } } 两层包装。
+ * biz_code 非 0 时不再当成「无数据」静默丢弃——40003 映射为凭证失效。
+ */
+function unwrap<T>(result: PlatformResult<unknown>): PlatformResult<T> {
+  if (result.data === null) return result as PlatformResult<T>
+  const raw = result.data
+  if (!raw || typeof raw !== 'object') return fail('malformed', '响应不是对象')
   const outer = raw as PlatformEnvelope<PlatformEnvelope<unknown>>
+  if (typeof outer.biz_code === 'number' && outer.biz_code !== 0) {
+    return outer.biz_code === BIZ_CODE_UNAUTHORIZED
+      ? fail('unauthorized', 'biz_code 40003：平台未认证（需网页登录）')
+      : fail('malformed', `平台 biz_code ${outer.biz_code}`)
+  }
   const inner = outer.biz_data
-  if (!inner || typeof inner !== 'object') return null
+  if (!inner || typeof inner !== 'object') return fail('malformed', '响应缺少 biz_data')
   // 有些端点只有一层 biz_data（直接是 payload），有些有两层
   const payload = (inner as PlatformEnvelope<unknown>).biz_data ?? inner
-  return payload as T
+  return { data: payload as T }
 }
 
 /**
@@ -153,9 +198,10 @@ export async function getDeepSeekUserSummary(
   apiKey: string | undefined,
   baseUrl: string | undefined,
   signal?: AbortSignal,
-): Promise<DeepSeekUserSummary | null> {
-  const raw = await platformFetch('/api/v0/users/get_user_summary', apiKey, baseUrl, signal)
-  return unwrap<DeepSeekUserSummary>(raw)
+): Promise<PlatformResult<DeepSeekUserSummary>> {
+  return unwrap<DeepSeekUserSummary>(
+    await platformFetch('/api/v0/users/get_user_summary', apiKey, baseUrl, signal),
+  )
 }
 
 /**
@@ -170,19 +216,16 @@ export async function getDeepSeekCostReport(
   month: number,
   year: number,
   signal?: AbortSignal,
-): Promise<DeepSeekCostReport | null> {
-  const raw = await platformFetch(
-    `/api/v0/usage/cost?month=${month}&year=${year}`,
-    apiKey,
-    baseUrl,
-    signal,
+): Promise<PlatformResult<DeepSeekCostReport>> {
+  const result = unwrap<{ total: DeepSeekCostReport['total']; days?: DeepSeekModelCost[] }>(
+    await platformFetch(`/api/v0/usage/cost?month=${month}&year=${year}`, apiKey, baseUrl, signal),
   )
-  if (!raw) return null
-  const data = unwrap<{ total: DeepSeekCostReport['total']; days?: DeepSeekModelCost[] }>(raw)
-  if (!data) return null
+  if (!result.data) return result as PlatformResult<DeepSeekCostReport>
   return {
-    total: data.total ?? { cost_in_cents: 0, total_tokens: 0 },
-    models: data.days ?? [],
+    data: {
+      total: result.data.total ?? { cost_in_cents: 0, total_tokens: 0 },
+      models: result.data.days ?? [],
+    },
   }
 }
 
@@ -195,12 +238,8 @@ export async function getDeepSeekAmount(
   baseUrl: string | undefined,
   month: string, // YYYY-MM format
   signal?: AbortSignal,
-): Promise<DeepSeekAmountDetail | null> {
-  const raw = await platformFetch(
-    `/api/v0/usage/amount?month=${month}`,
-    apiKey,
-    baseUrl,
-    signal,
+): Promise<PlatformResult<DeepSeekAmountDetail>> {
+  return unwrap<DeepSeekAmountDetail>(
+    await platformFetch(`/api/v0/usage/amount?month=${month}`, apiKey, baseUrl, signal),
   )
-  return unwrap<DeepSeekAmountDetail>(raw)
 }

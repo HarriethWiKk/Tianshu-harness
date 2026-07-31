@@ -11,6 +11,7 @@ import { ToolRegistry } from '../../tools/registry.js'
 import { READ_FILE_TOOL } from '../../tools/read-file.js'
 import { ContextClaimStore } from '../../context/claim-store.js'
 import { PlaybookStore } from '../playbook-store.js'
+import { PrewarmCache } from '../prewarm.js'
 import type { StreamCallbacks } from '../../api/stream-client.js'
 import type { StreamClient } from '../../api/stream-client.js'
 import type { ContentBlock, Message } from '../../api/types.js'
@@ -104,6 +105,28 @@ describe('AgentLoop — multi-turn tool_use', () => {
     assert.equal(completeCount, 1)
     assert.equal(session.getTurnCount(), 1)
     assert.equal(session.getMessages().length, 2) // user + assistant
+  })
+
+  it('config.prewarm 构造期注入——toolExecution 消费端拿到共享实例（断裂回归）', () => {
+    // 冒烟审查抓到的断裂：toolExecution deps 在构造时按值捕获 self.prewarm，
+    // 构造后替换 agent.prewarm 字段到不了 read-file 的 consumePrewarm——
+    // 批级共享 cache「有写无读」空转。必须在构造期经 config 注入。
+    const session = new SessionContext()
+    const registry = new ToolRegistry()
+    registry.register(READ_FILE_TOOL)
+    const shared = new PrewarmCache(60_000, 50)
+
+    const client = mockClient([makeTextBlock('ok')])
+    const agent = new AgentLoop({
+      client, promptEngine: makeEngine(), toolRegistry: registry, maxTurns: 5,
+      contextWindow: 1_000_000,
+      compact: { enabled: false, autoThreshold: 800_000, autoFloor: 500_000, model: 'flash' },
+      prewarm: shared,
+    }, session, TEST_CWD)
+
+    assert.equal(agent.prewarm, shared, 'agent.prewarm 必须是注入的共享实例')
+    const deps = (agent as unknown as { toolExecution: { deps: { prewarm: unknown } } }).toolExecution.deps
+    assert.equal(deps.prewarm, shared, 'toolExecution 消费端必须持有同一个共享实例（构造时值捕获路径）')
   })
 
   it('ends a wedged run when the same tool batch keeps erroring (denied-approval loop)', async () => {

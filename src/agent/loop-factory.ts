@@ -352,6 +352,8 @@ export function createToolExecutionController(self: AgentLoop): ToolExecutionCon
             signal,
           })
         : undefined,
+      // 工具截图寄存：agent 自己截的图也进 registry，ask_image 才问得到它。
+      registerImages: images => self.imageRegistry.register(images),
       // ask_image 查询句柄：从会话 ImageRegistry 取图 → 按主控视觉能力分派。
       //  - 主控多模态 → 返回原图转发（pipeline 递给主控原生识图）。
       //  - text-only → 用 question 定向问视觉桥，命中缓存零调用。
@@ -615,6 +617,7 @@ export function createRuntimeHooksPipeline(self: AgentLoop): RuntimeHookPipeline
     getInitialUserMessage: () => self.initialUserMessage,
     callAntiAnchoringSeedModel: prompt => self.antiAnchoring.callSeedModel(prompt),
     songlineEnabled: self.config.songlineEnabled,
+    securityGuidance: self.config.securityGuidance,
     getTaskSummary: self.config.taskLedger ? () => self.config.taskLedger!.getSummary() : undefined,
     setCycleClose: self.config.sessionRegistry
       ? (sessionId, closeHash) => self.config.sessionRegistry!.setCycleClose(sessionId, closeHash)

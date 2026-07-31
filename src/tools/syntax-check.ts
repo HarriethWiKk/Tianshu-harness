@@ -491,6 +491,12 @@ export interface PythonSyntaxResult {
 
 let _tsPyPromise: Promise<Parser | null> | undefined
 
+// web-tree-sitter 在 WASM 线性内存里分配 parser scratch，长期复用同一实例会让
+// 内存单调增长（JS GC 管不到 WASM 堆）。meridian-parser 用同样的计数阈值周期性
+// 重建 parser；此处照抄该阈值，独立计数。
+const MAX_PARSES_BEFORE_RESET = 250
+let _tsPyParseCount = 0
+
 async function loadPythonParser(): Promise<Parser | null> {
   try {
     const TreeSitter = (await import('web-tree-sitter')).default
@@ -507,6 +513,10 @@ async function loadPythonParser(): Promise<Parser | null> {
 }
 
 async function getPythonParser(): Promise<Parser | null> {
+  if (_tsPyParseCount >= MAX_PARSES_BEFORE_RESET) {
+    _tsPyPromise = undefined
+    _tsPyParseCount = 0
+  }
   if (_tsPyPromise) return _tsPyPromise
   _tsPyPromise = withTimeout(loadPythonParser(), 'tree-sitter python load', getTsParseTimeoutMs())
     .catch(() => null)
@@ -516,6 +526,12 @@ async function getPythonParser(): Promise<Parser | null> {
 /** Test-only: clear the tree-sitter python parser cache. */
 export function _resetPythonParserForTest(): void {
   _tsPyPromise = undefined
+  _tsPyParseCount = 0
+}
+
+/** Test-only: parses since the last parser rebuild (for the reset-cadence test). */
+export function _pythonParseCountForTest(): number {
+  return _tsPyParseCount
 }
 
 /** Depth-first search for the first ERROR or MISSING node (the syntax error
@@ -541,13 +557,19 @@ function firstErrorLine(node: Parser.SyntaxNode): number | undefined {
 export async function checkPythonSyntaxTreeSitter(content: string): Promise<PythonSyntaxResult> {
   const parser = await getPythonParser()
   if (!parser) return { error: null } // degrade
+  // Tree lives in WASM memory and is not reclaimed by the JS GC — it must be
+  // deleted on every path, including the error path (same as meridian-parser).
+  let tree: Parser.Tree | undefined
   try {
-    const tree = parser.parse(content)
+    tree = parser.parse(content)
+    _tsPyParseCount++
     if (!tree.rootNode.hasError) return { error: null }
     const line = firstErrorLine(tree.rootNode)
     return { error: '存在无法解析的语法结构（括号/引号未闭合、意外符号等）。', line }
   } catch {
     return { error: null } // parse threw → degrade
+  } finally {
+    tree?.delete()
   }
 }
 

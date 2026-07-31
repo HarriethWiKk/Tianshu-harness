@@ -188,7 +188,7 @@ export const WRITE_FILE_TOOL: Tool = {
     const syntax = await checkSyntax(filePath, finalContent)
     if (syntax.fatal) {
       const relPath = relative(params.cwd, filePath)
-      const restored = restoreLatestBackup(params.cwd, relPath)
+      const restored = restoreLatestBackup(params.cwd, relPath, params.sessionId)
       const fails = incrementEditFailCount(filePath)
       const gatePrefix = fails >= 3 ? `此文件已连续写入失败 ${fails} 次，再次编辑前必须先重新 read_file。\n\n` : ''
       const rollbackMsg = restored ? '更改已自动回滚。' : '自动回滚失败。'

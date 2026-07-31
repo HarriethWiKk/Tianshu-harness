@@ -70,17 +70,27 @@ function extractClaimsFromRun(run: CoordinatorRun, toolUseId: string, claimStore
     const evidencePaths = result.changedFiles.slice(0, 3)
     result.findings.forEach((finding, findingIndex) => {
       const claimText = typeof finding === 'string' ? finding : finding.claim
+      const evidenceText = typeof finding === 'string' ? finding : finding.evidence
       const confidence = typeof finding === 'string' ? 0.7
         : finding.confidence === 'high' ? 0.85
         : finding.confidence === 'medium' ? 0.7
         : 0.55
+      // 一手实测带 file:line 的发现天然比转述推断可信度高一个台阶
+      const isFirsthand = typeof finding !== 'string' && finding.evidenceKind === 'firsthand'
+      const fitness = isFirsthand ? 5
+        : confidence >= 0.85 ? 5 : confidence >= 0.7 ? 3 : 2
       const eventId = `${toolUseId}:worker:${result.workOrderId}:${findingIndex}`
+      const evidenceKind = typeof finding !== 'string' ? finding.evidenceKind : undefined
+      const prefix = evidenceKind === 'firsthand' ? '[一手] ' : evidenceKind === 'inferred' ? '[转述] ' : ''
+      const refs = typeof finding !== 'string' && finding.evidenceRefs?.length
+        ? ` (${finding.evidenceRefs.join(', ')})`
+        : ''
       const proposal: ClaimProposal = {
         kind: 'worker_finding',
         scope: 'session',
-        text: claimText,
+        text: `${prefix}${claimText}${refs}`,
         confidence,
-        fitness: confidence >= 0.85 ? 5 : confidence >= 0.7 ? 3 : 2,
+        fitness,
         source: { actor: 'worker', sessionId, turn: 0, eventId },
         evidence: [{
           id: `${eventId}:finding`,

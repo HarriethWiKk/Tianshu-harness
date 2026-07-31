@@ -557,7 +557,7 @@ export class PromptEngine {
 
             if (this.tracker) {
               // activeDomain is no longer habituation-tracked — it is a session
-              // constant folded into the frozen prefix (volatile.ts, after <locus>)
+              // constant folded into the frozen prefix (volatile.ts, frozen 末尾)
               // via setActiveDomain → rebuildFrozenBase. Only playbookLessons still
               // warms up through habituation into the <consolidated> block.
               const fieldValues: Record<string, string> = {}

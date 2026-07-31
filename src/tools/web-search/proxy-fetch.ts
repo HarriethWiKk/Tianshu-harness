@@ -1,4 +1,4 @@
-import { ProxyAgent } from 'undici'
+import { ProxyAgent, fetch as undiciFetch } from 'undici'
 import type { ProxyResolverOptions } from '../../tools/net/proxy-resolver.js'
 import { resolveProxyForUrl } from '../../tools/net/proxy-resolver.js'
 import { boundedSearchFetch } from './bounded-fetch.js'
@@ -21,7 +21,7 @@ import type { SearchFetch } from './types.js'
  */
 export function createProxyAwareFetch(
   proxyOpts?: ProxyResolverOptions,
-  fetchImpl: SearchFetch = globalThis.fetch.bind(globalThis) as SearchFetch,
+  fetchImpl: SearchFetch = undiciFetch as unknown as SearchFetch,
 ): SearchFetch {
   const bounded = boundedSearchFetch(fetchImpl)
   return async (url, init) => {

@@ -679,6 +679,9 @@ export class AgentLoop {
       this.config.permissionsOverlay = createPermissionOverlay()
     }
     this.cwd = cwd ?? process.cwd()
+    // 构造期注入共享 prewarm——必须早于 createToolExecutionController（下方
+    // L929 附近）：其 deps 按值捕获 self.prewarm，构造后替换字段到不了消费端。
+    if (config.prewarm) this.prewarm = config.prewarm
     this.evidence = new EvidenceTracker()
     // 证据义务状态机：与 EvidenceTracker 同寿命。验证事件单向流入——
     // blocked 只记 attempted、目标不匹配的失败不满足 RED（Wave 1 语义）。
@@ -1325,6 +1328,9 @@ export class AgentLoop {
       return
     }
     if (source === 'user') this.userReasoningOverride = true
+    // 用户已显式选档（/effort max 等）→ 程序化调整（perception strategy、
+    // autoReasoning 档位）不得覆盖，保护显式用户意图。
+    if (source === 'programmatic' && this.userReasoningOverride) return
     this.reasoningEffort.set(effort)
   }
 

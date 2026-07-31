@@ -118,6 +118,7 @@ const HELP_TEXT = `Available commands:
 /team <task|plan> — Run team-mode workflow through team_orchestrate
 /team max <task> — Run team-mode max planning through team_orchestrate
 /council <task> [--seats id1,id2,...] [--rounds 1-2] — Convene a star-domain council (single round; --rounds 2 enables a rebuttal round)
+/scout <诊断目标> [--dims 前端,后端,集成] — 巡天侦察蜂群：并行只读诊断，交付实测核对清单（不写文件）
 /review — Manually trigger L2 review (single adversarial verifier) on current changes via deliver_task
 /review max — Manually trigger L3 review (Review Squadron, 5 inspectors) on current changes via deliver_task
 /review off|on|status — 会话级关闭/恢复/查看自动审查门（off 只抑制自动审查省 token，手动 /review 始终可用）
@@ -798,6 +799,18 @@ const TUI_SLASH_COMMANDS: readonly TuiSlashCommandDef[] = [
     },
   },
   {
+    name: '/galaxy',
+    handler(ctx) {
+      const { parts, pushStatic, setIsStreaming } = ctx
+      if (!parts.slice(1).join(' ').trim()) {
+        pushStatic(createLogEntry({ type: 'system', content: 'Usage: /galaxy <任务描述>\n       启动星河集群——拆解为多个维度由不同星域并行执行。' }))
+        setIsStreaming(false)
+        return true
+      }
+      return false
+    },
+  },
+  {
     name: '/council',
     handler(ctx) {
       const { parts, pushStatic, setIsStreaming } = ctx
@@ -812,6 +825,18 @@ const TUI_SLASH_COMMANDS: readonly TuiSlashCommandDef[] = [
       const roundsMatch = /--rounds[\s=]+(\d+)/.exec(parts.slice(1).join(' '))
       if (roundsMatch && Number(roundsMatch[1]) >= 2 && !isProFeatureEnabled(ctx.config, 'councilMultiRound')) {
         pushStatic(createLogEntry({ type: 'system', content: '提示：议事会第 2 轮（反驳轮）是 Pro 功能，本次将按单轮执行。升级 Pro 解锁多轮辩论。' }))
+      }
+      return false
+    },
+  },
+  {
+    name: '/scout',
+    handler(ctx) {
+      const { parts, pushStatic, setIsStreaming } = ctx
+      if (!parts.slice(1).join(' ').trim()) {
+        pushStatic(createLogEntry({ type: 'system', content: 'Usage: /scout <诊断目标> [--dims 前端,后端,集成]\n并行只读诊断蜂群：先摸底 → 按维度派 code_scout → 实测核对清单 + runbook。' }))
+        setIsStreaming(false)
+        return true
       }
       return false
     },
@@ -3849,6 +3874,13 @@ export function registerTuiSlashCommands(app: TuiApp, ctx: BootstrapContext): vo
     handler: () => true,
   })
 
+  register("/cache", {
+    description: "缓存面板（token 消耗 / 命中率 / 缓存省钱 · DeepSeek 官方账单）",
+    immediate: true,
+    overlay: "cache",
+    handler: () => true,
+  })
+
   register("/enter", {
     description: "Resume a worker session (e.g. /enter wo_team:T1 continue fixing bug)",
     immediate: true,
@@ -4068,6 +4100,8 @@ export function registerTuiSlashCommands(app: TuiApp, ctx: BootstrapContext): vo
   }
   registerWorkflow("/team")
   registerWorkflow("/council")
+  registerWorkflow("/scout")
+  registerWorkflow("/galaxy")
   registerWorkflow("/plan")
   registerWorkflow("/write-plan")
   registerWorkflow("/plan-close")

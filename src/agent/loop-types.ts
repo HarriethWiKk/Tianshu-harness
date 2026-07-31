@@ -51,6 +51,10 @@ export interface AgentConfig {
    *  window-derived 120K cap lets one full-file read permanently occupy every
    *  subsequent turn's prompt. Absent → cap derived from contextWindow. */
   readCapOverride?: import('../tools/model-read-cap.js').ModelReadCap
+  /** Batch-scoped shared PrewarmCache（worker 经 WorkerSessionConfig.prewarm 透传）。
+   *  必须在构造期注入——toolExecution 的 deps 在构造时按值捕获 self.prewarm，
+   *  构造后替换字段到不了消费端（read-file consumePrewarm）。 */
+  prewarm?: import('./prewarm.js').PrewarmCache
   /** Provider registry key (e.g. 'deepseek') — used as ProviderHealthTracker id. */
   providerName?: string
   /** Cost-aware reclaim profile resolved from provider+model economics
@@ -162,6 +166,8 @@ export interface AgentConfig {
   defaultDomain?: string
   /** Explicit opt-in for Songline substrate post-session pheromone/cycle relay. Disabled by default. */
   songlineEnabled?: boolean
+  /** 安全模式正则告警（层1）。默认开；false 或 RIVET_SECURITY_GUIDANCE=0 关闭。 */
+  securityGuidance?: boolean
   /** Explicit opt-in for HEARTH anchor invariant observation (postTurn, diagnostic only). Disabled by default. */
   hearthObserveEnabled?: boolean
   /** Enable cross-session knowledge loading (memory block, playbook events, companion presence).

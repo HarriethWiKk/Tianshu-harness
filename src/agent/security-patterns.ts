@@ -3,12 +3,15 @@
  *
  * 纯数据 + 一个纯函数 scanContent。无 env 读取、无 I/O、无副作用——可独立导入。
  * 覆盖常见 web 漏洞类:命令注入、反序列化 RCE、XSS、eval 注入、弱加密、
- * TLS 校验关闭、XXE、CI 表达式注入、缺 SRI 的外链脚本。
+ * TLS 校验关闭、XXE、CI 表达式注入、缺 SRI 的外链脚本、SQL 注入、硬编码密钥。
  *
  * 与官方的差异:
  *   - reminder 文案改中文,与 Tianshu advisory 生态一致
  *   - 保留官方的 lookbehind / pathFilter 边界(防误报),逐条移植其正则
  *   - RuleId 稳定枚举照搬(便于遥测归因,值冻结不重编号)
+ *   - 26/27 是本仓库补的两条(SQL 注入、硬编码密钥)。官方规则表没有它们——
+ *     官方靠 LLM 审查层抓,但这两类最常见、形状足够固定,纯正则也能可靠命中,
+ *     没必要等有成本的层2。误报边界比移植规则更保守(见各条注释)。
  *
  * @module security-patterns
  */
@@ -214,6 +217,35 @@ export const SECURITY_PATTERNS: SecurityPattern[] = [
     regex: /\bjoblib\.load\s*\(|\b(?:pd|pandas)\.read_pickle\s*\(|\.cloudpickle_load\s*\(|\b(?:np|numpy)\.load\s*\([^)\n]{0,200}allow_pickle\s*=\s*True/,
     reminder: UNSAFE_DESERIALIZATION_REMINDER,
   },
+  {
+    ruleName: 'sql_string_interpolation',
+    // 官方规则表没有这条（官方靠 LLM 层抓 SQL 注入）。补上是因为纯正则能可靠
+    // 命中最常见的形状：SQL 语句 + 插值/拼接/% 格式化。
+    //
+    // 两处刻意的收紧，都是被误报逼出来的：
+    //   1. 要求成对的 SQL 语法（SELECT…FROM / UPDATE…SET），不认裸动词——
+    //      `store.update({ name })` 这类调用会被裸 UPDATE + `{` 命中。
+    //   2. 不把 `%s` 当危险信号——它正是 Python DB-API 的**参数化占位符**，
+    //      `execute("… %s", (uid,))` 是正确写法。危险的是字符串结束后的 `%`
+    //      运算（`"… %s" % uid`），所以匹配引号后紧跟的 `%`。
+    //
+    // 已知漏报：跨行 SQL（模板字符串里换行后才插值）——主体不跨行，跨行会把
+    // 误报面放大到整段代码。与本模块整体取向一致：漏报优于误报。
+    pathFilter: p => !endsWithAny(p, DOC_EXTS),
+    regex: /(?:SELECT\b[^;\n]{0,120}\bFROM\b|INSERT\s+INTO\b|UPDATE\b[^;\n]{0,120}\bSET\b|DELETE\s+FROM\b)[^;\n]{0,200}(?:\$\{|\{[a-zA-Z_]|["'`]\s*\+|["'`]\s*%\s*[a-zA-Z_(]|\.format\()/i,
+    reminder:
+      '⚠️ 安全警告:SQL 语句里出现字符串插值/拼接,这是 SQL 注入的典型形状。改用参数化查询,让驱动去转义:\n\n不安全:`SELECT * FROM users WHERE id = ${userId}`\n安全（占位符 + 参数数组）:db.query(\'SELECT * FROM users WHERE id = ?\', [userId])\nPython:cursor.execute("SELECT * FROM users WHERE id = %s", (user_id,))  # 注意是逗号,不是 %\n\n表名/列名不能参数化,只能用白名单校验后再拼。ORDER BY 方向同理（只允许 ASC/DESC）。\n若这是静态 SQL 且插值来自常量,先加注释说明再继续。',
+  },
+  {
+    ruleName: 'hardcoded_secret',
+    // 只认「密钥类字段名 = 长字面量」以及可辨识的 token 前缀（sk-/ghp_/AKIA…）。
+    // 刻意不认短值、占位符（xxx/your-…/<…>/env 读取/${}）——密钥泄露的代价高,
+    // 但误报会让这条规则被无视,所以宁可漏报明显是示例的写法。
+    pathFilter: p => !endsWithAny(p, DOC_EXTS),
+    regex: /(?:api[_-]?key|secret[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|password|passwd)\s*[:=]\s*["'`](?!(?:x{3,}|your[-_]|my[-_]|test|dummy|example|placeholder|change[-_]?me|\$\{|<|\.\.\.))[A-Za-z0-9_\-./+=]{16,}["'`]|\b(?:sk-[A-Za-z0-9]{20,}|ghp_[A-Za-z0-9]{30,}|gho_[A-Za-z0-9]{30,}|AKIA[0-9A-Z]{16}|AIza[A-Za-z0-9_\-]{30,}|xox[baprs]-[A-Za-z0-9-]{10,})\b/i,
+    reminder:
+      '⚠️ 安全警告:代码里出现疑似硬编码的密钥/令牌/口令。密钥一旦进 git 历史就收不回来——即使后续提交删掉,历史里仍可检出,必须视为已泄露并轮换。\n\n改法:从环境变量或密钥管理服务读取（process.env.X / os.environ["X"]），把真实值放进 .env 并确认 .env 已被 .gitignore 忽略;示例值写成明显的占位符（your-api-key-here）。\n\n若这是测试用的假值,把它改成一眼可辨的占位形状（xxx…/dummy-…),既消除告警也让读者不误当真值。',
+  },
 ]
 
 /**
@@ -246,6 +278,9 @@ export enum RuleId {
   TORCH_UNSAFE_LOAD = 23,
   YAML_UNSAFE_LOAD_VARIANTS = 24,
   PICKLE_WRAPPER_LOAD = 25,
+  // 26 起是本仓库在官方规则表之外补的（官方靠 LLM 层抓这两类）。
+  SQL_STRING_INTERPOLATION = 26,
+  HARDCODED_SECRET = 27,
 }
 
 const RULE_NAME_TO_ID: Record<string, RuleId> = {
@@ -274,6 +309,8 @@ const RULE_NAME_TO_ID: Record<string, RuleId> = {
   torch_unsafe_load: RuleId.TORCH_UNSAFE_LOAD,
   yaml_unsafe_load_variants: RuleId.YAML_UNSAFE_LOAD_VARIANTS,
   pickle_wrapper_load: RuleId.PICKLE_WRAPPER_LOAD,
+  sql_string_interpolation: RuleId.SQL_STRING_INTERPOLATION,
+  hardcoded_secret: RuleId.HARDCODED_SECRET,
 }
 
 // 导入期防呆:规则表与 RuleId 表脱钩时立刻抛错（测试每次跑都会命中）。

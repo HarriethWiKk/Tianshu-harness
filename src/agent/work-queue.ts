@@ -88,9 +88,15 @@ export class WorkOrderQueue {
   /** 检查 order 是否与 in-flight 任务有文件冲突 */
   hasFileConflict(order: WorkOrder): boolean {
     if (!order.scope.files?.length) return false
+    // Two read-only workers can inspect the same snapshot in parallel. Keep
+    // serialization whenever either side can write, so no worker reads a moving
+    // target and concurrent writers remain exclusive.
+    const orderWrites = classifyProfile(order.profile) === 'hands'
     const orderFiles = new Set(order.scope.files)
     for (const inflight of this.inFlightOrders.values()) {
       if (!inflight.scope.files?.length) continue
+      const inflightWrites = classifyProfile(inflight.profile) === 'hands'
+      if (!orderWrites && !inflightWrites) continue
       if (inflight.scope.files.some(f => orderFiles.has(f))) return true
     }
     return false

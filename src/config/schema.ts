@@ -258,6 +258,10 @@ export const agentSchema = z.object({
   resumeFallbackModel: z.string().optional(),
   /** Explicit opt-in for Songline substrate post-session pheromone/cycle relay. */
   songlineEnabled: z.boolean().default(false),
+  /** 写操作后的安全模式正则告警（层1）。默认开：纯正则、零 API 调用、命中才注入，
+   *  与其他 advisory hook 同档。设 false 或 RIVET_SECURITY_GUIDANCE=0 关闭。
+   *  配置项存在的意义是让桌面端用户也能关——GUI 启动的 sidecar 继承不到 shell 环境变量。 */
+  securityGuidance: z.boolean().default(true),
   /** Enable cross-session knowledge loading (memory block, playbook, companion presence).
    *  Default true — injects distilled project knowledge from .rivet/knowledge/.
    *  Set false for fully isolated sessions. Env RIVET_NO_CROSS_SESSION=1 overrides as force-off. */
@@ -339,6 +343,15 @@ export const agentSchema = z.object({
       model: z.string(),
     }).optional(),
   }).optional(),
+  /**
+   * Opt-in: when `visionModel` is unset and the primary model is text-only, pick
+   * the first vision-capable model that has usable credentials and bridge through
+   * it. Off by default on purpose — auto-bridging ships the user's images to a
+   * provider they never chose for this purpose, which is a cost and a privacy
+   * decision, not a convenience default. When off, an available candidate is
+   * reported (TUI hint / `visionBridge.detail`) instead of being used silently.
+   */
+  visionAutoBridge: z.boolean().default(false),
   /** Greeting LLM: welcome page dynamic greeting feature toggle + model selection. */
   greeting: z.object({
     /** When false, all greeting LLM calls are skipped (algorithm templates only). */

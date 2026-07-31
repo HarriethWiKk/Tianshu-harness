@@ -538,7 +538,7 @@ export function buildDynamicAppendixParts(ctx: VolatileContext, maxChars?: numbe
   // sections that change every turn go last so only the tail is new.
 
   // star-domain: NOT rendered in the appendix. As a session constant it is
-  // folded into the frozen prefix (buildVolatileBlockInternal, after <locus>) —
+  // folded into the frozen prefix (buildVolatileBlockInternal, frozen 末尾) —
   // provider-agnostic, in the exact-prefix cache from turn 1. Emitting it here
   // would duplicate the motto and break prefix stability.
 
@@ -1012,21 +1012,7 @@ function buildVolatileBlockInternal(ctx: VolatileContext): string {
     parts.push('<locus relation="world">你在一个外部项目中工作。遵循项目自身的约定（AGENTS.md + .rivet.md）。验证深度匹配任务复杂度：简单修改跑 related tests，跨模块改动跑 full suite。</locus>')
   }
 
-  // star-domain: session-constant identity, folded into the frozen prefix (next
-  // to sober/locus) so it enters the exact-prefix cache from turn 1 — provider-
-  // agnostic, no habituation warm-up. name/motto are registry constants (not user
-  // input), rendered unescaped to match the established <star-domain name="..."> shape.
-  if (ctx.activeDomain) {
-    const d = ctx.activeDomain
-    // knowledgeBlock: session-constant top-K domain lessons (bound once with the
-    // domain) — lesson text is agent-written store content, so it IS escaped.
-    const knowledge = d.knowledgeBlock ? `\n<domain-knowledge>\n${escapeXml(d.knowledgeBlock)}\n</domain-knowledge>` : ''
-    // 全星域共享执行纪律（字节恒定，随 star-domain 进 FROZEN 前缀）。
-    // 瑶光域在自己的 systemPromptSuffix 里保留放大版，此处是十域共同的底线。
-    const sharedDiscipline = '\n执行纪律（全星域共享）：绿非证明，复现即证——宣称已修/已验证前，先用工具复现结论；报告里的每个数字要能指到一条真实验证记录。'
-    parts.push(`<star-domain name="${d.name}" motto="${d.motto}">${d.volatileBlock}${sharedDiscipline}${knowledge}</star-domain>`)
-  }
-
+  // star-domain 块已移至 frozen 末尾（session-memory 之后）——见文件尾部。
   // 档位化上限：缺省回落 standard，保证无 policy 的调用方（worker / 测试 /
   // 直接构造 ctx 的路径）与历史输出逐字节一致。
   const caps = { ...FROZEN_BLOCK_CAPS, ...ctx.blockCaps }
@@ -1093,7 +1079,28 @@ function buildVolatileBlockInternal(ctx: VolatileContext): string {
     parts.push(`<session-memory>\n${escapeXml(ctx.sessionMemoryBlock)}\n</session-memory>`)
   }
 
-  // NOTE: activeDomain IS rendered here (above, after <locus>) — it is a session
+  // star-domain: session-constant identity, folded into the frozen prefix so it
+  // enters the exact-prefix cache from turn 1 — provider-agnostic, no habituation
+  // warm-up. name/motto are registry constants (not user input), rendered
+  // unescaped to match the established <star-domain name="..."> shape.
+  //
+  // 位置（2026-08-01 P1-1）：从 sober/locus 之后移到 frozen **末尾**。不同
+  // authority 的 worker 此前在星域块分叉，连带损失其后的 project-instructions /
+  // verify-block / session-memory 段缓存；移到最末后分叉点之前的前缀全共享。
+  // 代价是星域指令从「身份前置区」退到「记忆末区」，指令权重降低——认知影响
+  // 需冒烟观察（见 docs/plans/2026-07-31-galaxy-prewarm-and-cache-affinity.md）。
+  if (ctx.activeDomain) {
+    const d = ctx.activeDomain
+    // knowledgeBlock: session-constant top-K domain lessons (bound once with the
+    // domain) — lesson text is agent-written store content, so it IS escaped.
+    const knowledge = d.knowledgeBlock ? `\n<domain-knowledge>\n${escapeXml(d.knowledgeBlock)}\n</domain-knowledge>` : ''
+    // 全星域共享执行纪律（字节恒定，随 star-domain 进 FROZEN 前缀）。
+    // 瑶光域在自己的 systemPromptSuffix 里保留放大版，此处是十域共同的底线。
+    const sharedDiscipline = '\n执行纪律（全星域共享）：绿非证明，复现即证——宣称已修/已验证前，先用工具复现结论；报告里的每个数字要能指到一条真实验证记录。'
+    parts.push(`<star-domain name="${d.name}" motto="${d.motto}">${d.volatileBlock}${sharedDiscipline}${knowledge}</star-domain>`)
+  }
+
+  // NOTE: activeDomain IS rendered here (above, frozen 末尾) — it is a session
   // constant KEPT in FROZEN. The remaining per-turn dynamic fields (gitStatus,
   // toolHistory, taskProgress, decisions, playbookLessons, planModeState,
   // worktreeReality, …) are NOT rendered here. buildStableVolatileBlock — the

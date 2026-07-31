@@ -21,6 +21,7 @@ export type SettingsBlockId =
   | 'workers'
   | 'review'
   | 'vision'
+  | 'visionAuto'
   | 'toolPreset'
   | 'approval'
   | 'checkpoint'
@@ -45,6 +46,9 @@ export interface VisionDraft {
   model: string
   prompt?: string
   maxTokens: number
+  /** 备用识图桥（主桥 5xx/超时时切）。必须在 draft 里往返，否则面板一保存就把它
+   *  抹掉——桌面端与手写配置都可能设了它，面板不该删掉自己不显示的字段。 */
+  fallback?: { provider: string; model: string }
 }
 
 export interface BasicsDraft {
@@ -69,6 +73,9 @@ export interface SettingsDraft {
   workers: WorkersConfig
   review: ReviewConfig
   vision: VisionDraft | null
+  /** `agent.visionAutoBridge` — own block: it matters precisely when `vision` is
+   *  null, so it cannot live inside the nullable vision draft. */
+  visionAutoBridge: boolean
   basics: BasicsDraft
   net: NetDraft
 }
@@ -321,6 +328,8 @@ function modelField(input: {
   sentinel?: { id: string; label: string }
   get: (draft: SettingsDraft) => string
   set: (draft: SettingsDraft, ref: string) => SettingsDraft
+  /** Refuse the edit with a reason (e.g. depends on another field being set). */
+  guard?: (draft: SettingsDraft) => string | undefined
 }): SettingsField {
   return {
     id: input.id,
@@ -341,6 +350,8 @@ function modelField(input: {
     },
     selectedId: input.get,
     apply: (draft, value) => {
+      const blocked = input.guard?.(draft)
+      if (blocked) return { error: blocked }
       if (value === INHERIT) return input.set(draft, INHERIT)
       if (!splitModelRef(value)) return { error: '模型格式需为 provider:modelId' }
       return input.set(draft, value)
@@ -495,8 +506,25 @@ function visionCategory(): SettingsCategory {
             model: parts.model,
             prompt: d.vision?.prompt,
             maxTokens: d.vision?.maxTokens ?? 1024,
+            fallback: d.vision?.fallback,
           },
         }
+      },
+    }),
+    modelField({
+      id: 'vision.fallback',
+      label: '备用识图模型',
+      block: 'vision',
+      effect: 'next-session',
+      visionOnly: true,
+      sentinel: { id: INHERIT, label: OFF_LABEL },
+      hint: '主识图模型 5xx / 超时时自动切到它；不设即单桥',
+      guard: d => (d.vision ? undefined : '先选一个识图模型，再设备用'),
+      get: d => (d.vision?.fallback ? modelRef(d.vision.fallback.provider, d.vision.fallback.model) : INHERIT),
+      set: (d, ref) => {
+        if (!d.vision) return d
+        const parts = ref ? splitModelRef(ref) : null
+        return { ...d, vision: { ...d.vision, fallback: parts ? { provider: parts.provider, model: parts.model } : undefined } }
       },
     }),
     textField({
@@ -518,6 +546,15 @@ function visionCategory(): SettingsCategory {
       guard: d => (d.vision ? undefined : '先选一个识图模型，再改输出上限'),
       get: d => d.vision?.maxTokens ?? 1024,
       set: (d, value) => (d.vision ? { ...d, vision: { ...d.vision, maxTokens: value } } : d),
+    }),
+    boolField({
+      id: 'vision.autoBridge',
+      label: '未配置时自动选桥',
+      block: 'visionAuto',
+      effect: 'next-session',
+      hint: '开启后即使没指定识图模型，也会自动挑一个可用视觉模型——图片会发给那个 provider，默认关',
+      get: d => d.visionAutoBridge,
+      set: (d, value) => ({ ...d, visionAutoBridge: value }),
     }),
   ]
   return { id: 'vision', label: '识图模型', fields }
@@ -651,6 +688,7 @@ export function blockValue(draft: SettingsDraft, block: SettingsBlockId): unknow
     case 'workers': return draft.workers
     case 'review': return draft.review
     case 'vision': return draft.vision
+    case 'visionAuto': return draft.visionAutoBridge
     case 'toolPreset': return draft.basics.toolPreset
     case 'approval': return draft.basics.approval
     case 'checkpoint': return draft.basics.checkpointEveryTurns
@@ -663,7 +701,7 @@ export function blockValue(draft: SettingsDraft, block: SettingsBlockId): unknow
 }
 
 const ALL_BLOCKS: readonly SettingsBlockId[] = [
-  'workers', 'review', 'vision', 'toolPreset', 'approval',
+  'workers', 'review', 'vision', 'visionAuto', 'toolPreset', 'approval',
   'checkpoint', 'defaultDomain', 'defaultModel', 'mirrors', 'network', 'search',
 ]
 

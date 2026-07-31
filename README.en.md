@@ -113,7 +113,7 @@ rivet --goal "fix all type errors" --budget 50  # headless goal autonomy, max 50
 | `--skip-welcome` | Skip the welcome screen |
 | `--stream-events <path>` | Mirror this run as NDJSON `SessionEvent`s to a file |
 
-Subcommands: `rivet config` (interactive config), `rivet serve` (sidecar HTTP/SSE server), `rivet sessions` (list sessions).
+Subcommands: `rivet config` (interactive config), `rivet serve` (sidecar HTTP/SSE server), `rivet sessions` (list sessions), `rivet logs` (log locations), `rivet browser status` / `rivet browser install [--no-mirror]` (chromium health check and one-shot install for `browser_debug`; mirrors by default).
 
 ### Auto-Update
 
@@ -177,15 +177,20 @@ Built-in models that see images directly: `glm-5.2` (glm / ccswitch), `MiniMax-M
       "provider": "minimax",
       "model": "MiniMax-M3",
       "prompt": "Describe this image in detail…",  // optional
-      "maxTokens": 1024                            // optional, description output cap
-    }
+      "maxTokens": 1024,                           // optional, description output cap
+      "fallback": { "provider": "glm", "model": "glm-5.2" }  // optional, failover on 5xx/timeout
+    },
+    "visionAutoBridge": false   // auto-pick a vision model when visionModel is unset (off by default)
   }
 }
 ```
 
-- **Desktop**: Settings → Integrations → Vision model (the dropdowns list only configured models that declare image input; leave empty to disable).
-- **TUI**: `/config` → Vision model (same candidate list as desktop; pick the leading "off" entry to disable the bridge, `S` to save — takes effect next session).
-- **Where images come from**: paste an image *path* or `Ctrl+V` from the clipboard in the TUI, or attach via the desktop Composer (4 per message); plus screenshots the agent takes itself with `browser_debug` / `computer_use` (at most the 2 most recent per tool batch enter the context).
+- **Desktop**: Settings → Integrations → Vision model (the dropdowns list only configured models that declare image input; leave empty to disable; the same card holds the fallback vision model and the auto-bridge toggle). The card header shows the **live bridge status for the current session**, and attaching an image that would not be seen raises an inline warning in the Composer with a "configure" button.
+- **TUI**: `/config` → Vision model (same candidate list as desktop; pick the leading "off" entry to disable the bridge; the auto-bridge toggle lives in the same category, `S` to save — takes effect next session).
+- **`ask_image`**: with a bridge configured (or a multimodal primary), the model can re-interrogate the same image for specifics ("read the red error line verbatim") — both images you attached and screenshots the agent took itself; repeating the same angle hits a cache and costs nothing.
+- **Auto-bridge is off by default**: turning it on ships your images to a provider you never picked for that purpose. While off, an available vision model is *named* in the bridge status along with how to enable it — images are never dropped quietly.
+- **Where images come from**: paste an image *path* or `Ctrl+V` from the clipboard in the TUI, or attach via the desktop Composer (4 per message); plus screenshots the agent takes itself with `browser_debug` / `computer_use` (at most the 2 most recent per tool batch enter the context). Missing chromium? Run `rivet browser install`, or install it from Settings → Integrations → **Browser (Screenshots)** in the desktop app (with a live install log).
+- **CLI and desktop stand alone**: vision model, fallback bridge, auto-bridge opt-in and chromium install are all configurable from either surface — installing just one is enough to get image understanding working.
 - Images are appended at the tail of the conversation, so they **do not break the prefix cache**; tokens are estimated from resolution (1280×800 ≈ 1105, not a flat per-image constant).
 
 See the [Vision Guide](docs/user-guide-vision.md) for the full reference and troubleshooting.
@@ -333,13 +338,13 @@ Delegate sub-tasks to independent headless worker sessions:
 
 ### Toolset & presets
 
-Tianshu ships 47 built-in tools, assembled in three preset tiers (resolution priority: `RIVET_TOOL_PRESET` env > project `.rivet-config.json` `tools.preset` > user `~/.rivet/config.json` > default `minimal`):
+Tianshu ships 48 built-in tools, assembled in three preset tiers (resolution priority: `RIVET_TOOL_PRESET` env > project `.rivet-config.json` `tools.preset` > user `~/.rivet/config.json` > default `minimal`):
 
 | Preset | Tools | Description |
 |--------|-------|-------------|
-| **minimal** (default) | 27 | Full daily-dev capability — read/write/search/bash/git/tests/delegation/web/plan/todo/memory; saves tokens, preserves prefix cache |
-| **frontend** | 28 | minimal + `browser_debug` (UI rendering verification loop) |
-| **full** | 47 | Everything — `council_convene` / `team_orchestrate` / `attack_case` / `semantic_search` / `repo_graph` / `monitor` / `computer_use` / office tools, etc. |
+| **minimal** (default) | 29 | Full daily-dev capability — read/write/search/bash/git/tests/delegation/web/plan/todo/memory; saves tokens, preserves prefix cache |
+| **frontend** | 30 | minimal + `browser_debug` (UI rendering verification loop) |
+| **full** | 48 | Everything — `council_convene` / `team_orchestrate` / `attack_case` / `semantic_search` / `repo_graph` / `monitor` / `computer_use` / office tools, etc. |
 
 ```bash
 RIVET_TOOL_PRESET=full rivet          # use full for this session
@@ -789,6 +794,7 @@ Write only the fields you want to override; defaults are deep-merged. Full schem
       "provider": "minimax",      // must have a key configured and declare supportsVision
       "model": "MiniMax-M3"
     },
+    "visionAutoBridge": false,    // auto-pick a vision model when visionModel is unset (off by default)
     "permissions": {              // permission rules (mirrors /permission commands)
       "allow": [{ "tool": "read" }],
       "deny":  [{ "tool": "bash", "params": { "command": "rm -rf" } }],

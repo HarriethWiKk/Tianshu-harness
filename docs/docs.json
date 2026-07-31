@@ -1,7 +1,7 @@
 {
   "generator": "scripts/docs-index.ts",
   "spec": "docs/README.md",
-  "count": 1005,
+  "count": 1025,
   "docs": [
     {
       "path": "docs/AB测试期间损失审计.md",
@@ -878,6 +878,54 @@
       "tags": []
     },
     {
+      "path": "docs/analysis/2026-07-29-desktop-macos12-blank-window.md",
+      "title": "桌面端 macOS 12 安装后页面空白（首屏 chunk 后行断言正则）",
+      "type": "analysis",
+      "typeSource": "frontmatter",
+      "status": "fixed",
+      "statusSource": "frontmatter",
+      "date": "2026-07-29",
+      "related": [
+        "../../desktop/src/build/webkit-compat.ts",
+        "../../desktop/scripts/check-webkit-baseline.ts",
+        "../../desktop/vite.config.ts",
+        "../../desktop/src-tauri/tauri.conf.json"
+      ],
+      "supersedes": null,
+      "tags": [
+        "desktop",
+        "macos",
+        "webkit",
+        "javascriptcore",
+        "compatibility",
+        "release"
+      ]
+    },
+    {
+      "path": "docs/analysis/2026-07-29-desktop-thread-scroll-tail-hidden.md",
+      "title": "桌面端会话流「最后一条 agent 回复看不到」归因",
+      "type": "analysis",
+      "typeSource": "frontmatter",
+      "status": "likely-fixed-pending-verify",
+      "statusSource": "frontmatter",
+      "date": "2026-07-29",
+      "related": [
+        "../../desktop/src/surfaces/ThreadView.tsx",
+        "../../desktop/src/components/CompletionCurtain.tsx",
+        "../../desktop/src/surfaces/use-scroll-intent.ts",
+        "../../desktop/src/styles.css"
+      ],
+      "supersedes": null,
+      "tags": [
+        "desktop",
+        "thread",
+        "scroll",
+        "virtualizer",
+        "completion-curtain",
+        "regression-candidate"
+      ]
+    },
+    {
       "path": "docs/analysis/2026-07-29-team-mode-e2e-repro-and-gaps.md",
       "title": "Team 模式端到端实测：复现手册与入口层缺陷归因",
       "type": "analysis",
@@ -887,12 +935,15 @@
       "date": "2026-07-29",
       "related": [
         "../../src/tools/team-orchestrate.ts",
+        "../../src/tools/council-convene.ts",
         "../../src/agent/tool-tiers.ts",
-        "../../src/agent/worktree-scope.ts"
+        "../../src/agent/worktree-scope.ts",
+        "../../src/agent/council/council-to-plan.ts"
       ],
       "supersedes": null,
       "tags": [
         "team",
+        "council",
         "orchestration",
         "tool-gating",
         "worktree",
@@ -1510,6 +1561,22 @@
       "tags": []
     },
     {
+      "path": "docs/changelog/2026-07-29-browser-panel-inline-and-undock.md",
+      "title": "2026-07-29 浏览器面板：内联看图 + 非阻塞提示 + 全屏/独立窗",
+      "type": "changelog",
+      "typeSource": "frontmatter",
+      "status": "done",
+      "statusSource": "frontmatter",
+      "date": "2026-07-29",
+      "related": [
+        "docs/changelog/2026-07-15-browser-computer-use-workflow-loop.md",
+        "docs/changelog/2026-07-26-frontend-visual-verification-loop.md",
+        "docs/changelog/2026-07-29-vision-channel-honesty-and-test-entry-hardening.md"
+      ],
+      "supersedes": null,
+      "tags": []
+    },
+    {
       "path": "docs/changelog/2026-07-29-tui-settings-panel.md",
       "title": "2026-07-29 TUI 设置面板 /config",
       "type": "changelog",
@@ -1534,6 +1601,72 @@
       "date": "2026-07-29",
       "related": [
         "docs/changelog/2026-07-26-frontend-visual-verification-loop.md"
+      ],
+      "supersedes": null,
+      "tags": []
+    },
+    {
+      "path": "docs/changelog/2026-07-30-desktop-vision-parity.md",
+      "title": "2026-07-30 桌面端识图能力补齐：与 CLI 各自独立可用",
+      "type": "changelog",
+      "typeSource": "frontmatter",
+      "status": "done",
+      "statusSource": "frontmatter",
+      "date": "2026-07-30",
+      "related": [
+        "docs/changelog/2026-07-30-vision-copilot-review-fixes.md",
+        "docs/user-guide-vision.md"
+      ],
+      "supersedes": null,
+      "tags": []
+    },
+    {
+      "path": "docs/changelog/2026-07-30-python-syntax-check-treesitter.md",
+      "title": "2026-07-30 Python 语法校验改用进程内 tree-sitter",
+      "type": "changelog",
+      "typeSource": "inferred",
+      "status": null,
+      "statusSource": "none",
+      "date": "2026-07-30",
+      "related": [],
+      "supersedes": null,
+      "tags": []
+    },
+    {
+      "path": "docs/changelog/2026-07-30-scout-swarm-and-t5-plan-collapse.md",
+      "title": "2026-07-30 /scout 巡天侦察蜂群 + T5 计划坍缩修复",
+      "type": "changelog",
+      "typeSource": "inferred",
+      "status": null,
+      "statusSource": "none",
+      "date": "2026-07-30",
+      "related": [],
+      "supersedes": null,
+      "tags": []
+    },
+    {
+      "path": "docs/changelog/2026-07-30-security-layer1-hardening-and-treesitter-memory.md",
+      "title": "2026-07-30 安全告警层1 补漏 + tree-sitter 内存释放",
+      "type": "changelog",
+      "typeSource": "inferred",
+      "status": null,
+      "statusSource": "none",
+      "date": "2026-07-30",
+      "related": [],
+      "supersedes": null,
+      "tags": []
+    },
+    {
+      "path": "docs/changelog/2026-07-30-vision-copilot-review-fixes.md",
+      "title": "2026-07-30 视觉副驾评审修复：自动选桥改 opt-in + 工具截图可追问",
+      "type": "changelog",
+      "typeSource": "frontmatter",
+      "status": "done",
+      "statusSource": "frontmatter",
+      "date": "2026-07-30",
+      "related": [
+        "docs/changelog/2026-07-29-vision-channel-honesty-and-test-entry-hardening.md",
+        "docs/user-guide-vision.md"
       ],
       "supersedes": null,
       "tags": []
@@ -2079,6 +2212,84 @@
       "tags": []
     },
     {
+      "path": "docs/design/2026-07-30-scout-collab-evidence-firewall.md",
+      "title": "巡天/协同工作流深化——从「主控复述」到「证据防火墙」",
+      "type": "design",
+      "typeSource": "frontmatter",
+      "status": "draft",
+      "statusSource": "frontmatter",
+      "date": "2026-07-30",
+      "related": [
+        "../../src/agent/hooks/external-claim-tracking-hook.ts",
+        "../../src/agent/hooks/batch-convergence-hook.ts",
+        "../../src/agent/worker-evidence.ts",
+        "../../src/agent/aggregation.ts",
+        "../../src/tools/deliver-task.ts",
+        "../../src/workflows/ecosystem-workflows.ts",
+        "../../src/tools/browser-debug/tool.ts",
+        "../../src/tools/browser-debug/log-capture.ts",
+        "../../src/prompt/static.ts",
+        "../superpowers/specs/2026-07-30-vision-browser-maximization-design.md"
+      ],
+      "supersedes": null,
+      "tags": [
+        "scout",
+        "delegation",
+        "team",
+        "evidence",
+        "forcing-function",
+        "prefix-cache",
+        "deep-brainstorm"
+      ]
+    },
+    {
+      "path": "docs/design/2026-07-30-security-review-layers-2-3.md",
+      "title": "设计：安全审查 层2/层3（Stop-LLM 审查 + commit 跨文件审查）",
+      "type": "design",
+      "typeSource": "inferred",
+      "status": null,
+      "statusSource": "none",
+      "date": "2026-07-30",
+      "related": [],
+      "supersedes": null,
+      "tags": []
+    },
+    {
+      "path": "docs/design/2026-07-31-team-scout-evidence-pipeline.md",
+      "title": "Team + Scout 证据管线技术路线",
+      "type": "design",
+      "typeSource": "frontmatter",
+      "status": "accepted",
+      "statusSource": "frontmatter",
+      "date": "2026-07-31",
+      "related": [
+        "../../src/agent/task-planner.ts",
+        "../../src/agent/team-orchestrator.ts",
+        "../../src/agent/worker-prompts.ts",
+        "../../src/agent/work-order.ts",
+        "../../src/agent/review-coordinator-deps.ts",
+        "../../src/tools/delegate-batch.ts",
+        "../../src/workflows/ecosystem-workflows.ts",
+        "../../src/tui/slash-commands.ts",
+        "../../desktop/src/surfaces/ThreadView.tsx",
+        "../../desktop/src/components/WorkflowDialog.tsx",
+        "../../desktop/src/lib/workflow-command.ts",
+        "../superpowers/specs/2026-07-30-vision-browser-maximization-design.md",
+        "./2026-07-30-scout-collab-evidence-firewall.md"
+      ],
+      "supersedes": null,
+      "tags": [
+        "team",
+        "scout",
+        "evidence",
+        "plan",
+        "delegation",
+        "prompt",
+        "tui",
+        "desktop"
+      ]
+    },
+    {
       "path": "docs/design/TUI提问审批面板改版.md",
       "title": "TUI 提问框 / 审批框改版（2026-07-27）",
       "type": "design",
@@ -2535,6 +2746,18 @@
       "tags": []
     },
     {
+      "path": "docs/known-issues/2026-07-31-desktop-scroll-row-height-clamp.md",
+      "title": "桌面端会话区\"拉到最底部跳上去\"根因落定（2026-07-31）——行高测量收缩钳位",
+      "type": "issue",
+      "typeSource": "inferred",
+      "status": null,
+      "statusSource": "none",
+      "date": "2026-07-31",
+      "related": [],
+      "supersedes": null,
+      "tags": []
+    },
+    {
       "path": "docs/known-issues/HANDOFF-2026-06-05-steer-and-render-fixes.md",
       "title": "交接文档:TUI steer 丢消息 + 重复渲染/滚屏 修复",
       "type": "issue",
@@ -2759,6 +2982,36 @@
       "statusSource": "blockquote",
       "date": null,
       "related": [],
+      "supersedes": null,
+      "tags": []
+    },
+    {
+      "path": "docs/plans/2026-07-31-desktop-scroll-clamp-compensation.md",
+      "title": "桌面端滚动\"收缩钳位上移\"修复——virtual-core 补偿谓词落地",
+      "type": "plan",
+      "typeSource": "frontmatter",
+      "status": "active",
+      "statusSource": "frontmatter",
+      "date": "2026-07-31",
+      "related": [
+        "../known-issues/2026-07-31-desktop-scroll-row-height-clamp.md",
+        "../research/2026-07-31-chat-scroll-bottom-pinning-competitor-survey.md",
+        "../known-issues/2026-07-24-desktop-scroll-four-symptoms.md"
+      ],
+      "supersedes": null,
+      "tags": []
+    },
+    {
+      "path": "docs/plans/2026-07-31-galaxy-prewarm-and-cache-affinity.md",
+      "title": "星河集群（galaxy）天枢设施复用优化落地计划",
+      "type": "plan",
+      "typeSource": "frontmatter",
+      "status": "draft",
+      "statusSource": "frontmatter",
+      "date": "2026-07-31",
+      "related": [
+        "docs/superpowers/specs/2026-07-14-cluster-agent-architecture.md"
+      ],
       "supersedes": null,
       "tags": []
     },
@@ -3027,6 +3280,30 @@
       "tags": []
     },
     {
+      "path": "docs/releases/v2.25.0.md",
+      "title": "v2.25.0 迭代记录",
+      "type": "release",
+      "typeSource": "inferred",
+      "status": null,
+      "statusSource": "none",
+      "date": "2026-07-30",
+      "related": [],
+      "supersedes": null,
+      "tags": []
+    },
+    {
+      "path": "docs/releases/v2.26.0.md",
+      "title": "v2.26.0 — 创世纪 · 扩张！",
+      "type": "release",
+      "typeSource": "inferred",
+      "status": null,
+      "statusSource": "none",
+      "date": "2026-07-31",
+      "related": [],
+      "supersedes": null,
+      "tags": []
+    },
+    {
       "path": "docs/releases/v2.9.2-pre-merge-snapshot.md",
       "title": "main 分支合并前版本快照",
       "type": "release",
@@ -3253,6 +3530,26 @@
       "related": [],
       "supersedes": null,
       "tags": []
+    },
+    {
+      "path": "docs/research/2026-07-31-chat-scroll-bottom-pinning-competitor-survey.md",
+      "title": "竞品聊天列表\"钉底 + 动态行高\"实现调研",
+      "type": "research",
+      "typeSource": "frontmatter",
+      "status": "accepted",
+      "statusSource": "frontmatter",
+      "date": "2026-07-31",
+      "related": [
+        "../known-issues/2026-07-31-desktop-scroll-row-height-clamp.md",
+        "../known-issues/2026-07-24-desktop-scroll-four-symptoms.md"
+      ],
+      "supersedes": null,
+      "tags": [
+        "desktop",
+        "scroll",
+        "virtualization",
+        "competitor"
+      ]
     },
     {
       "path": "docs/research/2026-07-desktop-render-baseline.md",
@@ -10599,6 +10896,18 @@
       "tags": []
     },
     {
+      "path": "docs/superpowers/specs/2026-07-14-cluster-agent-architecture.md",
+      "title": "星河 (Galaxy) 集群 Agent 架构 — 设计文档",
+      "type": "spec",
+      "typeSource": "inferred",
+      "status": "设计迭代中（第二版——融入 skill 调用范式 + 意图分析 + 用户确认 + 前缀缓存保持）",
+      "statusSource": "blockquote",
+      "date": "2026-07-14",
+      "related": [],
+      "supersedes": null,
+      "tags": []
+    },
+    {
       "path": "docs/superpowers/specs/2026-07-15-mcp-ecosystem-postmortem.md",
       "title": "MCP 生态对标增强 — 事后分析",
       "type": "spec",
@@ -10834,6 +11143,30 @@
       "status": "设计已定稿",
       "statusSource": "blockquote",
       "date": "2026-07-28",
+      "related": [],
+      "supersedes": null,
+      "tags": []
+    },
+    {
+      "path": "docs/superpowers/specs/2026-07-30-vision-browser-maximization-design.md",
+      "title": "视觉层 + 无头浏览器效果最大化 · 深度头脑风暴结果",
+      "type": "spec",
+      "typeSource": "inferred",
+      "status": null,
+      "statusSource": "none",
+      "date": "2026-07-30",
+      "related": [],
+      "supersedes": null,
+      "tags": []
+    },
+    {
+      "path": "docs/superpowers/specs/2026-07-31-simulator-task-loop-diagnosis.md",
+      "title": "模拟器任务卡壳诊断：外部会话日志调研（测试题2）",
+      "type": "spec",
+      "typeSource": "inferred",
+      "status": null,
+      "statusSource": "none",
+      "date": "2026-07-31",
       "related": [],
       "supersedes": null,
       "tags": []

@@ -109,6 +109,10 @@ export interface WorkerSessionConfig {
    *  progress, findings, and escalations through this channel. The coordinator
    *  drains the mailbox after the wave completes. */
   mailbox?: WorkerMailbox
+  /** Batch-scoped shared PrewarmCache (delegateBatch 注入)——同批 worker 共享
+   *  派发前预热与彼此读热的文件条目。缺省 undefined 时 worker 用 AgentLoop
+   *  实例自带的隔离 cache（历史行为，单发 delegate 路径）。 */
+  prewarm?: import('./prewarm.js').PrewarmCache
   /** Prior conversation history to resume from. When provided, the session is
    *  pre-seeded with these messages before the first agent.run(), so the worker
    *  sees its previous context. The current objective is appended as a new user
@@ -554,6 +558,9 @@ export async function runWorkerSession(config: WorkerSessionConfig): Promise<Wor
     // authority 缺席时 bindSessionDomain 的 `?? 'qiming'` 兜底会钉定启明——
     // 不会落到关键词路由（那条分支只有显式传字符串 'auto' 才进得去）。
     defaultDomain: config.order.authority,
+    // 构造期注入批级共享 prewarm（loop.ts 构造器在 createToolExecutionController
+    // 之前应用）——构造后替换字段到不了 tool-pipeline 消费端（值捕获）。
+    prewarm: config.prewarm,
   }, session, config.cwd)
 
   // Record the selected model into the worker session JSONL so the actual

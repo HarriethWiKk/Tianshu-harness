@@ -59,7 +59,7 @@ export function createUndoTool(getFileHistory: () => FileHistory | undefined): T
         // restore by surfacing it as "Undo failed".
         for (const file of restored) {
           try {
-            trackFileRestore(params.cwd, file, 'undo tool restore')
+            trackFileRestore(params.cwd, file, 'undo tool restore', 0, params.sessionId)
           } catch { /* audit journal unavailable — restore already applied */ }
         }
         // B1: report if any restored files were not owned

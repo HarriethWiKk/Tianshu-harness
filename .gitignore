@@ -129,5 +129,13 @@ docs/*.html
 docs/*.docx
 
 
+
 # 公开仓：禁止 knowledge 回灌（私有仓策略不同；仅保留 .rivet/SELF）
 .rivet/knowledge/
+
+# 第三方运行时数据目录（WorkBuddy 等工具的本地 memory）
+.workbuddy/
+
+# 测试临时目录（测试中断时可能残留，不应进入 git status）
+src/**/__tests__/.scoped-commit-tmp/
+src/**/__tests__/.undo-test-backup/

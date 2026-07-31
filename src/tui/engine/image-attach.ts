@@ -16,8 +16,8 @@ import { randomUUID } from 'node:crypto'
 
 const execFileAsync = promisify(execFile)
 
-/** Server cap: 1.5 MB decoded per image (matches session-routes.ts). */
-export const MAX_IMAGE_BYTES = 1.5 * 1024 * 1024
+/** Provider cap: 10 MB decoded per image (matches common vision API limits). */
+export const MAX_IMAGE_BYTES = 10 * 1024 * 1024
 /** Long-edge clamp. 1568px keeps token cost bounded while staying legible. */
 export const MAX_EDGE = 1568
 /** Max number of images per prompt (matches desktop Composer). */

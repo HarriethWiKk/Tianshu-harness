@@ -264,6 +264,7 @@ import type { AutonomyCheckpointInfo } from '../../agent/loop-types.js'
 import { FleetRegistry } from '../fleet-registry.js'
 import { JobRegistry, type JobRow } from '../job-registry.js'
 import { renderJobsOverlay } from '../format/jobs-panel.js'
+import { renderCachePanel, CACHE_PERIODS, type CachePanelData } from '../format/cache-panel.js'
 import type { JobEvent } from '../../tools/job-store.js'
 import { WorkerMirrorStore } from '../worker-mirror.js'
 import { formatWorkerView } from '../format/worker-view.js'
@@ -1505,6 +1506,15 @@ export class TuiApp {
     return this.overlayController.getCockpitPanel()
   }
 
+  /**
+   * 异步数据到位后重画指定 overlay（仅当它仍是当前活动层）。
+   * `/cache` 的聚合扫描与官方账单都是 await 之后才有值，provider 是同步的，
+   * 需要一个「数据来了再画一次」的入口；overlay 已被关掉时不做任何事。
+   */
+  refreshOverlay(id: string): void {
+    if (this.overlay.activeId() === id) this.overlay.rerender()
+  }
+
   /** 激活 overlay */
   activateOverlay(id: string): boolean {
     // overlay 内 ESC 应即时响应，关闭输入处理器的 lone-ESC 超时。
@@ -1526,7 +1536,8 @@ export class TuiApp {
       case 'connect':
       case 'init':
       case 'settings':
-      case 'jobs': {
+      case 'jobs':
+      case 'cache': {
         // 复位导航状态，避免上次的翻页/选中残留到新 overlay
         this.overlayController.resetNav()
         return this.overlay.activate(id)
@@ -2296,6 +2307,19 @@ export class TuiApp {
       }
       if (key.name === 'right' || (key.name === 'tab' && !key.shift)) return cycle(1)
       if (key.name === 'left' || (key.name === 'tab' && key.shift)) return cycle(-1)
+    }
+
+    // Cache 面板 — ←/→/Tab 切换历史周期（今日/7天/30天），与 cockpit 同键位语义
+    if (id === 'cache') {
+      const nav = this.overlayController.nav()
+      const cyclePeriod = (dir: 1 | -1): boolean => {
+        const cur = CACHE_PERIODS.indexOf(nav.cachePeriod)
+        nav.cachePeriod = CACHE_PERIODS[(cur + dir + CACHE_PERIODS.length) % CACHE_PERIODS.length]!
+        this.overlay.rerender()
+        return true
+      }
+      if (key.name === 'right' || (key.name === 'tab' && !key.shift)) return cyclePeriod(1)
+      if (key.name === 'left' || (key.name === 'tab' && key.shift)) return cyclePeriod(-1)
     }
 
     if (id === 'tasks') {
@@ -3248,6 +3272,8 @@ export class TuiApp {
 
   /** 统一 phase 设置入口：联动渲染 ticker 启停 */
   private setPhase(phase: ActivityPhase): void {
+    // 轮末归零动态段高水位：下一轮从实际内容重新起量，不继承上轮高度。
+    if (phase === 'idle') this.dynamicRowsHighWater = 0
     this.state.phase = phase
     this.updateTicker()
   }
@@ -4550,21 +4576,42 @@ export class TuiApp {
    * 活动期（run 进行中，phase 非 idle——thinking/streaming/analyzing/waiting 均含）
    * 返回固定预算：renderLive 会把动态段垫高/截断到恰好该值，live region 总高度
    * 逐帧恒定 → 输入框屏幕坐标不随 thinking/streaming 字符数浮动。
-   * 空闲期返回 0，live region 自然塌回 chrome-only（每 turn 结束一次性收敛）。
+   *
+   * 空闲期：
+   * - turnNumber===0（首帧/欢迎屏）：返回 0，自然流——否则垫到满屏会在欢迎屏上方堆空白。
+   * - turnNumber>0（已有对话）：返回 ceiling，把输入框压底；动态内容少时空白在中间
+   *   （动态段与 chrome 之间），比输入框悬在半空占推理区域好。
    *
    * 预算 = rows - chromeRows - 2（留缝让 scrollback 最后输出可见），期望区间
    * 6–16 行；小终端优先不超屏——可用空间不足 6 行时取实际可用值（可为 0）。
    */
-  private getDynamicBudget(chromeRows: number): number {
-    if (this.state.phase === 'idle') return 0
+  private getDynamicBudget(chromeRows: number, dynamicRows: number): number {
     const terminalRows = this.rows || 24
     const raw = terminalRows - chromeRows - 2
-    // 预算上限 = liveMaxRows - chromeRows，与 LiveEngine 同口径。
-    // 大终端上 live region 能填更多空间，输入框更贴近底部；
-    // 小终端上由 raw 自然封顶（不超屏）。
-    const cap = liveMaxRowsFor(terminalRows) - chromeRows
-    return Math.max(0, Math.min(raw, cap))
+    // 上界 = min(不超屏, liveMaxRows - chromeRows)，与 LiveEngine 同口径。
+    const ceiling = Math.max(0, Math.min(raw, liveMaxRowsFor(terminalRows) - chromeRows))
+    if (this.state.phase === 'idle') {
+      return this.state.turnNumber === 0 ? 0 : ceiling
+    }
+    // 轮内高水位：定高值取「本轮出现过的最大动态高度」，只涨不缩。
+    //
+    // 旧实现（3ed60a00）直接返回 ceiling，把动态段恒定垫到近满屏。活动期输入框
+    // 确实钉住，但轮末 phase→idle 预算归零、区域从 chrome+ceiling 塌回 chrome：
+    // clearForCommit 爬到区域顶擦到屏末，再写入本轮提交的正文 + 新 chrome。
+    // 落点由提交量决定——正文短于 ceiling 时差额就留在输入框下方成一片空白
+    // （40 行终端 ceiling=23，一句短回复能露 20 行黑）。
+    //
+    // 按高水位定高后垫高量≈本轮真实内容量≈轮末提交量，塌回落差趋零；同时
+    // 「只涨不缩」保住原机制的目的——thinking/streaming 增减不会让输入框上抖。
+    this.dynamicRowsHighWater = Math.min(ceiling, Math.max(this.dynamicRowsHighWater, dynamicRows))
+    return this.dynamicRowsHighWater
   }
+
+  /**
+   * 轮内动态段高水位（display rows）。`setPhase('idle')` 归零——否则一次长
+   * thinking 会把之后每轮都垫到同样高度，塌回空白重现。
+   */
+  private dynamicRowsHighWater = 0
 
   /**
    * @file 节点 exists 诊断（按输入值缓存——同值不重复 existsSync）。
@@ -5273,7 +5320,11 @@ export class TuiApp {
       for (let i = chromeStart; i < lines.length; i++) {
         chromeRows += this.displayRowsFor(lines[i]!.text, cols)
       }
-      const budget = this.getDynamicBudget(chromeRows)
+      let dynamicRows = 0
+      for (let i = 0; i < chromeStart; i++) {
+        dynamicRows += this.displayRowsFor(lines[i]!.text, cols)
+      }
+      const budget = this.getDynamicBudget(chromeRows, dynamicRows)
       if (budget > 0) {
         const padded = padDynamicRegion(lines, chromeStart, budget, (text) => this.displayRowsFor(text, cols))
         lines = padded.lines
@@ -5584,6 +5635,7 @@ export class TuiApp {
     historySearchData?: () => HistorySearchData
     tasksData?: () => TasksData
     jobsData?: () => { rows: JobRow[]; selectedIndex: number }
+    cachePanelData?: () => CachePanelData
     domainPickerData?: () => DomainPickerData
     modelPickerData?: () => ModelPickerData
     themePickerData?: () => ThemePickerData
@@ -5717,6 +5769,15 @@ export class TuiApp {
       render: (_w, _h) => {
         const data = overlayData?.jobsData?.() ?? { rows: [], selectedIndex: 0 }
         return renderJobsOverlay(data.rows, this.columns, this.rows, this.theme, data.selectedIndex)
+      },
+    })
+
+    // Cache — /cache DeepSeek 缓存面板；period 由 overlayNav 注入
+    this.overlay.register('cache', {
+      render: (_w, _h) => {
+        const data = overlayData?.cachePanelData?.()
+        if (!data) return [' 缓存面板数据不可用。']
+        return renderCachePanel({ ...data, period: this.overlayController.nav().cachePeriod }, this.columns, this.rows, this.theme)
       },
     })
 

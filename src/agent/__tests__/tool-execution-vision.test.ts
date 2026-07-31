@@ -20,6 +20,7 @@ describe('ToolExecutionController vision-channel injection', () => {
     events: string[]
     uiPayloads?: unknown[][]
     sanitized?: Array<{ raw: string; sanitized: string; filterId?: string }>
+    registered?: string[][]
     observability?: TurnCacheObservability
   }
 
@@ -32,6 +33,8 @@ describe('ToolExecutionController vision-channel injection', () => {
       throwRegistryGetOnce?: boolean
       /** Vision bridge stub. `'throw'` simulates the side model failing. */
       describe?: ((images: string[]) => Promise<string | null>) | 'throw'
+      /** ImageRegistry stub. `false` = 无 registry（worker 场景）。 */
+      registerImages?: false
     },
   ) {
     let throwRegistryGet = opts.throwRegistryGetOnce ?? false
@@ -86,6 +89,12 @@ describe('ToolExecutionController vision-channel injection', () => {
       getSessionId: () => 'test-session',
       addToolResults: () => { captured.events.push('addToolResults') },
       getSupportsVision: () => opts.supportsVision,
+      registerImages: opts.registerImages === false
+        ? undefined
+        : (images: string[]) => {
+            captured.registered?.push(images)
+            return images.map((_, i) => `img_${i + 1}`)
+          },
       addUserMessageWithImages: opts.wireInjector === false
         ? undefined
         : (text: string, images: string[]) => {
@@ -229,6 +238,46 @@ describe('ToolExecutionController vision-channel injection', () => {
     const controller = makeController(captured, { supportsVision: true, images: [IMG], wireInjector: false })
     await controller.executeBatch(makeInput())
     assert.equal(captured.injected.length, 0)
+  })
+
+  // agent 自己截的图也必须进会话 ImageRegistry，否则 ask_image 只能问用户手动附的
+  // 图——「截图 → 逐字念出报错那一行」在浏览器验证闭环里就断了。
+  it('registers tool screenshots and names the ids for ask_image (vision model)', async () => {
+    const captured: Captured = { injected: [], events: [], registered: [] }
+    const controller = makeController(captured, { supportsVision: true, images: [IMG] })
+    await controller.executeBatch(makeInput())
+    assert.deepEqual(captured.registered, [[IMG]], '截图必须寄存')
+    assert.match(captured.injected[0]!.text, /img_1/, '提示里要点名 id，模型才知道能追问哪张')
+    assert.match(captured.injected[0]!.text, /ask_image/)
+  })
+
+  it('registers tool screenshots on the bridge path too', async () => {
+    const captured: Captured = { injected: [], events: [], registered: [] }
+    const controller = makeController(captured, {
+      supportsVision: false,
+      images: [IMG],
+      describe: async () => '一个设置窗口',
+    })
+    await controller.executeBatch(makeInput())
+    assert.deepEqual(captured.registered, [[IMG]])
+    assert.match(captured.injected[0]!.text, /img_1/)
+  })
+
+  it('registers only the images actually forwarded (respects the 2-shot cap)', async () => {
+    const captured: Captured = { injected: [], events: [], registered: [] }
+    const imgs = ['data:image/png;base64,ONE', 'data:image/png;base64,TWO', 'data:image/png;base64,THREE']
+    const controller = makeController(captured, { supportsVision: true, images: imgs })
+    await controller.executeBatch(makeInput())
+    assert.deepEqual(captured.registered, [[imgs[1]!, imgs[2]!]], '被丢掉的第一张不该拿到 id')
+  })
+
+  it('no registry (worker) → still injects, just without ask_image ids', async () => {
+    const captured: Captured = { injected: [], events: [], registered: [] }
+    const controller = makeController(captured, { supportsVision: true, images: [IMG], registerImages: false })
+    await controller.executeBatch(makeInput())
+    assert.equal(captured.injected.length, 1)
+    assert.equal(captured.registered?.length, 0)
+    assert.equal(/ask_image/.test(captured.injected[0]!.text), false)
   })
 
   it('counts tool UI events and observes sanitizer results without changing callback payloads', async () => {

@@ -80,6 +80,8 @@ import type { EFEComponents } from './prediction-error.js'
 import type { Sensorium } from './sensorium.js'
 import type { OaiMessage } from '../api/oai-types.js'
 import type { Usage } from '../api/types.js'
+import { PrewarmCache } from './prewarm.js'
+import { batchPrewarm } from './prewarm-file.js'
 
 /** Per-turn free-energy signals pulled from the primary loop at delegation time. */
 export interface EFERoutingSignals {
@@ -662,6 +664,13 @@ export class DelegationCoordinator {
   /** T9 P3: per-order real-time activity upstream (request callback survives
    *  the zod request→order conversion via this side table). */
   private readonly activityUpstream = new Map<string, (event: WorkerActivityEvent) => void>()
+  /** Batch-scoped shared PrewarmCache — one instance per delegateBatch call,
+   *  keyed by order id (side-table pattern, same as activityUpstream) so
+   *  overlapping batches never share. Same-batch workers read files warmed by
+   *  the pre-dispatch pass and by each other (e.g. DP replicas hitting the
+   *  same evidence). Entries are removed as orders settle; the cache itself
+   *  stays alive via workerConfig references until the batch drains. */
+  private readonly batchPrewarmByOrder = new Map<string, PrewarmCache>()
   /** Per-order prior messages for session resume. Set by delegate() when
    *  resumeWorkOrderId is provided; consumed by delegateOrder() when building
    *  the worker config. Side-table pattern (same as activityUpstream). */
@@ -1153,14 +1162,17 @@ export class DelegationCoordinator {
       ...result,
       model: result.model ?? model,
       provider: result.provider ?? provider,
-      usage: result.usage ?? (usage ? {
+      // 实测遥测优先于 worker 自报 usage——result.usage 是模型生成的 JSON 文本，
+      // 不可信（冒烟实测：副本虚报 514K cacheRead，其会话真实累计仅 ~103K，
+      // 聚合命中率被虚报数污染）。有实测一律覆盖，无实测才保留自报值。
+      usage: usage ? {
         input_tokens: usage.input_tokens,
         output_tokens: usage.output_tokens,
         cache_read_input_tokens: usage.cache_read_input_tokens,
         cache_creation_input_tokens: usage.cache_creation_input_tokens,
         reasoning_tokens: usage.reasoning_tokens,
         total_tokens: (usage.input_tokens ?? 0) + (usage.output_tokens ?? 0),
-      } : undefined),
+      } : result.usage,
     }
   }
 
@@ -1699,6 +1711,10 @@ export class DelegationCoordinator {
     workerConfig.parentApprovalMode = this.config.parentApprovalMode
     workerConfig.domainKnowledgeStore = this.config.domainKnowledgeStore
     workerConfig.mailbox = this.mailbox
+    // Batch-scoped shared prewarm (delegateBatch 派发前预热 + 同批 worker 互暖)。
+    // 单发 delegate() 路径不入表，worker 用 AgentLoop 实例默认 cache（历史行为）。
+    const batchPrewarmCache = this.batchPrewarmByOrder.get(order.id)
+    if (batchPrewarmCache) workerConfig.prewarm = batchPrewarmCache
     // Enable JSON-mode repair for OpenAI-protocol providers. The repair path
     // sends a tool-free request with response_format: json_object, which is an
     // OpenAI API standard. If the provider doesn't support it, the request
@@ -2322,6 +2338,7 @@ export class DelegationCoordinator {
       this.liveMessages.delete(order.id)
       this.nestedUpstream.delete(order.id)
       this.activityUpstream.delete(order.id)
+      this.batchPrewarmByOrder.delete(order.id)
       this.resumeMessages.delete(order.id)
       this.steerQueues.delete(order.id)
       if (this.liveness.size() === 0) this.stopStallSweep()
@@ -2495,6 +2512,7 @@ export class DelegationCoordinator {
             reviewDepth: r.reviewDepth,
             delegationDepth: (r.delegationDepth ?? 0) + 1,
             dependencies: r.dependencies,
+            groupId: r.groupId,
             authority: r.authority,
             riskTier: r.riskTier,
             sessionTurn: r.sessionTurn,
@@ -2514,6 +2532,7 @@ export class DelegationCoordinator {
             reviewDepth: r.reviewDepth,
             delegationDepth: (r.delegationDepth ?? 0) + 1,
             dependencies: r.dependencies,
+            groupId: r.groupId,
             authority: r.authority,
             riskTier: r.riskTier,
             sessionTurn: r.sessionTurn,
@@ -2540,6 +2559,20 @@ export class DelegationCoordinator {
             this.abortCheckpoints.delete(r.resumeWorkOrderId)
           }
         }
+      }
+    }
+
+    // Batch-scoped shared prewarm: one PrewarmCache per batch, registered per
+    // order before scheduling starts. Pre-warm the union of scope.files BEFORE
+    // the concurrent dispatch loop — otherwise early workers start cold while
+    // later siblings' warm-up is still in flight. Best-effort: failures are
+    // silent and never block dispatch.
+    if (orders.length > 0) {
+      const batchCache = new PrewarmCache(60_000, 50)
+      const files = [...new Set(orders.flatMap(o => o.scope.files ?? []))]
+      for (const order of orders) this.batchPrewarmByOrder.set(order.id, batchCache)
+      if (files.length > 0) {
+        await batchPrewarm(this.config.cwd ?? process.cwd(), files, batchCache, 25).catch(() => {})
       }
     }
 

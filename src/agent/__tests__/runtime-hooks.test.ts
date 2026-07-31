@@ -120,6 +120,49 @@ describe('RuntimeHookPipeline', () => {
     assert.match(errors[0]!.message, /boom/)
   })
 
+  it('异步挂起的 hook 超时降级跳过，后续 hook 照常执行（超时护栏）', async () => {
+    const order: string[] = []
+    const errors: RuntimeHookError[] = []
+    const wedged: PreTurnRuntimeHook = { phase: 'preTurn', name: 'wedged', run: () => new Promise<void>(() => {}) }
+    const good: PreTurnRuntimeHook = { phase: 'preTurn', name: 'good', run: async () => { order.push('good') } }
+    const pipeline = new RuntimeHookPipeline([wedged, good], {
+      onError: error => errors.push(error),
+      hookTimeoutMs: 50,
+    })
+
+    const start = Date.now()
+    await pipeline.runPreTurn(makeContext())
+    const elapsed = Date.now() - start
+
+    assert.ok(elapsed < 2000, `runPhase 必须在超时后返回，实际 ${elapsed}ms`)
+    assert.deepEqual(order, ['good'], '超时 hook 不得阻塞后续 hook')
+    assert.equal(errors.length, 1)
+    assert.equal(errors[0]!.hookName, 'wedged')
+    assert.match(errors[0]!.message, /\[hook-timeout\]/)
+  })
+
+  it('慢 hook 遥测：同步执行超过 hookSlowMs 报 [hook-slow]（事后检测）', async () => {
+    const errors: RuntimeHookError[] = []
+    const slow: PreTurnRuntimeHook = {
+      phase: 'preTurn',
+      name: 'slow',
+      run: () => {
+        const until = Date.now() + 60
+        while (Date.now() < until) { /* busy 60ms */ }
+      },
+    }
+    const pipeline = new RuntimeHookPipeline([slow], {
+      onError: error => errors.push(error),
+      hookSlowMs: 30,
+    })
+
+    await pipeline.runPreTurn(makeContext())
+
+    assert.equal(errors.length, 1)
+    assert.equal(errors[0]!.hookName, 'slow')
+    assert.match(errors[0]!.message, /\[hook-slow\]/)
+  })
+
   it('only runs hooks for the requested phase', async () => {
     const order: string[] = []
     const pre: PreTurnRuntimeHook = { phase: 'preTurn', name: 'pre', run: async () => { order.push('pre') } }

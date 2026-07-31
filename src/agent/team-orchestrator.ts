@@ -337,6 +337,32 @@ async function dispatchWaveAt(
   }
 
   const requests = waveToRequests(dispatchWave, taskMap, input.parentTurnId ?? 'team')
+  // Strip cross-wave dependencies that were already satisfied by a prior wave.
+  // waveToRequests faithfully copies TeamTask.dependsOn into DelegationRequest
+  // dependencies, but the coordinator treats those as intra-batch — T1 completed
+  // in a *previous* delegateBatch, so "team:T1" is an unmet dependency from the
+  // coordinator's perspective and triggers blockedDependencyResult for every
+  // task in the current wave. The cross-wave failure check above already
+  // handled the case where T1 *failed*; here we handle the case where it
+  // *succeeded* — strip the now-satisfied dep so the coordinator doesn't block.
+  if (priorResults && priorResults.length > 0) {
+    const priorPassedIds = new Set(
+      priorResults
+        .filter(r => r.status === 'passed')
+        .map(r => extractTaskIdFromWorkOrderId(r.workOrderId))
+        .filter(Boolean)
+    )
+    for (const req of requests) {
+      if (req.dependencies && req.dependencies.length > 0) {
+        const filtered = req.dependencies.filter(d => {
+          // dependency format is "team:T1", prior ID is "T1"
+          const depId = d.includes(':') ? d.slice(d.lastIndexOf(':') + 1) : d
+          return !priorPassedIds.has(depId)
+        })
+        req.dependencies = filtered.length > 0 ? filtered : undefined
+      }
+    }
+  }
   if (input.onActivity) for (const r of requests) r.onActivity = input.onActivity
   if (requests.length === 0) {
     return {

@@ -566,7 +566,8 @@ export function createDeliverTaskTool(getB1Context: (params?: ToolCallParams) =>
 
       // Recovery journal: detect files that were restored (undo/git checkout) during this session.
       // A clean file after restore may hide unfinished intent — surface it explicitly.
-      const recoveries = readUnacknowledged(params.cwd)
+      const recoverySessionId = ctx.sessionId ?? params.sessionId
+      const recoveries = readUnacknowledged(params.cwd, recoverySessionId)
       if (recoveries.length > 0) {
         lines.push('', '--- Recovery Journal ---')
         lines.push('  Files restored during this session (edit failure → restore):')
@@ -1019,7 +1020,7 @@ export function createDeliverTaskTool(getB1Context: (params?: ToolCallParams) =>
           lines.push(readback.stdout.trim())
         }
         // Acknowledge recovery journal entries — the commit confirms intent was preserved.
-        if (recoveries.length > 0) acknowledgeAll(params.cwd)
+        if (recoveries.length > 0) acknowledgeAll(params.cwd, recoverySessionId)
 
         // ── POST-COMMIT REVIEW (advisory, non-blocking) ──────────────────
         // Review runs AFTER the commit so a slow/timeout worker never stalls

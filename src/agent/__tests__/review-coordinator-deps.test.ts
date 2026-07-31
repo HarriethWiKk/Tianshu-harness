@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { createCoordinatorReviewDeps, type ReviewCoordinator } from '../review-coordinator-deps.js'
+import { createCoordinatorReviewDeps, formatFinding, type ReviewCoordinator } from '../review-coordinator-deps.js'
 import type { CoordinatorRun, DelegationRequest } from '../coordinator.js'
 import type { WorkerResult } from '../work-order.js'
 
@@ -303,5 +303,59 @@ describe('classifyInfraFailure 的 budget kind（max-turns 耗尽 ≠ 瞬时故�
     const deps = createCoordinatorReviewDeps(coordinator)
     const result = await deps.spawnWiringReviewer!({ files: ['src/agent/loop.ts'], crossModule: false, isFix: false })
     assert.equal(result.infraFailures?.[0]?.kind, 'worker')
+  })
+
+  // ── evidenceKind E2E: scout finding → formatFinding 渲染链 ──────
+
+  it('formatFinding: firsthand + evidenceRefs → [一手] prefix with file:line', () => {
+    const finding = {
+      claim: '超时阈值在 3 天前从 15 分钟降为 10 分钟',
+      evidence: 'Found in ci.yml:42 via git log',
+      confidence: 'high' as const,
+      evidenceKind: 'firsthand' as const,
+      evidenceRefs: ['ci.yml:42', 'cmd: git log -- ci.yml exit=0'],
+    }
+    const rendered = formatFinding(finding)
+    assert.match(rendered, /^\[一手\]/)
+    assert.match(rendered, /ci\.yml:42/)
+    assert.match(rendered, /cmd: git log/)
+    assert.match(rendered, /超时阈值/)
+  })
+
+  it('formatFinding: inferred without refs → [转述] prefix, no refs appended', () => {
+    const finding = {
+      claim: '可能是 runner 规格不够',
+      evidence: 'No direct measurement',
+      confidence: 'low' as const,
+      evidenceKind: 'inferred' as const,
+    }
+    const rendered = formatFinding(finding)
+    assert.match(rendered, /^\[转述\]/)
+    assert.doesNotMatch(rendered, /\(ci\.yml/)
+    assert.match(rendered, /可能是 runner/)
+  })
+
+  it('formatFinding: no evidenceKind → no prefix (backward compat)', () => {
+    const finding = {
+      claim: 'old finding',
+      evidence: 'some evidence',
+      confidence: 'medium' as const,
+    }
+    const rendered = formatFinding(finding)
+    assert.doesNotMatch(rendered, /^\[/)
+    assert.match(rendered, /^old finding/)
+  })
+
+  it('formatFinding: firsthand with empty evidenceRefs → prefix but no refs', () => {
+    const finding = {
+      claim: 'claim',
+      evidence: 'evidence',
+      confidence: 'high' as const,
+      evidenceKind: 'firsthand' as const,
+      evidenceRefs: [],
+    }
+    const rendered = formatFinding(finding)
+    assert.match(rendered, /^\[一手\]/)
+    assert.doesNotMatch(rendered, /\(/)
   })
 })

@@ -235,6 +235,66 @@ describe('ecosystem workflow helpers', () => {
     assert.ok(!resolved?.prompt.includes('rounds:'))
   })
 
+  it('resolves /scout into a scout-swarm workflow prompt', () => {
+    const resolved = resolveEcosystemWorkflowInput('/scout 全面体检这个仓库能否直接启动')
+
+    assert.equal(resolved?.command, '/scout')
+    assert.ok(resolved?.prompt.includes('巡天侦察蜂群'))
+    assert.ok(resolved?.prompt.includes('全面体检这个仓库能否直接启动'))
+    // 四步契约的关键锚点：先摸底、维度切分、delegate_batch 派发、实测清单交付。
+    assert.ok(resolved?.prompt.includes('先侦察后派发'))
+    assert.ok(resolved?.prompt.includes('按关注维度切分，不按文件分片'))
+    assert.ok(resolved?.prompt.includes('delegate_batch'))
+    assert.ok(resolved?.prompt.includes('code_scout'))
+    assert.ok(resolved?.prompt.includes('timeoutMs: 900000'))
+    assert.ok(resolved?.prompt.includes('实测核对清单'))
+    assert.ok(resolved?.prompt.includes('exit code'))
+    // 只读契约：不写文件、不走 team 编排、修复走 plan_task 交接。
+    assert.ok(resolved?.prompt.includes('不写文件'))
+    assert.ok(resolved?.prompt.includes('plan_task'))
+  })
+
+  it('/scout without --dims lets the model pick 2-5 dimensions', () => {
+    const resolved = resolveEcosystemWorkflowInput('/scout 诊断构建失败')
+
+    assert.ok(resolved?.prompt.includes('自选 2-5 个'))
+    assert.ok(!resolved?.prompt.includes('用户指定的'))
+  })
+
+  it('parses --dims flag and injects user dimensions into prompt', () => {
+    const resolved = resolveEcosystemWorkflowInput('/scout 全面体检 --dims 前端,后端,集成')
+
+    assert.equal(resolved?.command, '/scout')
+    assert.ok(resolved?.prompt.includes('全面体检'))
+    assert.ok(!resolved?.prompt.includes('--dims'))
+    assert.ok(resolved?.prompt.includes('用户指定的 3 个：前端 · 后端 · 集成'))
+    assert.ok(resolved?.prompt.includes('不增不减'))
+    assert.ok(!resolved?.prompt.includes('自选 2-5 个'))
+  })
+
+  it('--dims caps at 5 dimensions (delegate_batch batch limit)', () => {
+    const resolved = resolveEcosystemWorkflowInput('/scout 体检 --dims a,b,c,d,e,f,g')
+
+    assert.ok(resolved?.prompt.includes('用户指定的 5 个'))
+    assert.ok(!resolved?.prompt.includes(' f '))
+  })
+
+  it('--dims with no value degrades to model-picked dimensions and strips noise', () => {
+    const resolved = resolveEcosystemWorkflowInput('/scout 体检启动链路 --dims ,,')
+
+    assert.ok(resolved?.prompt.includes('体检启动链路'))
+    assert.ok(!resolved?.prompt.includes('--dims'))
+    assert.ok(resolved?.prompt.includes('自选 2-5 个'))
+  })
+
+  it('returns usage prompt for empty /scout args', () => {
+    const resolved = resolveEcosystemWorkflowInput('/scout')
+
+    assert.equal(resolved?.command, '/scout')
+    assert.ok(resolved?.prompt.includes('Scout usage:'))
+    assert.ok(resolved?.prompt.includes('--dims'))
+  })
+
   it('resolves /plan close into a plan_close tool prompt with apply by default', () => {
     const resolved = resolveEcosystemWorkflowInput('/plan close docs/superpowers/plans/demo.md --tasks 1-7 --verified npx tsc --noEmit --delivery YELLOW --note external files present')
 
@@ -298,9 +358,9 @@ describe('ecosystem workflow helpers', () => {
 })
 
 describe('workflow requiredTools declaration', () => {
-  it('/council 声明 council_convene + team_orchestrate 为必需工具', () => {
+  it('/council 只声明 council_convene——team_orchestrate 已升 CORE 无需挂载', () => {
     const resolved = resolveEcosystemWorkflowInput('/council 审查回滚方案')
-    assert.deepEqual(resolved?.requiredTools, ['council_convene', 'team_orchestrate'])
+    assert.deepEqual(resolved?.requiredTools, ['council_convene'])
   })
 
   it('/council 用法提示（空参数）不声明工具——没有真实调用发生', () => {
@@ -308,13 +368,18 @@ describe('workflow requiredTools declaration', () => {
     assert.equal(resolved?.requiredTools, undefined)
   })
 
-  it('/team 声明 team_orchestrate 为必需工具', () => {
+  it('/team 不声明 requiredTools——team_orchestrate 已升 CORE 默认可见', () => {
     const resolved = resolveEcosystemWorkflowInput('/team docs/superpowers/plans/x.md')
-    assert.deepEqual(resolved?.requiredTools, ['team_orchestrate'])
+    assert.equal(resolved?.requiredTools, undefined)
   })
 
   it('/team 用法提示（空参数）不声明工具', () => {
     const resolved = resolveEcosystemWorkflowInput('/team')
+    assert.equal(resolved?.requiredTools, undefined)
+  })
+
+  it('/scout 不声明 requiredTools——delegate_batch 在 CORE 层默认可见', () => {
+    const resolved = resolveEcosystemWorkflowInput('/scout 全面体检')
     assert.equal(resolved?.requiredTools, undefined)
   })
 

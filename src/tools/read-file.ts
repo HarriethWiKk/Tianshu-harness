@@ -400,13 +400,13 @@ const IMAGE_EXTENSIONS = new Map([
   ['.bmp', 'image/bmp'],
 ])
 
-/** 图片体积上限：base64 膨胀 1.33×，超过即拒绝并指向缩放/OCR 绕行路径。 */
-const MAX_IMAGE_BYTES = 5 * 1024 * 1024
+/** 图片体积上限：对齐主流视觉 API 的 10MB 限制。 */
+const MAX_IMAGE_BYTES = 10 * 1024 * 1024
 
 async function readImageFile(filePath: string, ext: string, sizeBytes: number) {
   if (sizeBytes > MAX_IMAGE_BYTES) {
     return {
-      content: `Error: image too large (${(sizeBytes / 1048576).toFixed(1)}MB，上限 5MB)。避免 base64 爆上下文——请先缩放/裁剪（如 sips -Z 1600 ${filePath} 或 magick ${filePath} -resize 1600x），或用 tesseract OCR 提取文字。`,
+      content: `Error: image too large (${(sizeBytes / 1048576).toFixed(1)}MB，上限 10MB)。请先缩放/裁剪（如 sips -Z 1600 ${filePath} 或 magick ${filePath} -resize 1600x），或用 tesseract OCR 提取文字。`,
       isError: true,
     }
   }

@@ -745,13 +745,37 @@ export function getVisionModelConfig(): VisionModelConfigSnapshot | null {
   return loadConfig().agent.visionModel ?? null
 }
 
+/** Opt-in flag: auto-pick a vision bridge when `visionModel` is unset. */
+export function getVisionAutoBridge(): boolean {
+  return loadConfig().agent.visionAutoBridge
+}
+
+/**
+ * Persist the auto-bridge opt-in. Off by default because auto-bridging sends the
+ * user's images to a provider they never picked for that purpose.
+ * Takes effect on the next session start.
+ */
+export function setVisionAutoBridge(enabled: boolean): boolean {
+  const cfg = loadConfig()
+  cfg.agent.visionAutoBridge = enabled
+  saveConfig(cfg)
+  return enabled
+}
+
 /**
  * Persist the vision bridge model to the user global config.
  * Pass `null` or empty provider/model to clear the bridge.
  * Takes effect on the next session start.
+ *
+ * `fallback` 的三态是刻意的：**省略 = 保留现有备用桥**，`null` = 清除，对象 = 设置。
+ * 早期实现直接整体替换，于是任何不带 `fallback` 的写入（桌面端旧 UI、TUI 设置面板、
+ * 第三方客户端）都会静默抹掉用户手写的备用识图模型——同一份配置被两个界面轮流写时，
+ * 后写的那个界面不知道的字段就消失了。省略即保留把"我没提到它"和"我要删掉它"分开。
  */
 export function setVisionModelConfig(
-  input: { provider?: unknown; model?: unknown; prompt?: unknown; maxTokens?: unknown } | null,
+  input:
+    | { provider?: unknown; model?: unknown; prompt?: unknown; maxTokens?: unknown; fallback?: unknown }
+    | null,
 ): VisionModelConfigSnapshot | null {
   const cfg = loadConfig()
   if (input === null || input.provider === '' || input.model === '') {
@@ -759,7 +783,13 @@ export function setVisionModelConfig(
     saveConfig(cfg)
     return null
   }
-  const parsed = visionModelConfigSchema.parse(input)
+  const fallback = 'fallback' in input
+    ? (input.fallback === null ? undefined : input.fallback)
+    : cfg.agent.visionModel?.fallback
+  const parsed = visionModelConfigSchema.parse({ ...input, fallback })
+  // 不留显式 undefined 键：zod 会把它保下来，返回对象凭空多一个字段，调用方的
+  // 结构比较就莫名失败。
+  if (parsed.fallback === undefined) delete parsed.fallback
   cfg.agent.visionModel = parsed
   saveConfig(cfg)
   return parsed

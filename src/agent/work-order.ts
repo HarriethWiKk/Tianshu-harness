@@ -122,6 +122,8 @@ export const workOrderSchema = z.object({
   disallowedTools: z.array(z.string()),
   dedupeKey: z.string().min(1),
   dependencies: z.array(z.string()),
+  /** Logical group for coordinated or multi-perspective tasks. */
+  groupId: z.string().min(1).optional(),
   aggregationPolicy: aggregationPolicySchema,
   budget: workerBudgetSchema,
   domain: domainAreaSchema.optional(),
@@ -159,10 +161,17 @@ const verificationMetadataSchema = z.object({
   durationMs: z.number(),
 }) satisfies z.ZodType<VerificationMetadata>
 
-const workerFindingSchema = z.object({
+export const workerFindingSchema = z.object({
   claim: z.string().min(1),
   evidence: z.string().min(1),
   confidence: z.enum(['low', 'medium', 'high']),
+  /** 'firsthand' = worker 亲自 read/grep/跑命令拿到的原始观测。
+   *  'inferred' = 基于已有信息的推断，未经 worker 亲自落地取证。
+   *  省略时表示未声明（等同于旧版 finding，消费端按转述处理）。 */
+  evidenceKind: z.enum(['firsthand', 'inferred']).optional(),
+  /** file:line 引用（如 "src/agent/foo.ts:42"）或命令 exit code 引用（如 "cmd: node --test exit=0"）。
+   *  一手实测必须至少带一条引用；转述推断可省略。 */
+  evidenceRefs: z.array(z.string().min(1)).optional(),
 })
 
 const workerArtifactSchema = z.object({
@@ -291,6 +300,9 @@ export interface CreateReadOnlyWorkOrderInput {
   scope: WorkOrderScope
   constraints?: string[]
   dependencies?: string[]
+  /** Logical group for related tasks. It participates in deduplication so
+   * independent perspectives over the same file scope are all preserved. */
+  groupId?: string
   aggregationPolicy?: AggregationPolicy
   budget?: Partial<WorkerBudget>
   domain?: DomainArea
@@ -358,8 +370,11 @@ export function createReadOnlyWorkOrder(input: CreateReadOnlyWorkOrderInput): Wo
     disallowedTools: input.profile === 'adversarial_verifier'
       ? ['bash', 'write_file', 'edit_file', 'delegate_task', 'delegate_batch'] // run_tests NOT disallowed — it's the verifier's primary weapon
       : [...PHASE1_DISALLOWED_WORKER_TOOLS],
-    dedupeKey: `${input.kind}:${input.scope.files?.join(',') || input.objective}`,
+    dedupeKey: input.groupId
+      ? `${input.kind}:group:${input.groupId}:${input.authority ?? 'default'}:${input.parentTurnId}:${input.scope.files?.join(',') || input.objective}`
+      : `${input.kind}:${input.scope.files?.join(',') || input.objective}`,
     dependencies: input.dependencies ?? [],
+    groupId: input.groupId,
     aggregationPolicy: input.aggregationPolicy ?? 'primary_decides',
     budget: {
       maxTurns: input.budget?.maxTurns ?? 24,
@@ -405,8 +420,11 @@ export function createWriteWorkOrder(input: CreateWriteWorkOrderInput): WorkOrde
       return toolsForAuthority(tools, input.authority)
     })(),
     disallowedTools: ['delegate_task', 'delegate_batch'],
-    dedupeKey: `write:${input.scope.files?.join(',') || input.objective}`,
+    dedupeKey: input.groupId
+      ? `write:group:${input.groupId}:${input.authority ?? 'default'}:${input.parentTurnId}:${input.scope.files?.join(',') || input.objective}`
+      : `write:${input.scope.files?.join(',') || input.objective}`,
     dependencies: input.dependencies ?? [],
+    groupId: input.groupId,
     aggregationPolicy: input.aggregationPolicy ?? 'primary_decides',
     budget: {
       // Self-contained shards run a full loop (implement + tsc/lint/tests) in one

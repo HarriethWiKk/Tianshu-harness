@@ -322,7 +322,8 @@ describe('resolveAppPromptInput', () => {
   it('workflow 命令透传 requiredTools', async () => {
     const r = resolveAppPromptInput('/council 审查方案', '/cwd')
     assert.ok(r && typeof r === 'object')
-    assert.deepEqual(r!.requiredTools, ['council_convene', 'team_orchestrate'])
+    // team_orchestrate 已升 CORE（T3）——只剩 EXTENDED 层的 council_convene 需要挂载。
+    assert.deepEqual(r!.requiredTools, ['council_convene'])
   })
 
   it('普通文本返回 requiredTools 为空', async () => {

@@ -48,6 +48,7 @@ import { createUndoTool } from './tools/undo.js'
 import { maybeWarnNoSandbox, applySandboxPolicyForApprovalMode } from './tools/sandbox-profile.js'
 import { applyConfiguredPathGrants, applyDefaultDependencyReadGrants, applyRivetRuntimeReadGrants, loadPersistedGrants } from './tools/path-grants.js'
 import { createDelegateBatchTool } from './tools/delegate-batch.js'
+import { createGalaxyTool } from './tools/galaxy.js'
 import { createTeamOrchestrateTool } from './tools/team-orchestrate.js'
 import type { PlanExecutorDeps } from './agent/plan-executor.js'
 import { runTypeCheck } from './lsp/client.js'
@@ -462,6 +463,16 @@ export function createInteractiveToolRegistry(
     () => refs.claimStore ?? undefined,
     () => refs.sessionId ?? undefined,
     () => refs.getProblemAttackStore?.() ?? null,
+  ))
+
+  // galaxy — 星河集群派发（子 Agent 内部分子 Agent 并行）
+  reg.register(createGalaxyTool(
+    {
+      delegateBatch: async (requests, policy, abortSignal, onProgress, onWorkerSettled) => {
+        if (!refs.coordinator) throw new Error('DelegationCoordinator not initialized')
+        return refs.coordinator.delegateBatch(requests, policy, abortSignal, onProgress, onWorkerSettled)
+      },
+    },
   ))
 
   // Shared plan-execution kernel deps: team_orchestrate and plan_task(execute:true)

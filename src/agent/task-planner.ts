@@ -53,6 +53,65 @@ function groupFilesByModule(files: string[]): Array<{ label: string; files: stri
   return [...map.entries()].map(([label, groupFiles]) => ({ label, files: groupFiles }))
 }
 
+/** Path-like tokens with at least one directory segment and an extension
+ *  (`toolkit2/slug.mjs`, `src/agent/loop.ts`). Requiring the directory part
+ *  keeps prose like `node:test` / `.mjs` / bare words out. */
+const MENTIONED_FILE_RE = /(?:[\w@.-]+\/)+[\w.-]+\.[a-zA-Z]\w{0,5}/g
+
+/** Bare filenames immediately after a Chinese action verb — the most common
+ *  pattern in free-form task descriptions ("创建 sound.ts", "扩展 persist.ts").
+ *  Limited to a small fixed verb set to avoid matching arbitrary words that
+ *  happen to end in `.ts`. Falls back when MENTIONED_FILE_RE finds nothing. */
+const BARE_FILE_RE = /(?:创建|扩展|修改|新增|删除|重构|接入|实现|编写|更新|移除|替换)\s+([\w.-]+\.[a-zA-Z]\w{0,5})/g
+
+/** Extract file paths mentioned in free text, de-duplicated, first-seen order. */
+function extractMentionedFiles(text: string): string[] {
+  const seen = new Set<string>()
+  const out: string[] = []
+  // Full paths first (dir/file.ext) — most reliable.
+  for (const match of text.matchAll(MENTIONED_FILE_RE)) {
+    const path = match[0]!
+    if (!seen.has(path)) {
+      seen.add(path)
+      out.push(path)
+    }
+  }
+  // Fallback: bare filenames after Chinese action verbs.
+  for (const match of text.matchAll(BARE_FILE_RE)) {
+    const name = match[1]!
+    if (!seen.has(name)) {
+      seen.add(name)
+      out.push(name)
+    }
+  }
+  return out
+}
+
+const NUMBERED_ITEM_RE = /^\s*\d{1,2}[.)、]\s*/
+
+/** Split an objective into numbered-list items (`1. …` / `2) …` / `3、…`).
+ *  Continuation lines attach to the preceding item. Returns [] when fewer
+ *  than 2 items — a single "1." is prose, not a shard list. */
+function splitNumberedItems(objective: string): string[] {
+  const items: string[] = []
+  let current: string[] | null = null
+  for (const line of objective.split('\n')) {
+    if (NUMBERED_ITEM_RE.test(line)) {
+      if (current) items.push(current.join('\n').trim())
+      current = [line.replace(NUMBERED_ITEM_RE, '')]
+    } else if (current) {
+      current.push(line)
+    }
+  }
+  if (current) items.push(current.join('\n').trim())
+  const filtered = items.filter(Boolean)
+  return filtered.length >= 2 ? filtered : []
+}
+
+/** Cap for objective-derived shards — beyond this the plan needs a real
+ *  planner (or wave structure), not a heuristic burst. */
+const MAX_ITEM_SHARDS = 8
+
 function shardRisk(depth: TaskDepthLayer, fileCount: number): 'low' | 'medium' | 'high' {
   if (depth === 'system') return 'high'
   if (depth === 'wiring' || fileCount >= 2) return 'medium'
@@ -98,7 +157,23 @@ function nextId(prefix: string, index: number): string {
  */
 export function decomposeObjective(input: PlanDecomposeInput): TaskGraph {
   const objective = input.objective.trim()
-  const files = input.files ?? []
+  const explicitFiles = input.files ?? []
+
+  // T5 fix (2026-07-30): when the caller passes no files — the normal shape for
+  // new-file tasks, where scope files don't exist yet so the model reasonably
+  // omits them — the old code fell straight into ONE monolith shard with
+  // files:[]. That silently dropped the parallel-shard promise (e2e Run 4:
+  // 7-task plan expectation collapsed to 单任务单波 + Scope Health leaked).
+  // Recover the sharding signal from the objective text itself:
+  //  a) a numbered list (≥2 items) → one shard per item, scoped to the files
+  //     each item mentions;
+  //  b) otherwise, file paths mentioned in prose → treat as scope files and
+  //     let module grouping shard them.
+  // Explicit `files` always wins — the caller declared scope, don't second-guess.
+  const itemShards = explicitFiles.length === 0 ? splitNumberedItems(objective).slice(0, MAX_ITEM_SHARDS) : []
+  const files = explicitFiles.length > 0
+    ? explicitFiles
+    : itemShards.length === 0 ? extractMentionedFiles(objective) : []
   const depth = inferDepth(input)
   const nodes: TaskGraphNode[] = []
   let seq = 1
@@ -113,7 +188,7 @@ export function decomposeObjective(input: PlanDecomposeInput): TaskGraph {
   // (structural / cross-module / refactor / many-file work). Small single-module
   // work skips it: the shard worker explores its own area inline.
   const needsExplore = depth === 'system' || depth === 'wiring'
-    || REFACTOR_PATTERN.test(objective) || files.length >= 4
+    || REFACTOR_PATTERN.test(objective) || files.length >= 4 || itemShards.length >= 4
   const baseDeps: string[] = []
   if (needsExplore) {
     const exploreObjective = depth === 'system'
@@ -128,6 +203,35 @@ export function decomposeObjective(input: PlanDecomposeInput): TaskGraph {
       dependsOn: [],
       riskTier: 'low',
     }))
+  }
+
+  if (itemShards.length > 0) {
+    // One self-contained shard per numbered item. Item-mentioned files become
+    // the shard scope (may not exist yet — downstream `toBeCreated` semantics
+    // handle new files); an item with no file mentions keeps an empty scope,
+    // which still beats one monolith absorbing every item.
+    for (const item of itemShards) {
+      const itemFiles = extractMentionedFiles(item)
+      const firstLine = item.split('\n')[0]!.trim()
+      add({
+        title: firstLine.length > 80 ? `${firstLine.slice(0, 77)}...` : firstLine,
+        objective: `${objective}\n\n本分片只负责下面这个条目,与其他分片并行执行,不要改动本分片范围外的文件:\n${item}${SHARD_SELF_VERIFY}`,
+        profile: 'patcher',
+        kind: 'patch_proposal',
+        files: itemFiles,
+        dependsOn: [...baseDeps],
+        riskTier: shardRisk(depth, itemFiles.length),
+      })
+    }
+    const itemGraph: TaskGraph = { mission: objective, nodes, createdAt: Date.now() }
+    const itemValidation = validateTaskGraph(itemGraph)
+    if (!itemValidation.valid) {
+      for (const node of itemGraph.nodes) {
+        const ids = new Set(itemGraph.nodes.map(n => n.id))
+        node.dependsOn = node.dependsOn.filter(d => ids.has(d))
+      }
+    }
+    return itemGraph
   }
 
   const groups = groupFilesByModule(files)

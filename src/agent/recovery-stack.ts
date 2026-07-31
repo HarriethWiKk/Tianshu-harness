@@ -19,12 +19,12 @@ export interface FileChangeRecord {
   ts: number
 }
 
-export function listRecoveryStack(cwd: string): RecoveryEntry[] {
-  return readUnacknowledged(cwd)
+export function listRecoveryStack(cwd: string, sessionId?: string): RecoveryEntry[] {
+  return readUnacknowledged(cwd, sessionId)
 }
 
-export function renderRecoveryStack(cwd: string): string {
-  const entries = listRecoveryStack(cwd)
+export function renderRecoveryStack(cwd: string, sessionId?: string): string {
+  const entries = listRecoveryStack(cwd, sessionId)
   if (entries.length === 0) return 'Recovery stack empty — no unacknowledged recovery events.'
 
   const lines = entries.map((e, i) =>
@@ -39,8 +39,9 @@ export function trackFileRestore(
   file: string,
   action: string,
   linesLost = 0,
+  sessionId?: string,
 ): void {
-  recordRecovery(cwd, { file, action, linesLost })
+  recordRecovery(cwd, { file, action, linesLost }, sessionId)
 }
 
 /** Per-process latest backup path per (cwd, filePath). Used by the edit tools
@@ -56,13 +57,14 @@ function backupKey(cwd: string, filePath: string): string {
  * Restore a file to its most recent backup recorded by trackFileChange.
  * Returns true if a backup existed and was restored; false otherwise.
  */
-export function restoreLatestBackup(cwd: string, filePath: string): boolean {
+export function restoreLatestBackup(cwd: string, filePath: string, sessionId?: string): boolean {
   const key = backupKey(cwd, filePath)
   const backupPath = latestBackups.get(key)
   if (!backupPath || !existsSync(backupPath)) return false
   const absPath = join(cwd, filePath)
   try {
     copyFileSync(backupPath, absPath)
+    recordRecovery(cwd, { file: filePath, action: 'restore latest backup', linesLost: 0 }, sessionId)
     return true
   } catch {
     return false
@@ -89,10 +91,6 @@ export function trackFileChange(cwd: string, record: Omit<FileChangeRecord, 'bac
     copyFileSync(absPath, backupPath)
     latestBackups.set(backupKey(cwd, record.filePath), backupPath)
   }
-
-  // Also record in the recovery journal for deliver_task visibility
-  const linesLost = 0 // mutations don't lose lines yet; only restores do
-  recordRecovery(cwd, { file: record.filePath, action: record.action, linesLost })
 
   return { ...record, backupPath, ts }
 }

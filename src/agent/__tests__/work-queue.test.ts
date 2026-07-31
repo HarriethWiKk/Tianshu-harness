@@ -129,7 +129,7 @@ describe('WorkOrderQueue', () => {
     assert.equal(events.length, 1)
   })
 
-  it('hasFileConflict detects shared files with in-flight orders', () => {
+  it('hasFileConflict allows two read-only orders sharing files', () => {
     const q = new WorkOrderQueue()
     const a = createReadOnlyWorkOrder({
       id: 'a', parentTurnId: 't', kind: 'code_search', profile: 'code_scout',
@@ -144,7 +144,29 @@ describe('WorkOrderQueue', () => {
     const dequeued = q.dequeue()!
     q.markInFlight(dequeued)
 
-    assert.equal(q.hasFileConflict(b), true)
+    // 只读 + 只读并行检查同一快照是安全的（galaxy 多视角 fan-out 依赖此语义）
+    assert.equal(q.hasFileConflict(b), false)
+  })
+
+  it('hasFileConflict serializes when either side can write', () => {
+    const q = new WorkOrderQueue()
+    const writer = {
+      ...createReadOnlyWorkOrder({
+        id: 'w', parentTurnId: 't', kind: 'patch_proposal', profile: 'patcher',
+        objective: 'W', scope: { files: ['src/agent/loop.ts'] },
+      }),
+      profile: 'patcher',
+    }
+    const reader = createReadOnlyWorkOrder({
+      id: 'r', parentTurnId: 't', kind: 'code_search', profile: 'code_scout',
+      objective: 'R', scope: { files: ['src/agent/loop.ts'] },
+    })
+
+    q.enqueue(writer)
+    q.markInFlight(q.dequeue()!)
+    // 在飞写工 × 待派只读 → 冲突（读移动靶）；反向（只读在飞 × 写工待派）同样序列化
+    assert.equal(q.hasFileConflict(reader), true)
+    assert.equal(q.hasFileConflict({ ...writer, id: 'w2' }), true)
   })
 
   it('hasFileConflict returns false when no files', () => {

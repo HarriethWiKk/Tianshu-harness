@@ -67,16 +67,91 @@ export function formatConsoleLine(entry: ConsoleEntry): string {
   return `[${entry.level}] ${text}`
 }
 
+/** Stable signature for console clustering. Strips line:column references,
+ *  URLs, hex addresses, and numeric values — keeps the error type and message
+ *  shape so "TypeError: x.y is undefined at foo.ts:12:3" and the same error
+ *  at "foo.ts:47:1" map to the same cluster key. */
+export function consoleSignature(text: string): string {
+  return text
+    .replace(/\s+$/, '')
+    // First line only — stack traces vary per occurrence
+    .split('\n')[0]!
+    // Strip source location markers: file.ts:line:col
+    .replace(/\(?\/[^)]*:\d+:\d+\)?/g, '')
+    .replace(/\b\w+\.\w+:\d+:\d+/g, '')
+    .replace(/:\d+:\d+/g, '')
+    // Strip hex addresses
+    .replace(/\b0x[0-9a-fA-F]+\b/g, '0x…')
+    // Normalise repeated whitespace
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+/** Pre-classified network error category. Each has a distinct fix strategy
+ *  (CORS → server config, DNS → URL typo, timeout → server not running, etc.)
+ *  so the model doesn't have to guess from a raw error string. */
+export type NetworkErrorCategory =
+  | 'CONNECTION_REFUSED'  // server not running or wrong port
+  | 'TIMEOUT'             // server hung or network too slow
+  | 'DNS'                 // hostname not resolvable (typo or not running)
+  | 'CORS'                // cross-origin blocked by browser
+  | 'ABORTED'             // request cancelled (user nav or signal)
+  | 'CERT'                // TLS certificate invalid/expired
+  | 'HTTP_5XX'            // server error
+  | 'HTTP_4XX'            // client error (404, 403, 401, …)
+  | 'NETWORK'             // other network-level failure
+
+/** Classify a network failure by its error text and HTTP status.
+ *  Rules are ordered — first match wins. */
+export function classifyNetworkError(errorText?: string, status?: number): NetworkErrorCategory {
+  if (status !== undefined) {
+    if (status >= 500) return 'HTTP_5XX'
+    if (status >= 400) return 'HTTP_4XX'
+  }
+  if (!errorText) return 'NETWORK'
+  const t = errorText.toLowerCase()
+  if (t.includes('connection refused') || t.includes('econnrefused')) return 'CONNECTION_REFUSED'
+  if (t.includes('timed out') || t.includes('timeout') || t.includes('etimedout')) return 'TIMEOUT'
+  if (t.includes('name not resolved') || t.includes('enotfound') || t.includes('eai_again')) return 'DNS'
+  if (t.includes('cors') || t.includes('cross-origin') || t.includes('blocked by cors')) return 'CORS'
+  if (t.includes('aborted') || t.includes('econnaborted') || t.includes('cancelled')) return 'ABORTED'
+  if (t.includes('cert') || t.includes('ssl') || t.includes('tls') || t.includes('self signed')) return 'CERT'
+  return 'NETWORK'
+}
+
+/** Human-readable one-liner for each error category — tells the model the
+ *  most likely fix direction so it doesn't waste turns guessing. */
+export function networkErrorHint(cat: NetworkErrorCategory): string {
+  switch (cat) {
+    case 'CONNECTION_REFUSED': return '（服务器未启动或端口错误）'
+    case 'TIMEOUT': return '（服务器无响应或网络超时）'
+    case 'DNS': return '（域名无法解析——检查 URL 拼写或网络连接）'
+    case 'CORS': return '（跨域被浏览器拦截——需服务端配置 CORS 头）'
+    case 'ABORTED': return '（请求被取消）'
+    case 'CERT': return '（TLS 证书无效——使用 http:// 或修复证书）'
+    case 'HTTP_5XX': return '（服务端错误——检查服务端日志）'
+    case 'HTTP_4XX': return '（客户端错误——检查请求参数或认证）'
+    case 'NETWORK': return ''
+  }
+}
+
 /** Single-line network render with a status-aware leading glyph. */
 export function formatNetworkLine(entry: NetworkEntry, includeBody = false): string {
   const dur = entry.durationMs !== undefined ? ` (${entry.durationMs}ms)` : ''
   let line: string
   if (entry.failed) {
+    const cat = classifyNetworkError(entry.errorText, entry.status)
+    const hint = networkErrorHint(cat)
     line = `✗ ${entry.method} ${entry.url}${entry.errorText ? ` (${entry.errorText})` : ''}`
+    if (hint) line += ` ${hint}`
   } else if (entry.status === undefined) {
     line = `→ ${entry.method} ${entry.url}`
   } else {
+    // Completed with status — classify 4xx/5xx for the hint too
+    const cat = classifyNetworkError(undefined, entry.status)
+    const hint = networkErrorHint(cat)
     line = `← ${entry.status} ${entry.method} ${entry.url}${dur}`
+    if (hint) line += ` ${hint}`
   }
   if (entry.resourceType) line += ` [${entry.resourceType}]`
   if (includeBody && entry.responseBody) {
@@ -111,6 +186,9 @@ export function parseNetworkLine(line: string): ParsedNetworkRow | null {
     resourceType = typeMatch[1]
     rest = rest.slice(0, rest.length - typeMatch[0].length)
   }
+  // Strip the error-classification hint that formatNetworkLine appends for
+  // 4xx/5xx/failed entries (e.g. "（服务端错误——检查服务端日志）").
+  rest = rest.replace(/\s*（[^）]+）\s*$/, '')
   if (rest.startsWith('✗ ')) {
     rest = rest.slice(2)
     let errorText: string | undefined
@@ -441,6 +519,25 @@ export class LogCapture {
 
   getConsole(level?: ConsoleLevel): ConsoleEntry[] {
     return level ? this.consoleEntries.filter((e) => e.level === level) : [...this.consoleEntries]
+  }
+
+  /** Cluster console entries by a stable signature so the model sees
+   *  "4× Uncaught TypeError: …" instead of four identical bare errors.
+   *  Signature strips line:column, URLs, and numeric values that vary per
+   *  occurrence while keeping the error shape recognisable. */
+  getConsoleClusters(level?: ConsoleLevel): { signature: string; count: number; sample: string; level: ConsoleLevel }[] {
+    const entries = level ? this.consoleEntries.filter((e) => e.level === level) : this.consoleEntries
+    const clusters = new Map<string, { count: number; sample: string; level: ConsoleLevel }>()
+    for (const e of entries) {
+      const sig = consoleSignature(e.text)
+      const existing = clusters.get(sig)
+      if (existing) {
+        existing.count++
+      } else {
+        clusters.set(sig, { count: 1, sample: e.text, level: e.level })
+      }
+    }
+    return [...clusters.entries()].map(([signature, v]) => ({ signature, ...v }))
   }
 
   getNetwork(query: NetworkQuery | boolean = false): NetworkEntry[] {

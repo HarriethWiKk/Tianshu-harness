@@ -28,9 +28,11 @@ main.ts → AgentLoop (agent/loop.ts)
   │       60+ 模块（src/agent/hooks/），按 deps/开关 gated。默认会话实际激活 ~18+：
   │       常驻 8（base 数组无条件）：perception, signal-consumer, kick,
   │               vigor×2(afterPerception+postTool), theta, stigmergy, radio
-  │       advisoryBus 恒构造(loop.ts) → 这批默认全开：self-verify、edit-tool-advisory、
-  │               lossy-observation、spec-verify-gate、typecheck-reminder、todo-reminder、
-  │               context-pressure(需 token getter)、dedup-guard(需 streamedText getter)
+ │       advisoryBus 恒构造(loop.ts) → 这批默认全开：self-verify、edit-tool-advisory、
+ │               lossy-observation、spec-verify-gate、typecheck-reminder、todo-reminder、
+ │               security-pattern(写后正则查危险模式；config agent.securityGuidance=false
+ │               或 RIVET_SECURITY_GUIDANCE=0 关)、
+ │               context-pressure(需 token getter)、dedup-guard(需 streamedText getter)
   │       deps-gated（默认多为真）：playbook-reflect、anchor-break-shadow、dream/skill-distill、
   │               meridian、telemetry-flush、physarum-file-access、memory-learning、courage/ccr(starSoul)
   │       默认关(opt-in)：songline、constellation、hearth-observe、companion、

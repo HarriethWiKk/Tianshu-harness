@@ -76,7 +76,7 @@ async function finalizeHashEdit(
   const check = await checkSyntax(filePath, newContent)
   if (check.fatal) {
     const relPath = relative(cwd, filePath)
-    const restored = restoreLatestBackup(cwd, relPath)
+    const restored = restoreLatestBackup(cwd, relPath, sessionId)
     // 回滚后 mtime 会变（copyFileSync 不保留原始时间戳），但内容已恢复。
     // 刷新读文件 mtime 追踪器——否则后续 hash_edit 的仅位置锚点检查会误报
     // "文件已变化，请重新 read_file"。

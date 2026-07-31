@@ -140,7 +140,19 @@ export interface RuntimeHookError {
 
 export interface RuntimeHookPipelineOptions {
   onError?: (error: RuntimeHookError) => void
+  /** 单 hook 异步执行超时（默认 10s）——pending promise 永不 resolve 时降级
+   *  跳过并报 onError，后续 hook 照常执行；卡死的 promise 遗留后台（泄漏有界）。
+   *  注意：同步 CPU 死循环无法被 in-process 抢占（同线程），此类缺陷只能
+   *  靠 worker 隔离根治；本护栏守住「异步挂起」与「慢 hook 可观测」两条线。
+   *  （2026-08-01 事故：postTool hook 正则死循环拖死整个 agent loop。） */
+  hookTimeoutMs?: number
+  /** 慢 hook 遥测阈值（默认 2s）——同步执行超过即报 onError（事后检测，
+   *  不能抢占，但让慢 hook 可见）。 */
+  hookSlowMs?: number
 }
+
+const DEFAULT_HOOK_TIMEOUT_MS = 10_000
+const DEFAULT_HOOK_SLOW_MS = 2_000
 
 function noop(): void {}
 
@@ -240,9 +252,24 @@ export class RuntimeHookPipeline {
     hooks: T[],
     invoke: (hook: T) => Promise<void> | void,
   ): Promise<void> {
+    const timeoutMs = this.options.hookTimeoutMs ?? DEFAULT_HOOK_TIMEOUT_MS
+    const slowMs = this.options.hookSlowMs ?? DEFAULT_HOOK_SLOW_MS
     for (const hook of hooks) {
+      const start = Date.now()
+      let timer: ReturnType<typeof setTimeout> | undefined
       try {
-        await invoke(hook)
+        const result = invoke(hook)
+        if (result instanceof Promise) {
+          await Promise.race([
+            result,
+            new Promise<never>((_, reject) => {
+              timer = setTimeout(
+                () => reject(new Error(`[hook-timeout] "${hook.name}" exceeded ${timeoutMs}ms in phase ${phase} — skipped`)),
+                timeoutMs,
+              )
+            }),
+          ])
+        }
       } catch (error) {
         this.options.onError?.({
           phase,
@@ -250,6 +277,17 @@ export class RuntimeHookPipeline {
           message: toMessage(error),
           error,
         })
+      } finally {
+        if (timer !== undefined) clearTimeout(timer)
+        const elapsed = Date.now() - start
+        if (elapsed >= slowMs) {
+          this.options.onError?.({
+            phase,
+            hookName: hook.name,
+            message: `[hook-slow] "${hook.name}" took ${elapsed}ms in phase ${phase}`,
+            error: undefined,
+          })
+        }
       }
     }
   }
