@@ -64,12 +64,13 @@ npm start          # or: node dist/main.js
 
 ### 3. Configure an API Key
 
-```bash
-# A. Environment variable (simplest for first try)
-export DEEPSEEK_API_KEY=sk-xxx
+**No manual step needed for installed builds** — the first launch walks you through it: the desktop app opens a connection wizard, and the CLI auto-runs a setup wizard when no key is found. Just paste your DeepSeek key. Change it anytime: Settings → Provider on desktop, `rivet config` on the CLI.
 
-# B. Persisted CLI config (saved to ~/.rivet/config.json)
-rivet config set-key deepseek sk-xxx
+**Manual configuration** is only for developers running from source (or pre-seeding a setup):
+
+```bash
+rivet config set-key deepseek sk-xxx   # persisted to config.json
+export DEEPSEEK_API_KEY=sk-xxx         # or: environment variable (current shell only)
 ```
 
 > Other providers (Claude, GLM, Codex, MiniMax, MiMo) use the same pattern. See
@@ -138,13 +139,12 @@ with `RIVET_NO_UPDATE_CHECK=1`.
 Switch providers inside a session with `/model <name>`.
 
 ```bash
-rivet config                                              # interactive setup (TTY)
-rivet config setup deepseek --key-env DEEPSEEK_API_KEY --default
-rivet config setup codex --default                       # OAuth (browser login)
+rivet config                          # interactive setup (TTY)
+rivet config setup codex --default    # Codex uses OAuth (browser login on first run)
 rivet config show
 ```
 
-Or edit `~/.rivet/config.json` directly (only overrides needed, defaults are deep-merged):
+Or edit `config.json` directly (only overrides needed, defaults are deep-merged). Location: `~/.rivet/config.json` for the CLI (`%LOCALAPPDATA%\.rivet` on Windows); for the desktop app check Settings → Storage (portable builds use `TianshuData\.rivet` next to the exe):
 
 ```json
 {
@@ -152,7 +152,7 @@ Or edit `~/.rivet/config.json` directly (only overrides needed, defaults are dee
     "default": "deepseek",
     "providers": {
       "deepseek": {
-        "apiKeyEnv": "DEEPSEEK_API_KEY",
+        "apiKey": "sk-xxx",
         "models": [
           { "id": "deepseek-v4-pro", "contextWindow": 1000000, "maxTokens": 384000 }
         ]

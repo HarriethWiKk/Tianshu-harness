@@ -1,4 +1,5 @@
 import type { TeamTask } from './team-plan.js'
+import { dependencyId } from './work-order.js'
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
@@ -51,8 +52,11 @@ function topologicalSort(tasks: TeamTask[]): string[] {
     visited.add(id)
     const task = taskMap.get(id)
     if (task) {
+      // 条件边（收编 #6）：拓扑只看主依赖（dependsOn）；skip/alternate 的
+      // 运行时分支由 coordinator 的 WorkOrderQueue 处理。
       for (const dep of task.dependsOn) {
-        if (taskMap.has(dep)) visit(dep)
+        const depId = dependencyId(dep)
+        if (taskMap.has(depId)) visit(depId)
       }
     }
     result.push(id)
@@ -89,7 +93,8 @@ export function validateTaskDependencies(tasks: TeamTask[]): DependencyDiagnosti
   const dangling: Array<{ taskId: string; missingDep: string }> = []
   for (const t of tasks) {
     for (const dep of t.dependsOn) {
-      if (!taskMap.has(dep)) dangling.push({ taskId: t.id, missingDep: dep })
+      const depId = dependencyId(dep)
+      if (!taskMap.has(depId)) dangling.push({ taskId: t.id, missingDep: depId })
     }
   }
 
@@ -104,13 +109,14 @@ export function validateTaskDependencies(tasks: TeamTask[]): DependencyDiagnosti
     const task = taskMap.get(id)
     if (task) {
       for (const dep of task.dependsOn) {
-        if (!taskMap.has(dep)) continue
-        const depState = state.get(dep)
+        const depId = dependencyId(dep)
+        if (!taskMap.has(depId)) continue
+        const depState = state.get(depId)
         if (depState === 'gray') {
-          const start = stack.indexOf(dep)
+          const start = stack.indexOf(depId)
           if (start >= 0) cycles.push(stack.slice(start))
         } else if (depState !== 'black') {
-          dfs(dep)
+          dfs(depId)
         }
       }
     }
@@ -240,9 +246,10 @@ export function groupTeamTasks(tasks: TeamTask[], options?: GroupingOptions): Te
       const task = taskMap.get(id)
       if (!task) { notReady.push(id); continue }
 
-      const depsMet = task.dependsOn.every(dep =>
-        completed.has(dep) || !taskMap.has(dep)
-      )
+      const depsMet = task.dependsOn.every(dep => {
+        const depId = dependencyId(dep)
+        return completed.has(depId) || !taskMap.has(depId)
+      })
       if (depsMet) {
         ready.push(id)
       } else {

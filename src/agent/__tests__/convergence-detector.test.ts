@@ -998,7 +998,7 @@ describe('evaluateConvergence', () => {
   describe('productive-ratio stagnation (alternating read-analyze)', () => {
     // The core problem: agent calls read_file each turn (so consecutiveNoToolTurns
     // resets to 0), but never calls edit/test/commit. The "hasProductive" boolean
-    // check is all-or-nothing, and on 1M window the turn gate (nLow=12) blocks
+    // check is all-or-nothing, and on 1M window the turn gate (nLow=25) blocks
     // all score-based detection for the first 12 turns.
     //
     // New signal: productiveRatio = productive tools / total tools in last K calls.
@@ -2243,12 +2243,12 @@ describe('evaluateConvergence — flow 软阈值（P1 Wave 2）', () => {
     assert.equal(noData.level, 1, 'no-data → 资格门拦截 → 基线 L1 不变')
   })
 
-  it('activePlan 与 flow 互斥不叠加：activePlan 时 nLow=12（1.5×），不是 15+（1.5×1.27）', () => {
+  it('activePlan 与 flow 互斥不叠加：activePlan 时 nLow=38 (25×1.5)，不是更大', () => {
     const result = evaluateConvergence(baseInput({
       turn: 13, phaseClass: 'explore', recentToolHistory: lowScoreHistory(),
       progressBeacons: { todoCompletedDelta: 0, activePlan: true, flowInputs: highFlow },
     }))
-    assert.equal(result.level, 1, 'turn 13 ≥ activePlan 调整后 nLow(12) → L1；若叠加为 15 则应是 L0')
+    assert.equal(result.level, 1, 'turn 13 < activePlan 调整后 nLow(38)，但低分+低产出触发停滞绕行 → L1')
   })
 
   // ─── P2 阴阳调度：structureRelaxation 单声源 ──────────────────────
@@ -2304,7 +2304,7 @@ describe('evaluateConvergence — flow 软阈值（P1 Wave 2）', () => {
       turn: 13, phaseClass: 'explore', recentToolHistory: lowScoreHistory(),
       progressBeacons: { todoCompletedDelta: 0, activePlan: true, structureRelaxation: 0.25 },
     }))
-    assert.equal(result.level, 1, 'turn 13 ≥ activePlan 调整后 nLow(12) → L1；若叠加 1.5×1.25 则应 L0')
+    assert.equal(result.level, 1, 'turn 13 < activePlan 调整后 nLow(38)，但低分+低产出触发停滞绕行 → L1')
   })
 
   it('P2 高 relaxation 不能救 no-tool 硬熔断', () => {

@@ -3,30 +3,33 @@
 > 本文件由 `scripts/docs-index.ts` 自动生成（`npm run docs:index`），请勿手工编辑。
 > 文档规范见 [README.md](README.md)；思维导图见 [MINDMAP.md](MINDMAP.md)（markmap 渲染）。
 
-共 1025 篇，其中 25 篇带 frontmatter。
+共 1035 篇，其中 34 篇带 frontmatter。
 
 ## 概览
 
 | 类型 | 职责 | 数量 |
 |------|------|------|
-| `plan` | 执行计划 | 347 |
-| `spec` | 事前规格 | 212 |
-| `design` | 技术设计 | 55 |
+| `plan` | 执行计划 | 350 |
+| `spec` | 事前规格 | 213 |
+| `design` | 技术设计 | 58 |
 | `analysis` | 分析复盘 | 174 |
-| `research` | 外部调研 | 19 |
-| `changelog` | 变更记录 | 47 |
+| `research` | 外部调研 | 21 |
+| `changelog` | 变更记录 | 48 |
 | `issue` | 问题追踪 | 33 |
 | `release` | 版本发布 | 22 |
 | `guide` | 手册指南 | 14 |
 | `reference` | 参考资料 | 49 |
 | `unclassified` | 未分类 | 53 |
 
-## plan — 执行计划（347）
+## plan — 执行计划（350）
 
 | 日期 | 文档 | 状态 |
 |------|------|------|
 | 2026-07-31 | [桌面端滚动"收缩钳位上移"修复——virtual-core 补偿谓词落地](plans/2026-07-31-desktop-scroll-clamp-compensation.md) | active |
+| 2026-07-31 | [桌面端滚动跟随态几何脱节修复——内容几何守望者](plans/2026-07-31-desktop-scroll-follow-geometry-watcher.md) | active |
+| 2026-07-31 | [桌面端自动更新国内加速——阿里云 OSS 双通道](plans/2026-07-31-desktop-update-china-oss.md) | active |
 | 2026-07-31 | [星河集群（galaxy）天枢设施复用优化落地计划](plans/2026-07-31-galaxy-prewarm-and-cache-affinity.md) | draft |
+| 2026-07-31 | [右栏文件树开合卡顿优化——首开常挂载保活](plans/2026-07-31-review-panel-open-jank-keepalive.md) | active |
 | 2026-07-28 | [Worker 活动事件类型清理 — 后续待办](tasks/2026-07-28-worker-activity-type-cleanup.md) | — |
 | 2026-07-26 | [CLI 端分波优化实施计划（对标 Claude Code）](superpowers/plans/2026-07-26-cli-optimization-waves.md) | — |
 | 2026-07-26 | [沙箱构建兼容性 —— 从开关到边界 实现计划](superpowers/plans/2026-07-26-sandbox-build-compat.md) | — |
@@ -373,10 +376,11 @@
 | — | [任务：修复 read_file 的 artifact 摘要导致 agent 感知断裂](tasks/fix-read-file-artifact-perception.md) | — |
 | — | [任务：为 B1 Delivery Gate 增加 verification supersession](tasks/verification-supersession.md) | — |
 
-## spec — 事前规格（212）
+## spec — 事前规格（213）
 
 | 日期 | 文档 | 状态 |
 |------|------|------|
+| 2026-08-01 | [级联 Tier 推测执行——DP quorum 未达成时自动 escalate strong 模型](3.0/D1-3-cascade-tier-speculation.md) | draft |
 | 2026-07-31 | [模拟器任务卡壳诊断：外部会话日志调研（测试题2）](superpowers/specs/2026-07-31-simulator-task-loop-diagnosis.md) | — |
 | 2026-07-30 | [视觉层 + 无头浏览器效果最大化 · 深度头脑风暴结果](superpowers/specs/2026-07-30-vision-browser-maximization-design.md) | — |
 | 2026-07-28 | [ResourceSensor 跨会话残留导致 Reliability Mode 误触发](superpowers/specs/2026-07-28-resource-sensor-cross-session-residual.md) | — |
@@ -590,10 +594,13 @@
 | 2025-05-17 | [天枢星图流 v2：态势感知 + 信息素记忆 — 深度头脑风暴设计文档](superpowers/specs/2025-05-17-starflow-v2-sensorium-design.md) | ✅ 已实施 (2026-05-17) |
 | 2025-05-17 | [终端 Agent 回复被吞/截断问题 — 深度头脑风暴 & 设计文档](superpowers/specs/2025-05-17-text-swallowing-design.md) | — |
 
-## design — 技术设计（55）
+## design — 技术设计（58）
 
 | 日期 | 文档 | 状态 |
 |------|------|------|
+| 2026-08-01 | [调度亲和升级——从 tie-breaker 到一级排序因子](3.0/D2-affinity-upgrade.md) | draft |
+| 2026-08-01 | [遗留落地：team 条件依赖扩展与 delegate_task 依赖参数](design/2026-08-01-galaxy-leftovers-team-deps-delegate-task.md) | — |
+| 2026-08-01 | [星河机制收编设计——把 galaxy 验证过的模式串联回底层与工作流](design/2026-08-01-galaxy-mechanism-convergence.md) | draft |
 | 2026-07-31 | [Team + Scout 证据管线技术路线](design/2026-07-31-team-scout-evidence-pipeline.md) | accepted |
 | 2026-07-30 | [巡天/协同工作流深化——从「主控复述」到「证据防火墙」](design/2026-07-30-scout-collab-evidence-firewall.md) | draft |
 | 2026-07-30 | [设计：安全审查 层2/层3（Stop-LLM 审查 + commit 跨文件审查）](design/2026-07-30-security-review-layers-2-3.md) | — |
@@ -829,10 +836,12 @@
 | — | [天枢 B+C 基础能力建设 — 工作记录](teamtask/天枢-B+C基础能力建设-工作记录.md) | — |
 | — | [天枢子代理工作流优化_6035537b.plan_副本](teamtask/天枢子代理工作流优化_6035537b.plan_副本.md) | — |
 
-## research — 外部调研（19）
+## research — 外部调研（21）
 
 | 日期 | 文档 | 状态 |
 |------|------|------|
+| 2026-08-01 | [DeepSeek MoE × 天枢 Galaxy 协同方向收编](3.0/D1-moe-galaxy-deepseek-synergy.md) | draft |
+| 2026-08-01 | [子代理结果契约调研：JSON 文本契约 vs 竞品做法](research/2026-08-01-worker-result-json-contract-vs-competitors.md) | accepted |
 | 2026-07-31 | [竞品聊天列表"钉底 + 动态行高"实现调研](research/2026-07-31-chat-scroll-bottom-pinning-competitor-survey.md) | accepted |
 | 2026-07-16 | [上下文压缩机制全景 + 会话 2c1186f5 实证分析](research/2026-07-16-compaction-mechanism-and-2c1186f5-analysis.md) | — |
 | 2026-07-10 | [桌面端流式渲染性能基线（Wave 0）](research/2026-07-10-desktop-stream-perf-baseline.md) | — |
@@ -853,10 +862,11 @@
 | 2026-05-27 | [Outlines Index：渐进式披露文档给 AI Agent 的方法](research/2026-05-27-outlines-index-progressive-disclosure.md) | — |
 | — | [桌面端渲染调度基线（渲染调度专项 Wave 0）](research/2026-07-desktop-render-baseline.md) | — |
 
-## changelog — 变更记录（47）
+## changelog — 变更记录（48）
 
 | 日期 | 文档 | 状态 |
 |------|------|------|
+| 2026-08-01 | [星河收编落地与实测验证记录——七项收编全落地、审查修复链、路由学习闭环实测](3.0/D3-convergence-landing-verification.md) | done |
 | 2026-07-30 | [2026-07-30 桌面端识图能力补齐：与 CLI 各自独立可用](changelog/2026-07-30-desktop-vision-parity.md) | done |
 | 2026-07-30 | [2026-07-30 Python 语法校验改用进程内 tree-sitter](changelog/2026-07-30-python-syntax-check-treesitter.md) | — |
 | 2026-07-30 | [2026-07-30 /scout 巡天侦察蜂群 + T5 计划坍缩修复](changelog/2026-07-30-scout-swarm-and-t5-plan-collapse.md) | — |

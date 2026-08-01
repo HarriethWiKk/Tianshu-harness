@@ -94,6 +94,60 @@ describe('WorkOrderQueue', () => {
     assert.equal(q.dequeue()?.id, 'free')
   })
 
+  it('conditional edge: skip — failed dependency keeps task unrunnable（收编 #6）', () => {
+    const q = new WorkOrderQueue()
+    const a = order('a')
+    const b = { ...order('b'), dependencies: [{ dependsOn: 'a', onFailure: 'skip' as const }] }
+    q.enqueue(a)
+    q.enqueue(b)
+
+    // a 失败 → b 永远不可运行（skip 语义：不执行，清扫时标 skipped）
+    const deqA = q.dequeue()!
+    q.markInFlight(deqA)
+    q.markFailed(deqA)
+    assert.equal(q.dequeue(), undefined)
+    assert.equal(q.pending().length, 1)
+  })
+
+  it('conditional edge: alternate — failed primary falls back to alternate id（收编 #6）', () => {
+    const q = new WorkOrderQueue()
+    const a = order('a')
+    const alt = order('alt')
+    const b = { ...order('b'), dependencies: [{ dependsOn: 'a', onFailure: 'alternate' as const, alternateOrderId: 'alt' }] }
+    q.enqueue(a)
+    q.enqueue(alt)
+    q.enqueue(b)
+
+    const deqA = q.dequeue()!
+    q.markInFlight(deqA)
+    q.markFailed(deqA)
+    // alternate 未完成 → b 仍不可运行；alt 出队
+    const deqAlt = q.dequeue()!
+    assert.equal(deqAlt.id, 'alt')
+    q.markInFlight(deqAlt)
+    q.markCompleted({ id: 'alt' })
+    // alternate 完成 → b 可运行
+    assert.equal(q.dequeue()?.id, 'b')
+  })
+
+  it('conditional edge: alternate also failed → task stays unrunnable（收编 #6）', () => {
+    const q = new WorkOrderQueue()
+    const a = order('a')
+    const alt = order('alt')
+    const b = { ...order('b'), dependencies: [{ dependsOn: 'a', onFailure: 'alternate' as const, alternateOrderId: 'alt' }] }
+    q.enqueue(a)
+    q.enqueue(alt)
+    q.enqueue(b)
+
+    const deqA = q.dequeue()!
+    q.markInFlight(deqA)
+    q.markFailed(deqA)
+    const deqAlt = q.dequeue()!
+    q.markInFlight(deqAlt)
+    q.markFailed(deqAlt)
+    assert.equal(q.dequeue(), undefined)
+  })
+
   it('emits enqueued events', () => {
     const q = new WorkOrderQueue()
     const events: string[] = []
@@ -121,12 +175,50 @@ describe('WorkOrderQueue', () => {
     const q = new WorkOrderQueue()
     const events: string[] = []
     const unsub = q.on(e => events.push(e.type))
-
+ 
     q.enqueue(order('a'))
     unsub()
     q.enqueue(order('b'))
-
+ 
     assert.equal(events.length, 1)
+  })
+
+  it('affinity: same priority dequeues same-authority order next（收编 #4）', () => {
+    const q = new WorkOrderQueue()
+    const a = order('a')
+    const b = { ...order('b'), authority: 'yaoguang' }
+    const c = { ...order('c'), authority: 'yaoguang' }
+    const d = { ...order('d'), authority: 'tianji' }
+
+    q.enqueue(a, 0)
+    q.enqueue(b, 0)
+    q.enqueue(c, 0)
+    q.enqueue(d, 0)
+
+    // 无亲和锚 → 入队序
+    assert.equal(q.dequeue()?.id, 'a')
+    // 锚 undefined → 无匹配 → 入队序
+    assert.equal(q.dequeue()?.id, 'b')
+    // 锚 yaoguang → c 亲和优先于 d
+    assert.equal(q.dequeue()?.id, 'c')
+    assert.equal(q.dequeue()?.id, 'd')
+  })
+
+  it('affinity: does not cross priority boundary（tie-breaker only）', () => {
+    const q = new WorkOrderQueue()
+    const hi = { ...order('hi'), authority: 'yaoguang' }
+    const same = { ...order('same'), authority: 'tianji' }
+    const low = { ...order('low'), authority: 'yaoguang' }
+
+    q.enqueue(hi, 10)
+    q.enqueue(same, 10)
+    q.enqueue(low, 0)
+
+    assert.equal(q.dequeue()?.id, 'hi')
+    // 同 priority(10) 档内找 yaoguang → 无（same 是 tianji）→ 入队序
+    assert.equal(q.dequeue()?.id, 'same')
+    // 锚 tianji → 同档无 → low
+    assert.equal(q.dequeue()?.id, 'low')
   })
 
   it('hasFileConflict allows two read-only orders sharing files', () => {

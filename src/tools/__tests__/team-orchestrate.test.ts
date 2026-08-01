@@ -11,6 +11,8 @@ import type { CoordinatorRun, DelegationRequest } from '../../agent/coordinator.
 import type { ChangeSet } from '../../agent/review-discipline.js'
 import type { TeamTask } from '../../agent/team-plan.js'
 import type { TeamRunSummary } from '../../agent/team-orchestrator.js'
+import { parseTeamTasks } from '../../agent/team-plan.js'
+import { teamTasksToDelegationRequests } from '../../agent/team-orchestrator.js'
 import { decodeTeamPanelModel } from '../../tui/team-panel-model.js'
 import { storePlan, consumePlan, getStoredPlan } from '../../agent/plan-store.js'
 
@@ -76,6 +78,59 @@ test('team_orchestrate dispatches a standard plan first wave', async () => {
   assert.ok(panel)
   assert.equal(panel.dispatched, 2)
   assert.equal(panel.tasks.length, 2)
+})
+
+test('team_orchestrate 透传条件依赖边（收编 #6：markdown → DependencyEdge）', async () => {
+  let captured: DelegationRequest[] = []
+  const tool = createTeamOrchestrateTool({
+    delegateBatch: async (requests) => { captured = requests; return stubRun('dispatched') },
+  })
+  const md = [
+    '### T1: 重构核心模块',
+    'Refactor `src/agent/loop.ts`',
+    '### T2: 备选调研',
+    '调研 `src/agent/loop.ts` 的替代路径',
+    '### T3: 测试覆盖',
+    '测试 `src/agent/loop.ts`',
+    '依赖 T1(onFailure:alternate:T2)',
+    '### T4: 文档同步',
+    '更新 `docs/architecture.md`',
+    '依赖 T1(onFailure:skip)',
+  ].join('\n')
+  const result = await tool.execute({
+    input: { mode: 'standard', objective: 'force: execute the plan with conditional edges', planMarkdown: md },
+    cwd: process.cwd(),
+    toolUseId: 'tu-edge',
+  })
+  assert.equal(result.isError, false)
+  // 第一波只派发无依赖任务（T1/T2）；T3/T4 因依赖 T1 在后续波——映射层
+  // 由 teamTasksToDelegationRequests 直接验证。
+  assert.ok(captured.length >= 2, `第一波应至少派发无依赖任务，got ${captured.length}`)
+
+  // fromWave 推进第二波：delegateBatch 实收数组必须携带 DependencyEdge 对象。
+  captured = []
+  const second = await tool.execute({
+    input: { mode: 'standard', objective: 'force: continue wave execution', planMarkdown: md, fromWave: 1 },
+    cwd: process.cwd(),
+    toolUseId: 'tu-edge-w2',
+  })
+  assert.equal(second.isError, false)
+  const w2t3 = captured.find(r => r.parentTurnId?.includes('team:T3'))
+  const w2t4 = captured.find(r => r.parentTurnId?.includes('team:T4'))
+  assert.ok(w2t3, '第二波应含 T3')
+  assert.ok(w2t4, '第二波应含 T4')
+  assert.deepEqual(w2t3!.dependencies, [{ dependsOn: 'team:T1', onFailure: 'alternate', alternateOrderId: 'team:T2' }])
+  assert.deepEqual(w2t4!.dependencies, [{ dependsOn: 'team:T1', onFailure: 'skip' }])
+
+  // 映射层直测：条件边 → DependencyEdge（team: 前缀）
+  const tasks = parseTeamTasks(md)
+  const reqs = teamTasksToDelegationRequests(tasks, 'tu-edge')
+  const t3 = reqs.find(r => r.parentTurnId?.includes('team:T3'))
+  const t4 = reqs.find(r => r.parentTurnId?.includes('team:T4'))
+  assert.ok(t3, 'T3 映射存在')
+  assert.ok(t4, 'T4 映射存在')
+  assert.deepEqual(t3!.dependencies, [{ dependsOn: 'team:T1', onFailure: 'alternate', alternateOrderId: 'team:T2' }])
+  assert.deepEqual(t4!.dependencies, [{ dependsOn: 'team:T1', onFailure: 'skip' }])
 })
 
 test('team_orchestrate forwards telemetry sink, reward closure sink, and session id', async () => {
@@ -826,4 +881,41 @@ test('team_orchestrate default keeps max mode available (gate defaults on for di
   // max with pre-parsed plan bypasses planner fanout — should not be Pro-blocked.
   assert.equal(result.isError, false)
   assert.ok(!result.content.includes('[Pro]'))
+})
+
+test('confirm:false → 只展示波次分派方案，零派发（收编 #7）', async () => {
+  let dispatched = false
+  const tool = createTeamOrchestrateTool({
+    delegateBatch: async () => { dispatched = true; return stubRun('should-not-run') },
+  })
+  const md = [
+    '### Task 1: edit foo',
+    'Modify `src/agent/foo.ts`',
+    '### Task 2: edit bar',
+    'Modify `src/agent/bar.ts`',
+  ].join('\n')
+  const result = await tool.execute({
+    input: { mode: 'standard', objective: 'force: preview the plan before dispatch', planMarkdown: md, confirm: false },
+    cwd: process.cwd(),
+    toolUseId: 'tu-confirm',
+  })
+  assert.equal(dispatched, false, 'proposal 阶段不得派发任何 worker')
+  assert.ok(result.content.includes('team 编排方案'))
+  assert.ok(result.content.includes('波次分派'))
+  assert.ok(result.content.includes('confirm: true'))
+})
+
+test('confirm 缺省（未传）→ 直接派发（向后兼容）', async () => {
+  let dispatched = false
+  const tool = createTeamOrchestrateTool({
+    delegateBatch: async (requests) => { dispatched = true; return stubRun('dispatched') },
+  })
+  const md = ['### Task 1: edit foo', 'Modify `src/agent/foo.ts`'].join('\n')
+  const result = await tool.execute({
+    input: { mode: 'standard', objective: 'force: execute without confirm', planMarkdown: md },
+    cwd: process.cwd(),
+    toolUseId: 'tu-default',
+  })
+  assert.equal(dispatched, true)
+  assert.ok(!result.content.includes('调用 team_orchestrate'))
 })

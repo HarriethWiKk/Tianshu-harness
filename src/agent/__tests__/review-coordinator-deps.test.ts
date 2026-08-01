@@ -118,7 +118,7 @@ describe('createCoordinatorReviewDeps', () => {
   })
 
   it('spawns squadron through delegateBatch and maps high-severity findings', async () => {
-    let capturedPolicy: string | undefined
+    let capturedPolicy: import('../work-order.js').AggregationPolicy | undefined
     let capturedRequests: DelegationRequest[] = []
     const coordinator: ReviewCoordinator = {
       delegate: async () => run([]),
@@ -215,12 +215,11 @@ describe('createCoordinatorReviewDeps', () => {
     assert.equal(requests.length, 2, 'auto review spawns 2 inspectors (Wiring + Silence)')
     assert.equal(requests[0]?.profile, 'reviewer')
     assert.equal(requests[0]?.kind, 'review')
-    assert.equal(requests[0]?.budget?.timeoutMs, 180_000)
-    assert.equal(requests[0]?.budget?.maxTurns, 12)
+    assert.equal(requests[0]?.budget?.timeoutMs, 300_000)
+    assert.equal(requests[0]?.budget?.maxTurns, 20)
     assert.match(requests[0]?.objective ?? '', /^【接线审查】/m)
-    assert.match(requests[0]?.objective ?? '', /预算约束\(12 轮\/180s\)/)
-    assert.match(requests[0]?.objective ?? '', /严禁扩散探索/)
-    assert.match(requests[0]?.objective ?? '', /best-effort > 无结论/)
+    assert.match(requests[0]?.objective ?? '', /预算约束\(20 轮\/300s\)/)
+    assert.match(requests[0]?.objective ?? '', /按此节奏收敛/)
     assert.match(requests[1]?.objective ?? '', /^【静默审查】/m)
     assert.ok(result.findings.length >= 0)
   })

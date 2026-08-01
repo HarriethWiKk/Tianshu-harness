@@ -80,6 +80,7 @@ import { DelegationCoordinator } from './agent/coordinator.js'
 import { ProviderHealthTracker } from './agent/provider-health.js'
 import { effectiveBanditMode, resolveBanditPromotion } from './agent/bandit-promotion.js'
 import { DomainKnowledgeStore } from './agent/domain-knowledge-store.js'
+import { emptyObligationStore } from './agent/evidence-obligation.js'
 import { profileRegistry } from './agent/profile-registry.js'
 import { starDomainRegistry } from './agent/star-domain-registry.js'
 import type { WorkerRuntimeFactory } from './agent/coordinator.js'
@@ -152,6 +153,12 @@ export interface RuntimeRefs {
   /** Mutable ref to the current GoalTracker. Set by slash-commands /goal,
    *  read by deliver_task B1Context for auto-review gating. */
   goalTrackerRef: { current: import('./agent/goal-tracker.js').GoalTracker | null }
+  /** 域知识库可变引用（galaxy 路由学习收编 #5 的存取口）：注册工具时经
+   *  getter 惰性读取，/cd 切换 cwd 后由 switchAgentCwd 更新指向新 store。 */
+  domainKnowledgeStoreRef?: { current: DomainKnowledgeStore | null }
+  /** 证据义务追踪器可变引用（收编 #2 的生产链）：createAgentRuntime 在 agent
+   *  构建后回写；deliver_task 读 store 做门禁，galaxy DP 创建/满足冗余义务。 */
+  obligationTrackerRef?: { current: import('./agent/obligation-tracker.js').ObligationTracker | null }
   /** 会话级审查门开关：TUI /review off|on 写入，deliver_task B1Context 经
    *  isAutoReviewOff 读取。初始值取 review.skipAuto 配置（配置成为会话默认）。 */
   reviewGateRef: { current: 'auto' | 'off' }
@@ -472,6 +479,10 @@ export function createInteractiveToolRegistry(
         if (!refs.coordinator) throw new Error('DelegationCoordinator not initialized')
         return refs.coordinator.delegateBatch(requests, policy, abortSignal, onProgress, onWorkerSettled)
       },
+      // 路由学习（收编 #5）存取口——getter 惰性读取，/cd 换 store 后自动指向新实例。
+      get domainKnowledgeStore() { return refs.domainKnowledgeStoreRef?.current ?? undefined },
+      // DP 证据冗余（收编 #2）——agent 构建后经 createAgentRuntime 回写。
+      get obligationTracker() { return refs.obligationTrackerRef?.current ?? undefined },
     },
   ))
 
@@ -689,6 +700,8 @@ export function createInteractiveToolRegistry(
     getPalConvergedCases: () => refs.getProblemAttackStore?.()?.convergedCasesSnapshot() ?? [],
     // 遗产回收 W-A1：needs_user 案件披露（minimalQuestion 由 store 预计算）
     getPalNeedsUserCases: () => refs.getProblemAttackStore?.()?.needsUserCasesSnapshot() ?? [],
+    // 收编 #2：冗余义务门禁消费——生产注入（此前仅测试注入，链路不可达）。
+    getObligationStore: () => refs.obligationTrackerRef?.current?.getStore() ?? emptyObligationStore(),
   })))
 
   // update_goal — model-driven goal lifecycle control (paused/blocked/complete)
@@ -1204,6 +1217,10 @@ export function createAgentRuntime(deps: {
     const palSnapshot = persist.loadMetadata()?.palSnapshot
     if (palSnapshot) agent.problemAttack.restoreSnapshot(palSnapshot)
   } catch { /* best-effort：恢复失败不阻断 agent 创建 */ }
+
+  // 证据义务追踪器引用：deliver_task 门禁读 store（收编 #2 冗余义务消费）、
+  // galaxy DP 派发创建/满足冗余义务。switchModel 重建路径经本函数每次刷新。
+  if (refs.obligationTrackerRef) refs.obligationTrackerRef.current = agent.obligations
 
   return { agent }
 }
@@ -1888,6 +1905,7 @@ export async function switchAgentCwd(ctx: BootstrapContext, target: string): Pro
   } catch { /* 索引器重建失败不阻断切换（repo 工具降级为空图） */ }
   try {
     ctx.domainKnowledgeStore = new DomainKnowledgeStore(join(newCwd, '.rivet', 'knowledge'))
+    if (ctx.refs.domainKnowledgeStoreRef) ctx.refs.domainKnowledgeStoreRef.current = ctx.domainKnowledgeStore
   } catch { /* best-effort */ }
 
   // 9. 语义漂移护栏：提醒模型历史里的路径属于旧目录（functional 通道，
@@ -2099,6 +2117,8 @@ export async function bootstrapInteractiveSession(opts: BootstrapOptions = {}): 
     banditState: null,
     promptEngine: null,
     goalTrackerRef: { current: null },
+    domainKnowledgeStoreRef: { current: domainKnowledgeStore },
+    obligationTrackerRef: { current: null },
     reviewGateRef: { current: config.agent.review.skipAuto ? 'off' : 'auto' },
     pluginHooks: [],
     pluginCommands: [],

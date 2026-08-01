@@ -45,8 +45,10 @@ export default {
     }
 
     // /tianshu/latest.json → GitHub releases/latest/download/latest.json
+    // 关键：manifest 内嵌的资产 url 必须改写到本 worker 的资产路由——否则
+    // 客户端只经镜像拿了入口，下载仍直连 GitHub（2026-07-31 前一直如此）。
     if (path === '/tianshu/latest.json') {
-      return proxyAndCache(`${GITHUB_BASE}/releases/latest/download/latest.json`, request, ctx, CACHE_SHORT, 'application/json')
+      return proxyManifest(`${GITHUB_BASE}/releases/latest/download/latest.json`, url.origin)
     }
 
     // /tianshu/releases/download/<tag>/<asset> → GitHub releases/download/<tag>/<asset>
@@ -61,6 +63,38 @@ export default {
 
     return new Response('not found\n', { status: 404 })
   },
+}
+
+/**
+ * 拉取 latest.json 并把内嵌资产 url 从 github.com 改写到本 worker 的资产路由
+ * （/tianshu/releases/download/<tag>/<asset>），manifest 很小，整体读入无压力。
+ * latest.json 不缓存（CACHE_SHORT）——它是 updater 的"有没有新版本"判据。
+ */
+async function proxyManifest(targetUrl, origin) {
+  try {
+    const upstream = await fetch(targetUrl, {
+      headers: { 'User-Agent': 'tianshu-update-mirror/1.0 (Cloudflare Worker)' },
+      redirect: 'follow',
+    })
+    if (!upstream.ok) {
+      return new Response(`upstream ${upstream.status}\n`, { status: upstream.status })
+    }
+    const text = await upstream.text()
+    const rewritten = text.replaceAll(
+      `${GITHUB_BASE}/releases/download/`,
+      `${origin}/tianshu/releases/download/`,
+    )
+    return new Response(rewritten, {
+      status: 200,
+      headers: {
+        'Cache-Control': CACHE_SHORT,
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*',
+      },
+    })
+  } catch (err) {
+    return new Response(`proxy error: ${err.message}\n`, { status: 502 })
+  }
 }
 
 /**

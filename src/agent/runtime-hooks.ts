@@ -257,16 +257,17 @@ export class RuntimeHookPipeline {
     for (const hook of hooks) {
       const start = Date.now()
       let timer: ReturnType<typeof setTimeout> | undefined
+      let timedOut = false
       try {
         const result = invoke(hook)
         if (result instanceof Promise) {
           await Promise.race([
             result,
             new Promise<never>((_, reject) => {
-              timer = setTimeout(
-                () => reject(new Error(`[hook-timeout] "${hook.name}" exceeded ${timeoutMs}ms in phase ${phase} — skipped`)),
-                timeoutMs,
-              )
+              timer = setTimeout(() => {
+                timedOut = true
+                reject(new Error(`[hook-timeout] "${hook.name}" exceeded ${timeoutMs}ms in phase ${phase} — skipped`))
+              }, timeoutMs)
             }),
           ])
         }
@@ -280,7 +281,10 @@ export class RuntimeHookPipeline {
       } finally {
         if (timer !== undefined) clearTimeout(timer)
         const elapsed = Date.now() - start
-        if (elapsed >= slowMs) {
+        // 超时已通过 [hook-timeout] 上报——同一次超时事件不再重复报 [hook-slow]
+        // （生产默认 timeoutMs=10s > slowMs=2s，超时后 elapsed 必 ≥ slowMs，
+        //  不跳过会把用户 onError 钩子对同一事件触发两次）。
+        if (!timedOut && elapsed >= slowMs) {
           this.options.onError?.({
             phase,
             hookName: hook.name,

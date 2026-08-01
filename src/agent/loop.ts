@@ -748,7 +748,9 @@ export class AgentLoop {
     this.frameRecorder = createFrameRecorder(this.cwd, this.config.sessionId)
     const sessionDir = join(getSessionDir(this.cwd), this.config.sessionId ?? 'anon')
     const pheromonesPath = join(sessionDir, 'pheromones.json')
-    this.stigmergyStore = new StigmergyStore(pheromonesPath)
+    // 批级共享 store 优先（星河收编 #3）：同批 worker 共用内存信息素库，
+    // 不各自落盘到 sessionDir。
+    this.stigmergyStore = this.config.stigmergyStore ?? new StigmergyStore(pheromonesPath)
 
     // Initialize ArtifactStore for append-only artifact log
     if (this.config.sessionId) {

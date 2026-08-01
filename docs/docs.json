@@ -1,8 +1,69 @@
 {
   "generator": "scripts/docs-index.ts",
   "spec": "docs/README.md",
-  "count": 1025,
+  "count": 1035,
   "docs": [
+    {
+      "path": "docs/3.0/D1-3-cascade-tier-speculation.md",
+      "title": "级联 Tier 推测执行——DP quorum 未达成时自动 escalate strong 模型",
+      "type": "spec",
+      "typeSource": "frontmatter",
+      "status": "draft",
+      "statusSource": "frontmatter",
+      "date": "2026-08-01",
+      "related": [
+        "docs/3.0/D1-moe-galaxy-deepseek-synergy.md",
+        "docs/design/2026-08-01-galaxy-mechanism-convergence.md"
+      ],
+      "supersedes": null,
+      "tags": []
+    },
+    {
+      "path": "docs/3.0/D1-moe-galaxy-deepseek-synergy.md",
+      "title": "DeepSeek MoE × 天枢 Galaxy 协同方向收编",
+      "type": "research",
+      "typeSource": "frontmatter",
+      "status": "draft",
+      "statusSource": "frontmatter",
+      "date": "2026-08-01",
+      "related": [
+        "docs/design/2026-08-01-galaxy-mechanism-convergence.md",
+        "docs/superpowers/specs/2026-07-14-cluster-agent-architecture.md"
+      ],
+      "supersedes": null,
+      "tags": []
+    },
+    {
+      "path": "docs/3.0/D2-affinity-upgrade.md",
+      "title": "调度亲和升级——从 tie-breaker 到一级排序因子",
+      "type": "design",
+      "typeSource": "frontmatter",
+      "status": "draft",
+      "statusSource": "frontmatter",
+      "date": "2026-08-01",
+      "related": [
+        "docs/3.0/D1-moe-galaxy-deepseek-synergy.md",
+        "docs/design/2026-08-01-galaxy-mechanism-convergence.md"
+      ],
+      "supersedes": null,
+      "tags": []
+    },
+    {
+      "path": "docs/3.0/D3-convergence-landing-verification.md",
+      "title": "星河收编落地与实测验证记录——七项收编全落地、审查修复链、路由学习闭环实测",
+      "type": "changelog",
+      "typeSource": "frontmatter",
+      "status": "done",
+      "statusSource": "frontmatter",
+      "date": "2026-08-01",
+      "related": [
+        "docs/design/2026-08-01-galaxy-mechanism-convergence.md",
+        "docs/plans/2026-07-31-galaxy-prewarm-and-cache-affinity.md",
+        "docs/3.0/D1-moe-galaxy-deepseek-synergy.md"
+      ],
+      "supersedes": null,
+      "tags": []
+    },
     {
       "path": "docs/AB测试期间损失审计.md",
       "title": "A/B 测试期间损失审计报告",
@@ -2290,6 +2351,33 @@
       ]
     },
     {
+      "path": "docs/design/2026-08-01-galaxy-leftovers-team-deps-delegate-task.md",
+      "title": "遗留落地：team 条件依赖扩展与 delegate_task 依赖参数",
+      "type": "design",
+      "typeSource": "inferred",
+      "status": null,
+      "statusSource": "none",
+      "date": "2026-08-01",
+      "related": [],
+      "supersedes": null,
+      "tags": []
+    },
+    {
+      "path": "docs/design/2026-08-01-galaxy-mechanism-convergence.md",
+      "title": "星河机制收编设计——把 galaxy 验证过的模式串联回底层与工作流",
+      "type": "design",
+      "typeSource": "frontmatter",
+      "status": "draft",
+      "statusSource": "frontmatter",
+      "date": "2026-08-01",
+      "related": [
+        "docs/plans/2026-07-31-galaxy-prewarm-and-cache-affinity.md",
+        "docs/superpowers/specs/2026-07-14-cluster-agent-architecture.md"
+      ],
+      "supersedes": null,
+      "tags": []
+    },
+    {
       "path": "docs/design/TUI提问审批面板改版.md",
       "title": "TUI 提问框 / 审批框改版（2026-07-27）",
       "type": "design",
@@ -3002,6 +3090,36 @@
       "tags": []
     },
     {
+      "path": "docs/plans/2026-07-31-desktop-scroll-follow-geometry-watcher.md",
+      "title": "桌面端滚动跟随态几何脱节修复——内容几何守望者",
+      "type": "plan",
+      "typeSource": "frontmatter",
+      "status": "active",
+      "statusSource": "frontmatter",
+      "date": "2026-07-31",
+      "related": [
+        "../known-issues/2026-07-31-desktop-scroll-row-height-clamp.md",
+        "2026-07-31-desktop-scroll-clamp-compensation.md"
+      ],
+      "supersedes": null,
+      "tags": []
+    },
+    {
+      "path": "docs/plans/2026-07-31-desktop-update-china-oss.md",
+      "title": "桌面端自动更新国内加速——阿里云 OSS 双通道",
+      "type": "plan",
+      "typeSource": "frontmatter",
+      "status": "active",
+      "statusSource": "frontmatter",
+      "date": "2026-07-31",
+      "related": [
+        "../analysis/2026-07-28-desktop-update-signature-mismatch.md",
+        "../更新镜像部署技术实录.md"
+      ],
+      "supersedes": null,
+      "tags": []
+    },
+    {
       "path": "docs/plans/2026-07-31-galaxy-prewarm-and-cache-affinity.md",
       "title": "星河集群（galaxy）天枢设施复用优化落地计划",
       "type": "plan",
@@ -3011,6 +3129,20 @@
       "date": "2026-07-31",
       "related": [
         "docs/superpowers/specs/2026-07-14-cluster-agent-architecture.md"
+      ],
+      "supersedes": null,
+      "tags": []
+    },
+    {
+      "path": "docs/plans/2026-07-31-review-panel-open-jank-keepalive.md",
+      "title": "右栏文件树开合卡顿优化——首开常挂载保活",
+      "type": "plan",
+      "typeSource": "frontmatter",
+      "status": "active",
+      "statusSource": "frontmatter",
+      "date": "2026-07-31",
+      "related": [
+        "../known-issues/2026-07-31-desktop-scroll-row-height-clamp.md"
       ],
       "supersedes": null,
       "tags": []
@@ -3562,6 +3694,24 @@
       "related": [],
       "supersedes": null,
       "tags": []
+    },
+    {
+      "path": "docs/research/2026-08-01-worker-result-json-contract-vs-competitors.md",
+      "title": "子代理结果契约调研：JSON 文本契约 vs 竞品做法",
+      "type": "research",
+      "typeSource": "frontmatter",
+      "status": "accepted",
+      "statusSource": "frontmatter",
+      "date": "2026-08-01",
+      "related": [],
+      "supersedes": null,
+      "tags": [
+        "worker",
+        "subagent",
+        "json-contract",
+        "structured-outputs",
+        "competitor"
+      ]
     },
     {
       "path": "docs/review-discipline.md",

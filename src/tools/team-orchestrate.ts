@@ -3,6 +3,8 @@ import { z } from 'zod'
 import { classifyOrchestrationScale } from '../agent/task-size-gate.js'
 import type { TeamRunSummary } from '../agent/team-orchestrator.js'
 import { deserializeUnifiedPlan, unifiedPlanToTeamTasks, validateUnifiedPlan } from '../agent/unified-plan.js'
+import { groupTeamTasks } from '../agent/team-grouping.js'
+import { parseTeamTasks } from '../agent/team-plan.js'
 import { formatSealStatus, verifyPlanSeal, type SealedUnifiedPlan } from '../agent/council/council-seal.js'
 import { clearPlan, consumePlan, storePlan } from '../agent/plan-store.js'
 import { buildTeamPanelModel, encodeTeamPanelModel } from '../tui/team-panel-model.js'
@@ -38,6 +40,9 @@ const inputSchema = z.object({
   planJson: z.string().optional(),
   maxParallel: z.number().int().min(1).max(5).optional(),
   fromWave: z.number().int().min(0).optional(),
+  /** 两阶段确认（星河收编 #7）：显式 confirm:false → 只展示波次分派方案不派发；
+   *  confirm:true → 点火。缺省 undefined → 直接执行（现状行为，向后兼容）。 */
+  confirm: z.boolean().optional(),
 })
 
 /**
@@ -142,6 +147,7 @@ export function createTeamOrchestrateTool(
           planJson: { type: 'string', description: 'plan_task 输出的 UnifiedPlan JSON。提供时跳过 Markdown 解析与 max planner fanout。' },
           maxParallel: { type: 'number', description: '每波次最大并行 worker 数（1-5，默认 3）。' },
           fromWave: { type: 'number', description: '整合前序波次 diff 后，派发这个从零开始的波次索引。' },
+          confirm: { type: 'boolean', description: '两阶段确认（收编 #7）：显式 false → 只展示波次分派方案不派发；true → 点火。缺省 → 直接执行（兼容）。' },
         },
         required: ['objective'],
       },
@@ -286,6 +292,41 @@ export function createTeamOrchestrateTool(
         : undefined
 
       const effectiveFromWave = fromWave ?? 0
+
+      // ── Phase 1: Proposal (explicit confirm:false) ─────────────────
+      // 星河收编 #7：只展示波次分派方案，不派发任何 worker。缺省/true 直接
+      // 执行（向后兼容——此前 team_orchestrate 没有 proposal 阶段）。
+      if (parsed.data.confirm === false) {
+        const lines = ['🚀 team 编排方案', '', `目标：${objective}`, '', `mode：${effectiveMode}${proGateNote ? '（Pro 门降级）' : ''}`]
+        if (tasks && tasks.length > 0) {
+          lines.push('', `任务（${tasks.length}）：`, ...tasks.map(t => `  ${t.id}`))
+          // 静态波次预览：与执行同用 groupTeamTasks 且**同参数**——执行路径
+          // （team-orchestrator.ts）三处均不传 options（恒 MAX_WRITE_WORKERS），
+          // 预览传参会让 maxTeamParallel≠3 时展示与真实分波不一致。
+          const previewWaves = groupTeamTasks(tasks)
+          lines.push('', '波次分派（静态预览）：')
+          for (const w of previewWaves) lines.push(`  ${w.id} [${w.risk}] ${w.taskIds.join(', ')} — ${w.reason}`)
+        } else if (markdown) {
+          // proposal 阶段同步解析 markdown 做波次预览（与 executePlan 同一
+          // 解析器），展示即真相。
+          const parsedTasks = parseTeamTasks(markdown)
+          if (parsedTasks.length > 0) {
+            lines.push('', `任务（${parsedTasks.length}）：`, ...parsedTasks.map(t => `  ${t.id}`))
+            // 同 tasks 分支：参数必须与执行路径一致（不传 options）。
+            const previewWaves = groupTeamTasks(parsedTasks)
+            lines.push('', '波次分派（静态预览）：')
+            for (const w of previewWaves) lines.push(`  ${w.id} [${w.risk}] ${w.taskIds.join(', ')} — ${w.reason}`)
+          } else {
+            lines.push('', '计划已提供（Markdown），解析未产生任务。')
+          }
+        } else {
+          lines.push('', effectiveMode === 'max'
+            ? '将先做多视角规划（planner fanout）再分组执行。'
+            : '需要 planJson / planMarkdown / planPath 之一。')
+        }
+        lines.push('', '调用 team_orchestrate({..., confirm: true}) 点火执行。')
+        return { content: lines.join('\n'), uiContent: `🚀 team 方案 · ${tasks?.length ?? '?'} 任务` }
+      }
 
       let run: PlanExecutorRun
       try {

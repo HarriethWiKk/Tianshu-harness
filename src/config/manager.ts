@@ -599,7 +599,7 @@ const TOOL_PRESETS = new Set(['minimal', 'frontend', 'full'])
 
 /** Snapshot of the tool preset for the desktop/TUI settings UI. */
 export function getToolPresetConfig(): ToolPresetConfigSnapshot {
-  return { preset: loadConfig().tools.preset ?? 'minimal' }
+  return { preset: loadConfig().tools.preset ?? 'frontend' }
 }
 
 /**
@@ -618,7 +618,7 @@ export function setToolPresetConfig(input: { preset?: unknown }): ToolPresetConf
   saveConfig(cfg)
   // 长驻进程（desktop sidecar）内 memo 必须失效，否则新会话拿到旧档位。
   invalidateToolPreset()
-  return { preset: cfg.tools.preset ?? 'minimal' }
+  return { preset: cfg.tools.preset ?? 'frontend' }
 }
 
 // --- Default star domain (new-session initial domain + Auto keyword routing) ---

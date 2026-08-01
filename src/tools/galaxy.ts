@@ -15,7 +15,7 @@
 import { z } from 'zod'
 import { deriveStableWorkOrderId, type CoordinatorRun, type DelegationRequest } from '../agent/coordinator.js'
 import { classifyProfile } from '../agent/coordination-policy.js'
-import { aggregationPolicySchema, type AggregationPolicy, type WorkOrderKind } from '../agent/work-order.js'
+import { aggregationPolicyKinds, aggregationPolicySchema, type AggregationPolicy, type WorkOrderKind } from '../agent/work-order.js'
 import { profileIsWriteCapable, profileRegistry, delegationToolTimeoutMs } from '../agent/profile-registry.js'
 import { starDomainRegistry } from '../agent/star-domain-registry.js'
 import { formatWorkerResultDigest } from '../agent/worker-result-digest.js'
@@ -41,6 +41,13 @@ export interface GalaxyCoordinator {
     onProgress?: (completed: number, total: number) => void,
     onWorkerSettled?: (result: import('../agent/work-order.js').WorkerResult) => void,
   ): Promise<CoordinatorRun>
+  /** 星河路由学习（收编 #5）：结算时沉淀路由事实、proposal 时召回胜率。
+   *  缺省 undefined → 路由学习关闭（现状行为）。 */
+  domainKnowledgeStore?: import('../agent/domain-knowledge-store.js').DomainKnowledgeStore
+  /** DP 证据冗余（收编 #2）：DP 维度派发时创建 quorum 冗余义务，副本
+   *  evidenceStatus=verified 各计一次独立证据；deliver_task 门禁消费。
+   *  缺省 undefined → 不创建义务（现状行为）。 */
+  obligationTracker?: import('../agent/obligation-tracker.js').ObligationTracker
 }
 
 // ── Schema ───────────────────────────────────────────────────────────────
@@ -165,10 +172,51 @@ function workerOrderId(parentTurnId: string): string {
 
 const GALAXY_GLYPH = '🌌'
 
+/** 任务形状限定枚举（收编 #5 设计推荐）——自由文本聚类成本高且不稳定
+ *  （frontend / Frontend UI / 前端 各自独立，胜率被稀释成精确重名匹配）。
+ *  经 mapDimensionToKind 两跳推导：维度名 → WorkOrderKind → 形状，单一映射源。 */
+type GalaxyTaskShape = 'impl' | 'review' | 'explore' | 'plan' | 'docs'
+
+function normalizeTaskShape(name: string): GalaxyTaskShape {
+  switch (mapDimensionToKind(name)) {
+    case 'patch_proposal': return 'impl'
+    case 'review':
+    case 'verify': return 'review'
+    case 'plan': return 'plan'
+    case 'doc_research': return 'docs'
+    default: return 'explore'
+  }
+}
+
+/** 同 taskShape 历史路由按 authority 聚合胜率（收编 #5 召回侧）。 */
+function buildRoutingStats(
+  store: import('../agent/domain-knowledge-store.js').DomainKnowledgeStore,
+  dimensions: z.infer<typeof dimensionSchema>[],
+): Array<{ dimensionName: string; taskShape: string; authority: string; passed: number; total: number; passRate: string }> {
+  const out: Array<{ dimensionName: string; taskShape: string; authority: string; passed: number; total: number; passRate: string }> = []
+  for (const d of dimensions) {
+    const taskShape = normalizeTaskShape(d.name)
+    const records = store.recallGalaxyRouting(taskShape)
+    if (records.length === 0) continue
+    const byAuthority = new Map<string, import('../agent/domain-knowledge-store.js').GalaxyRoutingRecord[]>()
+    for (const r of records) {
+      const list = byAuthority.get(r.authority)
+      if (list) list.push(r)
+      else byAuthority.set(r.authority, [r])
+    }
+    for (const [authority, rs] of byAuthority) {
+      const passed = rs.filter(r => r.status === 'passed').length
+      out.push({ dimensionName: d.name, taskShape, authority, passed, total: rs.length, passRate: String(Math.round((passed / rs.length) * 100)) })
+    }
+  }
+  return out
+}
+
 function formatGalaxyProposal(
   objective: string,
   dimensions: z.infer<typeof dimensionSchema>[],
   autoReview: boolean,
+  routingStats?: Array<{ dimensionName: string; taskShape: string; authority: string; passed: number; total: number; passRate: string }>,
 ): string {
   const lines: string[] = [
     `${GALAXY_GLYPH} 星河集群方案`,
@@ -198,6 +246,14 @@ function formatGalaxyProposal(
     lines.push(`     审查以上所有维度的输出，验证正确性、完整性和安全性`)
   }
 
+  // 路由学习召回（收编 #5）：同任务形状的历史路由，按 authority 聚合胜率。
+  if (routingStats && routingStats.length > 0) {
+    lines.push('', '历史路由（同任务形状 · 按 authority 聚合胜率）：')
+    for (const r of routingStats) {
+      lines.push(`  ${r.authority} @ ${r.dimensionName}: ${r.passed}/${r.total} 通过（${r.passRate}%）`)
+    }
+  }
+
   lines.push('')
   lines.push('调用 galaxy({..., confirm: true}) 确认并执行。')
 
@@ -214,6 +270,49 @@ interface GalaxyResultTarget {
 interface GalaxyDataParallelGroup {
   label: string
   workOrderIds: string[]
+  /** 派发时声明的组级 quorum 阈值（ceil(replicas/2)），展示判定用真实值。 */
+  quorumK: number
+}
+
+/** 从聚合注记提取组内原始通过数。quorum 组未达 k 时通过成员被聚合降级为
+ *  failed（组结论不可采信），status 统计已抹平原始通过数——它只存在于
+ *  我们自己的 risks 注记里（格式见 aggregation.ts applyQuorum）。 */
+function quorumOriginalPassed(risks: readonly string[]): number | undefined {
+  for (const r of risks) {
+    const m = /^quorum: group .* not reached — (\d+)\/\d+ passed/.exec(r)
+    if (m) return Number(m[1])
+  }
+  return undefined
+}
+
+/** 检测所有 DP 组 quorum 是否达成。返回未达成的组名列表（空 = 全部达成）。 */
+/** 组 quorum 通过数：聚合后的 status 已编码组判定（组未达 k → 成员全
+ *  failed），原始通过数在组失败时从 risks 注记恢复（格式见 aggregation.ts
+ *  applyQuorum）。组通过时无注记，直接统计 passed。 */
+function quorumPassedCount(
+  group: GalaxyDataParallelGroup,
+  resultsById: Map<string, import('../agent/work-order.js').WorkerResult>,
+): number {
+  const replicaResults = group.workOrderIds
+    .map(id => resultsById.get(id))
+    .filter((r): r is import('../agent/work-order.js').WorkerResult => r !== undefined)
+  let passed = replicaResults.filter(r => r.status === 'passed').length
+  for (const r of replicaResults) {
+    const original = quorumOriginalPassed(r.risks)
+    if (original !== undefined) { passed = original; break }
+  }
+  return passed
+}
+
+function checkDpQuorum(
+  dataParallelGroups: GalaxyDataParallelGroup[],
+  resultsById: Map<string, import('../agent/work-order.js').WorkerResult>,
+): string[] {
+  const failed: string[] = []
+  for (const group of dataParallelGroups) {
+    if (quorumPassedCount(group, resultsById) < group.quorumK) failed.push(group.label)
+  }
+  return failed
 }
 
 function formatGalaxyResult(
@@ -288,10 +387,9 @@ function formatGalaxyResult(
     const replicaResults = group.workOrderIds
       .map(id => resultsById.get(id))
       .filter((result): result is NonNullable<typeof result> => result !== undefined)
-    const passedReplicas = replicaResults.filter(result => result.status === 'passed').length
-    const quorum = Math.floor(group.workOrderIds.length / 2) + 1
-    const verdict = passedReplicas >= quorum ? 'reached' : 'not reached'
-    lines.push(`  DP ${group.label}: execution quorum ${verdict} (${passedReplicas}/${group.workOrderIds.length}, quorum ${quorum})`)
+    const passedReplicas = quorumPassedCount(group, resultsById)
+    const verdict = passedReplicas >= group.quorumK ? 'reached' : 'not reached'
+    lines.push(`  DP ${group.label}: execution quorum ${verdict} (${passedReplicas}/${group.workOrderIds.length}, quorum ${group.quorumK})`)
     // Per-replica cacheRead — 批级共享预热（P0-1）收益的直接度量：
     // 副本 1 冷读、副本 2..N 应显著更高。
     const replicaReads = group.workOrderIds.map(id => resultsById.get(id)?.usage?.cache_read_input_tokens)
@@ -299,6 +397,14 @@ function formatGalaxyResult(
       lines.push(`      replica cacheRead: ${replicaReads.map(v => v ?? '—').join(' / ')}`)
     }
   }
+
+  // DP quorum 结构化判定：未达成的组进报告红区并供上游消费。
+  const quorumFailed = checkDpQuorum(dataParallelGroups, resultsById)
+  if (quorumFailed.length > 0) {
+    lines.push(`  ⚠ DP quorum 未达成：${quorumFailed.join('、')} 组多数副本未通过，结论不可采信。`)
+    lines.push('')
+  }
+
   if (dataParallelGroups.length > 0) {
     lines.push('  DP replicas are independent evidence sources; final semantic review remains required.')
     lines.push('')
@@ -409,7 +515,7 @@ export function createGalaxyTool(coordinator: GalaxyCoordinator): Tool {
           },
           autoReview: { type: 'boolean', default: true, description: '执行完成后自动追加审查维度（瑶光）。默认开启。' },
           confirm: { type: 'boolean', default: false, description: '用户已确认集群方案。首次调用不带此参数以展示方案并请求确认。' },
-          policy: { type: 'string', enum: [...aggregationPolicySchema.options], description: '聚合策略。默认：all_required。' },
+          policy: { type: 'string', enum: [...aggregationPolicyKinds], description: '聚合策略。默认：all_required。' },
         },
         required: ['objective', 'dimensions'],
       },
@@ -427,12 +533,22 @@ export function createGalaxyTool(coordinator: GalaxyCoordinator): Tool {
 
       const { objective, dimensions, autoReview, confirm, policy } = parsed.data
 
-      if (dimensions.some(dimension => dimension.parallelism === 'data') && policy && policy !== 'all_required') {
+      // DP 组合法策略：all_required（默认）或 quorum（组级判定）。其他策略
+      // （first_success/majority 等）会把 DP 副本当普通 worker 聚合掉，破坏
+      // 「保留每个副本的结果和证据」的语义，仍拦截。
+      const hasDataParallel = dimensions.some(dimension => dimension.parallelism === 'data')
+      const isQuorumPolicy = typeof policy === 'object' && policy?.kind === 'quorum'
+      if (hasDataParallel && policy && policy !== 'all_required' && !isQuorumPolicy) {
         return {
-          content: '星河已拦截：DP 需要保留每个副本的结果和证据，因此只支持 all_required 聚合策略（默认）。语义分歧由后续审查维度处理。',
+          content: '星河已拦截：DP 需要保留每个副本的结果和证据，聚合策略仅支持 all_required（默认）或 quorum（组级判定，副本通过数 ≥ k 才采信组结论）。语义分歧由后续审查维度处理。',
           isError: true,
         }
       }
+      // DP 存在时默认组级 quorum（k=1：无组 worker 独立判定、perspective 组
+      // 全通过即保留；DP 组由各请求的 quorumK 覆盖为 floor(replicas/2)+1）。
+      const effectivePolicy: AggregationPolicy = hasDataParallel
+        ? (isQuorumPolicy ? policy! : { kind: 'quorum', k: 1 })
+        : (policy ?? 'all_required')
 
       // Pre-flight: validate file paths
       for (let i = 0; i < dimensions.length; i++) {
@@ -470,7 +586,10 @@ export function createGalaxyTool(coordinator: GalaxyCoordinator): Tool {
 
       // ── Phase 1: Proposal (no confirm) ────────────────────────────
       if (!confirm) {
-        const proposal = formatGalaxyProposal(objective, dimensions, autoReview)
+        const routingStats = coordinator.domainKnowledgeStore
+          ? buildRoutingStats(coordinator.domainKnowledgeStore, dimensions)
+          : undefined
+        const proposal = formatGalaxyProposal(objective, dimensions, autoReview, routingStats)
         return {
           content: [
             proposal,
@@ -490,6 +609,7 @@ export function createGalaxyTool(coordinator: GalaxyCoordinator): Tool {
       const dimensionIndexByParentTurnId = new Map<string, number>()
       const replicaIndexByParentTurnId = new Map<string, number>()
       const dataParallelGroups = new Map<number, GalaxyDataParallelGroup>()
+      const dpObligationByDim = new Map<number, string>()
       const explicitReviewIndexes = new Set(
         dimensions.flatMap((dimension, index) => isReviewDimension(dimension.name) ? [index] : []),
       )
@@ -501,7 +621,22 @@ export function createGalaxyTool(coordinator: GalaxyCoordinator): Tool {
         const perspectiveGroupId = stars.length > 1 ? `galaxy:perspectives:${params.toolUseId}:${i}` : undefined
         const dataParallelGroupId = isDataParallel ? `galaxy:data:${params.toolUseId}:${i}` : undefined
         const replicaCount = isDataParallel ? dim.replicas! : 1
-        if (isDataParallel) dataParallelGroups.set(i, { label: dim.name, workOrderIds: [] })
+        if (isDataParallel) {
+          const quorumK = Math.floor(dim.replicas! / 2) + 1
+          dataParallelGroups.set(i, { label: dim.name, workOrderIds: [], quorumK })
+          // 收编 #2：DP 维度创建 quorum 冗余义务——k 个独立副本 verified 才关闭，
+          // deliver_task 门禁在义务未满足时拦交付。缺 tracker（测试/旧装配）不创建。
+          if (coordinator.obligationTracker) {
+            const obligationId = coordinator.obligationTracker.upsert({
+              family: 'behavior',
+              claim: `星河 DP 维度「${dim.name}」的结论经 ${quorumK} 个独立副本验证（quorum=${quorumK}/${dim.replicas}）`,
+              targets: dim.files ?? [],
+              risk: 'high',
+              redundancy: { kind: 'quorum', k: quorumK, groupId: dataParallelGroupId },
+            })
+            dpObligationByDim.set(i, obligationId)
+          }
+        }
 
         for (let j = 0; j < stars.length; j++) {
           const star = stars[j]!
@@ -529,6 +664,7 @@ export function createGalaxyTool(coordinator: GalaxyCoordinator): Tool {
             modelOverride: dim.modelOverride,
             tierFloor: dim.tierFloor,
             groupId: dataParallelGroupId ?? perspectiveGroupId,
+            quorumK: isDataParallel ? Math.floor(dim.replicas! / 2) + 1 : undefined,
             ...(dim.timeoutMs || dim.maxTurns
               ? { budget: toBudgetOverride({ timeoutMs: dim.timeoutMs, maxTurns: dim.maxTurns }) }
               : {}),
@@ -657,7 +793,7 @@ export function createGalaxyTool(coordinator: GalaxyCoordinator): Tool {
       try {
         run = await coordinator.delegateBatch(
           requests,
-          policy ?? 'all_required',
+          effectivePolicy,
           params.abortSignal,
           (completed, total) => {
             if (completed > progressReported) {
@@ -672,6 +808,50 @@ export function createGalaxyTool(coordinator: GalaxyCoordinator): Tool {
         return {
           content: `星河执行失败：${msg}`,
           isError: true,
+        }
+      }
+
+      // 路由学习沉淀（收编 #5）：结算时按维度记录路由事实，供下次 proposal
+      // 召回聚合胜率。best-effort——store 故障绝不影响交付。
+      if (coordinator.domainKnowledgeStore) {
+        try {
+          const resultsById = new Map(run.results.map(r => [r.workOrderId, r]))
+          for (const req of requests) {
+            const dimIndex = dimensionIndexByParentTurnId.get(req.parentTurnId)
+            const dim = dimIndex === undefined ? undefined : dimensions[dimIndex]
+            const result = resultsById.get(workerOrderId(req.parentTurnId))
+            if (!dim || !result) continue
+            coordinator.domainKnowledgeStore.recordGalaxyRouting({
+              dimensionName: dim.name,
+              authority: req.authority ?? 'unknown',
+              taskShape: normalizeTaskShape(dim.name),
+              // escalated 视同 blocked：结论不可采信，不记作通过
+              status: result.status === 'escalated' ? 'blocked' : result.status,
+            })
+          }
+        } catch {
+          // best-effort
+        }
+      }
+
+      // DP 证据冗余结算（收编 #2）：verified 副本各计一次独立证据（ref =
+      // workOrderId，天然互异——重复提交不计数由 evidence-obligation 保证）。
+      // k 个独立证据凑齐义务自动 satisfied；未凑齐保持 attempted 拦交付门禁。
+      if (coordinator.obligationTracker && dpObligationByDim.size > 0) {
+        try {
+          const resultsById = new Map(run.results.map(r => [r.workOrderId, r]))
+          for (const [dimIndex, obligationId] of dpObligationByDim) {
+            const group = dataParallelGroups.get(dimIndex)
+            if (!group) continue
+            for (const workOrderId of group.workOrderIds) {
+              const result = resultsById.get(workOrderId)
+              if (result?.evidenceStatus === 'verified') {
+                coordinator.obligationTracker.satisfy(obligationId, workOrderId)
+              }
+            }
+          }
+        } catch {
+          // best-effort——义务结算失败不吞集群结果
         }
       }
 
@@ -693,6 +873,13 @@ export function createGalaxyTool(coordinator: GalaxyCoordinator): Tool {
           }
         }), [...dataParallelGroups.values()],
         [...strippedByDim.entries()].map(([idx, files]) => ({ label: dimensions[idx]!.name, files }))),
+        // DP quorum 未达成 → isError，让主 agent 的工具管线感知到失败信号，
+        // 而非只靠报告文本判断（展示层→判定层的断层修复）。
+        isError: dataParallelGroups.size > 0
+          && checkDpQuorum(
+            [...dataParallelGroups.values()],
+            new Map(run.results.map(r => [r.workOrderId, r])),
+          ).length > 0 || undefined,
         uiContent: formatGalaxyUi(run, dimensions),
       }
     },
@@ -702,8 +889,9 @@ export function createGalaxyTool(coordinator: GalaxyCoordinator): Tool {
     isEnabled: () => true,
     // 外层超时必须覆盖 worker pool 的波次 × profile 预算，否则工具层先杀
     timeoutMs: (params) => {
-      const dims = (params?.input?.dimensions as Array<{ name?: string; authorities?: string[]; authority?: string; profile?: string; timeoutMs?: number; parallelism?: 'expert' | 'data'; replicas?: number }> | undefined) ?? []
+      const dims = (params?.input?.dimensions as Array<{ name?: string; authorities?: string[]; authority?: string; profile?: string; timeoutMs?: number; parallelism?: 'expert' | 'data'; replicas?: number; tierFloor?: string }> | undefined) ?? []
       const profiles: Array<string | undefined> = []
+      const tierFloors: Array<string | undefined> = []
       const requestedTimeoutMs: Array<number | undefined> = []
       for (const d of dims) {
         const stars = d.authorities ?? (d.authority ? [d.authority] : [])
@@ -713,6 +901,7 @@ export function createGalaxyTool(coordinator: GalaxyCoordinator): Tool {
         const effectiveProfile = d.profile ?? (d.name ? mapDimensionToProfile(d.name) : undefined)
         for (let i = 0; i < stars.length * replicaCount; i++) {
           profiles.push(effectiveProfile)
+          tierFloors.push(d.tierFloor)
           requestedTimeoutMs.push(d.timeoutMs)
         }
       }
@@ -725,7 +914,7 @@ export function createGalaxyTool(coordinator: GalaxyCoordinator): Tool {
       const execMs = delegationToolTimeoutMs(
         params?.sessionTurnCount,
         profiles,
-        { taskCount: profiles.length, requestedTimeoutMs },
+        { taskCount: profiles.length, requestedTimeoutMs, tierFloors },
       )
       if (!autoReview || hasExplicitReview) return execMs
       const reviewMs = delegationToolTimeoutMs(params?.sessionTurnCount, ['reviewer'], { taskCount: 1 })

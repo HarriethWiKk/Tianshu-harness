@@ -81,6 +81,7 @@ import type { Sensorium } from './sensorium.js'
 import type { OaiMessage } from '../api/oai-types.js'
 import type { Usage } from '../api/types.js'
 import { PrewarmCache } from './prewarm.js'
+import { StigmergyStore } from '../context/stigmergy.js'
 import { batchPrewarm } from './prewarm-file.js'
 
 /** Per-turn free-energy signals pulled from the primary loop at delegation time. */
@@ -187,10 +188,20 @@ export interface DelegationRequest {
    *  params.onWorkerActivity → 会话事件流）。coordinator 转发前会把
    *  parentWorkerId 盖为本 order id，UI 据此渲染真实委派层级。NOT serialized. */
   onNestedActivity?: (activity: DelegationActivity) => void
-  /** Work order IDs this task depends on — propagated to WorkOrder.dependencies. */
-  dependencies?: string[]
+  /** Work order IDs this task depends on — propagated to WorkOrder.dependencies.
+   *  支持条件边（收编 #6）：{ dependsOn, onFailure: 'skip'|'alternate', alternateOrderId }。 */
+  dependencies?: Array<string | import('./work-order.js').DependencyEdge>
   /** Logical group identifier for related tasks (e.g. team wave). */
   groupId?: string
+  /** 写工显式 opt-in 批级共享信息素（星河收编 #3）。读工默认共享；写工只有
+   *  显式声明才挂批级 store——信号可能引导实现偏向，守护实现独立性。
+   *  Not serialized into the WorkOrder. */
+  batchStigmergy?: boolean
+  /** Group-level quorum threshold (only meaningful when groupId is set).
+   *  When the batch policy is `{ kind: 'quorum' }`, this overrides the global
+   *  k for this group — e.g. galaxy DP replicas with different replica counts
+   *  need per-group thresholds. Not serialized into the WorkOrder. */
+  quorumK?: number
   /** Star domain authority for cognitive injection (V3 Component A).
    *  When set, the worker's frozen <star-domain> prefix is pinned to this domain
    *  (worker-session.ts defaultDomain: order.authority； volatileBlock + 共享纪律
@@ -442,6 +453,26 @@ function blockedDependencyResult(order: WorkOrder, unmetDeps: string[], failedDe
   }
 }
 
+/**
+ * 条件依赖边 skipped（星河收编 #6）：依赖失败且 onFailure=skip（或 alternate
+ * 也失败）→ 本任务不执行。status 仍 blocked（无 skipped 状态），但 summary/
+ * risks 明确「跳过」语义——不是依赖未完成，是主动放弃。
+ */
+function skippedDependencyResult(order: WorkOrder, skippedDeps: string[]): WorkerResult {
+  const detail = skippedDeps.join(', ')
+  return {
+    workOrderId: order.id,
+    status: 'blocked',
+    summary: `Task skipped — conditional dependency failed (onFailure=skip): ${detail}`,
+    findings: [],
+    artifacts: [{ kind: 'risk', title: 'Dependency skipped', content: detail }],
+    changedFiles: [],
+    risks: [`skipped by conditional dependency: ${detail}`],
+    nextActions: ['Drop the conditional dependency, or re-dispatch with a passing dependency'],
+    evidenceStatus: 'blocked',
+  }
+}
+
 /** Cap on persisted worker-result files under ~/.rivet/subagents/. Without a
  *  TTL/cap this write-mostly sink grew unbounded (one+ file per worker, forever). */
 export const MAX_SUBAGENT_RESULTS = 500
@@ -671,6 +702,12 @@ export class DelegationCoordinator {
    *  same evidence). Entries are removed as orders settle; the cache itself
    *  stays alive via workerConfig references until the batch drains. */
   private readonly batchPrewarmByOrder = new Map<string, PrewarmCache>()
+  /** Batch-scoped shared StigmergyStore（星河收编 #3）— one memory-only instance
+   *  per delegateBatch call, keyed by order id (same side-table pattern as
+   *  batchPrewarmByOrder). Same-batch workers deposit/read shared pheromones:
+   *  a replica finding "X is suspicious" steers later workers to verify X first.
+   *  Entries are removed as orders settle; never persisted (batch-scoped GC). */
+  private readonly batchStigmergyByOrder = new Map<string, StigmergyStore>()
   /** Per-order prior messages for session resume. Set by delegate() when
    *  resumeWorkOrderId is provided; consumed by delegateOrder() when building
    *  the worker config. Side-table pattern (same as activityUpstream). */
@@ -1164,14 +1201,16 @@ export class DelegationCoordinator {
       provider: result.provider ?? provider,
       // 实测遥测优先于 worker 自报 usage——result.usage 是模型生成的 JSON 文本，
       // 不可信（冒烟实测：副本虚报 514K cacheRead，其会话真实累计仅 ~103K，
-      // 聚合命中率被虚报数污染）。有实测一律覆盖，无实测才保留自报值。
+      // 聚合命中率被虚报数污染）。字段级合并：有遥测的字段用遥测，无遥测的
+      // 保留 worker 自报值——避免遥测缺字段（如 API 未返回 cache 字段）时静默归零。
       usage: usage ? {
-        input_tokens: usage.input_tokens,
-        output_tokens: usage.output_tokens,
-        cache_read_input_tokens: usage.cache_read_input_tokens,
-        cache_creation_input_tokens: usage.cache_creation_input_tokens,
-        reasoning_tokens: usage.reasoning_tokens,
-        total_tokens: (usage.input_tokens ?? 0) + (usage.output_tokens ?? 0),
+        input_tokens: usage.input_tokens ?? result.usage?.input_tokens,
+        output_tokens: usage.output_tokens ?? result.usage?.output_tokens,
+        cache_read_input_tokens: usage.cache_read_input_tokens ?? result.usage?.cache_read_input_tokens,
+        cache_creation_input_tokens: usage.cache_creation_input_tokens ?? result.usage?.cache_creation_input_tokens,
+        reasoning_tokens: usage.reasoning_tokens ?? result.usage?.reasoning_tokens,
+        total_tokens: (usage.input_tokens ?? result.usage?.input_tokens ?? 0)
+          + (usage.output_tokens ?? result.usage?.output_tokens ?? 0),
       } : result.usage,
     }
   }
@@ -1715,6 +1754,12 @@ export class DelegationCoordinator {
     // 单发 delegate() 路径不入表，worker 用 AgentLoop 实例默认 cache（历史行为）。
     const batchPrewarmCache = this.batchPrewarmByOrder.get(order.id)
     if (batchPrewarmCache) workerConfig.prewarm = batchPrewarmCache
+    // 批级共享信息素（星河收编 #3）：读工默认共享；写工显式 opt-in 才挂——
+    // 信号可能引导实现偏向，守护写工实现独立性。
+    const batchStigmergy = this.batchStigmergyByOrder.get(order.id)
+    if (batchStigmergy && (classifyProfile(order.profile) !== 'hands' || order.batchStigmergy)) {
+      workerConfig.stigmergy = batchStigmergy
+    }
     // Enable JSON-mode repair for OpenAI-protocol providers. The repair path
     // sends a tool-free request with response_format: json_object, which is an
     // OpenAI API standard. If the provider doesn't support it, the request
@@ -2339,6 +2384,7 @@ export class DelegationCoordinator {
       this.nestedUpstream.delete(order.id)
       this.activityUpstream.delete(order.id)
       this.batchPrewarmByOrder.delete(order.id)
+      this.batchStigmergyByOrder.delete(order.id)
       this.resumeMessages.delete(order.id)
       this.steerQueues.delete(order.id)
       if (this.liveness.size() === 0) this.stopStallSweep()
@@ -2513,6 +2559,7 @@ export class DelegationCoordinator {
             delegationDepth: (r.delegationDepth ?? 0) + 1,
             dependencies: r.dependencies,
             groupId: r.groupId,
+            batchStigmergy: r.batchStigmergy,
             authority: r.authority,
             riskTier: r.riskTier,
             sessionTurn: r.sessionTurn,
@@ -2533,6 +2580,7 @@ export class DelegationCoordinator {
             delegationDepth: (r.delegationDepth ?? 0) + 1,
             dependencies: r.dependencies,
             groupId: r.groupId,
+            batchStigmergy: r.batchStigmergy,
             authority: r.authority,
             riskTier: r.riskTier,
             sessionTurn: r.sessionTurn,
@@ -2571,6 +2619,10 @@ export class DelegationCoordinator {
       const batchCache = new PrewarmCache(60_000, 50)
       const files = [...new Set(orders.flatMap(o => o.scope.files ?? []))]
       for (const order of orders) this.batchPrewarmByOrder.set(order.id, batchCache)
+      // 批级共享信息素（星河收编 #3）：内存 store 不落盘，生命周期 = 本次
+      // delegateBatch。写工默认不注入（守护实现独立性），读工共享。
+      const batchStigmergy = new StigmergyStore(undefined)
+      for (const order of orders) this.batchStigmergyByOrder.set(order.id, batchStigmergy)
       if (files.length > 0) {
         await batchPrewarm(this.config.cwd ?? process.cwd(), files, batchCache, 25).catch(() => {})
       }
@@ -2622,16 +2674,49 @@ export class DelegationCoordinator {
     // failed (or itself ended up blocked). processNext stops dequeuing these, so
     // without an explicit sweep they would be silently lost from the result set.
     for (const order of queue.pending()) {
-      const unmet = order.dependencies.filter(d => !queue.isCompleted(d))
-      const failedDeps = unmet.filter(d => queue.hasFailed(d))
-      const blocked = blockedDependencyResult(order, unmet, failedDeps)
-      allResults.push(blocked)
+      // 条件依赖边（星河收编 #6）：onFailure=skip → 依赖失败则本任务跳过；
+      // onFailure=alternate → 改等 alternateOrderId（完成放行、失败跳过）。
+      const skippedDeps: string[] = []
+      const unmet: string[] = []
+      const failedDeps: string[] = []
+      for (const dep of order.dependencies) {
+        const edge = typeof dep === 'string' ? undefined : dep
+        const depId: string = typeof dep === 'string' ? dep : dep.dependsOn
+        if (queue.isCompleted(depId)) continue
+        if (queue.hasFailed(depId)) {
+          if (edge?.onFailure === 'skip') { skippedDeps.push(depId); continue }
+          if (edge?.onFailure === 'alternate' && edge.alternateOrderId) {
+            if (queue.isCompleted(edge.alternateOrderId)) continue
+            if (queue.hasFailed(edge.alternateOrderId)) { skippedDeps.push(depId); continue }
+            unmet.push(depId)
+            continue
+          }
+          failedDeps.push(depId)
+          continue
+        }
+        unmet.push(depId)
+      }
+      const settled = skippedDeps.length > 0
+        ? skippedDependencyResult(order, skippedDeps)
+        : blockedDependencyResult(order, unmet, failedDeps)
+      allResults.push(settled)
       queue.markFailed(order)
-      onWorkerSettled?.(blocked)
+      onWorkerSettled?.(settled)
     }
 
     const profileMap = new Map(orders.map(o => [o.id, o.profile] as const))
-    const aggregated = [...aggregateResults(allResults, policy, profileMap), ...depthCapped]
+    // quorum 组级阈值（星河收编 #1）：从派发侧 requests 收集显式声明的组阈值，
+    // 供 quorum 聚合按组覆盖全局 k（不同副本数的 DP 组需要各自的 k）。
+    const quorumGroups = new Map<string, number>()
+    for (const req of requests) {
+      if (req.groupId && req.quorumK !== undefined && !quorumGroups.has(req.groupId)) {
+        quorumGroups.set(req.groupId, req.quorumK)
+      }
+    }
+    const aggregated = [
+      ...aggregateResults(allResults, policy, profileMap, undefined, quorumGroups.size > 0 ? quorumGroups : undefined),
+      ...depthCapped,
+    ]
     // Wave 3 aggregation path: post-verifyWorkerEvidence facts only.
     this.emitWorkerResultSignals(aggregated)
     // D1: persist worker results to ~/.rivet/subagents/。每个 order 此前已走

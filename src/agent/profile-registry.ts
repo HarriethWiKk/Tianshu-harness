@@ -663,10 +663,28 @@ export function profileIsPlanModeSafe(name: string): boolean {
 /** Default worker pool concurrency (mirrors bootstrap `maxWorkers: 3`). */
 export const DEFAULT_DELEGATE_CONCURRENCY = 3
 
+/**
+ * tierFloor → worker 超时倍率（单点事实源）。
+ * strong 模型单次推理天然更慢（DeepSeek V4 strong ≈ 1.4–1.6x），
+ * 不加倍率的话 worker 内层 budget.timeoutMs 会先于模型完成开枪。
+ * 所有消费 timeout 的路径（delegationToolTimeoutMs、work-order budget
+ * 构造、galaxy 外层）从此处取值，不散落硬编码系数。
+ */
+const TIER_TIMEOUT_MULTIPLIER: Record<string, number> = {
+  cheap: 1.0,
+  balanced: 1.0,
+  strong: 1.5,
+}
+
+export function tierTimeoutMultiplier(tierFloor?: string): number {
+  if (!tierFloor) return 1.0
+  return TIER_TIMEOUT_MULTIPLIER[tierFloor] ?? 1.0
+}
+
 export function delegationToolTimeoutMs(
   sessionTurnCount: number | undefined,
   profiles: ReadonlyArray<string | undefined>,
-  opts?: { taskCount?: number; maxWorkers?: number; requestedTimeoutMs?: ReadonlyArray<number | undefined> },
+  opts?: { taskCount?: number; maxWorkers?: number; requestedTimeoutMs?: ReadonlyArray<number | undefined>; tierFloors?: ReadonlyArray<string | undefined> },
 ): number {
   let budget = progressiveTimeout(sessionTurnCount)
   for (const name of profiles) {
@@ -703,5 +721,12 @@ export function delegationToolTimeoutMs(
   const allHands = profiles.length > 0
     && profiles.every(name => name !== undefined && profileRegistry.get(name)?.role === 'hands')
   const runs = allHands ? 1 + MAX_HANDS_EXTRA_RUNS : 1 + MAX_BUDGET_CONTINUATIONS
-  return budget * waves * runs + WORKER_EXIT_GRACE_MS
+
+  // tierFloor 超时倍率——取批内最大倍率（与 budget 取 max 同逻辑）。
+  let tierMul = 1.0
+  for (const tf of opts?.tierFloors ?? []) {
+    const m = tierTimeoutMultiplier(tf)
+    if (m > tierMul) tierMul = m
+  }
+  return budget * tierMul * waves * runs + WORKER_EXIT_GRACE_MS
 }

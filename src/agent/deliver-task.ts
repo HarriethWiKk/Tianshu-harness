@@ -124,6 +124,10 @@ export interface B1Context {
   /** Norns 义务账：advisory_gate 白名单命令执行器（默认 sh -c，60s 超时）。
    *  测试注入 mock 免真实 spawn。 */
   obligationGateRunner?: GateRunner
+  /** 星河收编 #2：运行时证据义务 store 入口。提供时，声明了 redundancy 的
+   *  义务未达 k 个独立证据会阻断交付（不静默降级为 satisfied）。缺省 →
+   *  冗余门禁关闭（现状行为不变）。 */
+  getObligationStore?: () => import('./evidence-obligation.js').ObligationStore
   /** W1 回归防线: Meridian blast-radius tests (EvidenceTracker.impactedTests).
    *  Absent → coverage check disabled (unchanged behavior). */
   getImpactedTests?: () => string[]
@@ -725,6 +729,26 @@ export function createDeliverTaskTool(getB1Context: (params?: ToolCallParams) =>
         // advisory: 收割邀请绝不让交付本身失败
       }
 
+      // ── 冗余义务门禁（星河收编 #2）──────────────────────────────
+      // 声明了 redundancy 的义务未达 k 个独立证据时交付 blocked——不静默
+      // 降级为 satisfied。force 不豁免：这是当前任务的证据义务，不是预存量
+      // 失败。未提供 store 入口时门禁关闭（现状行为不变）。
+      let redundancyBlocked = false
+      const obligationStore = ctx.getObligationStore?.()
+      if (obligationStore) {
+        const unsatisfied = obligationStore.obligations.filter(o =>
+          o.redundancy && o.state !== 'satisfied' && o.state !== 'superseded'
+        )
+        if (unsatisfied.length > 0) {
+          redundancyBlocked = true
+          lines.push('', '❌ 冗余验证未达 quorum（blocked，不静默降级）：')
+          for (const ob of unsatisfied) {
+            lines.push(`  - 义务「${ob.claim}」需要 ${ob.redundancy!.k} 个独立证据，当前 ${ob.satisfyCount ?? 0} 个（状态 ${ob.state}）`)
+          }
+          lines.push('  提供额外的独立证据（DP 副本验证、独立工具复现）后再次 deliver。')
+        }
+      }
+
       if (commit) {
         // Manual commit mode — user wants to review before committing.
         // Still run the full gate report, just skip the actual git commit.
@@ -763,10 +787,15 @@ export function createDeliverTaskTool(getB1Context: (params?: ToolCallParams) =>
           )
         }
 
-        if (report.state === 'RED') {
-          // Superseded failures: failures that were later fixed (already green).
-          // force=true allows override when all blocking failures look superseded.
-          if (forceGate && report.supersededFailures > 0) {
+        if (report.state === 'RED' || redundancyBlocked) {
+          if (redundancyBlocked) {
+            // 冗余义务未达 quorum：当前任务的证据义务，force 不豁免。
+            lines.push('', '❌ Cannot commit: redundancy obligations not met — quorum evidence insufficient.')
+            lines.push('', 'Recovery:')
+            lines.push('  → 提供额外的独立证据满足冗余义务（DP 副本验证、独立工具复现、')
+            lines.push('    第二条 file:line 证据链），或显式 supersede 该义务后重试。')
+            return { content: lines.join('\n'), isError: true }
+          } else if (forceGate && report.supersededFailures > 0) {
             lines.push('', '⚠️  RED overridden (force=true): superseded failures detected (these were later fixed).')
             lines.push('   Verify these pre-existing failures are unrelated to your changes before proceeding.')
           } else if (

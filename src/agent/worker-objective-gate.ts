@@ -34,6 +34,7 @@ export interface ObjectiveContext {
   scope: { files?: string[] }
   profile?: string
   authority?: string
+  groupId?: string
 }
 
 /** `workerResultIngestSchema` 在 summary 缺省时填的占位串。 */
@@ -109,6 +110,7 @@ export function reconcileWithObjective(
     objective: order.objective,
     profile: result.profile ?? order.profile,
     authority: result.authority ?? order.authority,
+    groupId: result.groupId ?? order.groupId,
   }
 
   // 已经如实报告没干成的，不必再去质疑它的交付物。

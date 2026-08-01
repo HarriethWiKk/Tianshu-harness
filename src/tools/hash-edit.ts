@@ -323,9 +323,10 @@ hash_edit / edit_file / write_file。编辑点之后的所有行号还会整体�
 apply_patch 加 unified diff。
 
 注意：new_string 较大时，消息历史只保留短指针
-（file_path + 大小）。后续轮次用 read_file 回看当前内容。
-new_string 必须是真实文件内容，绝不能把 [hash_edit applied to …]
-这类回吐指针当成内容传回来。`,
+（file_path + 大小）——看到指针说明那次编辑已成功落盘，
+不是你写了占位符，不要重做。后续轮次用 read_file 回看当前内容。
+new_string 必须是真实文件内容；把历史里的
+[hash_edit applied to …] 指针原样传回会被拦截。`,
     input_schema: {
       type: 'object',
       properties: {

@@ -20,6 +20,11 @@ export const modelConfigSchema = z.object({
     cacheRead: z.number().min(0).optional(),
     cacheWrite: z.number().min(0).optional(),
     reasoning: z.number().min(0).optional(),
+    /** True for a genuinely free model (e.g. GLM-4V-Flash) — distinct from a
+     *  subscription plan whose per-token price is also 0 (e.g. GLM Coding Plan).
+     *  Drives a "free" badge in the UI and is a candidate for the vision bridge.
+     *  Optional; absent = not known to be free (treated as paid). */
+    free: z.boolean().optional(),
   }).optional(),
   /** Model tier for routing/fallback decisions. Overrides name-based inference. */
   tier: z.enum(['cheap', 'balanced', 'strong']).optional(),

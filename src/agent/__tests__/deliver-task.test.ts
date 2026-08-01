@@ -47,6 +47,7 @@ function makeContext(opts: {
   isAutoReviewOff?: boolean
   goalAchieved?: boolean
   autoCommit?: boolean
+  obligationStore?: import('../evidence-obligation.js').ObligationStore
 }) {
   const baseline = createWorktreeBaseline({
     branch: 'feat/b1',
@@ -91,6 +92,7 @@ function makeContext(opts: {
     isAutoReviewOff: opts.isAutoReviewOff !== undefined ? () => opts.isAutoReviewOff! : undefined,
     isGoalAchieved: opts.goalAchieved !== undefined ? () => opts.goalAchieved! : undefined,
     autoCommit: opts.autoCommit,
+    getObligationStore: opts.obligationStore ? () => opts.obligationStore! : undefined,
   }))
 
   const params: ToolCallParams = {
@@ -2932,6 +2934,66 @@ Do not declare a streamed response duplicate in the middle of the stream.
       })
       const result = await tool.execute(params)
       assert.equal(/知识收割（虚空仓库）/.test(result.content), false)
+    })
+  })
+
+  describe('冗余义务门禁（星河收编 #2）', () => {
+    const redundantStore = (satisfyCount: number, state: import('../evidence-obligation.js').ObligationState = 'attempted'): import('../evidence-obligation.js').ObligationStore => ({
+      obligations: [{
+        id: 'ob_test',
+        family: 'behavior',
+        claim: 'migration is reversible',
+        targets: ['src/db/migrate.ts'],
+        risk: 'high',
+        requiredAction: 'micro_probe' as const,
+        state,
+        attempts: 1,
+        evidenceRefs: ['probe-a'],
+        redundancy: { kind: 'quorum', k: 2 },
+        ...(state === 'satisfied' ? {} : { satisfyCount }),
+      }],
+    })
+
+    it('冗余义务未达 k → commit 阻断（isError，不静默降级）', async () => {
+      const { tool, params } = makeContext({
+        taskId: 't-redundant',
+        ownedFiles: ['src/db/migrate.ts'],
+        verifications: [{ command: 'npx tsc --noEmit', status: 'passed' }],
+        obligationStore: redundantStore(1),
+        commitOwnedFiles: () => { throw new Error('commit executor should not run when redundancy gate blocks') },
+      })
+      const result = await tool.execute({ ...params, input: { commit: true, message: 'redundant check' } })
+      assert.equal(result.isError, true)
+      assert.match(result.content, /冗余验证未达 quorum/)
+      assert.match(result.content, /需要 2 个独立证据，当前 1 个/)
+      assert.match(result.content, /Cannot commit/)
+    })
+
+    it('冗余义务达 k → 不阻断', async () => {
+      let committed = false
+      const { tool, params } = makeContext({
+        taskId: 't-redundant-ok',
+        ownedFiles: ['src/db/migrate.ts'],
+        verifications: [{ command: 'npx tsc --noEmit', status: 'passed' }],
+        obligationStore: redundantStore(2, 'satisfied'),
+        commitOwnedFiles: () => { committed = true; return { ok: true, output: 'committed' } },
+      })
+      const result = await tool.execute({ ...params, input: { commit: true, message: 'redundant ok' } })
+      assert.equal(result.isError, undefined)
+      assert.doesNotMatch(result.content, /冗余验证未达 quorum/)
+      assert.equal(committed, true)
+    })
+
+    it('未提供义务 store 入口 → 门禁关闭（现状不变）', async () => {
+      const { tool, params } = makeContext({
+        taskId: 't-redundant-off',
+        ownedFiles: ['src/a.ts'],
+        verifications: [{ command: 'npx tsc --noEmit', status: 'passed' }],
+        commitOwnedFiles: () => ({ ok: true, output: 'committed' }),
+      })
+      const result = await tool.execute({ ...params, input: { commit: true, message: 'no store' } })
+      assert.equal(result.isError, undefined)
+      assert.doesNotMatch(result.content, /冗余验证未达 quorum/)
     })
   })
 })

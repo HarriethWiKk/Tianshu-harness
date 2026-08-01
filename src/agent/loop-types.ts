@@ -55,6 +55,11 @@ export interface AgentConfig {
    *  必须在构造期注入——toolExecution 的 deps 在构造时按值捕获 self.prewarm，
    *  构造后替换字段到不了消费端（read-file consumePrewarm）。 */
   prewarm?: import('./prewarm.js').PrewarmCache
+  /** Batch-scoped shared StigmergyStore（星河收编 #3，worker 经
+   *  WorkerSessionConfig.stigmergy 透传）。提供时覆盖本会话默认的
+   *  按 sessionDir 持久化 store——同批 worker 共享同一内存信息素库。
+   *  缺省 undefined → 构造期按 sessionDir 新建（历史行为）。 */
+  stigmergyStore?: import('../context/stigmergy.js').StigmergyStore
   /** Provider registry key (e.g. 'deepseek') — used as ProviderHealthTracker id. */
   providerName?: string
   /** Cost-aware reclaim profile resolved from provider+model economics

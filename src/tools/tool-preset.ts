@@ -6,17 +6,17 @@ import { userConfigPath } from '../config/paths.js'
  * Tool preset — 会话启动期的工具装配档位（会话内冻结，前缀缓存零影响）。
  *
  * 三档语义（2026-07-19 工具审计落地，入口成本实测见 .rivet/scratch/tool-audit.ts）：
- * - **minimal（默认，30 个）**：日常开发全能力——读写/检索/bash/git/测试/委托/
+ * - **minimal（30 个）**：日常开发全能力——读写/检索/bash/git/测试/委托/
  *   交付/plan/web_search/web_fetch。去掉编排（council/team）、browser 系、
  *   attack_case、semantic_search 等重而冷门的工具。
- * - **frontend（31）**：minimal + browser_debug（UI 渲染验证闭环）。
+ * - **frontend（默认，31）**：minimal + browser_debug（UI 渲染验证闭环）。
  * - **full（45）**：全集，含 attack_case/council/team/semantic_search/repo_graph/
  *   undo/recall_general/record_general_finding/ast_edit/related_tests/
  *   inspect_project/import_resource/leave_mark/browser_debug/monitor。
  *
  * 解析优先级：`RIVET_TOOL_PRESET` env > 项目 `.rivet-config.json` tools.preset
  * > 用户配置 tools.preset（`userConfigPath()`，认 RIVET_HOME/RIVET_CONFIG_PATH）
- * > 'minimal'。
+ * > 'frontend'。
  * 变更只在下个会话生效（会话中途改工具指纹 = 前缀全量重建，反经济）。
  */
 
@@ -59,7 +59,7 @@ export function resolveToolPreset(cwd: string): ToolPreset {
     }
   }
 
-  const resolved = preset ?? 'minimal'
+  const resolved = preset ?? 'frontend'
   memo.set(cwd, resolved)
   return resolved
 }

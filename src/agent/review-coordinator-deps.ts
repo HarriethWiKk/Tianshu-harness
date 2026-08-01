@@ -382,17 +382,20 @@ function squadronRequests(change: ChangeSet, options: CoordinatorReviewDepsOptio
 // (readCapOverride)+ 机械化 read 分页约束(见 earlyConvergenceHint)。
 // 外层 AUTO_REVIEW_BUDGET_MS 相应放宽到 420s;detached 后审查不阻塞交付,
 // 成本仅为后台时长。
-// 2026-07-28 按变更规模缩放:40 轮固定预算对 3 文件 40 行的小改动严重过度——
-// 审查 worker 用 59 次工具调用仍未收敛,探索空间过剩反而推迟收束。
+// 2026-08-01 再标定(廉价模型能力强但首字节延迟高,给足轮次和时间):
+// 审查 worker 频繁耗尽预算(近 4 天多个会话审查全部 infra failure)。
+// 廉价模型审查质量不差,差的是时间——三档全升:小改动 20 轮/300s,
+// 中改动 28 轮/360s,大改动 36 轮/480s。外层 AUTO_REVIEW_BUDGET_MS
+// 相应放宽到 600s。
 function computeAutoReviewBudget(change: ChangeSet): { maxTurns: number; timeoutMs: number } {
   const n = change.files.length
-  if (n <= 3) return { maxTurns: 12, timeoutMs: 180_000 }
-  if (n <= 10) return { maxTurns: 20, timeoutMs: 240_000 }
-  return { maxTurns: 30, timeoutMs: 360_000 }
+  if (n <= 3) return { maxTurns: 20, timeoutMs: 300_000 }
+  if (n <= 10) return { maxTurns: 28, timeoutMs: 360_000 }
+  return { maxTurns: 36, timeoutMs: 480_000 }
 }
 
-const FALLBACK_MAX_TURNS = 20
-const FALLBACK_TIMEOUT_MS = 240_000
+const FALLBACK_MAX_TURNS = 28
+const FALLBACK_TIMEOUT_MS = 360_000
 
 /** 早收敛预算计划 — 按规模分级:
  *  小改动(≤15轮)强收敛——禁止扩散探索,强制半数轮次前产出草案;

@@ -141,6 +141,28 @@ describe('RuntimeHookPipeline', () => {
     assert.match(errors[0]!.message, /\[hook-timeout\]/)
   })
 
+  it('超时 hook 只报 [hook-timeout]，不重复报 [hook-slow]（生产比例 timeout>slow）', async () => {
+    // 生产默认 hookTimeoutMs=10_000 > hookSlowMs=2_000（runtime-hooks.ts L154-155）。
+    // 现有超时测试 hookTimeoutMs:50 未设 slowMs（默认 2000），elapsed≈50 < 2000，
+    // 恰好避开双报路径——本测试用同比例（100 > 10）复现生产行为。
+    const errors: RuntimeHookError[] = []
+    const wedged: PreTurnRuntimeHook = {
+      phase: 'preTurn',
+      name: 'wedged',
+      run: () => new Promise<void>(() => {}),
+    }
+    const pipeline = new RuntimeHookPipeline([wedged], {
+      onError: error => errors.push(error),
+      hookTimeoutMs: 100,
+      hookSlowMs: 10,
+    })
+
+    await pipeline.runPreTurn(makeContext())
+
+    assert.equal(errors.length, 1, '一次超时事件应只报一条 onError（用户 onError 钩子不应被触发两次）')
+    assert.match(errors[0]!.message, /\[hook-timeout\]/)
+  })
+
   it('慢 hook 遥测：同步执行超过 hookSlowMs 报 [hook-slow]（事后检测）', async () => {
     const errors: RuntimeHookError[] = []
     const slow: PreTurnRuntimeHook = {

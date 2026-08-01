@@ -99,7 +99,9 @@ export class StigmergyStore {
   private readonly _flushDelayMs = 200
 
   constructor(
-    private filePath: string,
+    /** 持久化文件路径；undefined = 纯内存模式（批级共享 store，不落盘，
+     *  与 PrewarmCache 同生命周期——星河收编 #3）。 */
+    private filePath: string | undefined,
     maxCapacity = DEFAULT_MAX_CAPACITY,
   ) {
     this.maxCapacity = maxCapacity
@@ -109,6 +111,7 @@ export class StigmergyStore {
 
   /** Load pheromones from cache or disk. Returns [] if file missing or corrupt. */
   private async _loadFromDisk(): Promise<Pheromone[]> {
+    if (!this.filePath) return [] // memory-only mode: no disk
     try {
       const raw = await readFile(this.filePath, 'utf-8')
       const parsed: unknown = JSON.parse(raw)
@@ -151,8 +154,11 @@ export class StigmergyStore {
 
   /** Write entries to disk atomically and clear dirty flag. */
   private async _persist(entries: Pheromone[]): Promise<void> {
+    if (!this.filePath) { this._dirty = false; return } // memory-only mode: nothing to persist
     await mkdir(dirname(this.filePath), { recursive: true })
     await writeFileAtomicAsync(this.filePath, JSON.stringify(entries, null, 2))
+    // 写成功才清 dirty——先清再写的话，EPERM 类失败会静默丢弃 pending
+    // 信息素，shutdown 的 flushSync 也失去重试依据。
     this._dirty = false
   }
 
@@ -186,8 +192,10 @@ export class StigmergyStore {
       this._flushTimer = null
     }
     if (this._dirty && this._cache !== null) {
+      if (!this.filePath) { this._dirty = false; return } // memory-only mode: nothing to persist
       mkdirSync(dirname(this.filePath), { recursive: true })
       writeFileAtomicSync(this.filePath, JSON.stringify(this._cache, null, 2))
+      // 与 _persist 同纪律：写成功才清 dirty。
       this._dirty = false
     }
   }

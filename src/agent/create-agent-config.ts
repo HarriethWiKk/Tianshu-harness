@@ -531,7 +531,9 @@ function tryBuildVisionClientFrom(
 function visionCandidates(input: AgentConfigInput): Array<{ prov: ProviderConfig; spec: ModelConfig }> {
   const providers = input.allProviders
   if (!providers) return []
-  const PRIORITY = [input.provider.name, 'minimax', 'glm']
+  // zhipu-vision (glm-4v-flash, 免费) 排末位 —— 有付费视觉模型时优先用付费的
+  // （质量更高），它作为"用户没配其他视觉模型时的免费兜底"。
+  const PRIORITY = [input.provider.name, 'minimax', 'glm', 'zhipu-vision']
   const rank = (name: string): number => {
     const i = PRIORITY.indexOf(name)
     return i === -1 ? PRIORITY.length + 1 : i

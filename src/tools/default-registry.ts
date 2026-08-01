@@ -68,7 +68,7 @@ export interface DefaultRegistryOptions {
    *  `definition` is byte-identical either way, so prefix cache is unaffected. */
   searchBackends?: SearchBackend[]
   /** 工具装配档位（minimal/frontend/full）。缺省按 RIVET_TOOL_PRESET env >
-   *  项目 .rivet-config.json tools.preset > 用户配置 > minimal 解析。
+   *  项目 .rivet-config.json tools.preset > 用户配置 > frontend 解析。
    *  会话内冻结，前缀缓存零影响。 */
   preset?: ToolPreset
   /** web_fetch options built from config.fetch. Absent → the default

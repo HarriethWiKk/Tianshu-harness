@@ -126,8 +126,8 @@ export const APPROVAL_OPTIONS: readonly SettingsOption[] = [
 ]
 
 export const TOOL_PRESET_OPTIONS: readonly SettingsOption[] = [
-  { id: 'minimal', label: 'minimal — 27 个工具（默认，省 token）' },
-  { id: 'frontend', label: 'frontend — 28 个，含 browser_debug' },
+  { id: 'minimal', label: 'minimal — 27 个工具（省 token）' },
+  { id: 'frontend', label: 'frontend — 28 个，含 browser_debug（默认）' },
   { id: 'full', label: 'full — 47 个全集，含 computer_use / 办公工具' },
 ]
 
@@ -494,7 +494,7 @@ function visionCategory(): SettingsCategory {
       effect: 'next-session',
       visionOnly: true,
       sentinel: { id: INHERIT, label: OFF_LABEL },
-      hint: '候选只列声明了 supportsVision 的模型；主控模型本身支持识图时无需配桥',
+      hint: '主控不支持识图时才需配桥；想免费识图先 /connect zhipu-vision，选 glm-4v-flash（智谱完全免费）',
       get: d => (d.vision ? modelRef(d.vision.provider, d.vision.model) : INHERIT),
       set: (d, ref) => {
         const parts = ref ? splitModelRef(ref) : null
@@ -552,7 +552,7 @@ function visionCategory(): SettingsCategory {
       label: '未配置时自动选桥',
       block: 'visionAuto',
       effect: 'next-session',
-      hint: '开启后即使没指定识图模型，也会自动挑一个可用视觉模型——图片会发给那个 provider，默认关',
+      hint: '没指定识图模型时自动挑一个可用的视觉模型（含免费 glm-4v-flash）——图片会发给那个 provider，默认关',
       get: d => d.visionAutoBridge,
       set: (d, value) => ({ ...d, visionAutoBridge: value }),
     }),

@@ -110,9 +110,9 @@ export function pointerPlaceholderError(opts: {
   filePath: string
 }): string {
   return (
-    `❌ 写入被拦截：${opts.field} 的内容是系统显示占位符（"${opts.matchedPrefix} …"），不是真实的文件内容。\n\n`
-    + `原因：大内容写入成功后，历史消息中的参数会被替换为显示占位符（节省上下文 token）。AI 有时会误把占位符当正文写入。\n\n`
-    + `修复：用真实的完整内容重新调用 ${opts.toolName}。若需查看文件的当前内容，先 read_file ${opts.filePath}。\n\n`
+    `❌ 写入被拦截：${opts.field} 的内容是历史消息里的显示指针（"${opts.matchedPrefix} …"），不是真实的文件内容。\n\n`
+    + `机制：大内容写入成功后，历史消息中的参数会被替换成这种显示指针（节省上下文 token）——你之前的写入已成功落盘，没有出错；这次是把历史里的指针误当正文传了回来。\n\n`
+    + `修复：先 read_file ${opts.filePath} 看磁盘当前内容——它很可能已经是你要写的完整内容（若是，直接继续下一步，不要重写）；确认需要修改时，再用真实完整内容调用 ${opts.toolName}。\n\n`
     + `[${POINTER_GUARD_ERROR_MARKER}]`
   )
 }

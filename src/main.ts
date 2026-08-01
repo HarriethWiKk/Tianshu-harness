@@ -306,6 +306,7 @@ async function main() {
     const { createHeadlessCoordinator } = await import('./agent/headless-coordinator.js')
     const { initializePlugins } = await import('./plugins/plugin-loader.js')
     const { createGalaxyTool } = await import('./tools/galaxy.js')
+    const { DomainKnowledgeStore } = await import('./agent/domain-knowledge-store.js')
 
     const parsed = parseCliArgs(args)
     // Goal mode drives the same AgentLoop + GoalTracker as the TUI /goal command;
@@ -422,6 +423,9 @@ async function main() {
           isGoalAchieved: () => goalTrackerRef.current?.isGoalAchieved() ?? false,
           getLastVerdict: () => goalTrackerRef.current?.getLastVerdict() ?? null,
           getImpactedTests: () => headlessAgentRef.current ? [...headlessAgentRef.current.getEvidenceState().impactedTests] : [],
+          // 收编 #2：冗余义务门禁消费（headless 生产注入）
+          getObligationStore: () => headlessAgentRef.current?.obligations.getStore()
+            ?? { obligations: [] },
         })))
         if (presetIncludes(registryOptions.preset, 'update_goal')) {
           toolRegistry.register(createUpdateGoalTool(
@@ -448,6 +452,10 @@ async function main() {
         toolRegistry.register(createGalaxyTool({
           delegateBatch: async (requests, policy, abortSignal, onProgress, onWorkerSettled) =>
             headlessCoordinator.delegateBatch(requests, policy, abortSignal, onProgress, onWorkerSettled),
+          // 路由学习（收编 #5）：headless 无 SharedRuntime，per-session 建库即可。
+          domainKnowledgeStore: new DomainKnowledgeStore(join(process.cwd(), '.rivet', 'knowledge')),
+          // DP 证据冗余（收编 #2）：agent 创建后由 headlessAgentRef 惰性提供。
+          get obligationTracker() { return headlessAgentRef.current?.obligations },
         }))
 
         const agentCfg = createAgentConfig(createMainAgentConfigInput({

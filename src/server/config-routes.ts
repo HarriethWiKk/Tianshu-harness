@@ -8,6 +8,7 @@
  *   DELETE /config/providers/:name          remove a provider
  *   DELETE /config/providers/:name/models/:modelId  remove a model from a provider
  *   POST   /config/providers/:name/key      set API key (inline or env)
+ *   POST   /config/providers/test-key       probe a key against a provider's /models (setup-time validation)
  *   POST   /config/providers/:name/default  set as default provider
  *   GET    /config/balance                  query DeepSeek account balance (official API)
  *   GET    /config/autonomy                 autonomy brake mode + checkpoint interval (C3)
@@ -78,6 +79,7 @@ import { rivetHome } from '../config/paths.js'
 import { PROVIDER_PRESETS, providerPresetKeys, type ProviderPresetKey } from '../config/provider-presets.js'
 import { modelConfigSchema, type ModelConfig } from '../config/schema.js'
 import { queryDeepSeekBalance, type BalanceResult } from '../api/balance-client.js'
+import { probeProviderKey } from '../api/key-probe.js'
 import { getDeepSeekUserSummary, getDeepSeekCostReport } from '../api/deepseek-platform-client.js'
 import { listGrantedApps, revokeApp } from '../tools/computer-use/app-grants.js'
 import { createPlatformDriver, isComputerUsePlatform } from '../tools/computer-use/platform-driver.js'
@@ -240,6 +242,30 @@ export function buildConfigRoutes(apiToken?: string): Record<string, RouteHandle
       } catch (err) {
         return { status: 400, body: { error: (err as Error).message } }
       }
+    }, apiToken),
+
+    // Probe a key against a provider's /models before saving it. Avoids writing
+    // an invalid key that only surfaces as a 401 when the user later sends a msg.
+    // Body: { provider: string, apiKey: string }. Provider resolved to baseUrl
+    // from preset (zhipu-vision uses PaaS endpoint, not coding) or stored config.
+    'POST /config/providers/test-key': withAuth(async (body) => {
+      const { provider, apiKey, baseUrl: override } = body as { provider?: string; apiKey?: string; baseUrl?: string }
+      if (!provider) return { status: 400, body: { error: 'provider is required' } }
+      if (!apiKey) return { status: 400, body: { error: 'apiKey is required' } }
+      // Resolve baseUrl: explicit override (custom provider being created) wins,
+      // then stored config, then preset (preset has the right endpoint per provider
+      // — e.g. zhipu-vision uses api/paas/v4, not the coding endpoint).
+      let baseUrl = override
+      if (!baseUrl) {
+        const cfg = loadConfig()
+        const stored = cfg.provider.providers[provider]
+        baseUrl = stored?.baseUrl ?? (providerPresetKeys.includes(provider as ProviderPresetKey)
+          ? PROVIDER_PRESETS[provider as ProviderPresetKey].provider.baseUrl
+          : undefined)
+      }
+      if (!baseUrl) return { status: 400, body: { error: `cannot resolve baseUrl for provider "${provider}"` } }
+      const result = await probeProviderKey(apiKey, baseUrl)
+      return { status: 200, body: result }
     }, apiToken),
 
     'POST /config/providers/:name/default': withAuth((_body, params) => {

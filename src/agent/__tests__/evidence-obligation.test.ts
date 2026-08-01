@@ -338,3 +338,73 @@ describe('isDocOrConfigOnly', () => {
     assert.equal(isDocOrConfigOnly([]), false)
   })
 })
+
+// ── 冗余验证（星河收编 #2）：redundancy 声明义务需 k 个独立证据才关闭 ──
+
+describe('redundant obligations (quorum evidence)', () => {
+  const redundant = { family: 'behavior' as const, claim: 'migration is reversible', targets: ['src/db/migrate.ts'], risk: 'high' as const, redundancy: { kind: 'quorum' as const, k: 2 } }
+
+  it('single satisfy does not close a redundant obligation (state stays attempted)', () => {
+    let store = upsertObligation(emptyObligationStore(), redundant)
+    const id = store.obligations[0]!.id
+    store = satisfyObligation(store, id, 'src/db/migrate.test.ts:40')
+    const ob = store.obligations[0]!
+    assert.notEqual(ob.state, 'satisfied')
+    assert.equal(ob.state, 'attempted')
+    assert.equal(ob.satisfyCount, 1)
+    assert.deepEqual(ob.evidenceRefs, ['src/db/migrate.test.ts:40'])
+  })
+
+  it('second satisfy closes the obligation (k=2)', () => {
+    let store = upsertObligation(emptyObligationStore(), redundant)
+    const id = store.obligations[0]!.id
+    store = satisfyObligation(store, id, 'probe-a')
+    store = satisfyObligation(store, id, 'probe-b')
+    const ob = store.obligations[0]!
+    assert.equal(ob.state, 'satisfied')
+    assert.equal(ob.satisfyCount, 2)
+    assert.deepEqual(ob.evidenceRefs, ['probe-a', 'probe-b'])
+  })
+
+  it('duplicate evidence ref does not double-count', () => {
+    let store = upsertObligation(emptyObligationStore(), redundant)
+    const id = store.obligations[0]!.id
+    store = satisfyObligation(store, id, 'probe-a')
+    store = satisfyObligation(store, id, 'probe-a')
+    const ob = store.obligations[0]!
+    // 同一 ref 重复提交只计一次——k=2 未达成，义务不得 satisfied
+    assert.equal(ob.satisfyCount, 1)
+    assert.equal(ob.state, 'attempted')
+    assert.deepEqual(ob.evidenceRefs, ['probe-a'])
+    // 第二个独立证据到达才关闭
+    store = satisfyObligation(store, id, 'probe-b')
+    const ob2 = store.obligations[0]!
+    assert.equal(ob2.satisfyCount, 2)
+    assert.equal(ob2.state, 'satisfied')
+  })
+
+  it('blocked redundant obligation can still be satisfied by real evidence', () => {
+    let store = upsertObligation(emptyObligationStore(), redundant)
+    const id = store.obligations[0]!.id
+    store = blockObligation(store, id, 'no test runner')
+    store = satisfyObligation(store, id, 'manual replay log')
+    store = satisfyObligation(store, id, 'staging callback')
+    assert.equal(store.obligations[0]!.state, 'satisfied')
+  })
+
+  it('non-redundant obligations keep single-evidence close semantics', () => {
+    let store = upsertObligation(emptyObligationStore(), { family: 'behavior', claim: 'plain claim', risk: 'high' })
+    const id = store.obligations[0]!.id
+    store = satisfyObligation(store, id, 'probe-a')
+    assert.equal(store.obligations[0]!.state, 'satisfied')
+  })
+
+  it('upsert without redundancy does not strip an existing redundancy declaration', () => {
+    let store = upsertObligation(emptyObligationStore(), redundant)
+    const id = store.obligations[0]!.id
+    store = upsertObligation(store, { family: 'behavior', claim: 'migration is reversible', targets: ['src/db/migrate.ts'], risk: 'high' })
+    const ob = store.obligations.find(o => o.id === id)!
+    assert.ok(ob.redundancy)
+    assert.equal(ob.redundancy!.k, 2)
+  })
+})

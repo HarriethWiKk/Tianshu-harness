@@ -98,12 +98,13 @@ Add-Content $PROFILE ". C:\path\to\rivet.ps1"
 
 ### 4. 配置 API Key（首次必做）
 
-```bash
-# A. 环境变量（首次试用最简单）
-export DEEPSEEK_API_KEY=sk-xxx
+**直接安装的用户无需手动配置**——首次启动会自动进入引导，粘贴 DeepSeek key 即可：桌面端是连接向导，CLI 首启缺 key 时也会自动弹出配置向导。之后随时修改：桌面端 Settings → Provider，CLI 里 `rivet config`。
 
-# B. 持久化 CLI 配置（保存到 ~/.rivet/config.json）
-rivet config set-key deepseek sk-xxx
+**开发者拉源码启动**（或想在启动前预先配好）才需要手动来：
+
+```bash
+rivet config set-key deepseek sk-xxx   # 持久化到 config.json
+export DEEPSEEK_API_KEY=sk-xxx         # 或：环境变量（仅当前 shell 有效）
 ```
 
 > 其他提供商（Claude、GLM、Codex、MiniMax、MiMo）用法相同，详见 [模型配置](docs/user-guide-provider-config.md)。
@@ -168,13 +169,12 @@ rivet --goal "修复所有类型错误" --budget 50   # 无头目标自主模式
 会话内用 `/model <name>` 随时切换提供商。
 
 ```bash
-rivet config                                              # 交互式设置（TTY）
-rivet config setup deepseek --key-env DEEPSEEK_API_KEY --default
-rivet config setup codex --default                       # OAuth（首次浏览器登录）
-rivet config show                                         # 查看完整配置
+rivet config                          # 交互式设置（TTY）
+rivet config setup codex --default    # Codex 走 OAuth（首次浏览器登录）
+rivet config show                     # 查看完整配置
 ```
 
-也可直接编辑 `~/.rivet/config.json`（只写需要覆盖的字段，默认值会深度合并）：
+也可直接编辑 config.json（只写需要覆盖的字段，默认值会深度合并）。文件位置：CLI 在 `~/.rivet/config.json`（Windows 为 `%LOCALAPPDATA%\.rivet`）；桌面端以 Settings → 存储位置为准，便携版在 exe 旁 `TianshuData\.rivet`——详见[先定位数据根](#先定位数据根)：
 
 ```json
 {
@@ -182,7 +182,7 @@ rivet config show                                         # 查看完整配置
     "default": "deepseek",
     "providers": {
       "deepseek": {
-        "apiKeyEnv": "DEEPSEEK_API_KEY",
+        "apiKey": "sk-xxx",
         "models": [
           { "id": "deepseek-v4-pro", "contextWindow": 1000000, "maxTokens": 384000 }
         ]

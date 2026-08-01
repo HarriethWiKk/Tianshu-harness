@@ -337,4 +337,22 @@ describe('StigmergyStore integration with Sensorium freshness', () => {
     const remaining = await store.load()
     assert.equal(remaining.length, 0)
   })
+
+  it('memory-only mode (undefined filePath): deposit/query work, flush never writes（收编 #3）', async () => {
+    const store = new StigmergyStore(undefined)
+    await store.deposit({ path: 'src/a.ts', signal: 'fragile', strength: 0.8 })
+    await store.deposit({ path: 'src/b.ts', signal: 'dead-end', strength: 0.6, context: 'loop' })
+
+    const all = await store.query()
+    assert.equal(all.length, 2)
+    const a = all.find(e => e.path === 'src/a.ts')
+    assert.ok(a)
+    assert.equal(a!.signal, 'fragile')
+    assert.ok(a!.currentStrength > 0, 'fresh deposit has near-full strength')
+
+    // flush/flushSync 不得抛错、不得产生文件
+    await store.flush()
+    store.flushSync()
+    assert.doesNotThrow(async () => { await store.prune() })
+  })
 })
