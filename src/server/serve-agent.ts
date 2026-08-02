@@ -318,6 +318,10 @@ function buildSessionStores(
       ? () => shared.sameCwdRunningCount?.(cwd, sessionId) ?? 0
       : undefined,
     goalTrackerRef: { current: null },
+    // 域知识库引用：buildAgentLoop 解析 store（SharedRuntime.domainStores 优先）
+    // 后回写——galaxy 路由学习经此存取。
+    domainKnowledgeStoreRef: { current: null },
+    obligationTrackerRef: { current: null },
     // 会话级审查门开关：初始值取 review.skipAuto 配置快照。sidecar 无 /review off
     // 本地命令，运行期不变更（桌面端经 Settings 修改配置后新会话生效）。
     reviewGateRef: { current: ctx.config.agent.review.skipAuto ? 'off' : 'auto' },
@@ -445,6 +449,7 @@ function assembleAgentLoop(
   const domainKnowledgeStore = shared
     ? getOrCreateDomainStore(shared, cwd)
     : new DomainKnowledgeStore(join(cwd, '.rivet', 'knowledge'))
+  if (stores.refs.domainKnowledgeStoreRef) stores.refs.domainKnowledgeStoreRef.current = domainKnowledgeStore
 
   // sessionRegistry 透传：bootstrap.createAgentRuntime 通过 refs.sessionRegistry
   // 间接接到 AgentLoop，所以在调装配前先回写 refs（buildSessionStores 已经接收

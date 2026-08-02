@@ -59,11 +59,23 @@ export interface DepositInput {
   halfLifeMs?: number
 }
 
+/** 星河路由记录（收编 #5）：一次 galaxy/维度派发的路由事实。
+ *  按 taskShape（归一化维度名）聚合胜率，供 formatGalaxyProposal 回召。 */
+export interface GalaxyRoutingRecord {
+  dimensionName: string
+  authority: string
+  /** 归一化任务形状（小写去空白）——胜率聚合键。 */
+  taskShape: string
+  status: 'passed' | 'failed' | 'blocked'
+  depositedAt: number
+}
+
 // ─── Constants ──────────────────────────────────────────────────
 
 const DEFAULT_HALF_LIFE_MS = 604_800_000 // 7 days (same as stigmergy)
 const PRUNE_THRESHOLD = 0.05
 const MAX_PER_DOMAIN = 100
+const MAX_ROUTING_RECORDS = 500
 const MAX_TEXT_LENGTH = 200
 const MAX_EVIDENCE_LENGTH = 300
 const LOCK_RETRY_MAX_MS = 500
@@ -215,6 +227,10 @@ export class DomainKnowledgeStore {
   private cache = new Map<string, DomainLesson[]>()
   private dirty = new Set<string>()
   private flushTimer: ReturnType<typeof setTimeout> | null = null
+  /** 星河路由记录（收编 #5）：独立 JSONL（跨域共享，按 taskShape 聚合），
+   *  复用锁 + 原子写范式。有界（MAX_ROUTING_RECORDS，LRU 截断）。 */
+  private routingCache: GalaxyRoutingRecord[] | null = null
+  private routingDirty = false
 
   constructor(private baseDir: string) {}
 
@@ -322,6 +338,73 @@ export class DomainKnowledgeStore {
     return { kept, pruned: lessons.length - kept.length }
   }
 
+  // ── Galaxy routing records（星河收编 #5）──────────────────────
+
+  /** 沉淀一条路由事实（galaxy 结算时调用）。追加式（每次执行一条，供胜率
+   *  统计），有界截断（MAX_ROUTING_RECORDS，LRU 语义）。 */
+  recordGalaxyRouting(record: Omit<GalaxyRoutingRecord, 'depositedAt'>): void {
+    const records = this.loadRoutingRecords()
+    records.push({ ...record, depositedAt: Date.now() })
+    const capped = records.slice(-MAX_ROUTING_RECORDS)
+    this.routingCache = capped
+    this.routingDirty = true
+    this.scheduleFlush()
+  }
+
+  /** 召回同 taskShape 的历史路由记录（新→旧），供 proposal 胜率聚合。 */
+  recallGalaxyRouting(taskShape: string, topK = 20): GalaxyRoutingRecord[] {
+    return this.loadRoutingRecords()
+      .filter(r => r.taskShape === taskShape)
+      .sort((a, b) => b.depositedAt - a.depositedAt)
+      .slice(0, topK)
+  }
+
+  private routingPath(): string {
+    return join(this.baseDir, 'galaxy-routing.jsonl')
+  }
+
+  private routingLockPath(): string {
+    return join(this.baseDir, 'galaxy-routing.jsonl.lock')
+  }
+
+  private loadRoutingRecords(): GalaxyRoutingRecord[] {
+    if (this.routingCache) return this.routingCache
+    try {
+      const raw = readFileSync(this.routingPath(), 'utf-8')
+      const records = raw.split('\n').filter(l => l.trim())
+        .map(line => {
+          try { return JSON.parse(line) as GalaxyRoutingRecord }
+          catch { return null }
+        })
+        .filter((r): r is GalaxyRoutingRecord =>
+          r !== null && typeof r.taskShape === 'string' && typeof r.authority === 'string' && typeof r.status === 'string')
+      this.routingCache = records
+      return records
+    } catch {
+      this.routingCache = []
+      return this.routingCache
+    }
+  }
+
+  private flushRoutingDirty(): void {
+    if (!this.routingDirty || !this.routingCache) return
+    const path = this.routingPath()
+    const lockPath = this.routingLockPath()
+    try {
+      mkdirSync(dirname(path), { recursive: true })
+      const lock = acquireLock(lockPath)
+      if (!lock.acquired) return
+      try {
+        atomicWrite(path, this.routingCache.map(r => JSON.stringify(r)).join('\n') + '\n')
+        this.routingDirty = false
+      } finally {
+        lock.release()
+      }
+    } catch {
+      // 同 writer-health gate：保留 dirty，下次 flush 重试
+    }
+  }
+
   // ── Persistence ──────────────────────────────────────────────
 
   private domainPath(domainId: string): string {
@@ -362,6 +445,11 @@ export class DomainKnowledgeStore {
         // Keep background flush failures from crashing the process. Entries stay
         // dirty and flushSync() / the next deposit can retry with a fresh lock.
       }
+      try {
+        this.flushRoutingDirty()
+      } catch {
+        // 路由记录同样保持 dirty，下次重试
+      }
     }, DEBOUNCE_MS)
   }
 
@@ -401,6 +489,7 @@ export class DomainKnowledgeStore {
       this.flushTimer = null
     }
     this.flushDirty()
+    this.flushRoutingDirty()
   }
 
   /** List domain ids that have knowledge files on disk. */

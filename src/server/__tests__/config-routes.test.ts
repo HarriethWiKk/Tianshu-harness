@@ -399,3 +399,52 @@ describe('/config/default-domain', () => {
     assert.equal(res.status, 401)
   })
 })
+
+// 桌面端要能自己开关自动选桥：只装桌面端的用户没有 TUI 面板可用，缺这两条路由
+// 他们就只能手改 config.json。
+describe('/config/vision-auto-bridge', () => {
+  const prevHome = process.env.RIVET_HOME
+  let home: string
+
+  before(() => {
+    home = mkdtempSync(join(tmpdir(), 'rivet-vision-auto-'))
+    process.env.RIVET_HOME = home
+  })
+
+  after(() => {
+    if (prevHome === undefined) delete process.env.RIVET_HOME
+    else process.env.RIVET_HOME = prevHome
+    rmSync(home, { recursive: true, force: true })
+  })
+
+  it('defaults to off — 不替用户决定把图片发给未选中的 provider', async () => {
+    const router = createRouter(buildConfigRoutes(TOKEN))
+    const res = await router('GET', '/config/vision-auto-bridge', {}, AUTH)
+    assert.equal(res.status, 200)
+    assert.deepEqual(res.body, { enabled: false })
+  })
+
+  it('round-trips the opt-in through PUT + GET', async () => {
+    const router = createRouter(buildConfigRoutes(TOKEN))
+    const put = await router('PUT', '/config/vision-auto-bridge', { enabled: true }, AUTH)
+    assert.equal(put.status, 200)
+    assert.deepEqual(put.body, { ok: true, enabled: true })
+    const get = await router('GET', '/config/vision-auto-bridge', {}, AUTH)
+    assert.deepEqual(get.body, { enabled: true })
+
+    const off = await router('PUT', '/config/vision-auto-bridge', { enabled: false }, AUTH)
+    assert.deepEqual(off.body, { ok: true, enabled: false })
+  })
+
+  it('rejects a non-boolean payload instead of coercing it', async () => {
+    const router = createRouter(buildConfigRoutes(TOKEN))
+    const res = await router('PUT', '/config/vision-auto-bridge', { enabled: 'yes' }, AUTH)
+    assert.equal(res.status, 400)
+  })
+
+  it('rejects unauthorized requests', async () => {
+    const router = createRouter(buildConfigRoutes(TOKEN))
+    assert.equal((await router('GET', '/config/vision-auto-bridge', {}, {})).status, 401)
+    assert.equal((await router('PUT', '/config/vision-auto-bridge', { enabled: true }, {})).status, 401)
+  })
+})

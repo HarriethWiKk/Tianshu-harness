@@ -6,10 +6,12 @@
  */
 
 import type { DomainKnowledgeStore, DomainLesson } from './domain-knowledge-store.js'
+import type { StigmergyStore } from '../context/stigmergy.js'
 import { starDomainRegistry } from './star-domain-registry.js'
 
 const MAX_BLOCK_CHARS = 2000
 const MAX_LESSONS_PER_BLOCK = 6
+const MAX_BATCH_SIGNALS = 3
 
 /** Grade display names for prompt formatting */
 const GRADE_LABEL: Record<string, string> = {
@@ -61,6 +63,32 @@ export function buildDomainKnowledgeBlock(
     totalChars += line.length + 1
   }
 
+  lines.push('')
+  return lines.join('\n')
+}
+
+/**
+ * 批级共享信息素块（星河收编 #3）：同批先完成的 worker 沉积的语义信号，
+ * 供后启动的 worker 优先核验/避让。最多 MAX_BATCH_SIGNALS 条，按衰减后
+ * 强度排序。store 为批级内存实例（不落盘，批结束 GC）——空库返回空串。
+ */
+export async function formatBatchStigmergyBlock(store: StigmergyStore): Promise<string> {
+  const entries = await store.query()
+  if (entries.length === 0) return ''
+
+  const top = [...entries]
+    .sort((a, b) => b.currentStrength - a.currentStrength)
+    .slice(0, MAX_BATCH_SIGNALS)
+  const lines: string[] = [
+    '## 本批共享信号',
+    '',
+    '同批协作的 worker 已对以下文件沉积语义信号——优先核验这些位置、避让死路：',
+    '',
+  ]
+  for (const e of top) {
+    const ctx = e.context ? ` — ${e.context}` : ''
+    lines.push(`- [${e.signal}] ${e.path}${ctx}`)
+  }
   lines.push('')
   return lines.join('\n')
 }

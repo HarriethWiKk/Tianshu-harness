@@ -24,8 +24,10 @@ import { buildScheduleRoutes } from './schedule-routes.js'
 import { buildTaskRoutes } from './task-routes.js'
 import { buildConfigRoutes } from './config-routes.js'
 import { buildEnvRoute } from './env-route.js'
+import { buildBrowserRoutes } from './browser-routes.js'
 import { buildProjectTemplatesRoutes } from './project-templates-routes.js'
 import { buildProjectDocsRoutes } from './project-docs-routes.js'
+import { buildCacheRoutes } from './cache-routes.js'
 import { CronScheduler } from './cron-scheduler.js'
 import { CronWiring } from './cron-wiring.js'
 import { buildMcpRoutes } from './mcp-api.js'
@@ -585,11 +587,18 @@ export async function runServe(opts: RunServeOptions = {}): Promise<RunningServe
   // Environment route: host toolchain availability (python, uv, git, node) for setup UI.
   Object.assign(routes, buildEnvRoute(apiToken))
 
+  // Browser routes: chromium 就绪探测 + 一键安装。只装桌面端的用户没有 CLI 可敲
+  // `rivet browser install`，缺了这两条路由截图能力对他们就是不可用。
+  Object.assign(routes, buildBrowserRoutes(apiToken))
+
   // Project templates route: first-run AGENTS.md / .rivet.md bootstrap for desktop UI.
   Object.assign(routes, buildProjectTemplatesRoutes(apiToken))
 
   // Project docs route: read/write AGENTS.md / .rivet.md for the desktop settings UI.
   Object.assign(routes, buildProjectDocsRoutes(apiToken))
+
+  // Cache usage route: 跨会话 cache-log 聚合 — 桌面端读不到 ~/.rivet 下的日志文件。
+  Object.assign(routes, buildCacheRoutes({ apiToken, defaultCwd: () => process.cwd() }))
 
   // MCP routes: server management + live status for the desktop MCP settings UI.
   Object.assign(routes, buildMcpRoutes({

@@ -300,3 +300,62 @@ describe('aggregateResults', () => {
     assert.ok(aggregated[0]!.risks.some(r => r === NUDGE))
   })
 })
+
+describe('aggregateResults quorum', () => {
+  // 星河收编 #1：组级通过阈值判定。k 解析 = quorumGroups.get(groupId) ?? policy.k。
+  const g = (id: string, status: WorkerResult['status'], groupId: string): WorkerResult =>
+    ({ ...result(id, status), groupId })
+
+  it('group passes when passed >= k (results preserved)', () => {
+    const results = [g('r1', 'passed', 'g1'), g('r2', 'passed', 'g1'), g('r3', 'failed', 'g1')]
+    const aggregated = aggregateResults(results, { kind: 'quorum', k: 2 })
+    assert.equal(aggregated.length, 3)
+    assert.equal(aggregated.find(r => r.workOrderId === 'r1')!.status, 'passed')
+    assert.equal(aggregated.find(r => r.workOrderId === 'r2')!.status, 'passed')
+    // group conclusion holds: failed member keeps its status (signal preserved)
+    assert.equal(aggregated.find(r => r.workOrderId === 'r3')!.status, 'failed')
+  })
+
+  it('group fails when passed < k: passed members downgraded to failed with note', () => {
+    const results = [g('r1', 'passed', 'g1'), g('r2', 'failed', 'g1')]
+    const aggregated = aggregateResults(results, { kind: 'quorum', k: 2 })
+    assert.equal(aggregated.length, 2)
+    assert.equal(aggregated.find(r => r.workOrderId === 'r1')!.status, 'failed')
+    assert.ok(aggregated.find(r => r.workOrderId === 'r1')!.risks.some(rr => rr.includes('quorum') && rr.includes('1/2 passed') && rr.includes('need 2')))
+    assert.ok(aggregated.find(r => r.workOrderId === 'r2')!.risks.some(rr => rr.includes('quorum')))
+  })
+
+  it('independent workers (no groupId) judged individually alongside groups', () => {
+    const results = [g('r1', 'passed', 'g1'), g('r2', 'passed', 'g1'), g('r3', 'passed', 'g1'), result('solo', 'failed')]
+    const aggregated = aggregateResults(results, { kind: 'quorum', k: 2 })
+    assert.equal(aggregated.find(r => r.workOrderId === 'solo')!.status, 'failed')
+    assert.equal(aggregated.find(r => r.workOrderId === 'r1')!.status, 'passed')
+  })
+
+  it('quorumGroups overrides global k per group', () => {
+    const results = [
+      g('a1', 'passed', 'gA'), g('a2', 'failed', 'gA'), // gA needs 2 (via quorumGroups)
+      g('b1', 'passed', 'gB'), g('b2', 'failed', 'gB'), // gB needs 1 (global k)
+    ]
+    const quorumGroups = new Map([['gA', 2]])
+    const aggregated = aggregateResults(results, { kind: 'quorum', k: 1 }, undefined, undefined, quorumGroups)
+    // gA not reached: a1 downgraded
+    assert.equal(aggregated.find(r => r.workOrderId === 'a1')!.status, 'failed')
+    // gB reached with 1 pass
+    assert.equal(aggregated.find(r => r.workOrderId === 'b1')!.status, 'passed')
+  })
+
+  it('group smaller than k: whole group fails (fail-closed, no silent downgrade)', () => {
+    const results = [g('r1', 'passed', 'g1'), g('r2', 'passed', 'g1')]
+    const aggregated = aggregateResults(results, { kind: 'quorum', k: 3 })
+    assert.equal(aggregated.find(r => r.workOrderId === 'r1')!.status, 'failed')
+    assert.ok(aggregated.find(r => r.workOrderId === 'r1')!.risks.some(rr => rr.includes('2/2 passed') && rr.includes('need 3')))
+  })
+
+  it('single independent worker: passed preserved, failed flagged', () => {
+    const results = [result('solo1', 'passed'), result('solo2', 'failed')]
+    const aggregated = aggregateResults(results, { kind: 'quorum', k: 1 })
+    assert.equal(aggregated.find(r => r.workOrderId === 'solo1')!.status, 'passed')
+    assert.equal(aggregated.find(r => r.workOrderId === 'solo2')!.status, 'failed')
+  })
+})

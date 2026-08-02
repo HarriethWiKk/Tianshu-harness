@@ -4,8 +4,9 @@ import { mkdirSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { precipitateDomainLessons } from '../domain-lesson-precipitate.js'
-import { buildDomainKnowledgeBlock } from '../domain-knowledge-block.js'
+import { buildDomainKnowledgeBlock, formatBatchStigmergyBlock } from '../domain-knowledge-block.js'
 import { DomainKnowledgeStore } from '../domain-knowledge-store.js'
+import { StigmergyStore } from '../../context/stigmergy.js'
 import type { WorkerResult } from '../work-order.js'
 
 const TMP = join(tmpdir(), `rivet-domain-b-test-${Date.now()}`)
@@ -213,5 +214,77 @@ describe('buildDomainKnowledgeBlock', () => {
       store.flushSync()
       assert.ok(buildDomainKnowledgeBlock(store, 'pojun').length <= 2200)
     } finally { cleanup() }
+  })
+})
+
+// ── 星河路由记录（收编 #5）：沉淀 → 召回 → 持久化 ──
+
+describe('galaxy routing records', () => {
+  test('record + recall by taskShape (newest first)', () => {
+    const store = makeStore()
+    try {
+      store.recordGalaxyRouting({ dimensionName: 'review', authority: 'yaoguang', taskShape: 'review', status: 'passed' })
+      store.recordGalaxyRouting({ dimensionName: 'review', authority: 'yaoguang', taskShape: 'review', status: 'failed' })
+      store.recordGalaxyRouting({ dimensionName: 'search', authority: 'tianji', taskShape: 'search', status: 'passed' })
+
+      const review = store.recallGalaxyRouting('review')
+      // 追加式：两条都在（胜率统计需要多次执行记录）；同毫秒时间戳下
+      // 排序不做强断言，只验证内容与去重后的集合
+      assert.equal(review.length, 2)
+      assert.deepEqual(review.map(r => r.status).sort(), ['failed', 'passed'])
+      const search = store.recallGalaxyRouting('search')
+      assert.equal(search.length, 1)
+      assert.equal(search[0]!.authority, 'tianji')
+    } finally { cleanup() }
+  })
+
+  test('persists across store instances (flushSync + reload)', () => {
+    const store = makeStore()
+    try {
+      store.recordGalaxyRouting({ dimensionName: 'verify', authority: 'yaoguang', taskShape: 'verify', status: 'passed' })
+      store.flushSync()
+
+      const reloaded = new DomainKnowledgeStore(TMP)
+      const records = reloaded.recallGalaxyRouting('verify')
+      assert.equal(records.length, 1)
+      assert.equal(records[0]!.authority, 'yaoguang')
+      assert.equal(records[0]!.status, 'passed')
+    } finally { cleanup() }
+  })
+
+  test('unknown taskShape recalls nothing', () => {
+    const store = makeStore()
+    try {
+      store.recordGalaxyRouting({ dimensionName: 'plan', authority: 'tianquan', taskShape: 'plan', status: 'passed' })
+      assert.equal(store.recallGalaxyRouting('nope').length, 0)
+    } finally { cleanup() }
+  })
+})
+
+// ── 批级共享信息素块（收编 #3）：worker prompt 注入侧 ──
+
+describe('formatBatchStigmergyBlock', () => {
+  test('formats top signals by decayed strength, empty store returns empty string', async () => {
+    const store = new StigmergyStore(undefined)
+    await store.deposit({ path: 'src/a.ts', signal: 'fragile', strength: 0.5 })
+    await store.deposit({ path: 'src/b.ts', signal: 'dead-end', strength: 0.9, context: 'recursion' })
+
+    const block = await formatBatchStigmergyBlock(store)
+    assert.ok(block.includes('本批共享信号'))
+    assert.ok(block.includes('[dead-end] src/b.ts — recursion'), '高强度的 dead-end 应排前')
+    assert.ok(block.includes('[fragile] src/a.ts'))
+
+    const empty = await formatBatchStigmergyBlock(new StigmergyStore(undefined))
+    assert.equal(empty, '')
+  })
+
+  test('caps at 3 signals', async () => {
+    const store = new StigmergyStore(undefined)
+    for (let i = 0; i < 5; i++) {
+      await store.deposit({ path: `src/f${i}.ts`, signal: 'fragile', strength: 0.9 })
+    }
+    const block = await formatBatchStigmergyBlock(store)
+    const matches = block.match(/^\- /gm)?.length ?? 0
+    assert.ok(matches <= 3, `最多 3 条，got ${matches}`)
   })
 })

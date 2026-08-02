@@ -40,6 +40,7 @@ import { createBackgroundJobsHook } from './hooks/background-jobs-hook.js'
 import { createMonitorHook } from './hooks/monitor-hook.js'
 import { createEditToolAdvisoryHook } from './hooks/edit-tool-advisory-hook.js'
 import { createSecurityPatternHook } from './hooks/security-pattern-hook.js'
+import { isSecurityGuidanceEnabled } from '../config/security-guidance-config.js'
 import { createEditFailureRecoveryHook } from './hooks/edit-failure-recovery-hook.js'
 import { createLossyObservationHook } from './hooks/lossy-observation-hook.js'
 import { createCompactionAmnesiaHook, type CompactionAmnesiaHookDeps } from './hooks/compaction-amnesia-hook.js'
@@ -51,6 +52,7 @@ import { createExternalClaimTrackingHook } from './hooks/external-claim-tracking
 import { createGeneralLedgerHook } from './hooks/general-ledger-hook.js'
 import { createGitClearAfterFailHook } from './hooks/git-clear-after-fail-hook.js'
 import { createDeadEndDetectorHook } from './hooks/dead-end-detector.js'
+import { createScriptIterationDetectorHook } from './hooks/script-iteration-detector.js'
 import { createBatchConvergenceHook } from './hooks/batch-convergence-hook.js'
 import { createRegressionBisectHook } from './hooks/regression-bisect-hook.js'
 import { createIntentAnchorHook } from './hooks/intent-anchor-hook.js'
@@ -160,6 +162,8 @@ export interface RuntimeHookDeps {
   physarumFileAccess?: PhysarumFileAccessHookDeps
   /** Explicit opt-in for Songline substrate post-session deposit. Default: false. */
   songlineEnabled?: boolean
+  /** 安全模式告警（层1）。config `agent.securityGuidance`；undefined = 默认开。 */
+  securityGuidance?: boolean
   /** Task summary source for Songline substrate. Required only when songlineEnabled is true. */
   getTaskSummary?: () => TaskLedgerSummary | null
   /** Optional cycle relay bridge for Songline substrate. */
@@ -561,11 +565,13 @@ export function createDefaultRuntimeHooks(deps: RuntimeHookDeps): RuntimeHook[] 
   }
 
   // Security-Pattern: postTool hook — 移植自官方 security-guidance 插件的
-  // PostToolUse 层。写操作后正则扫描 25 条已知危险模式（命令注入、反序列化
-  // RCE、XSS、eval、弱加密、TLS 校验关闭、XXE 等），命中经 AdvisoryBus 注入
-  // 中文告警。零成本零延迟（纯正则不调 API），命中才注入（缓存安全）。
-  // Opt-in：默认关，需 RIVET_SECURITY_GUIDANCE=1 显式启用。
-  if (deps.advisoryBus && process.env.RIVET_SECURITY_GUIDANCE === '1') {
+  // PostToolUse 层。写操作后正则扫描已知危险模式（命令注入、反序列化 RCE、
+  // XSS、eval、弱加密、TLS 校验关闭、XXE、SQL 注入、硬编码密钥），命中经
+  // AdvisoryBus 注入中文告警。零成本零延迟（纯正则不调 API），命中才注入
+  // （缓存安全），同一 (文件, 规则) 全会话只提醒一次。
+  // 默认开（与其他 advisory hook 同档）；config `agent.securityGuidance=false`
+  // 或 RIVET_SECURITY_GUIDANCE=0 关闭。有成本的 LLM 安全审查是层2/层3，另有开关。
+  if (deps.advisoryBus && isSecurityGuidanceEnabled(deps.securityGuidance)) {
     hooks.push(createSecurityPatternHook({ advisoryBus: deps.advisoryBus }))
   }
 
@@ -662,6 +668,17 @@ export function createDefaultRuntimeHooks(deps: RuntimeHookDeps): RuntimeHook[] 
       advisoryBus: deps.advisoryBus,
       deposit: deps.stigmergyDeposit,
       obligations: deps.obligations,
+    }))
+  }
+
+  // Script-Iteration Detector: postTool hook — 同一脚本文件 edit→bash(run)→truncated→edit
+  // 迭代 ≥3 次且无诊断工具 → 脚本迭代停滞。与 dead-end-detector 互补：
+  // 那边抓 edit→verify-fail（需工具失败），这边抓 edit→bash→edit（工具全成功）。
+  // Gated by RIVET_SCRIPT_ITERATION_DETECTOR (default on; set to '0' to disable).
+  if (deps.advisoryBus && process.env.RIVET_SCRIPT_ITERATION_DETECTOR !== '0') {
+    hooks.push(createScriptIterationDetectorHook({
+      advisoryBus: deps.advisoryBus,
+      deposit: deps.stigmergyDeposit,
     }))
   }
 

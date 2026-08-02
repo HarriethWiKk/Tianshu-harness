@@ -17,6 +17,7 @@ import {
   getRoutingConfig,
   getSearchConfig,
   getToolPresetConfig,
+  getVisionAutoBridge,
   getVisionModelConfig,
   loadConfig,
   setApprovalMode,
@@ -28,6 +29,7 @@ import {
   setRoutingConfig,
   setSearchConfig,
   setToolPresetConfig,
+  setVisionAutoBridge,
   setVisionModelConfig,
 } from '../config/manager.js'
 import { buildDomainPickerEntries } from '../agent/domain-picker-entries.js'
@@ -56,8 +58,15 @@ export function loadSettingsDraft(): SettingsDraft {
     workers: routing.workers,
     review: routing.review,
     vision: vision
-      ? { provider: vision.provider, model: vision.model, prompt: vision.prompt, maxTokens: vision.maxTokens }
+      ? {
+          provider: vision.provider,
+          model: vision.model,
+          prompt: vision.prompt,
+          maxTokens: vision.maxTokens,
+          fallback: vision.fallback,
+        }
       : null,
+    visionAutoBridge: getVisionAutoBridge(),
     basics: {
       toolPreset: getToolPresetConfig().preset ?? 'minimal',
       approval: cfg.agent.approval,
@@ -134,7 +143,13 @@ export function saveSettings(
           model: draft.vision.model,
           prompt: draft.vision.prompt,
           maxTokens: draft.vision.maxTokens,
+          // 显式发 null 清除、发对象设置——省略会被 setter 当作"保留现有"，那样面板里
+          // 清掉备用桥就无效了。
+          fallback: draft.vision.fallback ?? null,
         }))
+        break
+      case 'visionAuto':
+        attempt(block, () => setVisionAutoBridge(draft.visionAutoBridge))
         break
       case 'toolPreset':
         attempt(block, () => setToolPresetConfig({ preset: draft.basics.toolPreset }))

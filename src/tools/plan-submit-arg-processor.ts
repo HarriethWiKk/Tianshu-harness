@@ -26,5 +26,5 @@ export const planSubmitArgProcessor = createFileContentArgProcessor({
     return `.rivet/plans/${slugify(title)}.md`
   },
   render: ({ path, lines, chars }) =>
-    `${PLAN_POINTER_PREFIX} ${path} — ${lines} lines, ${chars} chars. ${POINTER_INTERNAL_TAG} Use read_file to review.]`,
+    `${PLAN_POINTER_PREFIX} ${path} — ${lines} lines, ${chars} chars. 已成功落盘，勿重贴——历史正常截断，查看用 read_file。${POINTER_INTERNAL_TAG} display-only pointer]`,
 })

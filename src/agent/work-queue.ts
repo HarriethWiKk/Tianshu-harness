@@ -5,6 +5,9 @@ import type { AgentRole } from './coordination-policy.js'
 export interface QueueEntry {
   order: WorkOrder
   priority: number
+  /** 调度亲和键（星河收编 #4）：派生自 order.authority，dequeue 同 priority
+   *  档内优先连续出队同域任务（同域 worker 共享预热/信息素/域课）。 */
+  affinityKey?: string
 }
 
 export type QueueEvent =
@@ -25,6 +28,8 @@ export class WorkOrderQueue {
   /** Separate concurrency cap for hands (write) workers. Default: same as maxConcurrency. */
   private maxWriteConcurrency: number
   private listeners: Array<(event: QueueEvent) => void> = []
+  /** 上一个出队 order 的 authority——亲和 tie-breaker 的锚点。 */
+  private lastDequeuedAuthority: string | undefined
 
   constructor(maxConcurrency = Infinity, roleConcurrency?: { explore?: number; write?: number }) {
     this.maxConcurrency = maxConcurrency
@@ -44,7 +49,7 @@ export class WorkOrderQueue {
   enqueue(order: WorkOrder, priority = 0): boolean {
     if (this.inFlightKeys.has(order.dedupeKey)) return false
     if (this.entries.some(e => e.order.dedupeKey === order.dedupeKey)) return false
-    this.entries.push({ order, priority })
+    this.entries.push({ order, priority, affinityKey: order.authority })
     this.entries.sort((a, b) => b.priority - a.priority)
     this.emit({ type: 'enqueued', order })
     return true
@@ -60,9 +65,23 @@ export class WorkOrderQueue {
       else exploreInFlight++
     }
 
-    const index = this.entries.findIndex(e => {
+    // 条件依赖边（星河收编 #6）：主依赖完成 → 可运行；主依赖失败 →
+    // skip 边不可运行（清扫标 skipped）、alternate 边等 alternate 完成。
+    const depOk = (dep: string | import('./work-order.js').DependencyEdge): boolean => {
+      if (typeof dep === 'string') return this.completedIds.has(dep)
+      if (this.completedIds.has(dep.dependsOn)) return true
+      if (this.failedIds.has(dep.dependsOn)) {
+        if (dep.onFailure === 'alternate' && dep.alternateOrderId) {
+          return this.completedIds.has(dep.alternateOrderId)
+        }
+        return false // skip / 无分支：依赖失败 → 不运行（清扫阶段标 blocked/skipped）
+      }
+      return false // 主依赖未完成
+    }
+
+    const canRun = (e: QueueEntry): boolean => {
       // 依赖检查
-      if (!e.order.dependencies.every(dep => this.completedIds.has(dep))) return false
+      if (!e.order.dependencies.every(depOk)) return false
       // 文件冲突检查
       if (this.hasFileConflict(e.order)) return false
       // Global concurrency cap: never exceed maxConcurrency regardless of role pools
@@ -76,11 +95,25 @@ export class WorkOrderQueue {
         if (exploreInFlight >= this.maxExploreConcurrency) return false
       }
       return true
-    })
+    }
 
-    if (index === -1) return undefined
-    const [entry] = this.entries.splice(index, 1)
+    const firstRunnable = this.entries.findIndex(canRun)
+    if (firstRunnable === -1) return undefined
+    // 亲和 tie-breaker（星河收编 #4）：只在同 priority 档内选与上一个出队
+    // 同 authority 的任务——priority 优先不变，亲和不压依赖/冲突/并发检查
+    // （那些 canRun 已一致）。
+    let pick = firstRunnable
+    if (this.lastDequeuedAuthority !== undefined) {
+      const firstPriority = this.entries[firstRunnable]!.priority
+      const affinity = this.entries.findIndex((e, i) =>
+        i > firstRunnable && e.priority === firstPriority && e.affinityKey === this.lastDequeuedAuthority && canRun(e),
+      )
+      if (affinity !== -1) pick = affinity
+    }
+
+    const [entry] = this.entries.splice(pick, 1)
     if (!entry) return undefined
+    this.lastDequeuedAuthority = entry.order.authority
     this.emit({ type: 'dequeued', order: entry.order })
     return entry.order
   }
@@ -88,9 +121,15 @@ export class WorkOrderQueue {
   /** 检查 order 是否与 in-flight 任务有文件冲突 */
   hasFileConflict(order: WorkOrder): boolean {
     if (!order.scope.files?.length) return false
+    // Two read-only workers can inspect the same snapshot in parallel. Keep
+    // serialization whenever either side can write, so no worker reads a moving
+    // target and concurrent writers remain exclusive.
+    const orderWrites = classifyProfile(order.profile) === 'hands'
     const orderFiles = new Set(order.scope.files)
     for (const inflight of this.inFlightOrders.values()) {
       if (!inflight.scope.files?.length) continue
+      const inflightWrites = classifyProfile(inflight.profile) === 'hands'
+      if (!orderWrites && !inflightWrites) continue
       if (inflight.scope.files.some(f => orderFiles.has(f))) return true
     }
     return false

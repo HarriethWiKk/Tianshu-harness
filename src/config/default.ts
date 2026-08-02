@@ -105,6 +105,7 @@ export const DEFAULT_CONFIG: Config = {
     domainKeywordRouting: true,
     verificationSnapshot: 'auto',
     songlineEnabled: false,
+    securityGuidance: true,
     desktopTools: false,
     crossSessionEnabled: true,
     hearthObserveEnabled: false,
@@ -171,6 +172,8 @@ export const DEFAULT_CONFIG: Config = {
       skipAuto: true,
       mechanicalFastPath: true,
     },
+    // 未配 visionModel 时不自动挑视觉模型送图——opt-in，见 schema 注释。
+    visionAutoBridge: false,
     goal: {
       judge: {
         enabled: true,

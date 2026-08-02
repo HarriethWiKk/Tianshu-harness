@@ -2,6 +2,7 @@ import { z } from 'zod'
 import type { AggregationPolicy } from '../agent/work-order.js'
 import type { CoordinatorRun, DelegationRequest, WorkerActivityEvent } from '../agent/coordinator.js'
 import { runCouncil, runCouncilDebate, buildSeatObjective, type CouncilDeps } from '../agent/council/council-orchestrator.js'
+import { starDomainRegistry } from '../agent/star-domain-registry.js'
 import { summarizeCouncilPlan } from '../agent/council/council-render.js'
 import { encodeCouncilPanel, type CouncilPanelModel } from '../tui/council-panel-model.js'
 import { DEFAULT_COUNCIL_SEATS, THREE_PILLAR_COUNCIL_SEATS, mergeSeatOverrides, type CouncilSeat, type CouncilRoutingShadowEvent } from '../agent/council/council-routing.js'
@@ -69,6 +70,9 @@ const inputSchema = z.object({
    *  Saves a model round-trip — the council result directly triggers execution
    *  instead of waiting for the model to extract planJson and call team_orchestrate. */
   autoExecute: z.boolean().optional(),
+  /** 两阶段确认（星河收编 #7）：显式 confirm:false → 只返回席位分配方案不执行；
+   *  confirm:true → 点火。缺省 undefined → 直接执行（现状行为，向后兼容）。 */
+  confirm: z.boolean().optional(),
 })
 export function createCouncilConveneTool(
   coordinator: CouncilConveneCoordinator,
@@ -123,6 +127,7 @@ export function createCouncilConveneTool(
           rounds: { type: 'number', description: '最大辩论轮数（1-2，默认 1 = 单轮）。传 2 启用反驳轮；第 2 轮仅在第 1 轮暴露冲突时触发。' },
           pillars: { type: 'boolean', description: '为 true 时启用三柱旗舰议事会（council max）：扩张柱（破军激进+天机质疑）× 约束柱（天权称量+华盖否决）× 平衡柱（瑶光合成裁决），共 5 席制度化对抗。最复杂的工程任务用它。显式 seats 参数优先于此模式。' },
           autoExecute: { type: 'boolean', description: '为 true 时，自动把 council 批准的计划派发给 team_orchestrate。省去一次模型往返——计划在审查后立即执行，无需手工提取。' },
+          confirm: { type: 'boolean', description: '两阶段确认（收编 #7）：显式 false → 只展示席位分配方案不执行；true → 点火。缺省 → 直接执行（兼容）。' },
         },
         required: ['objective'],
       },
@@ -171,6 +176,30 @@ export function createCouncilConveneTool(
       const dupe = authorities.find((a, i) => authorities.indexOf(a) !== i)
       if (dupe) {
         return { content: `council_convene: 席位 authority 重复「${dupe}」—— 每席必须是不同的星域 id（议事会按 authority 绑定结果，重复会丢席并重复计票）。`, isError: true }
+      }
+
+      // ── Phase 1: Proposal (explicit confirm:false) ─────────────────
+      // 星河收编 #7：只展示席位分配方案，不派发任何 worker。缺省/true 直接
+      // 执行（向后兼容——此前 council_convene 没有 proposal 阶段）。
+      if (parsed.data.confirm === false) {
+        const lines = [
+          '🌌 议事会席位分配方案',
+          '',
+          `目标：${objective}`,
+          '',
+          `席位（${councilSeats.length}）：`,
+        ]
+        for (const seat of councilSeats) {
+          const star = starDomainRegistry.get(seat.authority)
+          const label = star ? `${star.name}（${seat.authority}）` : seat.authority
+          const tier = seat.tierHint ? ` [${seat.tierHint}]` : ''
+          const charter = seat.charter ? ` — ${seat.charter}` : ''
+          lines.push(`  ${label}${tier}${charter}`)
+          lines.push(`     objective: ${buildSeatObjective(seat, { objective, items }).split('\n')[0]}`)
+        }
+        lines.push('', `轮数：${rounds ?? 1}${proGateNote ? '（已按单轮执行——Pro 门）' : ''}`)
+        lines.push('', '调用 council_convene({..., confirm: true}) 点火执行。')
+        return { content: lines.join('\n'), uiContent: `♟ 议事会方案 · ${councilSeats.length} 席位` }
       }
 
       // Build authority lookup: workOrderId prefix → authority, for activity mapper.

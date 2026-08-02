@@ -42,10 +42,18 @@ export interface CouncilWorkflowPromptOptions {
   rounds?: number
 }
 
+export interface ScoutWorkflowPromptOptions {
+  objective: string
+  /** 用户显式指定的诊断维度（--dims 前端,后端,集成）；缺省由模型按仓库形态自选。 */
+  dims?: string[]
+}
+
 const WRITING_PLAN_COMMANDS = new Set(['/plan', '/write-plan'])
 const PLAN_CLOSE_COMMANDS = new Set(['/plan-close'])
 const TEAM_COMMANDS = new Set(['/team'])
 const COUNCIL_COMMANDS = new Set(['/council'])
+const SCOUT_COMMANDS = new Set(['/scout'])
+const GALAXY_COMMANDS = new Set(['/galaxy'])
 
 export function isWritingPlanCommand(command: string): boolean {
   return WRITING_PLAN_COMMANDS.has(command.toLowerCase())
@@ -329,8 +337,17 @@ If the objective IS a Markdown plan file path (e.g. .rivet/knowledge/...md or do
      (No need to pass planJson — team_orchestrate reads it from the internal plan store.)
 
 If the objective is a free-form task description (no plan file):
+  0. Terrain scout (skip for trivial/single-file tasks): before calling plan_task, run one delegate_batch
+     with 1-3 code_scout workers to map the affected modules. Each scout gets one dimension —
+     e.g. "find all callers of <X>" / "check if similar fix already exists in <area>" / "identify
+     test files touched by this change". Scouts return findings with evidenceKind + evidenceRefs
+     (firsthand file:line citations or inferred notes). This gives plan_task a grounded picture
+     instead of guessing the blast radius from a free-form sentence.
   1. Call plan_task with { objective, files: [the source files in scope], execute: true } to shard and dispatch the first wave.
-     Listing scope files lets the planner cut orthogonal per-module shards instead of one monolith.
+     **Always include the files parameter** — even for new-file tasks where the files don't exist yet.
+     Use full relative paths (e.g. "desktop/src/lib/sound.ts"). If you ran a terrain scout, also include
+     the key source files its findings revealed. Listing scope files lets the planner cut orthogonal
+     per-module shards instead of one monolith with empty scope (which causes workers to produce nothing).
   2. Follow the same review-aggregate-then-continue pattern as above (team_orchestrate without planJson).
 
 After ALL waves complete:
@@ -416,25 +433,115 @@ ${objective}
 - 用户确认执行后,提取 content 中 council-plan-json 块里的 JSON,原样作为 team_orchestrate 的 planJson 参数发起执行(模型交接,team 直接按 files 分波,无需重新解析)。用户不确认就此打住——议事会绝不自行触发 team_orchestrate。`
 }
 
+export const SCOUT_USAGE = 'Scout usage: /scout <诊断目标> [--dims 前端,后端,集成]'
+
+export function parseScoutWorkflowArgs(args: string): ScoutWorkflowPromptOptions | null {
+  let objective = args.trim()
+  if (!objective) return null
+
+  // Parse --dims flag: /scout 全面体检 --dims 前端,后端,集成
+  let dims: string[] | undefined
+  const dimsIdx = objective.search(/\s+--dims\b/)
+  if (dimsIdx >= 0) {
+    const afterDims = objective.slice(dimsIdx).replace(/^\s+--dims\s*/, '')
+    // 空 token 过滤：`--dims` 后仅空白/逗号时不注入空维度，降级为模型自选。
+    const dimTokens = afterDims.split(/[\s,]+/).filter(s => s.length > 0 && !s.startsWith('--'))
+    objective = objective.slice(0, dimsIdx).trim()
+    // delegate_batch 单批上限 5 任务 → 维度最多取 5 个。
+    if (dimTokens.length > 0) dims = dimTokens.slice(0, 5)
+  }
+
+  return objective ? { objective, ...(dims?.length ? { dims } : {}) } : null
+}
+
+export function buildScoutWorkflowPrompt(options: ScoutWorkflowPromptOptions): string {
+  const objective = options.objective.trim()
+  const dimsNote = options.dims && options.dims.length > 0
+    ? `诊断维度用用户指定的 ${options.dims.length} 个：${options.dims.join(' · ')}——每个维度一个 scout，不增不减`
+    : '诊断维度由你按仓库形态自选 2-5 个（如 前端 / 后端 / 前后端集成一致性 / 构建与依赖健康）'
+
+  return `我正在使用 /scout 巡天侦察蜂群——轻量并行只读诊断。只诊断不动手：不写文件、不出计划文档、不走 team 编排。
+
+诊断目标：
+${objective}
+
+执行契约——四步，顺序执行：
+
+1. 先侦察后派发：先自己内联摸底（README / 构建清单 / 目录形态，几次读操作即可），一句话向用户报出技术栈与将要并行的诊断维度，然后立即派发。不要把摸底做成全量阅读——摸底的产出只是维度切分依据。
+
+2. 按关注维度切分，不按文件分片：${dimsNote}。维度之间正交指「各自独立回答一类问题」；集成一致性类维度（前后端接口对齐、配置贯通、鉴权链路）天然跨模块，允许覆盖其他维度已读的文件——诊断的正交是问题维度正交，不是文件集不相交。
+
+3. 一次 delegate_batch 并行派发全部维度：每个任务 profile: "code_scout"（只读），kind: "code_search"；各配不同星域 authority 带入差异化视角（如前端/代码质感 wenqu、后端/前提质疑 tianji、跨域集成 tianxuan、复现验证 yaoguang）；objective 写清该维度要回答的具体问题清单（编号列出，5 条以内）。深度体检显式传 timeoutMs: 900000——code_scout 默认 8 分钟对全仓深侦察不够。
+
+4. 交付契约——实测核对清单 + runbook：
+   - 每项结论标 ✅/❌ 并附证据：命令 exit code、逐一比对的数量、file:line 引用。拿不出证据的项标「未验证」，不得标 ✅。
+   - scout 返回的 findings 是待核验假设：构建/安装/测试类验证命令由你亲自实跑取 exit code，不引用 scout 转述；关键结论抽查 read_file/grep 核验。
+   - 结尾输出「启动/修复前需要准备」小节：环境依赖、启动命令、账号等可操作清单。
+
+后续出口：诊断发现需要修复的问题时，先问用户是否修复；用户确认后把核对清单作为 plan_task 的输入走计划-执行链。不要在 /scout 流程里直接改文件。`
+}
+
 export function resolveEcosystemWorkflowInput(input: string, opts?: { date?: Date }): WorkflowResolveResult | null {
   const parsed = parseSlashInput(input)
   if (!parsed) return null
 
   if (TEAM_COMMANDS.has(parsed.command)) {
     const team = parseTeamWorkflowArgs(parsed.args)
-    // team_orchestrate 在 EXTENDED 层——成功分支才声明（usage 无真实调用）。
+    // team_orchestrate 已升入 CORE（T3，2026-07-29）——默认可见，无需 requiredTools
+    // 挂载；继续声明反而会把用户显式 deny 的工具强行挂回。
     return team
-      ? { command: parsed.command, prompt: buildTeamWorkflowPrompt(team), requiredTools: ['team_orchestrate'] }
+      ? { command: parsed.command, prompt: buildTeamWorkflowPrompt(team) }
       : { command: parsed.command, prompt: TEAM_USAGE }
+  }
+
+  if (SCOUT_COMMANDS.has(parsed.command)) {
+    const scout = parseScoutWorkflowArgs(parsed.args)
+    // delegate_batch 在 CORE 层（tool-tiers.ts）——默认可见，无需 requiredTools 挂载。
+    return scout
+      ? { command: parsed.command, prompt: buildScoutWorkflowPrompt(scout) }
+      : { command: parsed.command, prompt: SCOUT_USAGE }
   }
 
   if (COUNCIL_COMMANDS.has(parsed.command)) {
     const council = parseCouncilWorkflowArgs(parsed.args)
-    // council_convene 出计划 + 用户确认后 team_orchestrate 交接执行（prompt L409 契约），
-    // 两者都在 EXTENDED 层——成功分支才声明（usage 无真实调用）。
+    // council_convene 在 EXTENDED 层——成功分支才声明（usage 无真实调用）。
+    // 交接执行用的 team_orchestrate 已升入 CORE（T3），不再需要挂载。
     return council
-      ? { command: parsed.command, prompt: buildCouncilWorkflowPrompt(council), requiredTools: ['council_convene', 'team_orchestrate'] }
+      ? { command: parsed.command, prompt: buildCouncilWorkflowPrompt(council), requiredTools: ['council_convene'] }
       : { command: parsed.command, prompt: COUNCIL_USAGE }
+  }
+
+  if (GALAXY_COMMANDS.has(parsed.command)) {
+    if (!parsed.args) return { command: parsed.command, prompt: 'Usage: /galaxy <任务描述>\n启动星河集群——拆解为多个维度由不同星域并行执行。' }
+    return {
+      command: parsed.command,
+      prompt: `用户通过 /galaxy 启动了星河 MoE 集群。你是监管者，只做分派和汇总。
+
+任务：${parsed.args}
+
+完整生命周期（严格按序执行）：
+
+【派发阶段】
+1. skill(name="galaxy")
+2. memory recall 查看历史同类任务的星域组合模式，复用成功经验
+3. 如需外部资料，用 web_search 搜索（每个 worker 也可以自己搜）
+4. glob 扫文件，按后缀分组；结合历史模式确定激活哪些专家
+5. galaxy({confirm: false}) 展示方案，确认后 galaxy({confirm: true}) 启动集群
+6. 等待子代理全部完成——期间不做任何代码操作，只等待
+
+【汇总阶段】
+7. 子代理全部返回后，汇总各维度产出
+8. 逐一检查：每个 worker 是否跑了测试？是否 typecheck 通过？是否有遗留 TODO？
+   - 任何不满足 → 标为阻塞，重启集群修复
+9. memory remember 记录本次星域组合的成功/失败模式
+10. 判断结果：
+    - 全部通过 + 测试绿 + typecheck 绿 → deliver_task commit=true 交付（释放文件归属）
+    - 有失败/冲突/测试红 → 先 deliver_task commit=true 释放本轮文件归属，再分析根因 → galaxy 重启集群修复
+
+【释放纪律】每轮集群结束后必须 deliver_task commit=true 或显式释放文件归属。
+上一轮没释放 = 下一轮文件冲突被拦截。绝不跨轮持有文件归属。`,
+      requiredTools: ['galaxy'],
+    }
   }
 
   if (PLAN_CLOSE_COMMANDS.has(parsed.command)) {

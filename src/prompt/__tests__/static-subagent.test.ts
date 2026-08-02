@@ -10,11 +10,13 @@ import {
 } from '../static-subagent.js'
 import type { ToolDefinition } from '../../api/types.js'
 
-/** sha256 of buildSystemPrompt({ tools: [] }) as of 2026-07-27（0c3bfb62 有意变更：
- *  交叉验证纪律退回启明域，通用层不再双重剂量）。The sub-agent
- *  refactor must never move this: the main-controller prompt is the frozen head
- *  of every prefix-cached request, and a byte change invalidates every session. */
-const MAIN_PROMPT_SHA256 = '54dcf9bdcff53ddec88c2ce52bd99c2abb70554a133fbb8f933512dbada55374'
+/** sha256 of buildSystemPrompt({ tools: [] }) as of 2026-07-30（Phase 2：
+ *  视觉验证闭环指导补上 compare+intent 用法——改前截基线、改后像素比对、
+ *  声明意图区域、裁决越界）。
+ *  The sub-agent refactor must never move this: the main-controller prompt is
+ *  the frozen head of every prefix-cached request, and a byte change
+ *  invalidates every session. */
+const MAIN_PROMPT_SHA256 = '04a6e69835f3ebdce3f84ecc271044fb7f438905cc48df7abdc5616a714ce68e'
 
 function tool(name: string): ToolDefinition {
   return { name, description: '', input_schema: { type: 'object', properties: {} } } as ToolDefinition

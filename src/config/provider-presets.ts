@@ -1,6 +1,6 @@
 import type { ModelConfig, ProviderConfig } from './schema.js'
 
-export type ProviderPresetKey = 'deepseek' | 'glm' | 'mimo' | 'mimo-api' | 'minimax' | 'codex' | 'siliconflow' | 'longcat' | 'ccswitch'
+export type ProviderPresetKey = 'deepseek' | 'glm' | 'mimo' | 'mimo-api' | 'minimax' | 'codex' | 'siliconflow' | 'longcat' | 'ccswitch' | 'zhipu-vision'
 
 export interface ProviderPreset {
   key: ProviderPresetKey
@@ -415,6 +415,44 @@ export const PROVIDER_PRESETS: Record<ProviderPresetKey, ProviderPreset> = {
         },
       ],
       unsupported: [],
+    },
+  },
+  // 智谱免费视觉模型 — 走通用 PaaS 端点（非 coding 套餐端点）。
+  // glm-4v-flash 是智谱首个完全免费的图像理解模型，API 调用免费、不限期。
+  // 与 glm provider 复用同一个 ZHIPU_API_KEY，但端点不同：
+  //   coding 套餐 → api/coding/paas/v4（glm provider 用，按订阅计费）
+  //   通用 PaaS  → api/paas/v4（本 provider 用，glm-4v-flash 在此免费）
+  // 上下文 8K / 最大输出 1K —— 只适合做识图桥（描述图片），不适合当主控。
+  'zhipu-vision': {
+    key: 'zhipu-vision',
+    label: '智谱视觉 (GLM-4V-Flash 免费)',
+    defaultModelId: 'glm-4v-flash',
+    provider: {
+      name: 'zhipu-vision',
+      apiKeyEnv: 'ZHIPU_API_KEY',
+      baseUrl: 'https://open.bigmodel.cn/api/paas/v4',
+      protocol: 'openai',
+      capabilities: {
+        cacheControl: false,
+        stripParams: [],
+        toolJsonBug: false,
+        prefixCache: 'none',
+        prefixCompletion: false,
+      },
+      thinking: 'disabled',
+      maxTokens: 1024,
+      models: [
+        {
+          id: 'glm-4v-flash',
+          alias: 'glm-4v-flash',
+          contextWindow: 8192,
+          maxTokens: 1024,
+          tier: 'cheap',
+          supportsVision: true,
+          pricing: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, free: true },
+        },
+      ],
+      unsupported: ['stream_options'],
     },
   },
 }

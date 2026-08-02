@@ -1,6 +1,6 @@
 import { z } from 'zod'
 import type { CoordinatorRun, DelegationRequest } from '../agent/coordinator.js'
-import { aggregationPolicySchema, workOrderKindSchema, type AggregationPolicy } from '../agent/work-order.js'
+import { aggregationPolicyKinds, aggregationPolicySchema, workOrderKindSchema, type AggregationPolicy } from '../agent/work-order.js'
 import type { ContextClaimStore } from '../context/claim-store.js'
 import type { ClaimProposal } from '../context/claims.js'
 import { DEFAULT_DELEGATE_PROFILE, profileRegistry, delegationToolTimeoutMs } from '../agent/profile-registry.js'
@@ -39,6 +39,14 @@ const authorityStringSchema = z.string().refine(
   (val) => ({ message: `未知星域 "${val}"。可用：${starDomainRegistry.getDomainIds().join(', ')}` }),
 )
 
+/** 条件依赖边（星河收编 #6 入口）：index 引用批内任务，失败时按 onFailure
+ *  分支——skip 跳过本任务、alternate 改等 alternateOrderId（同为批内索引）。 */
+const dependsOnEdgeSchema = z.object({
+  index: z.number().int().nonnegative(),
+  onFailure: z.enum(['skip', 'alternate']).optional(),
+  alternateOrderId: z.number().int().nonnegative().optional(),
+})
+
 const taskSchema = z.object({
   objective: z.string().min(1),
   kind: workOrderKindSchema.optional(),
@@ -48,8 +56,9 @@ const taskSchema = z.object({
   symbols: z.array(z.string()).optional(),
   /** Indices (into this batch's tasks array) this task depends on — the
    *  referenced tasks run first. Enforced by WorkOrderQueue via stable
-   *  `batch:N` ids. */
-  dependsOn: z.array(z.number().int().nonnegative()).optional(),
+   *  `batch:N` ids. 支持条件边对象（收编 #6）：{ index, onFailure,
+   *  alternateOrderId }。 */
+  dependsOn: z.array(z.union([z.number().int().nonnegative(), dependsOnEdgeSchema])).optional(),
   /** Worker ID to resume. The worker continues from its previous session
    *  context instead of starting fresh. Use the workOrderId from a previous
    *  delegate_task/delegate_batch result. */
@@ -70,17 +79,27 @@ function extractClaimsFromRun(run: CoordinatorRun, toolUseId: string, claimStore
     const evidencePaths = result.changedFiles.slice(0, 3)
     result.findings.forEach((finding, findingIndex) => {
       const claimText = typeof finding === 'string' ? finding : finding.claim
+      const evidenceText = typeof finding === 'string' ? finding : finding.evidence
       const confidence = typeof finding === 'string' ? 0.7
         : finding.confidence === 'high' ? 0.85
         : finding.confidence === 'medium' ? 0.7
         : 0.55
+      // 一手实测带 file:line 的发现天然比转述推断可信度高一个台阶
+      const isFirsthand = typeof finding !== 'string' && finding.evidenceKind === 'firsthand'
+      const fitness = isFirsthand ? 5
+        : confidence >= 0.85 ? 5 : confidence >= 0.7 ? 3 : 2
       const eventId = `${toolUseId}:worker:${result.workOrderId}:${findingIndex}`
+      const evidenceKind = typeof finding !== 'string' ? finding.evidenceKind : undefined
+      const prefix = evidenceKind === 'firsthand' ? '[一手] ' : evidenceKind === 'inferred' ? '[转述] ' : ''
+      const refs = typeof finding !== 'string' && finding.evidenceRefs?.length
+        ? ` (${finding.evidenceRefs.join(', ')})`
+        : ''
       const proposal: ClaimProposal = {
         kind: 'worker_finding',
         scope: 'session',
-        text: claimText,
+        text: `${prefix}${claimText}${refs}`,
         confidence,
-        fitness: confidence >= 0.85 ? 5 : confidence >= 0.7 ? 3 : 2,
+        fitness,
         source: { actor: 'worker', sessionId, turn: 0, eventId },
         evidence: [{
           id: `${eventId}:finding`,
@@ -140,7 +159,24 @@ export function createDelegateBatchTool(
                 authority: { type: 'string', description: '可选星域人格（如 tianquan、tianji、yuheng）。' },
                 files: { type: 'array', items: { type: 'string' } },
                 symbols: { type: 'array', items: { type: 'string' } },
-                dependsOn: { type: 'array', items: { type: 'integer' }, description: '本批次中必须先完成的任务下标（被引用的任务会先运行）。例如测试任务依赖它所覆盖的源码任务。' },
+                dependsOn: {
+                  type: 'array',
+                  description: '本批次中必须先完成的任务下标（被引用的任务会先运行）。例如测试任务依赖它所覆盖的源码任务。支持条件边对象：{ index, onFailure: skip|alternate, alternateOrderId }（收编 #6）。',
+                  items: {
+                    anyOf: [
+                      { type: 'integer', minimum: 0 },
+                      {
+                        type: 'object',
+                        properties: {
+                          index: { type: 'integer', minimum: 0 },
+                          onFailure: { type: 'string', enum: ['skip', 'alternate'] },
+                          alternateOrderId: { type: 'integer', minimum: 0 },
+                        },
+                        required: ['index'],
+                      },
+                    ],
+                  },
+                },
                 resume: { type: 'string', description: '要恢复的 worker ID。worker 从之前的会话上下文继续，而不是从零开始。' },
                 maxTurns: { type: 'integer', description: MAX_TURNS_TOOL_DESCRIPTION },
                 timeoutMs: { type: 'integer', description: TIMEOUT_MS_TOOL_DESCRIPTION },
@@ -149,7 +185,7 @@ export function createDelegateBatchTool(
             },
             description: '要并行运行的任务数组（最多 5 个）。',
           },
-          policy: { type: 'string', enum: [...aggregationPolicySchema.options], description: '聚合策略。默认：primary_decides。' },
+          policy: { type: 'string', enum: [...aggregationPolicyKinds], description: '聚合策略。默认：primary_decides。' },
         },
         required: ['tasks'],
       },
@@ -185,14 +221,24 @@ export function createDelegateBatchTool(
       // Validate dependsOn indices: must point at another task in this batch.
       // Out-of-range / self-reference is a malformed plan — fail loud rather than
       // silently dropping the dependency (which would let a dependent run early).
+      // 条件边对象（收编 #6）同校验：index 与 alternateOrderId 都必须是批内
+      // 其他任务的索引。
       const taskCount = parsed.data.tasks.length
       const badDeps: string[] = []
       for (let i = 0; i < taskCount; i++) {
         const deps = parsed.data.tasks[i]!.dependsOn
         if (!deps?.length) continue
         for (const d of deps) {
-          if (d === i) badDeps.push(`task[${i}] 依赖了自身`)
-          else if (d >= taskCount) badDeps.push(`task[${i}] 依赖了越界索引 ${d}（本批共 ${taskCount} 个任务）`)
+          const depIndex = typeof d === 'number' ? d : d.index
+          const edgeLabel = typeof d === 'number'
+            ? `${depIndex}`
+            : `edge{index:${d.index}, onFailure:${d.onFailure ?? 'undefined'}${d.alternateOrderId !== undefined ? `, alternate:${d.alternateOrderId}` : ''}}`
+          if (depIndex === i) badDeps.push(`task[${i}] 依赖了自身（${edgeLabel}）`)
+          else if (depIndex >= taskCount) badDeps.push(`task[${i}] 依赖了越界索引 ${depIndex}（${edgeLabel}；本批共 ${taskCount} 个任务）`)
+          if (typeof d !== 'number' && d.onFailure === 'alternate' && d.alternateOrderId !== undefined) {
+            if (d.alternateOrderId === i) badDeps.push(`task[${i}] 的 alternate 指向自身（${edgeLabel}）`)
+            else if (d.alternateOrderId >= taskCount) badDeps.push(`task[${i}] 的 alternateOrderId 越界 ${d.alternateOrderId}（本批共 ${taskCount} 个任务）`)
+          }
         }
       }
       if (badDeps.length > 0) {
@@ -231,8 +277,15 @@ export function createDelegateBatchTool(
         taskAuthorityMap.set(i, t.authority)
         // `batch:${i}` is a stable work-order id (see deriveStableWorkOrderId);
         // dependsOn indices resolve to those same ids so the queue can order them.
+        // 条件边对象（收编 #6）映射为 DependencyEdge（index → batch:N）。
         const dependencies = t.dependsOn?.length
-          ? t.dependsOn.map(d => `batch:${d}`)
+          ? t.dependsOn.map(d => typeof d === 'number'
+              ? `batch:${d}`
+              : {
+                  dependsOn: `batch:${d.index}`,
+                  ...(d.onFailure ? { onFailure: d.onFailure } : {}),
+                  ...(d.alternateOrderId !== undefined ? { alternateOrderId: `batch:${d.alternateOrderId}` } : {}),
+                })
           : undefined
         return {
         parentTurnId: `${params.toolUseId}:batch:${i}`,

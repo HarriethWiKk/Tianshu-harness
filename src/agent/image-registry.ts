@@ -87,7 +87,9 @@ export class ImageRegistry {
       ids.push(id)
     }
     this.evictIfNeeded()
-    return ids
+    // 只返回活下来的 id：一张超出字节预算的图会在同一轮被驱逐，返回它的 id 等于
+    // 递给调用方一个查不到的引用（提示里写着 img_9，ask_image 却说没有这张图）。
+    return ids.filter(id => this.images.has(id))
   }
 
   /** Fetch a retained image by id, or the most-recently-registered when id is
@@ -125,10 +127,12 @@ export class ImageRegistry {
     this.images.clear()
   }
 
+  /** Highest `lastUsed` wins. No tie-break needed: the clock advances on every
+   *  register/touch, so two entries can never share a value. */
   private mostRecent(): RegisteredImage | undefined {
     let best: RegisteredImage | undefined
     for (const img of this.images.values()) {
-      if (!best || img.lastUsed > best.lastUsed || (img.lastUsed === best.lastUsed && img.id > best.id)) best = img
+      if (!best || img.lastUsed > best.lastUsed) best = img
     }
     return best
   }

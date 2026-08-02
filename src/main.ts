@@ -77,6 +77,9 @@ import { checkForUpdate, formatUpdateBanner, detectInstallRoot, getCurrentVersio
 import { detectEnv, formatGitMissingBanner } from './tools/env-check.js'
 import { computeUsageCost, findModelPricing } from './utils/pricing.js'
 import { projectCacheTelemetry } from './tui/cache-telemetry.js'
+import { CachePanelSource } from './tui/cache-panel-source.js'
+import { sessionsDir } from './config/paths.js'
+import { fetchOfficialUsage } from './cache/deepseek-official-usage.js'
 import type { CacheStatus } from './tui/status-types.js'
 import { TuiPerfMonitor, isTuiPerfEnabled } from './tui/engine/perf-monitor.js'
 import { runTuiShutdownSequence } from './tui/engine/shutdown-sequence.js'
@@ -302,6 +305,8 @@ async function main() {
     const { createWorktreeBaseline } = await import('./agent/worktree-baseline.js')
     const { createHeadlessCoordinator } = await import('./agent/headless-coordinator.js')
     const { initializePlugins } = await import('./plugins/plugin-loader.js')
+    const { createGalaxyTool } = await import('./tools/galaxy.js')
+    const { DomainKnowledgeStore } = await import('./agent/domain-knowledge-store.js')
 
     const parsed = parseCliArgs(args)
     // Goal mode drives the same AgentLoop + GoalTracker as the TUI /goal command;
@@ -333,12 +338,17 @@ async function main() {
       }),
       fetchOptions: buildFetchOptions(cfg),
     }
-    const prov = cfg.provider.providers[cfg.provider.default]
-    if (!prov) { process.stderr.write('Provider not configured. Run: rivet config setup <provider>\n'); process.exit(1) }
+    // headless 此前完全忽略 --model/--provider（只有 TUI 路径经
+    // bootstrapInteractiveSession 生效）——对齐：显式 flag 优先，缺省走配置默认。
+    const provName = requestedProvider ?? cfg.provider.default
+    const prov = cfg.provider.providers[provName]
+    if (!prov) { process.stderr.write(`Provider not configured: ${provName}. Run: rivet config setup <provider>\n`); process.exit(1) }
     const key = prov.apiKey ?? process.env[prov.apiKeyEnv ?? '']
     if (!key) { process.stderr.write(`API key not set. Export ${prov.apiKeyEnv ?? 'API_KEY'} or run: rivet config setup ${prov.name}\n`); process.exit(1) }
 
-    const model = prov.models[0]!
+    const model = requestedModel
+      ? (prov.models.find(m => m.id === requestedModel || m.alias === requestedModel) ?? prov.models[0]!)
+      : prov.models[0]!
     const sessionId = crypto.randomUUID()
 
     // --budget N (default 100) is the hard turn cap for goal mode; it doubles as
@@ -413,6 +423,9 @@ async function main() {
           isGoalAchieved: () => goalTrackerRef.current?.isGoalAchieved() ?? false,
           getLastVerdict: () => goalTrackerRef.current?.getLastVerdict() ?? null,
           getImpactedTests: () => headlessAgentRef.current ? [...headlessAgentRef.current.getEvidenceState().impactedTests] : [],
+          // 收编 #2：冗余义务门禁消费（headless 生产注入）
+          getObligationStore: () => headlessAgentRef.current?.obligations.getStore()
+            ?? { obligations: [] },
         })))
         if (presetIncludes(registryOptions.preset, 'update_goal')) {
           toolRegistry.register(createUpdateGoalTool(
@@ -420,6 +433,30 @@ async function main() {
             () => ({ sessionId, cwd: process.cwd() }),
           ))
         }
+
+        // Headless DelegationCoordinator — 此前只在 --goal 模式创建（供 goal
+        // judge），-p 模式没有任何编排工具可用。常驻创建并注册 galaxy：
+        // headless 冒烟/benchmark 需要真实的星河扇出（worker 侧缓存指标经
+        // worker cache-log.jsonl 落盘，是预热收益的量化来源）。
+        // 注意：必须在 createAgentConfig（取 toolDefinitions）之前注册，
+        // 否则模型看不到工具定义——registry 有但 prompt 里没有，工具"不在线"。
+        const headlessCoordinator = createHeadlessCoordinator({
+          toolRegistry,
+          provider: prov,
+          providerName: provName,
+          apiKey: key,
+          auth: undefined,
+          cwd: process.cwd(),
+          sessionId,
+        })
+        toolRegistry.register(createGalaxyTool({
+          delegateBatch: async (requests, policy, abortSignal, onProgress, onWorkerSettled) =>
+            headlessCoordinator.delegateBatch(requests, policy, abortSignal, onProgress, onWorkerSettled),
+          // 路由学习（收编 #5）：headless 无 SharedRuntime，per-session 建库即可。
+          domainKnowledgeStore: new DomainKnowledgeStore(join(process.cwd(), '.rivet', 'knowledge')),
+          // DP 证据冗余（收编 #2）：agent 创建后由 headlessAgentRef 惰性提供。
+          get obligationTracker() { return headlessAgentRef.current?.obligations },
+        }))
 
         const agentCfg = createAgentConfig(createMainAgentConfigInput({
           apiKey: key,
@@ -436,6 +473,8 @@ async function main() {
         const session = new SessionContext()
         const agent = new AgentLoop({ ...agentCfg, toolRegistry, maxTurns: headlessMaxTurns }, session, process.cwd())
         headlessAgentRef.current = agent
+        agent.config.coordinatorRef = () => headlessCoordinator
+
         if (parsed.goal) {
           const tracker = new GoalTracker({
             goal: parsed.goal,
@@ -448,21 +487,8 @@ async function main() {
           // Side-path criteria extraction for the completion judge. Async + fail-open:
           // criteria default to a generic template. With the headless coordinator
           // wired, the judge actually runs; without it, it degrades to inconclusive.
+          // （coordinator 已在上方常驻创建——goal judge 与 galaxy 共用同一实例。）
           if (agent.config.goalJudge?.enabled !== false) {
-            // Wire a minimal DelegationCoordinator so the goal judge can spawn
-            // goal_judge workers. Without this, getGoalJudgeDeps returns empty
-            // deps and the judge is a permanent no-op in headless mode.
-            const coordinator = createHeadlessCoordinator({
-              toolRegistry,
-              provider: prov,
-              providerName: cfg.provider.default,
-              apiKey: key,
-              auth: undefined,
-              cwd: process.cwd(),
-              sessionId,
-            })
-            agent.config.coordinatorRef = () => coordinator
-
             // Fail-closed: browser verification requires interactive TUI approval
             // (web_fetch/browser need permission prompts). Headless degrades to
             // web_fetch-only read-only mode; full browser is disabled.
@@ -744,6 +770,47 @@ async function main() {
     ctx!.persist.updateMetadata({ sidePanelOpen: open })
   })
 
+  // ── /cache 面板数据源 ─────────────────────────────────────────
+  // 本会话实时口径与 GlanceBar 同源（getTotalUsage + getRecentTurnHitRate），
+  // 历史走跨会话聚合器，官方账单走共享凭证降级链。三者都在 source 内做 TTL 缓存。
+  const cachePanelSource = new CachePanelSource({
+    sessionsRoot: () => sessionsDir(ctx!.cwd),
+    resolvePricing: model => findModelPricing(
+      ctx?.agent.config.allProviders ?? {},
+      ctx?.agent.config.providerName,
+      model,
+    ),
+    session: () => {
+      if (!ctx) return null
+      const total = ctx.session.getTotalUsage()
+      if (!total.input_tokens && !total.output_tokens) return null
+      const pricing = findModelPricing(
+        ctx.agent.config.allProviders ?? {},
+        ctx.agent.config.providerName,
+        ctx.agent.config.promptEngine.getModel(),
+      )
+      const cacheRead = total.cache_read_input_tokens ?? 0
+      const savings = pricing
+        ? cacheRead / 1_000_000 * Math.max(0, (pricing.input ?? 0) - (pricing.cacheRead ?? pricing.input ?? 0))
+        : null
+      return {
+        hitRate: ctx.session.getRecentTurnHitRate(3) ?? ctx.session.getCacheHitRate(),
+        input: total.input_tokens,
+        output: total.output_tokens,
+        cacheRead,
+        cacheCreate: total.cache_creation_input_tokens ?? 0,
+        cost: pricing ? computeUsageCost(total, pricing).total : null,
+        savings,
+      }
+    },
+    loadOfficial: () => {
+      const provider = ctx?.provider
+      const apiKey = provider?.apiKey ?? (provider?.apiKeyEnv ? process.env[provider.apiKeyEnv] : undefined)
+      return fetchOfficialUsage({ apiKey, baseUrl: provider?.baseUrl })
+    },
+    onUpdate: () => { tuiApp.refreshOverlay('cache') },
+  })
+
   // 命令面板的过滤列表：display 与 paletteExec 必须共用同一份（含实时 query 过滤 + 排序），
   // 否则选中索引会错位（Enter 执行到错误命令）。
   const filteredPaletteCommands = (): PaletteCommand[] => {
@@ -939,6 +1006,8 @@ async function main() {
     tasksData: () => tuiApp.getTasksData(),
     // Jobs — /jobs 显示后台 shell 任务（来自 TUI job 读模型）
     jobsData: () => tuiApp.getJobsData(),
+    // Cache — /cache DeepSeek 缓存面板（period 由 overlay nav 注入）
+    cachePanelData: () => cachePanelSource.data(),
     // Domain Picker — 裸 /domain 打开的 CC 风星域选择器（entries 由共享 builder 构造）
     domainPickerData: () => ({
       entries: buildDomainPickerEntries(ctx!.agent.getSessionDomain()),
@@ -1084,6 +1153,8 @@ async function main() {
         tuiApp.activateOverlay('cockpit')
       } else if (name === '/rewind') {
         tuiApp.activateOverlay('rewind')
+      } else if (name === '/cache') {
+        tuiApp.activateOverlay('cache')
       } else {
         tuiApp.setInput(name + ' ')
       }
@@ -1626,11 +1697,11 @@ async function main() {
   if (ctx.templatesPendingAgents && !args.includes('--dangerously-skip-permissions')) {
     // Detect git availability to advise first-run users. Git is optional (the
     // agent runs in-place without it), but unlocks worktree isolation, commit,
-    // diff review, and checkpoints. Mirrors the inline try/catch probe pattern
-    // used at main.ts:396 (gitBranch detection).
+    // diff review, and checkpoints. Use `git --version` — `git rev-parse
+    // --is-inside-work-tree` fails outside a repo even when git is installed.
     const gitAvailable = (() => {
       try {
-        execSync('git rev-parse --is-inside-work-tree', { cwd: process.cwd(), stdio: 'pipe' })
+        execSync('git --version', { cwd: process.cwd(), stdio: 'pipe' })
         return true
       } catch {
         return false
@@ -1796,10 +1867,14 @@ async function main() {
     }
   }
 
-  // 自然流：欢迎页写完后直接渲染底部 chrome（GlanceBar + 输入框），
-  // 输入框以 append 模式落在欢迎页正下方。不再用 padding 撑底——padding 会
-  // 与 cursor-resident live region 的相对光标假设冲突，切换 model/theme/domain
-  // 提交内容触发滚动时造成顶部残影/塌行。随交互增长终端原生滚动自然把输入框保持在视口底部。
+  // 自然流：欢迎页写完后直接渲染底部 chrome（GlanceBar + 输入框），输入框以 append
+  // 模式落在欢迎页正下方，随交互增长由终端原生滚动保持在视口底部。
+  //
+  // 不补空行撑底 —— 试过两种补法都不成立：补在欢迎屏之后，欢迎屏钉在顶部、输入框沉到
+  // 底，中间撑开一大片空白（Claude Code v2.1.168 的 #66191 形态）；补在欢迎屏之前，
+  // 整块下沉，空白全堆到上方。输出流 append-only，凭空造出的空白只能二选一地堆在某侧，
+  // 两者都比自然流难看。真正扎眼的「输入框下方死区」另有其因（活动期动态段恒定垫高、
+  // 轮末塌回），已由 getDynamicBudget 的轮内高水位治本。
   app.start()
 
   // 首屏交接提醒（resume 场景）：上下文已过半的会话，建议先 /handoff 再开新会话——

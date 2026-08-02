@@ -60,6 +60,21 @@ test('byte budget evicts until under maxBytes', () => {
   assert.ok(reg.size <= 1)
 })
 
+// 返回的 id 必须都能查到：提示文本里写着 img_N，ask_image 却报"没有这张图"是
+// 最难查的那种不一致——调用方无从知道自己拿到的是个已被驱逐的引用。
+test('register only returns ids that survived this round of eviction', () => {
+  const reg = new ImageRegistry({ maxImages: 100, maxBytes: 1 })
+  const ids = reg.register([PNG, PNG, PNG])
+  assert.equal(ids.length, reg.size)
+  for (const id of ids) assert.ok(reg.get(id), `${id} 必须可查`)
+})
+
+test('register returns nothing when a single image blows the whole budget', () => {
+  const reg = new ImageRegistry({ maxImages: 4, maxBytes: 1 })
+  assert.deepEqual(reg.register([PNG]), [])
+  assert.equal(reg.size, 0)
+})
+
 test('clear empties the registry', () => {
   const reg = new ImageRegistry()
   reg.register([PNG, PNG])

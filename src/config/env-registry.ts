@@ -3,7 +3,7 @@
  *
  * name/defaultHint/files 由 scripts/gen-env-registry.ts 生成，勿手改；
  * description 字段人工维护，重新生成时按 name 保留。
- * 最后生成：2026-07-30T13:49:59.548Z
+ * 最后生成：2026-07-30T14:59:27.053Z
  * 共 122 个变量。
  *
  * 每个条目含：名称 / 默认值提示 / 引用文件 / 简要说明。
@@ -590,8 +590,8 @@ export const ENV_REGISTRY: EnvRegistryEntry[] = [
   {
     name: 'RIVET_SECURITY_GUIDANCE',
     defaultHint: '',
-    files: ['agent/create-runtime-hooks.ts'],
-    description: '',
+    files: ['config/security-guidance-config.ts', 'agent/__tests__/create-runtime-hooks.test.ts'],
+    description: '安全模式正则告警（层1）总开关，默认开；设 0/false/off/no 关闭（等价 config agent.securityGuidance=false）',
   },
   {
     name: 'RIVET_SERVE_TIMING',

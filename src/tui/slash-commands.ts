@@ -118,6 +118,7 @@ const HELP_TEXT = `Available commands:
 /team <task|plan> — Run team-mode workflow through team_orchestrate
 /team max <task> — Run team-mode max planning through team_orchestrate
 /council <task> [--seats id1,id2,...] [--rounds 1-2] — Convene a star-domain council (single round; --rounds 2 enables a rebuttal round)
+/scout <诊断目标> [--dims 前端,后端,集成] — 巡天侦察蜂群：并行只读诊断，交付实测核对清单（不写文件）
 /review — Manually trigger L2 review (single adversarial verifier) on current changes via deliver_task
 /review max — Manually trigger L3 review (Review Squadron, 5 inspectors) on current changes via deliver_task
 /review off|on|status — 会话级关闭/恢复/查看自动审查门（off 只抑制自动审查省 token，手动 /review 始终可用）
@@ -798,6 +799,18 @@ const TUI_SLASH_COMMANDS: readonly TuiSlashCommandDef[] = [
     },
   },
   {
+    name: '/galaxy',
+    handler(ctx) {
+      const { parts, pushStatic, setIsStreaming } = ctx
+      if (!parts.slice(1).join(' ').trim()) {
+        pushStatic(createLogEntry({ type: 'system', content: 'Usage: /galaxy <任务描述>\n       启动星河集群——拆解为多个维度由不同星域并行执行。' }))
+        setIsStreaming(false)
+        return true
+      }
+      return false
+    },
+  },
+  {
     name: '/council',
     handler(ctx) {
       const { parts, pushStatic, setIsStreaming } = ctx
@@ -812,6 +825,45 @@ const TUI_SLASH_COMMANDS: readonly TuiSlashCommandDef[] = [
       const roundsMatch = /--rounds[\s=]+(\d+)/.exec(parts.slice(1).join(' '))
       if (roundsMatch && Number(roundsMatch[1]) >= 2 && !isProFeatureEnabled(ctx.config, 'councilMultiRound')) {
         pushStatic(createLogEntry({ type: 'system', content: '提示：议事会第 2 轮（反驳轮）是 Pro 功能，本次将按单轮执行。升级 Pro 解锁多轮辩论。' }))
+      }
+      return false
+    },
+  },
+  {
+    name: '/scout',
+    handler(ctx) {
+      const { parts, pushStatic, setIsStreaming } = ctx
+      if (!parts.slice(1).join(' ').trim()) {
+        pushStatic(createLogEntry({ type: 'system', content: 'Usage: /scout <诊断目标> [--dims 前端,后端,集成]\n并行只读诊断蜂群：先摸底 → 按维度派 code_scout → 实测核对清单 + runbook。' }))
+        setIsStreaming(false)
+        return true
+      }
+      return false
+    },
+  },
+  {
+    name: '/starflow',
+    handler(ctx) {
+      const { parts, pushStatic, setIsStreaming, submitToAgent } = ctx
+      const task = parts.slice(1).join(' ').trim()
+      if (!task) {
+        pushStatic(createLogEntry({ type: 'system', content: 'Usage: /starflow <任务描述>\n       星流（Starflow）——需求澄清+环境基线 → council 评审 → team 波次 → galaxy 攻坚 → 交付门禁，从大白话到工业级可交付代码。' }))
+        setIsStreaming(false)
+        return true
+      }
+      if (submitToAgent) {
+        // 协议内嵌注入（不依赖 skill 注册）：命令自包含，新会话/旧产物都可用。
+        // 来自社区 PR #17（KinoGao），原文落地。
+        submitToAgent(`进入星流（Starflow）模式。按以下五阶段协议执行任务：${task}
+
+【星流（Starflow）五阶段协议】
+阶段 0 需求澄清+环境基线：至多一轮把大白话转成目标/非目标/验收标准（模板"当我【动作】，【系统】会【可观察结果】"）；探测项目是否存在/有无 typecheck/git；空项目先脚手架子流程（git init/package.json/tsconfig/测试框架/typecheck），脚手架写操作过安全闸门（创建文件/装依赖前确认）。
+阶段 1 council 评审：council_convene({ objective, draftItems, rounds })，draftItems 从阶段 0 产出映射（id/title/detail/files）；高风险 rounds:2 低风险 rounds:1。守卫：返回 isError 或含"已禁用（COUNCIL=0）""未派发任何席位"→ 视为评审未执行，禁止前进；驳回/blocking 冲突需修订复议。通过后二选一：autoExecute:true 或取编译后 UnifiedPlan 的 planJson 传 team_orchestrate；禁止把审计 Markdown 当 planMarkdown。
+阶段 2 team 波次：team_orchestrate({ objective, planJson })；分片文件不重叠、dependsOn 排序、wave-gate 每波验证；波次失败回阶段 1 复议。
+阶段 3 galaxy 攻坚：先 galaxy({ confirm: false }) 展示维度方案（拆哪些维度/星域/worker）→ 用户确认 → galaxy({ confirm: true }) 执行；可写维度文件不重叠；多星域仅只读视角。
+阶段 4 交付门禁（按任务分级）：小工具/一次性脚本=最小可运行+运行演示通过+三项报告；工业级=typecheck exit 0 / 消费方核对 / 语义回归 / RED-GREEN 有据 / 三项报告。未运行=说"未验证"。
+全程：每阶段开始/结束用大白话同步"完成了什么/接下来什么"；任何机制回退（council 复议/team 重派/galaxy 维度失败）附带人话版错误解释。`)
+        return true
       }
       return false
     },
@@ -3849,6 +3901,13 @@ export function registerTuiSlashCommands(app: TuiApp, ctx: BootstrapContext): vo
     handler: () => true,
   })
 
+  register("/cache", {
+    description: "缓存面板（token 消耗 / 命中率 / 缓存省钱 · DeepSeek 官方账单）",
+    immediate: true,
+    overlay: "cache",
+    handler: () => true,
+  })
+
   register("/enter", {
     description: "Resume a worker session (e.g. /enter wo_team:T1 continue fixing bug)",
     immediate: true,
@@ -4068,6 +4127,9 @@ export function registerTuiSlashCommands(app: TuiApp, ctx: BootstrapContext): vo
   }
   registerWorkflow("/team")
   registerWorkflow("/council")
+  registerWorkflow("/scout")
+  registerWorkflow("/galaxy")
+  registerWorkflow("/starflow")
   registerWorkflow("/plan")
   registerWorkflow("/write-plan")
   registerWorkflow("/plan-close")

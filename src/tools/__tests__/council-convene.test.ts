@@ -744,4 +744,27 @@ describe('council_convene 工具', () => {
     assert.deepEqual(sessions[0]!.modelsUsed, ['test-model'])
     assert.equal(sessions[0]!.heterogeneous, false)
   })
+
+  it('confirm:false → 只展示席位分配方案，零派发（收编 #7）', async () => {
+    const { coordinator, calls } = makeCoordinator()
+    const tool = createCouncilConveneTool(coordinator)
+    const result = await tool.execute(paramsWith({
+      objective: '评审新缓存策略',
+      confirm: false,
+    }))
+
+    assert.equal(result.isError, undefined)
+    assert.equal(calls.requests.length, 0, 'proposal 阶段不得派发任何席位')
+    assert.ok(result.content.includes('议事会席位分配方案'))
+    assert.ok(result.content.includes('天权'))
+    assert.ok(result.content.includes('confirm: true'))
+  })
+
+  it('confirm 缺省（未传）→ 直接执行（向后兼容）', async () => {
+    const { coordinator, calls } = makeCoordinator()
+    const tool = createCouncilConveneTool(coordinator)
+    const result = await tool.execute(paramsWith({ objective: '评审默认行为' }))
+    assert.equal(calls.requests.length, 1, '缺省 confirm 保持直接执行')
+    assert.ok(result.content.includes('议事会'))
+  })
 })

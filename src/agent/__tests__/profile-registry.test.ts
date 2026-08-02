@@ -4,7 +4,7 @@ import { writeFileSync, rmSync, mkdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
-import { ProfileRegistry, profileRegistry, delegationToolTimeoutMs, DEFAULT_DELEGATE_CONCURRENCY } from '../profile-registry.js'
+import { ProfileRegistry, profileRegistry, delegationToolTimeoutMs, tierTimeoutMultiplier, DEFAULT_DELEGATE_CONCURRENCY } from '../profile-registry.js'
 import { progressiveTimeout, WORKER_EXIT_GRACE_MS } from '../timeout-ladder.js'
 import { MAX_BUDGET_CONTINUATIONS, MAX_HANDS_EXTRA_RUNS } from '../worker-continuation.js'
 
@@ -315,5 +315,51 @@ describe('delegationToolTimeoutMs (A2: wave-scaled batch timeout)', () => {
     const omitted = delegationToolTimeoutMs(undefined, [undefined], { taskCount: 1 })
     assert.equal(omitted, mature * runs + WORKER_EXIT_GRACE_MS)
     assert.ok(omitted >= scoutBudget, '放宽后的天花板不得低于 code_scout 单轮预算')
+  })
+
+  it('tierFloor=strong 时 outer timeout 按 1.5x 放大', async () => {
+    const reviewerBudget = profileRegistry.get('reviewer')?.defaultTimeoutMs ?? mature
+    const budget = Math.max(mature, reviewerBudget)
+    const base = delegationToolTimeoutMs(undefined, ['reviewer'], { taskCount: 1 })
+    const strong = delegationToolTimeoutMs(undefined, ['reviewer'], { taskCount: 1, tierFloors: ['strong'] })
+    const expected = Math.round(budget * 1.5) * runs + WORKER_EXIT_GRACE_MS
+    assert.equal(strong, expected)
+    assert.ok(strong > base, `strong 预算(${strong}) 应大于 base(${base})`)
+  })
+
+  it('tierFloor=cheap/balanced 不加倍率', async () => {
+    const base = delegationToolTimeoutMs(undefined, ['reviewer'], { taskCount: 1 })
+    const cheap = delegationToolTimeoutMs(undefined, ['reviewer'], { taskCount: 1, tierFloors: ['cheap'] })
+    const balanced = delegationToolTimeoutMs(undefined, ['reviewer'], { taskCount: 1, tierFloors: ['balanced'] })
+    assert.equal(cheap, base)
+    assert.equal(balanced, base)
+  })
+
+  it('tierFloor 未知值时 fallback 1.0', async () => {
+    const base = delegationToolTimeoutMs(undefined, ['reviewer'], { taskCount: 1 })
+    const unknown = delegationToolTimeoutMs(undefined, ['reviewer'], { taskCount: 1, tierFloors: ['nonexistent' as any] })
+    assert.equal(unknown, base)
+  })
+
+  it('mixed tierFloors 取批内最大倍率', async () => {
+    const strongOnly = delegationToolTimeoutMs(undefined, ['reviewer'], { taskCount: 1, tierFloors: ['strong'] })
+    const mixed = delegationToolTimeoutMs(undefined, ['reviewer', 'reviewer', 'reviewer'], {
+      taskCount: 3,
+      tierFloors: ['cheap', 'strong', 'balanced'],
+    })
+    // mixed 中 strong 的 1.5x 应为最大，且跑满 3 个 task 的 waves
+    assert.equal(mixed, strongOnly, 'mixed [cheap,strong,balanced] 应取 max=1.5x 即与纯 strong 同倍率')
+    assert.ok(mixed > delegationToolTimeoutMs(undefined, ['reviewer', 'reviewer', 'reviewer'], {
+      taskCount: 3,
+      tierFloors: ['cheap', 'cheap', 'balanced'],
+    }), 'mixed 含 strong 应大于全非 strong')
+  })
+
+  it('tierTimeoutMultiplier 单点事实源', () => {
+    assert.equal(tierTimeoutMultiplier('strong'), 1.5)
+    assert.equal(tierTimeoutMultiplier('balanced'), 1.0)
+    assert.equal(tierTimeoutMultiplier('cheap'), 1.0)
+    assert.equal(tierTimeoutMultiplier(undefined), 1.0)
+    assert.equal(tierTimeoutMultiplier('unknown'), 1.0)
   })
 })

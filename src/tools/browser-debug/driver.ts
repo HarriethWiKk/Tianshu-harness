@@ -35,10 +35,21 @@ export interface BrowserCookie {
   sameSite?: string
 }
 
+export interface ScreenshotOptions {
+  /** Take a full-page screenshot instead of just the viewport. Default: false. */
+  fullPage?: boolean
+  /** Skip animation-disabling CSS injection and font-ready wait.
+   *  Use for pages where the injected stylesheet itself causes a
+   *  meaningful layout shift. Default: false. */
+  raw?: boolean
+  /** CSS selector to clip the screenshot to this element's bounding box. */
+  element?: string
+}
+
 export interface BrowserDebugDriver {
   goto(url: string, signal?: AbortSignal): Promise<void>
   evaluate(expression: string): Promise<string>
-  screenshot(): Promise<Buffer>
+  screenshot(opts?: ScreenshotOptions): Promise<Buffer>
   snapshot(selector?: string): Promise<string>
   click(selector: string): Promise<void>
   type(selector: string, text: string): Promise<void>
@@ -312,7 +323,55 @@ function buildDriver(
       }
     },
     evaluate: async (expression) => stringifyEvalResult(await getPage().evaluate(expression)),
-    screenshot: () => getPage().screenshot({ fullPage: true }),
+    screenshot: async (opts) => {
+      const page = getPage()
+      const fullPage = opts?.fullPage ?? false
+      const raw = opts?.raw ?? false
+
+      if (!raw) {
+        // Inject animation-disabling CSS so the frame is visually stable
+        // before we capture it. Without this, mid-transition states produce
+        // diff noise that look like UI changes.
+        await page.evaluate(`
+          (() => {
+            const el = document.createElement('style');
+            el.id = '__rivet_screenshot';
+            el.textContent = '*{animation:none!important;transition:none!important;animation-duration:0s!important;transition-duration:0s!important}';
+            document.head.appendChild(el);
+          })()
+        `)
+        // Wait for web fonts to finish loading so text isn't captured in a
+        // fallback face (rendering-diff false positive).
+        try {
+          await page.evaluate('document.fonts.ready')
+        } catch { /* font API unavailable (e.g. about:blank) */ }
+      }
+
+      const pwOpts: Record<string, unknown> = {}
+      if (fullPage) pwOpts.fullPage = true
+
+      try {
+        if (opts?.element) {
+          const clip = await page.evaluate(`
+            (() => {
+              const el = document.querySelector(${JSON.stringify(opts.element)});
+              if (!el) return null;
+              const r = el.getBoundingClientRect();
+              return { x: r.x, y: r.y, width: r.width, height: r.height };
+            })()
+          `)
+          if (!clip) throw new Error(`元素 "${opts.element}" 未找到。`)
+          pwOpts.clip = clip
+        }
+        return await page.screenshot(pwOpts)
+      } finally {
+        if (!raw) {
+          try {
+            await page.evaluate('document.getElementById("__rivet_screenshot")?.remove()')
+          } catch { /* ignore cleanup failure */ }
+        }
+      }
+    },
     snapshot: async (selector) => {
       const page = getPage()
       if (selector) return (await page.textContent(selector, { timeout: 10_000 })) ?? ''

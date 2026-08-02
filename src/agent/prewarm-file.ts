@@ -94,15 +94,18 @@ export function consumePrewarm(cache: PrewarmCache, canonicalPath: string): Prew
 /**
  * Batch prewarm recently-read files — yields to the event loop between
  * each file so the TUI stays responsive during turn boundary.
+ * `limit` caps files per call (default 5); batch dispatch pre-warming
+ * passes a larger explicit bound.
  */
 export async function batchPrewarm(
   cwd: string,
   paths: string[],
   cache: import('./prewarm.js').PrewarmCache,
+  limit = 5,
 ): Promise<void> {
   let count = 0
   for (const filePath of paths) {
-    if (count >= 5) break
+    if (count >= limit) break
     const value = await buildPrewarmValueAsync(cwd, filePath)
     if (!value) continue
     if (cache.has(value.canonicalPath)) continue

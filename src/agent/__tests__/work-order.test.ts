@@ -467,4 +467,81 @@ describe('work-order contract', () => {
     assert.equal(order.budget.retryBackoffMs, 10000)
     assert.equal(order.budget.maxRetryBackoffMs, 300000)
   })
+
+  // ── evidenceKind / evidenceRefs: 结构化一手/转述标注 ─────────
+
+  it('parseWorkerResult accepts finding with evidenceKind "firsthand" + evidenceRefs', () => {
+    const result = parseWorkerResult(JSON.stringify({
+      workOrderId: 'wo_ev',
+      status: 'passed',
+      summary: 'scanned routing config',
+      findings: [{
+        claim: 'model routing is hardcoded in src/main.ts',
+        confidence: 'high',
+        evidence: 'Found route map literal at L42-L58',
+        evidenceKind: 'firsthand',
+        evidenceRefs: ['src/main.ts:42', 'src/main.ts:58'],
+      }],
+      artifacts: [],
+      changedFiles: [],
+    }), 'wo_ev')
+    assert.equal(result.findings.length, 1)
+    const f = result.findings[0]!
+    assert.equal(f.claim, 'model routing is hardcoded in src/main.ts')
+    assert.equal(f.evidenceKind, 'firsthand')
+    assert.deepEqual(f.evidenceRefs, ['src/main.ts:42', 'src/main.ts:58'])
+  })
+
+  it('parseWorkerResult accepts finding with evidenceKind "inferred" without refs', () => {
+    const result = parseWorkerResult(JSON.stringify({
+      workOrderId: 'wo_infer',
+      status: 'passed',
+      summary: 'speculation',
+      findings: [{
+        claim: 'this module likely has dead code',
+        confidence: 'medium',
+        evidence: 'No imports found in the three callers I checked',
+        evidenceKind: 'inferred',
+      }],
+      artifacts: [],
+      changedFiles: [],
+    }), 'wo_infer')
+    assert.equal(result.findings[0]!.evidenceKind, 'inferred')
+    assert.equal(result.findings[0]!.evidenceRefs, undefined)
+  })
+
+  it('parseWorkerResult: finding without evidenceKind still parses (backward compat)', () => {
+    const result = parseWorkerResult(JSON.stringify({
+      workOrderId: 'wo_legacy',
+      status: 'passed',
+      summary: 'old format',
+      findings: [{
+        claim: 'something',
+        confidence: 'low',
+        evidence: 'just a hunch',
+      }],
+      artifacts: [],
+      changedFiles: [],
+    }), 'wo_legacy')
+    assert.equal(result.findings[0]!.evidenceKind, undefined)
+    assert.equal(result.findings[0]!.evidenceRefs, undefined)
+  })
+
+  it('parseWorkerResult rejects invalid evidenceKind', () => {
+    assert.throws(() => {
+      parseWorkerResult(JSON.stringify({
+        workOrderId: 'wo_bad',
+        status: 'passed',
+        summary: 'bad kind',
+        findings: [{
+          claim: 'x',
+          confidence: 'low',
+          evidence: 'y',
+          evidenceKind: 'definitely_real',
+        }],
+        artifacts: [],
+        changedFiles: [],
+      }), 'wo_bad')
+    })
+  })
 })

@@ -181,7 +181,7 @@ export const APPLY_PATCH_TOOL: Tool = {
     if (verify) {
       const fatal = await firstFatalSyntax(targets)
       if (fatal) {
-        await rollbackTargets(params.cwd, targets)
+        await rollbackTargets(params.cwd, targets, params.sessionId)
         for (const t of targets) incrementEditFailCount(t.abs)
         return {
           content: `补丁已应用，但在 ${fatal.rel} 中引入了致命错误：\n${fatal.message}\n\n`
@@ -296,10 +296,10 @@ async function firstFatalSyntax(targets: PatchTarget[]): Promise<{ rel: string; 
 
 /** Undo an applied patch: restore pre-patch content for files that existed,
  *  delete files the patch newly created. Best-effort per file. */
-async function rollbackTargets(cwd: string, targets: PatchTarget[]): Promise<void> {
+async function rollbackTargets(cwd: string, targets: PatchTarget[], sessionId?: string): Promise<void> {
   for (const t of targets) {
     if (t.existedBefore) {
-      restoreLatestBackup(cwd, t.rel)
+      restoreLatestBackup(cwd, t.rel, sessionId)
     } else {
       try { await unlink(t.abs) } catch { /* already gone */ }
     }

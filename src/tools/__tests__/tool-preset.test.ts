@@ -87,8 +87,8 @@ describe('resolveToolPreset precedence', () => {
     __resetToolPresetForTest()
   })
 
-  it('defaults to minimal with no env and no config', () => {
-    assert.equal(resolveToolPreset(dir), 'minimal')
+  it('defaults to frontend with no env and no config', () => {
+    assert.equal(resolveToolPreset(dir), 'frontend')
   })
 
   it('project .rivet-config.json tools.preset wins over default', () => {
@@ -111,10 +111,10 @@ describe('resolveToolPreset precedence', () => {
     assert.equal(resolveToolPreset(dir), 'frontend')
   })
 
-  it('invalid values fall back to minimal', () => {
+  it('invalid values fall back to frontend', () => {
     writeFileSync(join(dir, '.rivet-config.json'), JSON.stringify({ tools: { preset: 'huge' } }))
     __resetToolPresetForTest()
-    assert.equal(resolveToolPreset(dir), 'minimal')
+    assert.equal(resolveToolPreset(dir), 'frontend')
   })
 })
 
@@ -170,9 +170,9 @@ describe('resolveToolPreset honors the active data root', () => {
     assert.equal(resolveToolPreset(dir), 'frontend')
   })
 
-  it('数据根下没有 config.json 时回落 minimal', () => {
+  it('数据根下没有 config.json 时回落 frontend', () => {
     process.env.RIVET_HOME = home
     __resetToolPresetForTest()
-    assert.equal(resolveToolPreset(dir), 'minimal')
+    assert.equal(resolveToolPreset(dir), 'frontend')
   })
 })

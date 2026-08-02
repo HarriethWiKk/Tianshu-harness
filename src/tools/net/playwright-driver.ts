@@ -17,9 +17,12 @@ export const PLAYWRIGHT_MANUAL_INSTALL_HINT =
   'npx playwright install chromium' +
   '（国内网络：PLAYWRIGHT_DOWNLOAD_HOST=https://registry.npmmirror.com/-/binary/playwright npx playwright install chromium）'
 
+// 两条入口都要给：只装了桌面端的用户没有 `rivet` 命令可敲，只报 CLI 命令等于把他
+// 们指向一条走不通的路。
 export const PLAYWRIGHT_INSTALL_HINT =
-  'chromium 未安装。一键安装：rivet browser install（自动带国内镜像）。' +
-  `或手动：${PLAYWRIGHT_MANUAL_INSTALL_HINT}`
+  'chromium 未安装。一键安装：终端 `rivet browser install`（自动带国内镜像），' +
+  '或桌面端 设置 → 集成 → 浏览器（截图）里点安装。' +
+  `手动：${PLAYWRIGHT_MANUAL_INSTALL_HINT}`
 
 /**
  * 动态 specifier（变量形式），避免 tsc/tsup 构建期静态解析。
@@ -31,15 +34,13 @@ export async function loadPlaywrightCore(): Promise<unknown> {
   try {
     return await import(specifier)
   } catch (err) {
-    // 模块解析失败 ≠ 浏览器没装。别在这条路径上给 `playwright install` 提示：
+    // 模块解析失败 ≠ 浏览器没装。别在这条路径上给 `playwright install` 提示——
     // 打包运行时最常见的成因是 dist/node_modules 暂存残缺（空目录反而遮蔽了仓库
-    // 里完整的包），提示装浏览器只会把排查引向错误方向。原始错误必须带上——
-    // 它含解析尝试过的具体路径，是唯一能直接指向成因的信息。
+    // 里完整的包），提示装浏览器只会把排查引向错误方向。排查命令留给 CLI banner
+    //（formatBrowserMissingBanner），这里只报事实 + 原始错误。
     const msg = err instanceof Error ? err.message : String(err)
     throw new Error(
       '无法加载 playwright-core 模块（不是浏览器缺失）。' +
-        '仓库内开发：npm i playwright-core；打包/桌面端：检查 dist/node_modules/playwright-core 是否完整' +
-        '（`npm run build` 会清空 dist，需重跑 scripts/stage-runtime-deps.js）。' +
         `\n（原始错误：${msg.split('\n')[0]}）`,
     )
   }

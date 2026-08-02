@@ -679,6 +679,9 @@ export class AgentLoop {
       this.config.permissionsOverlay = createPermissionOverlay()
     }
     this.cwd = cwd ?? process.cwd()
+    // 构造期注入共享 prewarm——必须早于 createToolExecutionController（下方
+    // L929 附近）：其 deps 按值捕获 self.prewarm，构造后替换字段到不了消费端。
+    if (config.prewarm) this.prewarm = config.prewarm
     this.evidence = new EvidenceTracker()
     // 证据义务状态机：与 EvidenceTracker 同寿命。验证事件单向流入——
     // blocked 只记 attempted、目标不匹配的失败不满足 RED（Wave 1 语义）。
@@ -745,7 +748,9 @@ export class AgentLoop {
     this.frameRecorder = createFrameRecorder(this.cwd, this.config.sessionId)
     const sessionDir = join(getSessionDir(this.cwd), this.config.sessionId ?? 'anon')
     const pheromonesPath = join(sessionDir, 'pheromones.json')
-    this.stigmergyStore = new StigmergyStore(pheromonesPath)
+    // 批级共享 store 优先（星河收编 #3）：同批 worker 共用内存信息素库，
+    // 不各自落盘到 sessionDir。
+    this.stigmergyStore = this.config.stigmergyStore ?? new StigmergyStore(pheromonesPath)
 
     // Initialize ArtifactStore for append-only artifact log
     if (this.config.sessionId) {
@@ -1325,6 +1330,9 @@ export class AgentLoop {
       return
     }
     if (source === 'user') this.userReasoningOverride = true
+    // 用户已显式选档（/effort max 等）→ 程序化调整（perception strategy、
+    // autoReasoning 档位）不得覆盖，保护显式用户意图。
+    if (source === 'programmatic' && this.userReasoningOverride) return
     this.reasoningEffort.set(effort)
   }
 

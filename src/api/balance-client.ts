@@ -7,6 +7,7 @@
  * 仅 DeepSeek 官方端点支持此接口（其他 OpenAI 兼容 provider 无此 API）。
  * 非 DeepSeek provider 返回 null，调用方静默处理。
  */
+import { fetchWithTimeout } from './fetch-timeout.js'
 
 export interface BalanceInfo {
   currency: string
@@ -25,6 +26,16 @@ function isDeepSeekProvider(baseUrl: string | undefined): boolean {
 }
 
 /**
+ * 余额端点挂在账号域根上（`api.deepseek.com/user/balance`），不在 OpenAI 兼容
+ * 层下。`/v1`、`/beta`、`/anthropic` 都只是聊天接口的兼容别名——preset 里的
+ * baseUrl 带 `/v1`，直接拼接会得到 `/v1/user/balance`。
+ */
+export function balanceEndpoint(baseUrl: string): string {
+  const root = baseUrl.replace(/\/+$/, '').replace(/\/(?:v1|beta|anthropic)$/i, '')
+  return `${root}/user/balance`
+}
+
+/**
  * 查询 DeepSeek 账户余额。非 DeepSeek provider 返回 null。
  * 10 秒超时；网络错误/API 错误返回 null（静默，不阻断 UI）。
  */
@@ -34,14 +45,12 @@ export async function queryDeepSeekBalance(
   signal?: AbortSignal,
 ): Promise<BalanceResult | null> {
   if (!apiKey || !isDeepSeekProvider(baseUrl)) return null
-  const url = `${baseUrl!.replace(/\/$/, '')}/user/balance`
+  const url = balanceEndpoint(baseUrl!)
   try {
-    const timeoutSignal = AbortSignal.timeout(10_000)
-    const combinedSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal
-    const res = await fetch(url, {
-      headers: { Authorization: `Bearer ${apiKey}` },
-      signal: combinedSignal,
-    })
+    const res = await fetchWithTimeout(url, {
+      headers: { Authorization: `Bearer ${apiKey}`, Accept: 'application/json' },
+      signal,
+    }, 10_000)
     if (!res.ok) return null
     const data = (await res.json()) as {
       is_available?: boolean

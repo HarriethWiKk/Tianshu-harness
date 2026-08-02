@@ -19,38 +19,75 @@ export interface RecoveryEntry {
   action: string
   ts: string
   linesLost: number
+  /** Session that actually performed the recovery. Never infer liveness from this log. */
+  sessionId?: string
   /** Set to true after deliver_task has shown the warning so it won't repeat. */
   acknowledged?: boolean
+  /** A handoff preserved the context in the successor session. */
+  handedOff?: boolean
 }
 
 function journalPath(cwd: string): string {
   return join(cwd, '.rivet', 'recovery-journal.jsonl')
 }
 
-export function recordRecovery(cwd: string, entry: Omit<RecoveryEntry, 'ts'>): void {
-  const dir = join(cwd, '.rivet')
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
-  const record: RecoveryEntry = { ...entry, ts: new Date().toISOString() }
-  appendFileSync(journalPath(cwd), JSON.stringify(record) + '\n', 'utf-8')
-}
-
-export function readUnacknowledged(cwd: string): RecoveryEntry[] {
+function readEntries(cwd: string): RecoveryEntry[] {
   const path = journalPath(cwd)
   if (!existsSync(path)) return []
   try {
-    const raw = readFileSync(path, 'utf-8')
-    return raw.split('\n').filter(Boolean).map(line => {
+    return readFileSync(path, 'utf-8').split('\n').filter(Boolean).map(line => {
       try { return JSON.parse(line) as RecoveryEntry } catch { return null }
-    }).filter((e): e is RecoveryEntry => e !== null && !e.acknowledged)
+    }).filter((e): e is RecoveryEntry => e !== null)
   } catch {
     return []
   }
 }
 
-export function acknowledgeAll(cwd: string): void {
-  const entries = readUnacknowledged(cwd)
-  if (entries.length === 0) return
-  const acknowledged = entries.map(e => ({ ...e, acknowledged: true }))
+function writeEntries(cwd: string, entries: readonly RecoveryEntry[]): void {
   const path = journalPath(cwd)
-  writeFileSync(path, acknowledged.map(e => JSON.stringify(e)).join('\n') + '\n', 'utf-8')
+  writeFileSync(path, entries.map(e => JSON.stringify(e)).join('\n') + (entries.length > 0 ? '\n' : ''), 'utf-8')
+}
+
+export function recordRecovery(cwd: string, entry: Omit<RecoveryEntry, 'ts' | 'sessionId'>, sessionId?: string): void {
+  const dir = join(cwd, '.rivet')
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
+  const record: RecoveryEntry = { ...entry, ts: new Date().toISOString(), ...(sessionId ? { sessionId } : {}) }
+  appendFileSync(journalPath(cwd), JSON.stringify(record) + '\n', 'utf-8')
+}
+
+/**
+ * Session-scoped callers intentionally ignore legacy unscoped entries. They are
+ * historical evidence, not proof that a different session still owns a file.
+ */
+export function readUnacknowledged(cwd: string, sessionId?: string): RecoveryEntry[] {
+  return readEntries(cwd).filter(entry =>
+    !entry.acknowledged && !entry.handedOff && (sessionId === undefined || entry.sessionId === sessionId),
+  )
+}
+
+export function acknowledgeAll(cwd: string, sessionId?: string): void {
+  const entries = readEntries(cwd)
+  let changed = false
+  const updated = entries.map(entry => {
+    if (!entry.acknowledged && !entry.handedOff && (sessionId === undefined || entry.sessionId === sessionId)) {
+      changed = true
+      return { ...entry, acknowledged: true }
+    }
+    return entry
+  })
+  if (changed) writeEntries(cwd, updated)
+}
+
+/** Mark the source session's recovery evidence as transferred after handoff. */
+export function handoffRecoveries(cwd: string, sessionId: string): void {
+  const entries = readEntries(cwd)
+  let changed = false
+  const updated = entries.map(entry => {
+    if (!entry.acknowledged && !entry.handedOff && entry.sessionId === sessionId) {
+      changed = true
+      return { ...entry, handedOff: true }
+    }
+    return entry
+  })
+  if (changed) writeEntries(cwd, updated)
 }

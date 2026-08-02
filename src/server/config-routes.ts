@@ -8,6 +8,7 @@
  *   DELETE /config/providers/:name          remove a provider
  *   DELETE /config/providers/:name/models/:modelId  remove a model from a provider
  *   POST   /config/providers/:name/key      set API key (inline or env)
+ *   POST   /config/providers/test-key       probe a key against a provider's /models (setup-time validation)
  *   POST   /config/providers/:name/default  set as default provider
  *   GET    /config/balance                  query DeepSeek account balance (official API)
  *   GET    /config/autonomy                 autonomy brake mode + checkpoint interval (C3)
@@ -16,6 +17,10 @@
  *   POST   /config/computer-use/revoke      revoke an app's "always allow" grant ({ app })
  *   GET    /config/permission-dirs          Codex-style standing directory grants (read/write, exists probe)
  *   PUT    /config/permission-dirs          set standing directory grants; additions apply immediately
+ *   GET    /config/vision-model             vision bridge model (provider/model/prompt/maxTokens/fallback)
+ *   PUT    /config/vision-model             set/clear the vision bridge
+ *   GET    /config/vision-auto-bridge       auto-pick a vision bridge when unconfigured (opt-in)
+ *   PUT    /config/vision-auto-bridge       toggle the auto-bridge opt-in
  */
 import type { RouteHandler } from './index.js'
 import { isAuthorizedRequest } from './auth.js'
@@ -48,7 +53,9 @@ import {
   setPrDefaultsConfig,
   getPermissionDirs,
   setPermissionDirs,
+  getVisionAutoBridge,
   getVisionModelConfig,
+  setVisionAutoBridge,
   setVisionModelConfig,
   getGreetingConfig,
   setGreetingConfig,
@@ -72,6 +79,7 @@ import { rivetHome } from '../config/paths.js'
 import { PROVIDER_PRESETS, providerPresetKeys, type ProviderPresetKey } from '../config/provider-presets.js'
 import { modelConfigSchema, type ModelConfig } from '../config/schema.js'
 import { queryDeepSeekBalance, type BalanceResult } from '../api/balance-client.js'
+import { probeProviderKey } from '../api/key-probe.js'
 import { getDeepSeekUserSummary, getDeepSeekCostReport } from '../api/deepseek-platform-client.js'
 import { listGrantedApps, revokeApp } from '../tools/computer-use/app-grants.js'
 import { createPlatformDriver, isComputerUsePlatform } from '../tools/computer-use/platform-driver.js'
@@ -234,6 +242,30 @@ export function buildConfigRoutes(apiToken?: string): Record<string, RouteHandle
       } catch (err) {
         return { status: 400, body: { error: (err as Error).message } }
       }
+    }, apiToken),
+
+    // Probe a key against a provider's /models before saving it. Avoids writing
+    // an invalid key that only surfaces as a 401 when the user later sends a msg.
+    // Body: { provider: string, apiKey: string }. Provider resolved to baseUrl
+    // from preset (zhipu-vision uses PaaS endpoint, not coding) or stored config.
+    'POST /config/providers/test-key': withAuth(async (body) => {
+      const { provider, apiKey, baseUrl: override } = body as { provider?: string; apiKey?: string; baseUrl?: string }
+      if (!provider) return { status: 400, body: { error: 'provider is required' } }
+      if (!apiKey) return { status: 400, body: { error: 'apiKey is required' } }
+      // Resolve baseUrl: explicit override (custom provider being created) wins,
+      // then stored config, then preset (preset has the right endpoint per provider
+      // — e.g. zhipu-vision uses api/paas/v4, not the coding endpoint).
+      let baseUrl = override
+      if (!baseUrl) {
+        const cfg = loadConfig()
+        const stored = cfg.provider.providers[provider]
+        baseUrl = stored?.baseUrl ?? (providerPresetKeys.includes(provider as ProviderPresetKey)
+          ? PROVIDER_PRESETS[provider as ProviderPresetKey].provider.baseUrl
+          : undefined)
+      }
+      if (!baseUrl) return { status: 400, body: { error: `cannot resolve baseUrl for provider "${provider}"` } }
+      const result = await probeProviderKey(apiKey, baseUrl)
+      return { status: 200, body: result }
     }, apiToken),
 
     'POST /config/providers/:name/default': withAuth((_body, params) => {
@@ -591,6 +623,21 @@ export function buildConfigRoutes(apiToken?: string): Record<string, RouteHandle
       }
     }, apiToken),
 
+    // 未配 visionModel 时是否自动挑一个可用视觉模型做桥。默认关，因为开了就会把
+    // 用户的图片发给一个用户从未为此选择过的 provider——桌面端得能自己开关它，
+    // 否则单独部署桌面的用户只能去手改 config.json。
+    'GET /config/vision-auto-bridge': withAuth(() => {
+      return { status: 200, body: { enabled: getVisionAutoBridge() } }
+    }, apiToken),
+
+    'PUT /config/vision-auto-bridge': withAuth((body) => {
+      const { enabled } = (body ?? {}) as { enabled?: unknown }
+      if (typeof enabled !== 'boolean') {
+        return { status: 400, body: { error: 'enabled must be a boolean' } }
+      }
+      return { status: 200, body: { ok: true, enabled: setVisionAutoBridge(enabled) } }
+    }, apiToken),
+
     // Greeting LLM: welcome page dynamic greeting toggle + model selection.
     'GET /config/greeting': withAuth(() => {
       return { status: 200, body: { config: getGreetingConfig() } }
@@ -640,8 +687,9 @@ export function buildConfigRoutes(apiToken?: string): Record<string, RouteHandle
       const provider = cfg.provider.providers[cfg.provider.default]
       if (!provider) return { status: 200, body: { summary: null } }
       const apiKey = provider.apiKey ?? (provider.apiKeyEnv ? process.env[provider.apiKeyEnv] : undefined)
-      const summary = await getDeepSeekUserSummary(apiKey, provider.baseUrl)
-      return { status: 200, body: { summary } }
+      // failure/message 透出，桌面端才能区分「未登录」与「网络错」。
+      const result = await getDeepSeekUserSummary(apiKey, provider.baseUrl)
+      return { status: 200, body: { summary: result.data, failure: result.failure, message: result.message } }
     }, apiToken),
 
     // DeepSeek 平台成本明细：按模型按天的 token/cost。month=1-12, year=YYYY。
@@ -653,8 +701,8 @@ export function buildConfigRoutes(apiToken?: string): Record<string, RouteHandle
       const now = new Date()
       const month = Number(params?.month ?? now.getMonth() + 1)
       const year = Number(params?.year ?? now.getFullYear())
-      const cost = await getDeepSeekCostReport(apiKey, provider.baseUrl, month, year)
-      return { status: 200, body: { cost } }
+      const result = await getDeepSeekCostReport(apiKey, provider.baseUrl, month, year)
+      return { status: 200, body: { cost: result.data, failure: result.failure, message: result.message } }
     }, apiToken),
 
     // ── DeepSeek 平台网页登录（token + cookie 持久化） ────────────

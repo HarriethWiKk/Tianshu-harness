@@ -1,5 +1,6 @@
 import type { CoordinatorRun, DelegationRequest } from './coordinator.js'
 import type { AggregationPolicy } from './work-order.js'
+import { dependencyId } from './work-order.js'
 import { deriveAuthority } from './star-domain.js'
 import { debugLog } from '../utils/debug.js'
 import { parseTeamTaskDrafts, parseTeamTasks, buildUnifiedTeamPlan, hasOverlappingFiles, type TeamTaskDraft, type TeamTask, type UnifiedTeamPlan } from './team-plan.js'
@@ -132,9 +133,9 @@ export function selectDispatchableTeamTasks(tasks: TeamTaskDraft[], maxParallel 
 export function teamTasksToDelegationRequests(tasks: TeamTaskDraft[], parentTurnId = 'team'): DelegationRequest[] {
   return tasks.map((task, index) => {
     const stableId = `team:${task.id || index}`
-    let deps: string[] | undefined
-    if ('dependsOn' in task && Array.isArray((task as any).dependsOn) && (task as any).dependsOn.length > 0) {
-      deps = (task as any).dependsOn.map((d: string) => `team:${d}`)
+    let deps: Array<string | import('./work-order.js').DependencyEdge> | undefined
+    if (task.dependsOn && task.dependsOn.length > 0) {
+      deps = task.dependsOn.map(d => mapTeamDependency(d))
     }
     return {
       parentTurnId: `${parentTurnId}:${stableId}`,
@@ -149,6 +150,17 @@ export function teamTasksToDelegationRequests(tasks: TeamTaskDraft[], parentTurn
   })
 }
 
+/** team 任务依赖 → DelegationRequest 依赖（收编 #6）：字符串 id 映射 team:<id>，
+ *  条件边映射 DependencyEdge（dependsOn/alternateOrderId 同样加 team: 前缀）。 */
+function mapTeamDependency(dep: string | import('./work-order.js').DependencyEdge): string | import('./work-order.js').DependencyEdge {
+  if (typeof dep === 'string') return `team:${dep}`
+  return {
+    dependsOn: `team:${dep.dependsOn}`,
+    ...(dep.onFailure ? { onFailure: dep.onFailure } : {}),
+    ...(dep.alternateOrderId ? { alternateOrderId: `team:${dep.alternateOrderId}` } : {}),
+  }
+}
+
 function waveToRequests(wave: TeamWave, taskMap: Map<string, TeamTask>, parentTurnId: string): DelegationRequest[] {
   return wave.taskIds
     .map(id => taskMap.get(id))
@@ -156,7 +168,7 @@ function waveToRequests(wave: TeamWave, taskMap: Map<string, TeamTask>, parentTu
     .map(task => {
       const stableId = `team:${task.id}`
       const deps = task.dependsOn.length > 0
-        ? task.dependsOn.map(d => `team:${d}`)
+        ? task.dependsOn.map(d => mapTeamDependency(d))
         : undefined
       return {
         parentTurnId: `${parentTurnId}:${stableId}`,
@@ -166,7 +178,7 @@ function waveToRequests(wave: TeamWave, taskMap: Map<string, TeamTask>, parentTu
         scope: { files: task.files },
         dependencies: deps,
         authority: taskAuthority(task),
-        riskTier: 'riskTier' in task ? (task as TeamTask).riskTier : undefined,
+        riskTier: task.riskTier,
       }
     })
 }
@@ -325,7 +337,7 @@ async function dispatchWaveAt(
       for (const taskId of dispatchWave.taskIds) {
         const task = taskMap.get(taskId)
         if (!task) { filteredTaskIds.push(taskId); continue }
-        const failedDeps = (task.dependsOn ?? []).filter(depId => failedIds.has(depId))
+        const failedDeps = (task.dependsOn ?? []).filter(dep => failedIds.has(dependencyId(dep)))
         if (failedDeps.length > 0) {
           crossWaveBlocked.push(`${taskId}: blocked by prior wave failure (${failedDeps.join(', ')})`)
         } else {
@@ -337,6 +349,33 @@ async function dispatchWaveAt(
   }
 
   const requests = waveToRequests(dispatchWave, taskMap, input.parentTurnId ?? 'team')
+  // Strip cross-wave dependencies that were already satisfied by a prior wave.
+  // waveToRequests faithfully copies TeamTask.dependsOn into DelegationRequest
+  // dependencies, but the coordinator treats those as intra-batch — T1 completed
+  // in a *previous* delegateBatch, so "team:T1" is an unmet dependency from the
+  // coordinator's perspective and triggers blockedDependencyResult for every
+  // task in the current wave. The cross-wave failure check above already
+  // handled the case where T1 *failed*; here we handle the case where it
+  // *succeeded* — strip the now-satisfied dep so the coordinator doesn't block.
+  if (priorResults && priorResults.length > 0) {
+    const priorPassedIds = new Set(
+      priorResults
+        .filter(r => r.status === 'passed')
+        .map(r => extractTaskIdFromWorkOrderId(r.workOrderId))
+        .filter(Boolean)
+    )
+    for (const req of requests) {
+      if (req.dependencies && req.dependencies.length > 0) {
+        const filtered = req.dependencies.filter(d => {
+          // dependency format is "team:T1", prior ID is "T1"
+          const rawId = dependencyId(d)
+          const depId = rawId.includes(':') ? rawId.slice(rawId.lastIndexOf(':') + 1) : rawId
+          return !priorPassedIds.has(depId)
+        })
+        req.dependencies = filtered.length > 0 ? filtered : undefined
+      }
+    }
+  }
   if (input.onActivity) for (const r of requests) r.onActivity = input.onActivity
   if (requests.length === 0) {
     return {
@@ -476,7 +515,8 @@ export async function runTeamSkeleton(input: TeamRunInput, deps: TeamOrchestrato
     }
     // Non-blocking advisory on the final merged graph (covers cached + fresh):
     // shards touching the same file without an explicit dependsOn ordering.
-    const advisories = detectOverlapWithoutOrder(mergedTasks)
+    // 条件边（收编 #6）：overlap 检查只关心主依赖——映射 dependencyId。
+    const advisories = detectOverlapWithoutOrder(mergedTasks.map(t => ({ ...t, dependsOn: t.dependsOn.map(dependencyId) })))
     const waves = groupTeamTasks(mergedTasks)
     const taskMap = new Map(mergedTasks.map(t => [t.id, t]))
 

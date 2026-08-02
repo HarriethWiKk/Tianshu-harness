@@ -13,6 +13,7 @@ function draft(): SettingsDraft {
     },
     review: { profiles: {}, skipAuto: true, mechanicalFastPath: true },
     vision: null,
+    visionAutoBridge: false,
     basics: {
       toolPreset: 'minimal',
       approval: 'auto-safe',

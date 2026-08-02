@@ -1,5 +1,8 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
+import { mkdtempSync, writeFileSync, rmSync, realpathSync } from 'node:fs'
+import { join } from 'node:path'
+import { tmpdir } from 'node:os'
 import type { StreamClient } from '../../api/stream-client.js'
 import { PromptEngine } from '../../prompt/engine.js'
 import { filterToolRegistry, ToolRegistry } from '../../tools/registry.js'
@@ -581,6 +584,54 @@ describe('DelegationCoordinator', () => {
     assert.deepEqual(capturedFloors.sort(), ['strong', undefined].sort(), 'tierFloor 必须进 WorkOrder（声明 strong 的席位不得被静默降档）')
   })
 
+  it('delegateBatch 同批 worker 共享一个 PrewarmCache，且派发前已预热 scope.files（P0-1）', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'coord-prewarm-'))
+    writeFileSync(join(dir, 'a.txt'), 'alpha evidence')
+    writeFileSync(join(dir, 'b.txt'), 'beta evidence')
+    const seen: Array<unknown> = []
+    const coordinator = new DelegationCoordinator({
+      baseToolRegistry: makeRegistry(),
+      modelCards: cards,
+      maxWorkers: 2,
+      cwd: dir,
+      runtimeFactory: (order, card, workerRegistry) => ({
+        order,
+        client: {} as StreamClient,
+        promptEngine: new PromptEngine({ model: card.model, maxTokens: 1024, staticCtx: { tools: workerRegistry.getDefinitions() }, volatileCtx: { cwd: dir } }),
+        toolRegistry: workerRegistry,
+        cwd: dir,
+        maxTurns: 2,
+        contextWindow: card.contextWindow,
+        compact: { enabled: false, autoThreshold: 800_000, autoFloor: 500_000, model: 'flash' },
+      }),
+      runWorker: async config => {
+        seen.push(config.prewarm)
+        return {
+          result: resultFor(config.order.id),
+          transcript: { text: '', thinking: '', toolUses: [], toolResults: [], errors: [], repairAttempts: 0 },
+          session: { getTurnCount: () => 1 } as never,
+          usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+        }
+      },
+    })
+
+    await coordinator.delegateBatch([
+      { parentTurnId: 'batch:pw:0', objective: 'Inspect alpha file for routing seams.', kind: 'code_search', profile: 'code_scout', scope: { files: ['a.txt'] } },
+      { parentTurnId: 'batch:pw:1', objective: 'Inspect beta file for risk patterns.', kind: 'code_search', profile: 'code_scout', scope: { files: ['b.txt'] } },
+    ])
+
+    assert.equal(seen.length, 2)
+    assert.ok(seen[0], 'worker 必须拿到批级共享 prewarm 实例')
+    assert.equal(seen[0], seen[1], '同批两个 worker 必须共享同一个 PrewarmCache 实例')
+    const cache = seen[0] as import('../prewarm.js').PrewarmCache
+    // 派发前预热已把两个 scope 文件装进共享 cache（canonical 可能是 realpath）
+    const canonA = realpathSync(join(dir, 'a.txt'))
+    const canonB = realpathSync(join(dir, 'b.txt'))
+    assert.ok(cache.has(canonA) || cache.has(join(dir, 'a.txt')), 'a.txt 应在派发前被预热')
+    assert.ok(cache.has(canonB) || cache.has(join(dir, 'b.txt')), 'b.txt 应在派发前被预热')
+    rmSync(dir, { recursive: true, force: true })
+  })
+
   it('A3: a dependent of a failed worker is reported as blocked, never silently dropped', async () => {
     const ran: string[] = []
     const coordinator = new DelegationCoordinator({
@@ -641,6 +692,121 @@ describe('DelegationCoordinator', () => {
     assert.match(t2.summary, /dependency failed: team:T1/)
     // The dependent must never have actually run on the broken foundation.
     assert.ok(!ran.includes('team:T2'), 'dependent worker was not executed')
+  })
+
+  it('条件边 skip：依赖失败 → 本任务跳过（summary 明示 skipped，不执行）（收编 #6）', async () => {
+    const ran: string[] = []
+    const coordinator = new DelegationCoordinator({
+      baseToolRegistry: makeRegistry(),
+      modelCards: cards,
+      maxWorkers: 2,
+      runtimeFactory: (order, card, workerRegistry) => {
+        if (order.id === 'team:T1') throw new Error('factory boom')
+        return {
+          order,
+          client: {} as StreamClient,
+          promptEngine: new PromptEngine({ model: card.model, maxTokens: 1024, staticCtx: { tools: workerRegistry.getDefinitions() }, volatileCtx: { cwd: '/repo' } }),
+          toolRegistry: workerRegistry,
+          cwd: '/repo',
+          maxTurns: 2,
+          contextWindow: card.contextWindow,
+          compact: { enabled: false, autoThreshold: 800_000, autoFloor: 500_000, model: 'flash' },
+        }
+      },
+      runWorker: async config => {
+        ran.push(config.order.id)
+        return {
+          result: resultFor(config.order.id),
+          transcript: { text: '', thinking: '', toolUses: [], toolResults: [], errors: [], repairAttempts: 0 },
+          session: { getTurnCount: () => 1 } as never,
+          usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+        }
+      },
+    })
+
+    const run = await coordinator.delegateBatch([
+      {
+        parentTurnId: 'turn_meta:team:T1',
+        objective: 'Scout the routing seams in the main module before review.',
+        kind: 'code_search',
+        profile: 'code_scout',
+        scope: { files: ['src/main.tsx'] },
+      },
+      {
+        parentTurnId: 'turn_meta:team:T2',
+        objective: 'Review the coordinator risk patterns that the scout surfaces.',
+        kind: 'review',
+        profile: 'reviewer',
+        scope: { files: ['src/agent/coordinator.ts'] },
+        dependencies: [{ dependsOn: 'team:T1', onFailure: 'skip' }],
+      },
+    ])
+
+    const t2 = run.results.find(r => r.workOrderId === 'team:T2')!
+    assert.equal(t2.status, 'blocked')
+    assert.match(t2.summary, /skipped/)
+    assert.ok(!ran.includes('team:T2'), 'skip 语义：依赖失败后本任务不得执行')
+  })
+
+  it('条件边 alternate：依赖失败 → 改等 alternate，其完成则本任务执行（收编 #6）', async () => {
+    const ran: string[] = []
+    const coordinator = new DelegationCoordinator({
+      baseToolRegistry: makeRegistry(),
+      modelCards: cards,
+      maxWorkers: 2,
+      runtimeFactory: (order, card, workerRegistry) => {
+        if (order.id === 'team:T1') throw new Error('factory boom')
+        return {
+          order,
+          client: {} as StreamClient,
+          promptEngine: new PromptEngine({ model: card.model, maxTokens: 1024, staticCtx: { tools: workerRegistry.getDefinitions() }, volatileCtx: { cwd: '/repo' } }),
+          toolRegistry: workerRegistry,
+          cwd: '/repo',
+          maxTurns: 2,
+          contextWindow: card.contextWindow,
+          compact: { enabled: false, autoThreshold: 800_000, autoFloor: 500_000, model: 'flash' },
+        }
+      },
+      runWorker: async config => {
+        ran.push(config.order.id)
+        return {
+          result: resultFor(config.order.id),
+          transcript: { text: '', thinking: '', toolUses: [], toolResults: [], errors: [], repairAttempts: 0 },
+          session: { getTurnCount: () => 1 } as never,
+          usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+        }
+      },
+    })
+
+    const run = await coordinator.delegateBatch([
+      {
+        parentTurnId: 'turn_meta:team:T1',
+        objective: 'Scout the routing seams in the main module before review.',
+        kind: 'code_search',
+        profile: 'code_scout',
+        scope: { files: ['src/main.tsx'] },
+      },
+      {
+        parentTurnId: 'turn_meta:team:T3',
+        objective: 'Explore the fallback path as an alternate dependency source.',
+        kind: 'code_search',
+        profile: 'code_scout',
+        scope: { files: ['src/agent/coordinator.ts'] },
+      },
+      {
+        parentTurnId: 'turn_meta:team:T2',
+        objective: 'Review the coordinator risk patterns that the scout surfaces.',
+        kind: 'review',
+        profile: 'reviewer',
+        scope: { files: ['src/agent/coordinator.ts'] },
+        dependencies: [{ dependsOn: 'team:T1', onFailure: 'alternate', alternateOrderId: 'team:T3' }],
+      },
+    ])
+
+    // T1 失败 → T2 改等 T3；T3 完成 → T2 真实执行
+    assert.ok(ran.includes('team:T2'), 'alternate 完成时本任务应执行')
+    const t2 = run.results.find(r => r.workOrderId === 'team:T2')!
+    assert.equal(t2.status, 'passed')
   })
 
   it('returns selected model metadata for each runnable batch work order', async () => {
@@ -2405,5 +2571,51 @@ describe('DelegationCoordinator', () => {
       assert.equal(sleepCalls[0], 5000, 'first delay: 5000 * 2^0 = 5000')
       assert.equal(sleepCalls[1], 10000, 'second delay: 5000 * 2^1 = 10000')
     })
+  })
+
+  it('delegateBatch 同批读工共享批级 StigmergyStore；写工默认不挂、显式 opt-in 才挂（收编 #3）', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'coord-stigmergy-'))
+    const seen: Array<{ profile: string; stigmergy: unknown }> = []
+    const coordinator = new DelegationCoordinator({
+      baseToolRegistry: makeRegistry(),
+      modelCards: cards,
+      maxWorkers: 2,
+      cwd: dir,
+      runtimeFactory: (order, card, workerRegistry) => ({
+        order,
+        client: {} as StreamClient,
+        promptEngine: new PromptEngine({ model: card.model, maxTokens: 1024, staticCtx: { tools: workerRegistry.getDefinitions() }, volatileCtx: { cwd: dir } }),
+        toolRegistry: workerRegistry,
+        cwd: dir,
+        maxTurns: 2,
+        contextWindow: card.contextWindow,
+        compact: { enabled: false, autoThreshold: 800_000, autoFloor: 500_000, model: 'flash' },
+      }),
+      runWorker: async config => {
+        seen.push({ profile: config.order.profile, stigmergy: config.stigmergy })
+        return {
+          result: resultFor(config.order.id),
+          transcript: { text: '', thinking: '', toolUses: [], toolResults: [], errors: [], repairAttempts: 0 },
+          session: { getTurnCount: () => 1 } as never,
+          usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+        }
+      },
+    })
+
+    await coordinator.delegateBatch([
+      { parentTurnId: 'batch:st:0', objective: 'Explore the alpha module for routing seams and risk patterns.', kind: 'code_search', profile: 'code_scout', scope: {} },
+      { parentTurnId: 'batch:st:1', objective: 'Explore the beta module for cache affinity and hot paths.', kind: 'code_search', profile: 'code_scout', scope: {} },
+      { parentTurnId: 'batch:st:2', objective: 'Implement the gamma feature with tests and typecheck verification.', kind: 'patch_proposal', profile: 'patcher', scope: {} },
+      { parentTurnId: 'batch:st:3', objective: 'Implement the delta feature with tests and typecheck verification.', kind: 'patch_proposal', profile: 'patcher', scope: {}, batchStigmergy: true },
+    ])
+
+    assert.equal(seen.length, 4)
+    const read0 = seen[0]!
+    assert.ok(read0.stigmergy, '读工必须拿到批级共享 store')
+    assert.equal(read0.stigmergy, seen[1]!.stigmergy, '同批读工共享同一 store 实例')
+    assert.equal(seen[2]!.stigmergy, undefined, '写工默认不挂（守护实现独立性）')
+    assert.ok(seen[3]!.stigmergy, '写工显式 opt-in 后挂')
+    assert.equal(seen[3]!.stigmergy, read0.stigmergy, 'opt-in 写工与读工共享同一批级实例')
+    rmSync(dir, { recursive: true, force: true })
   })
 })

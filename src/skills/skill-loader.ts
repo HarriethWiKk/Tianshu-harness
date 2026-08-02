@@ -363,7 +363,10 @@ export function listSkillFiles(
     for (const e of entries.sort((a, b) => a.name.localeCompare(b.name))) {
       if (out.length >= maxEntries) return
       const abs = join(d, e.name)
-      const rel = relative(skillDir, abs)
+      // 展示层路径统一正斜杠——relative() 在 Windows 返回反斜杠，会让
+      // <skill-files> 里给模型看的路径与 glob/repo_map 输出不一致，
+      // 且跨平台断言不成立（Windows 上 skill-loader 测试红）。
+      const rel = relative(skillDir, abs).replace(/\\/g, '/')
       if (rel === 'SKILL.md') continue
       if (e.isDirectory()) {
         out.push({ path: rel + '/', kind: 'dir' })
@@ -470,6 +473,54 @@ export const BUILTIN_SKILLS: SkillDefinition[] = [
       '- **L3 子文件**：目录技能加载后会附带 `<skill-files>` 清单；',
       '  **用到哪个子文件才 `read_file` 哪个**，不要预先全读。大子文件用',
       '  `read_file` 的 offset/limit **分页读完整**，绝不据残段执行。',
+    ].join('\n'),
+  },
+  {
+    name: 'galaxy',
+    description:
+      '启动星河 MoE 集群——将复杂任务拆解为多个维度，由不同星域专家并行执行、协商领地、互审合并。输入 /galaxy <任务> 或描述中包含"星河""集群""并行分析"时激活。',
+    triggers: [
+      /\/galaxy/,
+      /星河/,
+      /集群/,
+      /并行分析/,
+      /多维审查/,
+      /启动星河/,
+      /galaxy cluster/i,
+    ],
+    builtIn: true,
+    body: [
+      '# 星河 (Galaxy) — MoE 集群执行环境',
+      '',
+      '你已进入星河模式。星河采用混合专家（MoE）架构——每个星域是一个专家，',
+      '你作为门控网络自动选择激活哪些专家。',
+      '',
+      '## 执行流程',
+      '',
+      '1. **门控路由** — glob 扫项目文件后缀，按 MoE 规则选择激活的星域专家',
+      '2. **展示方案** — 调用 galaxy({confirm: false}) 展示集群方案，等待用户确认',
+      '3. **分片执行** — 确认后调用 galaxy({confirm: true}) 启动集群',
+      '   - 可写任务必须拆成文件范围不重叠的单星域维度',
+      '   - 多星域仅用于独立、只读的多视角分析；它们不共享实时上下文',
+      '4. **全局审查** — 所有执行维度完成后做跨维度一致性检查',
+      '5. **汇总交付** — 输出统一汇总报告',
+      '',
+      '## 星域专家选择',
+      '- 前端/UI → 文曲（代码美学）',
+      '- 后端/逻辑 → 天机（前提质疑）',
+      '- 架构/规划 → 天权（规划审查）',
+      '- 实现/编码 → 天梁（执行落地）',
+      '- 审查/验证 → 瑶光（复现验证）',
+      '- 探索/实验 → 破军（突破勘探）',
+      '- 重构/优化 → 天府（结构守护）',
+      '- 数据/对账 → 开阳（对账测量）',
+      '- 文档/调研 → 天璇（跨域视角）',
+      '- 统筹/编排 → 天枢（全貌定向）',
+      '',
+      '## 注意事项',
+      '- 你是监管者，不是执行者——不要自己改代码，全部委派给分子 Agent',
+      '- 稀疏激活：只有匹配的星域进入集群，不活跃的不进 prompt',
+      '- 多视角分析不替代协作通信；需要修改时先拆出不重叠的文件归属',
     ].join('\n'),
   },
 ]

@@ -32,7 +32,7 @@ export const WRITE_FILE_TOOL: Tool = {
 好的：write_file(file_path="/abs/path/src/new-component.tsx", content="...full file content...")
 坏的：用 write_file 只改已有文件里的一行（应改用 edit_file）
 
-**注意：** 磁盘上的文件是唯一事实来源。大内容写入后，消息历史里只保留一个指向 \`file_path\` 的短指针而不是完整内容——后续轮次如需回看写入内容，用 \`read_file\`。`,
+**注意：** 磁盘上的文件是唯一事实来源。大内容写入后，消息历史里只保留一个指向 \`file_path\` 的短指针而不是完整内容——**看到指针说明那次写入已成功落盘，不是你写了占位符，绝不要因此重写文件**；后续轮次如需回看写入内容，用 \`read_file\`。`,
     input_schema: {
       type: 'object',
       properties: {
@@ -188,7 +188,7 @@ export const WRITE_FILE_TOOL: Tool = {
     const syntax = await checkSyntax(filePath, finalContent)
     if (syntax.fatal) {
       const relPath = relative(params.cwd, filePath)
-      const restored = restoreLatestBackup(params.cwd, relPath)
+      const restored = restoreLatestBackup(params.cwd, relPath, params.sessionId)
       const fails = incrementEditFailCount(filePath)
       const gatePrefix = fails >= 3 ? `此文件已连续写入失败 ${fails} 次，再次编辑前必须先重新 read_file。\n\n` : ''
       const rollbackMsg = restored ? '更改已自动回滚。' : '自动回滚失败。'
@@ -228,7 +228,7 @@ export const WRITE_FILE_TOOL: Tool = {
       finalContent.length,
     )
     const receipt = draftReceipt
-      ?? `已写入 ${finalContent.length} 字节（${lines} 行）到 ${toPosixPath(filePath)}`
+      ?? `已写入 ${finalContent.length} 字节（${lines} 行）到 ${toPosixPath(filePath)}——内容与你提交的一致`
     return {
       content: receipt + (warn ? '\n\n' + warn : ''),
       uiContent,

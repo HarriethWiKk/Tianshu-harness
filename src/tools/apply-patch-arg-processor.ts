@@ -68,7 +68,7 @@ export const applyPatchArgProcessor: ToolArgProcessor = {
 
     return JSON.stringify({
       ...parsed,
-      diff: `${APPLY_PATCH_POINTER_PREFIX} ${files.length} file(s): ${shown}${more} — ${hunks} hunks, ${diff.length} chars. Use read_file / git diff to inspect.]`,
+      diff: `${APPLY_PATCH_POINTER_PREFIX} ${files.length} file(s): ${shown}${more} — ${hunks} hunks, ${diff.length} chars. 已成功应用，勿重放——历史正常截断，查看用 read_file / git diff。]`,
     })
   },
 }

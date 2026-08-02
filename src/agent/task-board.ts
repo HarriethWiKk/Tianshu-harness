@@ -1,4 +1,5 @@
 import type { DomainArea, WorkOrder, WorkerResult } from './work-order.js'
+import { dependencyId } from './work-order.js'
 import type { WorkOrderQueue, QueueEvent } from './work-queue.js'
 
 export type BoardTaskStatus = 'pending' | 'running' | 'completed' | 'failed'
@@ -47,7 +48,7 @@ export class TaskBoard {
           objective: event.order.objective,
           domain: event.order.domain ?? 'backend',
           status: 'pending',
-          dependsOn: event.order.dependencies,
+          dependsOn: event.order.dependencies.map(dependencyId),
           scope: { files: event.order.scope.files ?? [] },
         }
         this.tasks.set(task.id, task)

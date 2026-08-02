@@ -1,4 +1,5 @@
 import { STAR_DOMAINS, type StarDomainId } from '../agent/star-domain.js'
+import { dependencyId } from '../agent/work-order.js'
 import type { TeamRunSummary } from '../agent/team-orchestrator.js'
 import type { TeamTask } from '../agent/team-plan.js'
 import type { TeamWave } from '../agent/team-grouping.js'
@@ -130,7 +131,7 @@ export function buildTeamPanelModel(
       authority: authorityForTask(task),
       profile: task.profile,
       kind: task.kind,
-      dependsOn: [...task.dependsOn],
+      dependsOn: task.dependsOn.map(dependencyId),
       riskTier: task.riskTier,
       files: [...task.files],
       status: taskStatus(task.id, current, summary.run?.results, activeTaskIds),

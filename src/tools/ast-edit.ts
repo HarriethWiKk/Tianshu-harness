@@ -320,7 +320,7 @@ export const AST_EDIT_TOOL: Tool = {
                 try {
                   const check = await checkSyntax(filePath, currentSource)
                   if (check.fatal) {
-                    restoreLatestBackup(cwd, relPath)
+                    restoreLatestBackup(cwd, relPath, params.sessionId)
                     incrementEditFailCount(filePath)
                     errors.push(`${filePath}: 写入后语法错误——已回滚：${check.fatal.split('\n')[0]}`)
                     rolledBack = true

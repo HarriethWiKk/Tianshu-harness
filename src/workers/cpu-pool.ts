@@ -172,4 +172,15 @@ export const cpuPool = {
   get available(): boolean {
     return !DISABLED && !_dead
   },
+
+  /**
+   * Terminate the worker (if any) and mark the pool permanently dead.
+   * Use at process shutdown / test teardown: the lazily spawned worker holds
+   * a MessagePort that keeps node:test from exiting even though it is unref'd
+   * (worker stays alive waiting for messages).
+   */
+  dispose(): void {
+    killWorker()
+    _dead = true
+  },
 }

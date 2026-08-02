@@ -1,4 +1,5 @@
 import type { WorkOrderKind, WorkerProfile } from './work-order.js'
+import type { DependencyEdge } from './work-order.js'
 
 // ── Phase 1 lightweight model ──────────────────────────────────────────────
 
@@ -10,12 +11,15 @@ export interface TeamTaskDraft {
   profile: WorkerProfile
   kind: WorkOrderKind
   verification: string[]
+  /** 依赖（收编 #6）：纯任务 id 或条件边（{ dependsOn, onFailure, alternateOrderId }）。
+   *  draft 阶段可选——markdown 解析后由 draftToTeamTask 填充。 */
+  dependsOn?: Array<string | DependencyEdge>
 }
 
 // ── Phase 3.5 enriched model ───────────────────────────────────────────────
 
 export interface TeamTask extends TeamTaskDraft {
-  dependsOn: string[]
+  dependsOn: Array<string | DependencyEdge>
   riskTier: 'low' | 'medium' | 'high'
   touchSet: string[]
   groupId?: string
@@ -82,8 +86,9 @@ function normalizeTaskId(raw: string): string {
   return raw.trim().replace(/\s+/g, ' ')
 }
 
-function unique(values: string[]): string[] {
-  return [...new Set(values)]
+function unique<T>(values: T[]): T[] {
+  // 对象元素按序列化键去重（同键只保留一条——依赖对象按 dependsOn+onFailure+alternate）。
+  return [...new Map(values.map(v => [JSON.stringify(v), v])).values()]
 }
 
 function stripLineNoise(line: string): string {
@@ -161,13 +166,34 @@ function extractVerification(lines: string[]): string[] {
     .filter(line => COMMAND_RE.test(line) || /`[^`]+`/.test(line)))
 }
 
-function extractDependencies(lines: string[]): string[] {
-  const deps: string[] = []
+/**
+ * 解析单个依赖引用（收编 #6 语法）：
+ * - 纯 `T1` → 字符串（向后兼容）
+ * - `T1(onFailure:skip)` → { dependsOn: 'T1', onFailure: 'skip' }
+ * - `T2(onFailure:alternate:T3)` → { dependsOn: 'T2', onFailure: 'alternate', alternateOrderId: 'T3' }
+ * 无法解析的形态原样返回字符串（保持旧行为，不误吞）。
+ */
+function parseDependencyRef(raw: string): string | DependencyEdge {
+  const m = raw.match(/^([A-Za-z0-9_-]+)\(onFailure:(skip|alternate)(?::([A-Za-z0-9_-]+))?\)$/)
+  if (!m) return raw
+  const id = m[1]!
+  const onFailure = m[2] as 'skip' | 'alternate'
+  const alternateId = m[3]
+  if (onFailure === 'alternate' && !alternateId) return raw
+  return {
+    dependsOn: id,
+    onFailure,
+    ...(alternateId ? { alternateOrderId: alternateId } : {}),
+  }
+}
+
+function extractDependencies(lines: string[]): Array<string | DependencyEdge> {
+  const deps: Array<string | DependencyEdge> = []
   for (const line of lines) {
     const m = line.match(/(?:depends?\s*(?:on)?|依赖|前置)\s*[:：]?\s*(.+)/i)
     if (m) {
       const refs = m[1]!.split(/[,，、;；\s]+/).filter(r => r && r.toLowerCase() !== 'none')
-      deps.push(...refs)
+      deps.push(...refs.map(parseDependencyRef))
     }
   }
   return unique(deps)

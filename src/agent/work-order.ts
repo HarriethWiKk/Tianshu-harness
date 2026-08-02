@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import type { CapabilityTask } from '../model/capability.js'
 import type { VerificationMetadata } from '../tools/types.js'
-import { profileRegistry } from './profile-registry.js'
+import { profileRegistry, tierTimeoutMultiplier } from './profile-registry.js'
 import { starDomainRegistry } from './star-domain-registry.js'
 import { resolveAuthorityReason } from './star-domain.js'
 import { progressiveTimeout } from './timeout-ladder.js'
@@ -52,12 +52,22 @@ export const workerProfileSchema = z.string().refine(
 
 export type WorkerProfile = z.infer<typeof workerProfileSchema>
 
-export const aggregationPolicySchema = z.enum([
+/** 字符串枚举聚合策略（现有五档）。quorum 是对象形态（带组级阈值 k）。 */
+export const aggregationPolicyKinds = [
   'all_required',
   'first_success',
   'majority',
   'primary_decides',
   'weighted_confidence',
+] as const
+
+export const aggregationPolicySchema = z.union([
+  z.enum(aggregationPolicyKinds),
+  z.object({
+    kind: z.literal('quorum'),
+    /** 组内通过数达 k 即组通过（组阈值可由 aggregateResults 的 quorumGroups 覆盖）。 */
+    k: z.number().int().min(1),
+  }),
 ])
 
 export type AggregationPolicy = z.infer<typeof aggregationPolicySchema>
@@ -110,7 +120,24 @@ export function deriveWorkerSessionId(orderId: string, dispatchNonce?: string): 
   return dispatchNonce ? `${base}-${dispatchNonce}` : base
 }
 
-export const workOrderSchema = z.object({
+/** 条件依赖边（星河收编 #6）：主依赖失败时的分支。
+ *  - onFailure=skip：依赖失败 → 本任务不执行（清扫时标 skipped）
+ *  - onFailure=alternate：依赖失败 → 改等 alternateOrderId（其完成才可运行，
+ *    其失败则本任务同样跳过）。 */
+export const dependencyEdgeSchema = z.object({
+  dependsOn: z.string().min(1),
+  onFailure: z.enum(['skip', 'alternate']).optional(),
+  alternateOrderId: z.string().optional(),
+})
+
+export type DependencyEdge = z.infer<typeof dependencyEdgeSchema>
+
+/** 依赖的实际 id：字符串边取自身，条件边取 dependsOn。 */
+export function dependencyId(dep: string | DependencyEdge): string {
+  return typeof dep === 'string' ? dep : dep.dependsOn
+}
+
+const workOrderSchema = z.object({
   id: z.string().min(1),
   parentTurnId: z.string().min(1),
   kind: workOrderKindSchema,
@@ -121,7 +148,12 @@ export const workOrderSchema = z.object({
   allowedTools: z.array(z.string()),
   disallowedTools: z.array(z.string()),
   dedupeKey: z.string().min(1),
-  dependencies: z.array(z.string()),
+  dependencies: z.array(z.union([z.string().min(1), dependencyEdgeSchema])),
+  /** Logical group for coordinated or multi-perspective tasks. */
+  groupId: z.string().min(1).optional(),
+  /** 写工显式 opt-in 批级共享信息素（星河收编 #3）。读工默认共享；写工只有
+   *  显式声明才挂批级 store（守护实现独立性）。 */
+  batchStigmergy: z.boolean().optional(),
   aggregationPolicy: aggregationPolicySchema,
   budget: workerBudgetSchema,
   domain: domainAreaSchema.optional(),
@@ -159,10 +191,17 @@ const verificationMetadataSchema = z.object({
   durationMs: z.number(),
 }) satisfies z.ZodType<VerificationMetadata>
 
-const workerFindingSchema = z.object({
+export const workerFindingSchema = z.object({
   claim: z.string().min(1),
   evidence: z.string().min(1),
   confidence: z.enum(['low', 'medium', 'high']),
+  /** 'firsthand' = worker 亲自 read/grep/跑命令拿到的原始观测。
+   *  'inferred' = 基于已有信息的推断，未经 worker 亲自落地取证。
+   *  省略时表示未声明（等同于旧版 finding，消费端按转述处理）。 */
+  evidenceKind: z.enum(['firsthand', 'inferred']).optional(),
+  /** file:line 引用（如 "src/agent/foo.ts:42"）或命令 exit code 引用（如 "cmd: node --test exit=0"）。
+   *  一手实测必须至少带一条引用；转述推断可省略。 */
+  evidenceRefs: z.array(z.string().min(1)).optional(),
 })
 
 const workerArtifactSchema = z.object({
@@ -227,6 +266,10 @@ export const workerResultSchema = z.object({
   profile: z.string().optional(),
   /** Runtime metadata: 派发侧 authority（星域 id），与 profile 同点盖章。 */
   authority: z.string().optional(),
+  /** Runtime metadata: 派发侧 logical group（DP 副本组/多视角组），由 coordinator
+   *  与 objective 同点盖章。quorum 聚合按它分组；刻意不进 ingest schema（同
+   *  objective 纪律）——分组不能信 worker 自报。 */
+  groupId: z.string().optional(),
   /** Runtime metadata: actual model used by the worker. */
   model: z.string().optional(),
   /** Runtime metadata: provider used by the worker. */
@@ -240,6 +283,10 @@ export const workerResultSchema = z.object({
     reasoning_tokens: z.number().optional(),
     total_tokens: z.number().optional(),
   }).optional(),
+  /** D 度量：结果契约失败的细分类型（no_json/json_syntax/schema_field/truncated），
+   *  由解析侧在 terminal 路径盖章——worker 自报不可信，但 hands 路径会经
+   *  parseWorkerResult 内部往返一次，ingest 侧也要放行此键（同 failureReason 纪律）。 */
+  parseErrorKind: z.enum(['no_json', 'json_syntax', 'schema_field', 'truncated']).optional(),
 })
 
 const workerResultIngestSchema = z.object({
@@ -278,9 +325,38 @@ const workerResultIngestSchema = z.object({
    *  写工的失败原因（含续跑判据依赖的 max_turns / timeout）会在这道内部序列化
    *  边界上被静默剥掉，主控只看到一个没有原因的 blocked。 */
   failureReason: z.enum(['caller_aborted', 'circuit_open', 'claim_conflict', 'timeout', 'max_turns', 'json_parse', 'schema_mismatch', 'worker_crash', 'worker_blocked', 'unknown']).optional(),
+  /** D 度量细分，同 failureReason 的内部往返纪律（见 workerResultSchema 同名注释）。 */
+  parseErrorKind: z.enum(['no_json', 'json_syntax', 'schema_field', 'truncated']).optional(),
 })
 
 export type WorkerResult = z.infer<typeof workerResultSchema>
+
+/** D 度量：结果契约失败的细分类型。failureReason 只给路由级枚举
+ *  （json_parse / schema_mismatch），度量需要知道具体死法——
+ *  是语法错、字段错、截断，还是根本没产出 JSON。 */
+export type WorkerParseErrorKind =
+  /** 全文找不到任何 JSON 候选（纯散文/思考流） */
+  | 'no_json'
+  /** JSON.parse 失败：未转义引号/逗号/括号等语法错 */
+  | 'json_syntax'
+  /** JSON 合法但 zod 校验不过：缺字段/类型错/多字段 */
+  | 'schema_field'
+  /** 输出被 maxTokens/中断截断（Unterminated string / Unexpected end） */
+  | 'truncated'
+
+/** 从 parseWorkerResult 抛出的错误分类。只认 WorkerResultParseError 与
+ *  extractJsonCandidates 的「无 JSON」错误；其余返回 undefined（调用方不附带）。 */
+export function classifyWorkerParseError(error: unknown): WorkerParseErrorKind | undefined {
+  if (error instanceof WorkerResultParseError) {
+    const joined = error.parseErrors.join(' | ')
+    if (/Unterminated|string.*end|Unexpected end/i.test(joined)) return 'truncated'
+    if (/Required|invalid_type|invalid_union|invalid_enum|Unrecognized key|expected .+ received|too_small|too_big/i.test(joined)) return 'schema_field'
+    return 'json_syntax'
+  }
+  const msg = error instanceof Error ? error.message : String(error)
+  if (/did not contain a JSON object|no JSON/i.test(msg)) return 'no_json'
+  return undefined
+}
 
 export interface CreateReadOnlyWorkOrderInput {
   id?: string
@@ -290,7 +366,10 @@ export interface CreateReadOnlyWorkOrderInput {
   objective: string
   scope: WorkOrderScope
   constraints?: string[]
-  dependencies?: string[]
+  dependencies?: Array<string | DependencyEdge>
+  /** Logical group for related tasks. It participates in deduplication so
+   * independent perspectives over the same file scope are all preserved. */
+  groupId?: string
   aggregationPolicy?: AggregationPolicy
   budget?: Partial<WorkerBudget>
   domain?: DomainArea
@@ -308,6 +387,8 @@ export interface CreateReadOnlyWorkOrderInput {
   modelOverride?: { provider: string; model: string }
   /** 瑶光门 tier 下限：路由结果不得低于此档。只抬升不降级。 */
   tierFloor?: 'cheap' | 'balanced' | 'strong'
+  /** 写工显式 opt-in 批级共享信息素（星河收编 #3）。 */
+  batchStigmergy?: boolean
 }
 
 function toolsForAuthority(tools: string[], authority?: string): string[] {
@@ -358,13 +439,20 @@ export function createReadOnlyWorkOrder(input: CreateReadOnlyWorkOrderInput): Wo
     disallowedTools: input.profile === 'adversarial_verifier'
       ? ['bash', 'write_file', 'edit_file', 'delegate_task', 'delegate_batch'] // run_tests NOT disallowed — it's the verifier's primary weapon
       : [...PHASE1_DISALLOWED_WORKER_TOOLS],
-    dedupeKey: `${input.kind}:${input.scope.files?.join(',') || input.objective}`,
+    dedupeKey: input.groupId
+      ? `${input.kind}:group:${input.groupId}:${input.authority ?? 'default'}:${input.parentTurnId}:${input.scope.files?.join(',') || input.objective}`
+      : `${input.kind}:${input.scope.files?.join(',') || input.objective}`,
     dependencies: input.dependencies ?? [],
+    groupId: input.groupId,
+    batchStigmergy: input.batchStigmergy,
     aggregationPolicy: input.aggregationPolicy ?? 'primary_decides',
     budget: {
       maxTurns: input.budget?.maxTurns ?? 24,
       maxTokens: input.budget?.maxTokens ?? profileRegistry.get(input.profile)?.defaultMaxTokens ?? 4096,
-      timeoutMs: input.budget?.timeoutMs ?? profileRegistry.get(input.profile)?.defaultTimeoutMs ?? progressiveTimeout(input.sessionTurn),
+      timeoutMs: Math.round((input.budget?.timeoutMs
+        ?? profileRegistry.get(input.profile)?.defaultTimeoutMs
+        ?? progressiveTimeout(input.sessionTurn))
+        * tierTimeoutMultiplier(input.tierFloor)),
       maxRetries: input.budget?.maxRetries ?? 2,
       retryBackoffMs: input.budget?.retryBackoffMs ?? 10000,
       maxRetryBackoffMs: input.budget?.maxRetryBackoffMs ?? 300000,
@@ -405,8 +493,12 @@ export function createWriteWorkOrder(input: CreateWriteWorkOrderInput): WorkOrde
       return toolsForAuthority(tools, input.authority)
     })(),
     disallowedTools: ['delegate_task', 'delegate_batch'],
-    dedupeKey: `write:${input.scope.files?.join(',') || input.objective}`,
+    dedupeKey: input.groupId
+      ? `write:group:${input.groupId}:${input.authority ?? 'default'}:${input.parentTurnId}:${input.scope.files?.join(',') || input.objective}`
+      : `write:${input.scope.files?.join(',') || input.objective}`,
     dependencies: input.dependencies ?? [],
+    groupId: input.groupId,
+    batchStigmergy: input.batchStigmergy,
     aggregationPolicy: input.aggregationPolicy ?? 'primary_decides',
     budget: {
       // Self-contained shards run a full loop (implement + tsc/lint/tests) in one
@@ -415,7 +507,10 @@ export function createWriteWorkOrder(input: CreateWriteWorkOrderInput): WorkOrde
       // 8–14 turns was far too tight for real implement+verify work.
       maxTurns: input.budget?.maxTurns ?? 32,
       maxTokens: input.budget?.maxTokens ?? profileRegistry.get(input.profile ?? 'patcher')?.defaultMaxTokens ?? 16384,
-      timeoutMs: input.budget?.timeoutMs ?? profileRegistry.get(input.profile ?? 'patcher')?.defaultTimeoutMs ?? progressiveTimeout(input.sessionTurn),
+      timeoutMs: Math.round((input.budget?.timeoutMs
+        ?? profileRegistry.get(input.profile ?? 'patcher')?.defaultTimeoutMs
+        ?? progressiveTimeout(input.sessionTurn))
+        * tierTimeoutMultiplier(input.tierFloor)),
       maxRetries: input.budget?.maxRetries ?? 1,
       retryBackoffMs: input.budget?.retryBackoffMs ?? 10000,
       maxRetryBackoffMs: input.budget?.maxRetryBackoffMs ?? 300000,
@@ -645,7 +740,7 @@ export function parseWorkerResult(text: string, expectedWorkOrderId: string): Wo
  *     schema; tier 2 recovered them.)
  *  Both tiers share one `seenClaims` set so the same finding isn't counted
  *  twice when a balanced candidate already captured it at tier 1. */
-export function salvageWorkerResult(text: string, expectedWorkOrderId: string): WorkerResult | null {
+export function salvageWorkerResult(text: string, expectedWorkOrderId: string, parseError?: unknown): WorkerResult | null {
   let candidates: string[]
   try {
     candidates = extractJsonCandidates(text)
@@ -720,6 +815,7 @@ export function salvageWorkerResult(text: string, expectedWorkOrderId: string): 
     nextActions: ['Weigh salvaged findings as unverified leads; re-dispatch with resume if full fidelity is needed'],
     evidenceStatus: 'unverified',
     failureReason: 'json_parse',
+    ...(parseError !== undefined ? { parseErrorKind: classifyWorkerParseError(parseError) ?? 'json_syntax' } : {}),
   }
 }
 

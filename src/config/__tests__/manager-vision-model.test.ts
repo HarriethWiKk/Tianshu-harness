@@ -53,6 +53,49 @@ describe('vision model config', () => {
     assert.equal(loadConfig().agent.visionModel, undefined)
   })
 
+  // fallback 的三态：省略=保留、null=清除、对象=设置。省略即保留是为了两个界面
+  // （桌面端 / TUI 面板 / 手写配置）轮流写同一份配置时，后写的那个不会抹掉自己不
+  // 显示的字段——早期整体替换让"保存一下别的项"就吞掉了备用识图桥。
+  it('keeps an existing fallback when the payload omits it', () => {
+    setVisionModelConfig({
+      provider: 'minimax',
+      model: 'MiniMax-M3',
+      fallback: { provider: 'glm', model: 'glm-5.2' },
+    })
+    const saved = setVisionModelConfig({ provider: 'minimax', model: 'MiniMax-M3', maxTokens: 2048 })
+    assert.deepEqual(saved?.fallback, { provider: 'glm', model: 'glm-5.2' }, '不提到它就不该删它')
+    assert.equal(saved?.maxTokens, 2048)
+  })
+
+  it('clears the fallback only on an explicit null', () => {
+    setVisionModelConfig({
+      provider: 'minimax',
+      model: 'MiniMax-M3',
+      fallback: { provider: 'glm', model: 'glm-5.2' },
+    })
+    const saved = setVisionModelConfig({ provider: 'minimax', model: 'MiniMax-M3', fallback: null })
+    assert.equal(saved?.fallback, undefined)
+    assert.equal(loadConfig().agent.visionModel?.fallback, undefined)
+  })
+
+  it('replaces the fallback when a new one is given', () => {
+    setVisionModelConfig({ provider: 'minimax', model: 'MiniMax-M3', fallback: { provider: 'glm', model: 'glm-5.2' } })
+    const saved = setVisionModelConfig({
+      provider: 'minimax',
+      model: 'MiniMax-M3',
+      fallback: { provider: 'deepseek', model: 'deepseek-vl' },
+    })
+    assert.deepEqual(saved?.fallback, { provider: 'deepseek', model: 'deepseek-vl' })
+  })
+
+  it('rejects a malformed fallback instead of silently dropping it', () => {
+    assert.throws(() => setVisionModelConfig({
+      provider: 'minimax',
+      model: 'MiniMax-M3',
+      fallback: { provider: 'glm' },
+    }))
+  })
+
   it('treats empty provider/model as a clear and rejects malformed payloads', () => {
     setVisionModelConfig({ provider: 'minimax', model: 'MiniMax-M3' })
     assert.equal(getVisionModelConfig()?.provider, 'minimax')

@@ -61,19 +61,55 @@ npm run build      # 生成 dist/main.js
 npm start          # 或：node dist/main.js
 ```
 
-### 3. 配置 API Key（首次必做）
+### 3. 启用 Shell 补全（可选）
+
+仓库自带 `completions/` 目录，覆盖 bash / zsh / fish / Windows PowerShell 四种 shell。按你的 shell 安装对应文件：
+
+**bash** —— 任选其一：
 
 ```bash
-# A. 环境变量（首次试用最简单）
-export DEEPSEEK_API_KEY=sk-xxx
+source /path/to/rivet.bash                                   # 追加到 ~/.bashrc
+cp completions/rivet.bash ~/.local/share/bash-completion/completions/rivet
+sudo cp completions/rivet.bash /usr/share/bash-completion/completions/rivet
+```
 
-# B. 持久化 CLI 配置（保存到 ~/.rivet/config.json）
-rivet config set-key deepseek sk-xxx
+**zsh** —— 把 `rivet.zsh` 以 `_rivet` 名字放入 `$fpath`：
+
+```bash
+mkdir -p ~/.zsh/completions
+cp completions/rivet.zsh ~/.zsh/completions/_rivet
+echo 'fpath=(~/.zsh/completions $fpath)' >> ~/.zshrc   # 需在 compinit 之前
+```
+
+**fish**：
+
+```bash
+mkdir -p ~/.config/fish/completions
+cp completions/rivet.fish ~/.config/fish/completions/rivet.fish
+```
+
+**Windows PowerShell** —— 在 `$PROFILE` 里 dot-source：
+
+```powershell
+Add-Content $PROFILE ". C:\path\to\rivet.ps1"
+```
+
+> 补全内容与 CLI 保持一致：顶层命令（`config` / `serve` / `sessions` / `browser` / `logs`）、全局 flags、`config` 全部子命令，以及从 `~/.rivet/config.json` 动态读取的 provider 名。
+
+### 4. 配置 API Key（首次必做）
+
+**直接安装的用户无需手动配置**——首次启动会自动进入引导，粘贴 DeepSeek key 即可：桌面端是连接向导，CLI 首启缺 key 时也会自动弹出配置向导。之后随时修改：桌面端 Settings → Provider，CLI 里 `rivet config`。
+
+**开发者拉源码启动**（或想在启动前预先配好）才需要手动来：
+
+```bash
+rivet config set-key deepseek sk-xxx   # 持久化到 config.json
+export DEEPSEEK_API_KEY=sk-xxx         # 或：环境变量（仅当前 shell 有效）
 ```
 
 > 其他提供商（Claude、GLM、Codex、MiniMax、MiMo）用法相同，详见 [模型配置](docs/user-guide-provider-config.md)。
 
-### 4. 启动
+### 5. 启动
 
 ```bash
 rivet            # 或：npm start / node dist/main.js
@@ -111,7 +147,7 @@ rivet --goal "修复所有类型错误" --budget 50   # 无头目标自主模式
 | `--skip-welcome` | 跳过欢迎屏 |
 | `--stream-events <path>` | 把本次 run 镜像为 NDJSON `SessionEvent` 写入文件 |
 
-子命令：`rivet config`（交互式配置）、`rivet serve`（启动 sidecar HTTP/SSE）、`rivet sessions`（列会话）。
+子命令：`rivet config`（交互式配置）、`rivet serve`（启动 sidecar HTTP/SSE）、`rivet sessions`（列会话）、`rivet logs`（日志落点）、`rivet browser status` / `rivet browser install [--no-mirror]`（`browser_debug` 所需 chromium 的体检与一键安装，默认走国内镜像）。
 
 ### 自动更新
 
@@ -133,13 +169,12 @@ rivet --goal "修复所有类型错误" --budget 50   # 无头目标自主模式
 会话内用 `/model <name>` 随时切换提供商。
 
 ```bash
-rivet config                                              # 交互式设置（TTY）
-rivet config setup deepseek --key-env DEEPSEEK_API_KEY --default
-rivet config setup codex --default                       # OAuth（首次浏览器登录）
-rivet config show                                         # 查看完整配置
+rivet config                          # 交互式设置（TTY）
+rivet config setup codex --default    # Codex 走 OAuth（首次浏览器登录）
+rivet config show                     # 查看完整配置
 ```
 
-也可直接编辑 `~/.rivet/config.json`（只写需要覆盖的字段，默认值会深度合并）：
+也可直接编辑 config.json（只写需要覆盖的字段，默认值会深度合并）。文件位置：CLI 在 `~/.rivet/config.json`（Windows 为 `%LOCALAPPDATA%\.rivet`）；桌面端以 Settings → 存储位置为准，便携版在 exe 旁 `TianshuData\.rivet`——详见[先定位数据根](#先定位数据根)：
 
 ```json
 {
@@ -147,7 +182,7 @@ rivet config show                                         # 查看完整配置
     "default": "deepseek",
     "providers": {
       "deepseek": {
-        "apiKeyEnv": "DEEPSEEK_API_KEY",
+        "apiKey": "sk-xxx",
         "models": [
           { "id": "deepseek-v4-pro", "contextWindow": 1000000, "maxTokens": 384000 }
         ]
@@ -172,15 +207,20 @@ rivet config show                                         # 查看完整配置
       "provider": "minimax",
       "model": "MiniMax-M3",
       "prompt": "请详细描述这张图片…",  // 可选
-      "maxTokens": 1024                 // 可选，描述的输出上限
-    }
+      "maxTokens": 1024,                // 可选，描述的输出上限
+      "fallback": { "provider": "glm", "model": "glm-5.2" }  // 可选，主桥 5xx/超时时自动切
+    },
+    "visionAutoBridge": false           // 未配 visionModel 时是否自动挑一个可用视觉模型（默认关）
   }
 }
 ```
 
-- **桌面端**：Settings → 集成 → 识图模型（下拉只列已配置且支持图片输入的组合，留空即关闭）。
-- **TUI**：`/config` → 识图模型（候选同桌面端；选「（关闭）」即关掉桥接，`S` 保存，下次会话生效）。
-- **图片来源**：TUI 粘贴图片路径或 `Ctrl+V` 读剪贴板、桌面端 Composer 附件（每条最多 4 张）；以及 agent 自己截的 `browser_debug` / `computer_use` 截图（每轮最多带最近 2 张进上下文）。
+- **桌面端**：Settings → 集成 → 识图模型（下拉只列已配置且支持图片输入的组合，留空即关闭；同卡还有备用识图模型与自动选桥开关）。卡片顶部显示**当前会话的真实桥状态**；附图而图不会被看到时，Composer 直接警告并给「去配置」按钮。
+- **TUI**：`/config` → 识图模型（候选同桌面端；选「（关闭）」即关掉桥接，同分类还有自动选桥开关，`S` 保存，下次会话生效）。
+- **`ask_image`**：配了桥（或主控本身多模态）后，模型可就同一张图反复追问细节（"逐字念出红色报错那一行"），你附的图和 agent 自己截的图都能问；同一问法命中缓存零额外调用。
+- **自动选桥默认关**：开了它就会把图片发给一个你没为此选择过的 provider。关着时若检测到可用视觉模型，天枢会点名它并告诉你怎么启用，不闷声丢图。
+- **图片来源**：TUI 粘贴图片路径或 `Ctrl+V` 读剪贴板、桌面端 Composer 附件（每条最多 4 张）；以及 agent 自己截的 `browser_debug` / `computer_use` 截图（每轮最多带最近 2 张进上下文）。`browser_debug` 缺 chromium 时：终端 `rivet browser install`，或桌面端 Settings → 集成 → **浏览器（截图）** 一键装（带安装日志）。
+- **CLI 与桌面各自独立**：识图模型、备用桥、自动选桥、chromium 安装两端都配得全，只装一个也能自己把识图跑通。
 - 图片走对话尾部追加，**不打断前缀缓存**；token 按分辨率估算（1280×800 ≈ 1105，不是固定值）。
 
 完整说明与排查见 [识图能力用户手册](docs/user-guide-vision.md)。
@@ -311,13 +351,13 @@ DeepSeek 对缓存未命中收取 50× 费用。天枢的提示词引擎围绕�
 
 ### 工具集与 preset
 
-天枢内置 47 个工具，按三档 preset 装配（解析优先级：`RIVET_TOOL_PRESET` 环境变量 > 项目 `.rivet-config.json` 的 `tools.preset` > 用户 `~/.rivet/config.json` > 默认 `minimal`）：
+天枢内置 48 个工具，按三档 preset 装配（解析优先级：`RIVET_TOOL_PRESET` 环境变量 > 项目 `.rivet-config.json` 的 `tools.preset` > 用户 `~/.rivet/config.json` > 默认 `minimal`）：
 
 | Preset | 工具数 | 说明 |
 |--------|--------|------|
-| **minimal**（默认） | 27 | 日常开发全能力——读写/检索/bash/git/测试/委托/web/计划/todo/memory，省 token、保 prefix cache |
-| **frontend** | 28 | minimal + `browser_debug`（UI 渲染验证闭环） |
-| **full** | 47 | 全集，含 `council_convene` / `team_orchestrate` / `attack_case` / `semantic_search` / `repo_graph` / `monitor` / `computer_use` / 办公工具族等进阶能力 |
+| **minimal**（默认） | 29 | 日常开发全能力——读写/检索/bash/git/测试/委托/web/计划/todo/memory，省 token、保 prefix cache |
+| **frontend** | 30 | minimal + `browser_debug`（UI 渲染验证闭环） |
+| **full** | 48 | 全集，含 `council_convene` / `team_orchestrate` / `attack_case` / `semantic_search` / `repo_graph` / `monitor` / `computer_use` / 办公工具族等进阶能力 |
 
 ```bash
 RIVET_TOOL_PRESET=full rivet          # 本次会话用 full
@@ -601,6 +641,7 @@ TUI 是 CLI 的默认表面。桌面端（Tauri）与 VS Code/Cursor 插件共�
 | `/ask` | 进入/退出 Ask Mode（只读问答，toggle） |
 | `/council <text>` | 召集多模型议事会审查（天权/天府/天璇三席） |
 | `/team <plan.md>` | 团队模式：多 agent 并行执行计划 |
+| `/scout <目标> [--dims 前端,后端,集成]` | 巡天侦察蜂群：并行只读诊断，交付带证据的实测核对清单 + runbook（不写文件；选型口诀——要留计划资产用 /team，只要这一次并行加速用 /scout） |
 
 **子代理与后台任务**
 
@@ -815,6 +856,7 @@ rivet logs open desktop            # 打开 sidecar 日志目录（GUI 起不来
       "provider": "minimax",      // 需已配好 key，且该模型声明 supportsVision
       "model": "MiniMax-M3"
     },
+    "visionAutoBridge": false,    // 未配 visionModel 时自动挑一个可用视觉模型（默认关）
     "permissions": {              // 权限规则（对应 /permission 命令）
       "allow": [{ "tool": "read" }],
       "deny":  [{ "tool": "bash", "params": { "command": "rm -rf" } }],

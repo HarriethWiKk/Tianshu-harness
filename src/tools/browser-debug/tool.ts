@@ -4,6 +4,10 @@
 
 import { join } from 'node:path'
 import { writeFile } from 'node:fs/promises'
+import { readFileSync } from 'node:fs'
+import { createConnection } from 'node:net'
+import pixelmatch from 'pixelmatch'
+import { PNG } from 'pngjs'
 import type { Tool, ToolCallParams, ToolResult } from '../types.js'
 import { rivetHome } from '../../config/paths.js'
 import {
@@ -118,6 +122,96 @@ export function isCdpUrlAllowed(raw: string, allowlist: string[]): boolean {
   } catch {
     return false
   }
+}
+
+/** Common dev server ports to probe when navigation fails with a connection
+ *  error. Ordered by prevalence — Vite (5173), Next.js (3000), common
+ *  alternatives. Only localhost — no external network. */
+const DEV_PORT_CANDIDATES = [5173, 3000, 8080, 4200, 3001, 5000, 8000, 9000, 1234, 6006]
+
+/** Try connecting to localhost:port; resolve with port number if listening,
+ *  reject if not. Timeout set low so probing a dozen ports takes ~1s total. */
+function probePort(port: number, timeoutMs = 150): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const sock = createConnection(port, '127.0.0.1')
+    const timer = setTimeout(() => { sock.destroy(); reject(new Error('timeout')) }, timeoutMs)
+    sock.on('connect', () => { clearTimeout(timer); sock.destroy(); resolve(port) })
+    sock.on('error', () => { clearTimeout(timer); sock.destroy(); reject(new Error('refused')) })
+  })
+}
+
+/** Scan candidate ports in parallel, return the ones that are listening. */
+async function probeDevPorts(): Promise<number[]> {
+  const results = await Promise.allSettled(DEV_PORT_CANDIDATES.map((p) => probePort(p)))
+  return results
+    .filter((r): r is PromiseFulfilledResult<number> => r.status === 'fulfilled')
+    .map((r) => r.value)
+}
+
+/** Read package.json and extract likely dev server port numbers from scripts.
+ *  Looks for `--port N`, `-p N`, `:N`（rollup/vite output）, and `PORT=N`.
+ *  Returns deduplicated integer ports. */
+function parseDevPortsFromScripts(cwd: string): number[] {
+  try {
+    const raw = readFileSync(join(cwd, 'package.json'), 'utf-8')
+    const pkg = JSON.parse(raw) as { scripts?: Record<string, string> }
+    if (!pkg.scripts) return []
+    const ports = new Set<number>()
+    const seen = new Set<string>()
+    for (const cmd of Object.values(pkg.scripts)) {
+      // --port 3000 / -p 3000
+      for (const m of cmd.matchAll(/(?:--port|-p)\s+(\d{2,5})/g)) {
+        const p = parseInt(m[1]!, 10)
+        if (!seen.has(`flag:${p}`) && p > 1 && p < 65536) { ports.add(p); seen.add(`flag:${p}`) }
+      }
+      // vite/rollup "localhost:5173" output line
+      for (const m of cmd.matchAll(/:(\d{4,5})\b/g)) {
+        const p = parseInt(m[1]!, 10)
+        if (!seen.has(`colon:${p}`) && p > 1024 && p < 65536) { ports.add(p); seen.add(`colon:${p}`) }
+      }
+      // PORT=3000 env style
+      for (const m of cmd.matchAll(/\bPORT=(\d{2,5})\b/g)) {
+        const p = parseInt(m[1]!, 10)
+        if (!seen.has(`env:${p}`) && p > 1 && p < 65536) { ports.add(p); seen.add(`env:${p}`) }
+      }
+    }
+    return [...ports]
+  } catch {
+    return []
+  }
+}
+
+/** After an interactive action (click/type/…), check the session log for
+ *  newly appeared console errors or failed network requests. Returns an empty
+ *  string when nothing new — the action result stays clean. */
+function actionImpactNote(
+  session: BrowserDebugSession,
+  beforeConsoleCount: number,
+  beforeNetworkCount: number,
+): string {
+  const newConsoles = session.log.getConsole().filter(
+    (_e, i) => i >= beforeConsoleCount,
+  )
+  const newErrors = newConsoles.filter((e) => e.level === 'error')
+  const newNet = session.log.getNetwork().filter(
+    (_e, i) => i >= beforeNetworkCount,
+  )
+  const newFails = newNet.filter((e) => e.failed || (e.status !== undefined && e.status >= 400))
+  if (newErrors.length === 0 && newFails.length === 0) return ''
+  const parts: string[] = []
+  if (newErrors.length > 0) {
+    const sample = newErrors[0]!.text.replace(/\s+$/, '').split('\n')[0]!
+    parts.push(newErrors.length === 1
+      ? `控制台新增错误：${sample}`
+      : `控制台新增 ${newErrors.length} 条错误（首条：${sample}）`)
+  }
+  if (newFails.length > 0) {
+    const f = newFails[0]!
+    parts.push(newFails.length === 1
+      ? `新增失败请求：${f.method} ${f.url}${f.status !== undefined ? ` (${f.status})` : ''}`
+      : `新增 ${newFails.length} 条失败请求（首条：${f.method} ${f.url}${f.status !== undefined ? ` ${f.status}` : ''}）`)
+  }
+  return `\n（${parts.join('；')}）`
 }
 
 type BrowserDebugAction =
@@ -356,6 +450,11 @@ API 联调技巧：
           width: { type: 'integer', description: 'set_viewport/open：视口宽度 px（默认 1280）。响应式断点问题只在特定宽度下暴露，改完 UI 至少验两个宽度。' },
           height: { type: 'integer', description: 'set_viewport/open：视口高度 px（默认 800）。' },
           timeout_ms: { type: 'integer', description: 'wait：超时毫秒数（默认 10000）。' },
+          fullPage: { type: 'boolean', description: 'screenshot：截取完整页面而非仅视口（默认 false）。' },
+          raw: { type: 'boolean', description: 'screenshot：跳过动画禁用和字体等待（默认 false）。动画驱动的页面中禁用样式表反而引发布局偏移时用。' },
+          element: { type: 'string', description: 'screenshot：CSS 选择器，裁剪截图为该元素的包围盒。' },
+          compare: { type: 'boolean', description: 'screenshot：与同页面同视口的上一次截图做像素比对，返回差异百分比和变化区域。无基线时保存为基线。' },
+          intent: { type: 'string', description: 'screenshot：配合 compare，声明预期变化的 CSS 选择器。compare 会判断变化区域是否落在该元素内，输出三态裁决（在区域内 / 越界 / 无变化）。' },
           message: { type: 'string', description: 'await_login：展示给用户的提示。' },
         },
         required: ['action'],
@@ -452,7 +551,25 @@ API 联调技巧：
               `使用 network 并设 url_filter="/api/" failed_only=true include_body=true 可查看 API 错误。`,
           }
         } catch (err) {
-          return { content: `browser_debug 导航失败：${(err as Error).message}`, isError: true }
+          const msg = (err as Error).message
+          const isConnErr = /ECONNREFUSED|ERR_CONNECTION_REFUSED|net::ERR_CONNECTION|timeout/i.test(msg)
+          if (isConnErr) {
+            // Connection failed — probe nearby ports to help the model
+            // diagnose. Only probe, never start a server.
+            try {
+              const livePorts = await probeDevPorts()
+              if (livePorts.length > 0) {
+                return { content: `browser_debug 导航失败：${msg}\n探测到本机已监听的端口：${livePorts.join(', ')}。是否拼错了 URL 或端口？`, isError: true }
+              }
+            } catch { /* probing best-effort */ }
+            try {
+              const devPorts = parseDevPortsFromScripts(params.cwd)
+              if (devPorts.length > 0) {
+                return { content: `browser_debug 导航失败：${msg}\npackage.json scripts 中出现的端口：${devPorts.join(', ')}——这些端口当前均未监听。是否忘记启动 dev server？`, isError: true }
+              }
+            } catch { /* best effort */ }
+          }
+          return { content: `browser_debug 导航失败：${msg}`, isError: true }
         }
       }
 
@@ -468,8 +585,21 @@ API 联调技巧：
         switch (action) {
           case 'console': {
             const level = params.input.level as ConsoleLevel | undefined
-            const entries = session.log.getConsole(level).slice(-CONSOLE_TAIL)
-            if (entries.length === 0) return { content: '（无控制台输出）' }
+            const raw = session.log.getConsole(level)
+            if (raw.length === 0) return { content: '（无控制台输出）' }
+            // Over ~20 lines the model loses the signal in the noise — cluster
+            // by error signature so "15× same TypeError" is one actionable line.
+            const useClusters = raw.length > 20
+            if (useClusters) {
+              const clusters = session.log.getConsoleClusters(level)
+              const lines = clusters.map((c) => {
+                const prefix = c.count > 1 ? `${c.count}× ` : ''
+                const sample = c.sample.replace(/\s+$/, '')
+                return `[${c.level}] ${prefix}${sample}`
+              })
+              return { content: lines.join('\n') + `\n（共 ${raw.length} 条，按签名聚类为 ${clusters.length} 组）` }
+            }
+            const entries = raw.slice(-CONSOLE_TAIL)
             return { content: entries.map(formatConsoleLine).join('\n') }
           }
           case 'network': {
@@ -536,11 +666,17 @@ API 联调技巧：
               observe(session.driver, { question: params.input.question as string }),
             )
           }
+          // Interactive actions (click/type/press/select/hover/scroll) —
+          // after the action, check whether new console errors or failed
+          // network requests appeared so the model sees the consequence
+          // without an extra round-trip.
           case 'click': {
             const selector = params.input.selector as string | undefined
             if (!selector) return { content: 'click 需要 "selector"。', isError: true }
+            const beforeC = session.log.getConsole().length
+            const beforeN = session.log.getNetwork().length
             await withLiveLogs(session, params.onOutput, () => session.driver.click(selector))
-            return { content: `已点击 ${selector}。` }
+            return { content: `已点击 ${selector}。` + actionImpactNote(session, beforeC, beforeN) }
           }
           case 'type': {
             const selector = params.input.selector as string | undefined
@@ -549,18 +685,22 @@ API 联调技巧：
               return { content: 'type 需要 "selector" 和 "text"。', isError: true }
             }
             const submit = params.input.submit === true
+            const beforeC = session.log.getConsole().length
+            const beforeN = session.log.getNetwork().length
             await withLiveLogs(session, params.onOutput, async () => {
               await session.driver.type(selector, text)
               if (submit) await session.driver.press(selector, 'Enter')
             })
-            return { content: `已向 ${selector} 输入文本${submit ? '并按下 Enter' : ''}。` }
+            return { content: `已向 ${selector} 输入文本${submit ? '并按下 Enter' : ''}。` + actionImpactNote(session, beforeC, beforeN) }
           }
           case 'press': {
             const selector = params.input.selector as string | undefined
             const key = params.input.key as string | undefined
             if (!key) return { content: 'press 需要 "key"（如 Enter、Tab、Escape）。', isError: true }
+            const beforeC = session.log.getConsole().length
+            const beforeN = session.log.getNetwork().length
             await withLiveLogs(session, params.onOutput, () => session.driver.press(selector, key))
-            return { content: selector ? `已在 ${selector} 上按下 ${key}。` : `已按下 ${key}。` }
+            return { content: (selector ? `已在 ${selector} 上按下 ${key}。` : `已按下 ${key}。`) + actionImpactNote(session, beforeC, beforeN) }
           }
           case 'select': {
             const selector = params.input.selector as string | undefined
@@ -568,22 +708,28 @@ API 联调技巧：
             if (!selector || value === undefined) {
               return { content: 'select 需要 "selector" 和 "value"。', isError: true }
             }
+            const beforeC = session.log.getConsole().length
+            const beforeN = session.log.getNetwork().length
             const chosen = await withLiveLogs(session, params.onOutput, () =>
               session.driver.selectOption(selector, value),
             )
-            return { content: `已在 ${selector} 中选择 ${JSON.stringify(chosen)}。` }
+            return { content: `已在 ${selector} 中选择 ${JSON.stringify(chosen)}。` + actionImpactNote(session, beforeC, beforeN) }
           }
           case 'hover': {
             const selector = params.input.selector as string | undefined
             if (!selector) return { content: 'hover 需要 "selector"。', isError: true }
+            const beforeC = session.log.getConsole().length
+            const beforeN = session.log.getNetwork().length
             await withLiveLogs(session, params.onOutput, () => session.driver.hover(selector))
-            return { content: `已悬停 ${selector}。` }
+            return { content: `已悬停 ${selector}。` + actionImpactNote(session, beforeC, beforeN) }
           }
           case 'scroll': {
             const selector = params.input.selector as string | undefined
             const to = params.input.to === 'top' ? 'top' : 'bottom'
+            const beforeC = session.log.getConsole().length
+            const beforeN = session.log.getNetwork().length
             await withLiveLogs(session, params.onOutput, () => session.driver.scroll(selector, to))
-            return { content: selector ? `已将 ${selector} 滚入视图。` : `已滚动到 ${to}。` }
+            return { content: (selector ? `已将 ${selector} 滚入视图。` : `已滚动到 ${to}。`) + actionImpactNote(session, beforeC, beforeN) }
           }
           case 'history': {
             const go = params.input.go as string | undefined
@@ -698,7 +844,13 @@ API 联调技巧：
             return { content: `视口已设为 ${target.width}×${target.height}。重新截图或量 DOM 以查看该宽度下的布局。` }
           }
           case 'screenshot': {
-            const png = await session.driver.screenshot()
+            const png = await session.driver.screenshot({
+              fullPage: params.input.fullPage === true,
+              raw: params.input.raw === true,
+              element: typeof params.input.element === 'string' && params.input.element.trim()
+                ? params.input.element.trim()
+                : undefined,
+            })
             const base64 = png.toString('base64')
             let artifactId: string | undefined
             if (params.artifactStore) {
@@ -748,10 +900,147 @@ API 联调技巧：
             // computer_use 无此缺口：它的结果文本始终带无障碍树，图掉了页面结构还在。
             const blindNote = '\n（视觉模型可直接看图；非视觉模型该附件会被自动丢弃——'
               + '若你没有真的看到画面，不要凭截图存在断言渲染结果，改用 observe / extract / eval 读 DOM。）'
+            // compare mode: pixel-diff against previous screenshot for this
+            // host + path + viewport. A deterministic, zero-LLM-cost verdict
+            // that the model can cite as evidence without needing to see the
+            // image itself.
+            let compareNote = ''
+            const wantCompare = params.input.compare === true
+            if (wantCompare && params.artifactStore && !tooBig) {
+              const cmpHost = (() => {
+                try { return new URL(session.driver.currentUrl()).hostname }
+                catch { return 'page' }
+              })()
+              const cmpPath = (() => {
+                try { return new URL(session.driver.currentUrl()).pathname }
+                catch { return '/' }
+              })()
+              const vp = size ?? { width: 0, height: 0 }
+              const elKey = typeof params.input.element === 'string' && params.input.element.trim()
+                ? `:${params.input.element.trim()}`
+                : ''
+              const cmpKey = `screenshot-baseline:${cmpHost}${cmpPath}@${vp.width}x${vp.height}${elKey}`
+              try {
+                const prev = params.artifactStore.listByTarget(cmpKey)
+                if (prev.length === 0) {
+                  await params.artifactStore.save({
+                    tool: 'browser_screenshot',
+                    target: cmpKey,
+                    rawContent: base64,
+                    summary: `Baseline: ${session.driver.currentUrl()} (${vp.width}×${vp.height})`,
+                    sections: [],
+                  })
+                  compareNote = '\n[compare] 已保存为基线（首次截图）。下次同页面同视口截图时将自动比对。'
+                } else {
+                  const baseline = prev[prev.length - 1]!
+                  const baselineRaw = await params.artifactStore.readRaw(baseline.id)
+                  if (!baselineRaw) {
+                    compareNote = '\n[compare] 基线无法读取，已跳过比对。'
+                  } else {
+                    const baselineBuf = Buffer.from(baselineRaw, 'base64')
+                    const curPng = PNG.sync.read(png)
+                    const basePng = PNG.sync.read(baselineBuf)
+                    const dimNote = (curPng.width !== basePng.width || curPng.height !== basePng.height)
+                      ? `（尺寸不同：当前 ${curPng.width}×${curPng.height}，基线 ${basePng.width}×${basePng.height}——比对重叠区域）`
+                      : ''
+                    const w = Math.min(curPng.width, basePng.width)
+                    const h = Math.min(curPng.height, basePng.height)
+                    // pixelmatch requires width-aligned RGBA arrays. When
+                    // dimensions differ, extract the common region row by row.
+                    let curAligned: Uint8Array, baseAligned: Uint8Array
+                    if (curPng.width === basePng.width) {
+                      curAligned = curPng.data
+                      baseAligned = basePng.data
+                    } else {
+                      curAligned = new Uint8Array(w * h * 4)
+                      baseAligned = new Uint8Array(w * h * 4)
+                      for (let y = 0; y < h; y++) {
+                        curAligned.set(curPng.data.subarray(y * curPng.width * 4, y * curPng.width * 4 + w * 4), y * w * 4)
+                        baseAligned.set(basePng.data.subarray(y * basePng.width * 4, y * basePng.width * 4 + w * 4), y * w * 4)
+                      }
+                    }
+                    const diffPng = new PNG({ width: w, height: h })
+                    const mismatched = pixelmatch(
+                      curAligned, baseAligned, diffPng.data, w, h,
+                      { threshold: 0.1, diffMask: true },
+                    )
+                    const total = w * h
+                    const pct = ((mismatched / total) * 100).toFixed(1)
+                    if (mismatched === 0) {
+                      compareNote = '\n[compare] 与基线完全一致（0% 差异）。'
+                    } else {
+                      // Bounding box of changed pixels for a rough region hint
+                      let minX = w, minY = h, maxX = 0, maxY = 0
+                      for (let y = 0; y < h; y++) {
+                        for (let x = 0; x < w; x++) {
+                          if (diffPng.data[(y * w + x) * 4 + 3] !== 0) {
+                            if (x < minX) minX = x
+                            if (y < minY) minY = y
+                            if (x > maxX) maxX = x
+                            if (y > maxY) maxY = y
+                          }
+                        }
+                      }
+                      const bboxW = maxX - minX + 1
+                      const bboxH = maxY - minY + 1
+                      compareNote = `\n[compare] 差异 ${pct}%（${mismatched} / ${total} 像素）${dimNote}`
+                        + `，变化区域集中于 (${minX},${minY})–(${maxX},${maxY}) ${bboxW}×${bboxH}。`
+                      // Intent-aware verdict: when the model declares what it
+                      // meant to change, check whether the actual pixel diff
+                      // stays within that declared region.
+                      const intentSel = typeof params.input.intent === 'string' && params.input.intent.trim()
+                        ? params.input.intent.trim()
+                        : ''
+                      if (intentSel) {
+                        try {
+                          const intentJson = await session.driver.evaluate(`
+                            (() => {
+                              const el = document.querySelector(${JSON.stringify(intentSel)});
+                              if (!el) return 'null';
+                              const r = el.getBoundingClientRect();
+                              return JSON.stringify({x:r.x, y:r.y, w:r.width, h:r.height});
+                            })()
+                          `)
+                          if (intentJson === 'null') {
+                            compareNote += `\n[intent] 声明区域 "${intentSel}" 未在页面中找到。`
+                          } else {
+                            const ir = JSON.parse(intentJson) as { x: number; y: number; w: number; h: number }
+                            const iLeft = ir.x, iTop = ir.y, iRight = ir.x + ir.w, iBottom = ir.y + ir.h
+                            const dLeft = minX, dTop = minY, dRight = maxX, dBottom = maxY
+                            // Overlap rectangle
+                            const oLeft = Math.max(iLeft, dLeft)
+                            const oTop = Math.max(iTop, dTop)
+                            const oRight = Math.min(iRight, dRight)
+                            const oBottom = Math.min(iBottom, dBottom)
+                            const overlapArea = Math.max(0, oRight - oLeft) * Math.max(0, oBottom - oTop)
+                            const diffArea = (dRight - dLeft) * (dBottom - dTop)
+                            const overlapRatio = diffArea > 0 ? overlapArea / diffArea : 0
+                            if (overlapRatio >= 0.95) {
+                              compareNote += `\n[intent] ✓ 变化在声明区域 "${intentSel}" 内。`
+                            } else if (overlapRatio > 0) {
+                              const pctOverlap = (overlapRatio * 100).toFixed(0)
+                              compareNote += `\n[intent] ⚠ 变化 ${pctOverlap}% 在 "${intentSel}" 内——其余部分越界。`
+                            } else {
+                              compareNote += `\n[intent] ✗ 越界——变化在 (${minX},${minY})–(${maxX},${maxY})，`
+                                + `但声明区域 "${intentSel}" 在 (${iLeft.toFixed(0)},${iTop.toFixed(0)})–(${iRight.toFixed(0)},${iBottom.toFixed(0)})，无交集。`
+                            }
+                          }
+                        } catch {
+                          compareNote += `\n[intent] 无法读取声明区域 "${intentSel}" 的位置。`
+                        }
+                      }
+                    }
+                  }
+                }
+              } catch (cmpErr) {
+                compareNote = `\n[compare] 比对失败：${(cmpErr as Error).message}`
+              }
+            }
             return {
               content: `${BROWSER_SCREENSHOT_OF_PREFIX} ${session.driver.currentUrl()}${sizeNote}`
                 + (artifactId ? ` → artifact ${artifactId}` : '')
                 + pngNote
+                + compareNote
                 + (tooBig
                   ? `\n（${Math.round(png.byteLength / 1024)}KB 超出视觉通道上限，未附图——缩小视口后重截，或用 eval 量 DOM。）`
                   : blindNote),

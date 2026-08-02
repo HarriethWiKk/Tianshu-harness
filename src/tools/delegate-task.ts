@@ -33,7 +33,7 @@ const profileStringSchema = z.string().refine(
  *  worker, and intersects the worker's tools with the domain whitelist.
  *  （systemPromptSuffix 是展示面字段，不参与注入——见 assembly-audit 白名单注记。） */
 const authorityStringSchema = z.string().refine(
-  (val) => starDomainRegistry.getDomainIds().includes(val),
+  (val) => val === '' || starDomainRegistry.get(val) !== undefined,
   (val) => ({ message: `未知星域 "${val}"。可用：${starDomainRegistry.getDomainIds().join(', ')}` }),
 )
 

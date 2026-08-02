@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto'
 import type { CoordinatorRun } from './coordinator.js'
 import { matchDomain } from './star-domain.js'
+import { dependencyId } from './work-order.js'
 import type { TeamTask } from './team-plan.js'
 import type { TeamWave } from './team-grouping.js'
 
@@ -170,7 +171,7 @@ export function buildTeamWaveTelemetry(input: BuildTeamWaveTelemetryInput): Team
       files: uniqueSorted(tasks.flatMap(task => task.touchSet.length > 0 ? task.touchSet : task.files)),
       taskDependencies: tasks
         .filter(task => task.dependsOn.length > 0)
-        .map(task => ({ taskId: task.id, dependsOn: uniqueSorted(task.dependsOn) })),
+        .map(task => ({ taskId: task.id, dependsOn: uniqueSorted(task.dependsOn.map(dependencyId)) })),
     },
     outcome: {
       dispatched: input.dispatched ?? input.run.results.length,

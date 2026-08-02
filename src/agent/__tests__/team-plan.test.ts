@@ -216,4 +216,40 @@ describe('extractVerification — prose vs command', () => {
     assert.ok(drafts[0]!.verification.some(v => v.includes('npm test')))
     assert.ok(drafts[0]!.verification.some(v => v.includes('tsc --noEmit')))
   })
+
+  it('parses conditional dependency edges（收编 #6 语法）', () => {
+    const tasks = parseTeamTasks(`
+### T1: 重构
+Refactor src/agent/loop.ts
+### T2: 测试
+测试覆盖 src/agent/loop.ts
+依赖 T1(onFailure:skip)
+### T3: 文档
+更新 docs
+依赖 T1(onFailure:alternate:T2)
+### T4: 独立
+独立任务
+`)
+    assert.equal(tasks.length, 4)
+    assert.deepEqual(tasks[0]!.dependsOn, [])
+    // skip 边 → 对象
+    assert.deepEqual(tasks[1]!.dependsOn, [{ dependsOn: 'T1', onFailure: 'skip' }])
+    // alternate 边 → 对象（含 alternateOrderId）
+    assert.deepEqual(tasks[2]!.dependsOn, [{ dependsOn: 'T1', onFailure: 'alternate', alternateOrderId: 'T2' }])
+    // 纯字符串保持向后兼容
+    assert.deepEqual(tasks[3]!.dependsOn, [])
+  })
+
+  it('mixes plain and conditional deps in one line（收编 #6 兼容）', () => {
+    const tasks = parseTeamTasks(`
+### T1: 基础
+Base task
+### T2: 依赖
+依赖 T1, T3(onFailure:skip)
+### T3: 备选
+Alternate task
+`)
+    const t2 = tasks.find(t => t.id === 'T2')!
+    assert.deepEqual(t2.dependsOn, ['T1', { dependsOn: 'T3', onFailure: 'skip' }])
+  })
 })

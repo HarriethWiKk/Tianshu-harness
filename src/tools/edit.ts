@@ -97,7 +97,7 @@ export const EDIT_FILE_TOOL: Tool = {
 - old_string 必须唯一——必要时带上周边上下文
 - 严格保留文件原有的缩进（tabs/spaces）
 - replace_all 替换所有出现处；expected_count 数量不符时给出警告
-- 大编辑后消息历史只保留短指针；用 read_file 回看
+- 大编辑后消息历史只保留短指针——看到指针说明编辑已成功，不要重做；用 read_file 回看
 
 唯一字符串替换优先用 edit_file；空白字符有歧义的编辑用 hash_edit；单文件多处改动、超过约 20 行的编辑或结构性重构，用 apply_patch 加 unified diff。`,
 
@@ -496,7 +496,7 @@ async function finalizeEdit(
   const check = await checkSyntax(filePath, after)
   if (check.fatal) {
     const relPath = relative(cwd, filePath)
-    const restored = restoreLatestBackup(cwd, relPath)
+    const restored = restoreLatestBackup(cwd, relPath, sessionId)
     // 回滚后 mtime 会变（copyFileSync 不保留原始时间戳），但内容已恢复。
     // 刷新读文件 mtime 追踪器——否则后续 hash_edit 的仅位置锚点检查会误报
     // "文件已变化，请重新 read_file"，主控白费一轮重读。

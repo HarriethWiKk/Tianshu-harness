@@ -124,9 +124,19 @@ export async function resolveGitExePath(deps: GitExeProbeDeps): Promise<string |
   const override = deps.env['RIVET_GIT_PATH']
   if (override && deps.exists(override)) return override
 
+  // 2. where git (Electron's PATH — may be truncated)
   const path = await deps.whichGit()
   if (path) return path
 
+  // 3. cmd /c where git — cmd.exe inherits the full system PATH, unlike Electron
+  //    which may miss entries only in Machine-level PATH (e.g. D:\App\Git\cmd).
+  try {
+    const { stdout } = await execFileAsync('cmd', ['/c', 'where', 'git'], { timeout: 5000 })
+    const first = stdout.split('\n')[0]?.trim()
+    if (first && deps.exists(first)) return first
+  } catch { /* fall through */ }
+
+  // 4. Common install locations (Program Files / LOCALAPPDATA)
   const candidates = [
     'C:\\Program Files\\Git\\cmd\\git.exe',
     'C:\\Program Files (x86)\\Git\\cmd\\git.exe',
@@ -137,6 +147,25 @@ export async function resolveGitExePath(deps: GitExeProbeDeps): Promise<string |
   for (const c of candidates) {
     if (deps.exists(c)) return c
   }
+
+  // 5. Scan system (Machine) PATH for git.exe — covers non-standard install
+  //    drives like D:\App\Git that aren't in the per-process PATH Electron sees.
+  try {
+    const { stdout } = await execFileAsync('cmd', ['/c', 'reg', 'query',
+      'HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment',
+      '/v', 'Path'], { timeout: 5000 })
+    const match = stdout.match(/REG_(?:EXPAND_)?SZ\s+(.+)/i)
+    if (match?.[1]) {
+      const sysPath = match[1].trim()
+      for (const dir of sysPath.split(';')) {
+        const trimmed = dir.trim()
+        if (!trimmed) continue
+        const candidate = winPath.join(trimmed, 'git.exe')
+        if (deps.exists(candidate)) return candidate
+      }
+    }
+  } catch { /* fall through */ }
+
   return undefined
 }
 

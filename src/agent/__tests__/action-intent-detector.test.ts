@@ -82,6 +82,29 @@ describe('hasActionIntent', () => {
     assert.ok(!hasActionIntent('我来了，正在运行测试环境'))
   })
 
+  // ── 问句收尾守卫（ca63f970 回归）──
+  // 收尾问句 = 把控制权交还用户，即便尾部同时出现承诺词与工具动词也不是悬空承诺。
+  // 生产现场：报告以三选一收尾，「或你指定某组文件我来读」+「哪条？」被
+  // "我来"+"读"命中，注入 reminder 后模型被迫自答自干，用户视角凭空多出一轮。
+  it('三选一问句收尾不触发（ca63f970 现场文本）', () => {
+    const text = [
+      '**核心问题**：你想了解的是',
+      '1. **整体状态**（已完成 + 正在做 + 待做）——这次报告已给你',
+      '2. **未提交那 40 个文件的具体意图**——我建议点开最新两份分析文档，或你指定某组文件我来读',
+      '3. **某条具体线索的深挖**——告诉我具体方向',
+      '',
+      '哪条？',
+    ].join('\n')
+    assert.ok(!hasActionIntent(text))
+  })
+  it('请求许可的问句不触发：「要我跑一下测试吗？」', () => {
+    assert.ok(!hasActionIntent('改动完成待验证。要我跑一下测试吗？'))
+    assert.ok(!hasActionIntent('Shall I run the tests now?'))
+  })
+  it('问句在中间、承诺在结尾时仍触发', () => {
+    assert.ok(hasActionIntent('这样对吗？先假设对。接下来修改 loop.ts'))
+  })
+
   // ── Edge cases ──
   it('仅"看"不触发（已从动词列表移除，误报太高）', () => {
     assert.ok(!hasActionIntent('让我看一下这个问题'))
@@ -144,6 +167,9 @@ describe('hasWriteActionIntent（只读轮闸门用的写侧承诺）', () => {
   })
   it('纯陈述不触发', () => {
     assert.ok(!hasWriteActionIntent('这个函数的修改历史在 git log 里'))
+  })
+  it('问句收尾不触发（同 hasActionIntent 的 ca63f970 守卫）：「要我改吗？」', () => {
+    assert.ok(!hasWriteActionIntent('方案已列出。我可以直接修改 loop.ts，要我改吗？'))
   })
 })
 

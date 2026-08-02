@@ -1,6 +1,14 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { syntaxCheck, checkSyntax, _resetEsbuildCacheForTest, _resetTsCacheForTest, _resetPythonParserForTest } from '../syntax-check.js'
+import {
+  syntaxCheck,
+  checkSyntax,
+  checkPythonSyntaxTreeSitter,
+  _resetEsbuildCacheForTest,
+  _resetTsCacheForTest,
+  _resetPythonParserForTest,
+  _pythonParseCountForTest,
+} from '../syntax-check.js'
 
 describe('syntaxCheck', async () => {
   describe('CSS', async () => {
@@ -225,6 +233,29 @@ describe('syntaxCheck', async () => {
       // 对"写完即时结构校验"可接受(漏报优于误报回滚);关键是不产生 false fatal。
       const r = await checkSyntax('/a/script.py', 'def foo():\n    return 1\n  bad\n')
       assert.equal(r.fatal, null, '缩进错误在 tree-sitter 下不判 fatal(已知宽松,不误报)')
+    })
+
+    it('parser 每 250 次解析重建一次（WASM 内存不随会话单调增长）', async () => {
+      // tree 在 finally 里 delete，parser scratch 靠计数重建——两者缺一，长会话
+      // 里每写一个 .py 都会在 WASM 线性内存留下不被 JS GC 回收的残留。
+      _resetPythonParserForTest()
+      try {
+        for (let i = 0; i < 250; i++) {
+          await checkPythonSyntaxTreeSitter('x = 1\n')
+        }
+        assert.equal(_pythonParseCountForTest(), 250, '前 250 次不该触发重建')
+
+        // 第 251 次触发重建：计数归零后重新计 1，且解析结果仍然正确。
+        const ok = await checkPythonSyntaxTreeSitter('def foo():\n    return 1\n')
+        assert.equal(_pythonParseCountForTest(), 1, '第 251 次应重建 parser 并重新计数')
+        assert.equal(ok.error, null, '重建后合法代码仍判通过')
+
+        const bad = await checkPythonSyntaxTreeSitter('y = (1 + 2\n')
+        assert.ok(bad.error !== null, '重建后仍能检出未闭合括号')
+        assert.equal(bad.line, 1)
+      } finally {
+        _resetPythonParserForTest()
+      }
     })
   })
 

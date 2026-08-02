@@ -45,6 +45,7 @@ export interface AgentConfigInput {
   sessionMemoryBlock?: string
   approvalMode?: 'auto-accept' | 'auto-safe' | 'manual' | 'dangerously-skip-permissions'
   songlineEnabled?: boolean
+  securityGuidance?: boolean
   hearthObserveEnabled?: boolean
   antiAnchoring?: AntiAnchoringConfig
   intentRetrievalRouter?: IntentRetrievalRouterConfigInput
@@ -78,6 +79,9 @@ export interface AgentConfigInput {
     /** Optional backup vision model — failover when the primary errors. */
     fallback?: { provider: string; model: string }
   }
+  /** Opt-in (config.agent.visionAutoBridge): allow auto-picking a vision bridge
+   *  when `visionModel` is unset. Off ⇒ a candidate is only named, never used. */
+  visionAutoBridge?: boolean
   /** /cd: previous PromptEngine whose frozen snapshots the new one inherits.
    *  resume 场景传盘存 FrozenSnapshotData（<id>.frozen.json），同语义。 */
   inheritFrozenFrom?: PromptEngine | FrozenSnapshotData
@@ -114,6 +118,7 @@ export function createMainAgentConfigInput(params: MainAgentConfigInputParams): 
     sessionMemoryBlock: params.sessionMemoryBlock,
     approvalMode: params.config.agent.approval as 'auto-accept' | 'auto-safe' | 'manual' | 'dangerously-skip-permissions',
     songlineEnabled: params.config.agent.songlineEnabled,
+    securityGuidance: params.config.agent.securityGuidance,
     hearthObserveEnabled: params.config.agent.hearthObserveEnabled,
     crossSessionEnabled: params.config.agent.crossSessionEnabled,
     antiAnchoring: params.config.agent.antiAnchoring,
@@ -128,6 +133,7 @@ export function createMainAgentConfigInput(params: MainAgentConfigInputParams): 
     // undefined → 桥接从不触发 → "配了却报图片未发送"）。visionModel 必须从 config
     // 流到 input，桥接才建得起来。见 buildVisionClient / loop.ts 桥接点。
     visionModel: params.config.agent.visionModel,
+    visionAutoBridge: params.config.agent.visionAutoBridge,
     auth: params.auth,
     habituationThreshold: params.habituationThreshold,
     permissions: params.config.agent.permissions as PermissionConfig,
@@ -145,7 +151,7 @@ export function createMainAgentConfigInput(params: MainAgentConfigInputParams): 
 
 export function createAgentConfig(input: AgentConfigInput): Pick<
   AgentConfig,
-  'client' | 'promptEngine' | 'contextWindow' | 'compact' | 'cwd' | 'blockPolicy' | 'providerProfile' | 'providerName' | 'compactionProfile' | 'primaryClient' | 'compactClient' | 'sessionId' | 'approvalMode' | 'autoReasoning' | 'reasoningFloor' | 'turnLevelThinking' | 'songlineEnabled' | 'hearthObserveEnabled' | 'crossSessionEnabled' | 'antiAnchoring' | 'intentRetrievalRouter' | 'llmSpeculation' | 'autoDelegateEnabled' | 'domainKeywordRouting' | 'defaultDomain' | 'goalJudge' | 'allProviders' | 'permissions' | 'toolGating' | 'prefixCacheStrategy' | 'supportsVision' | 'visionClient' | 'visionModelPrompt' | 'visionModelMaxTokens' | 'visionBridge'
+  'client' | 'promptEngine' | 'contextWindow' | 'compact' | 'cwd' | 'blockPolicy' | 'providerProfile' | 'providerName' | 'compactionProfile' | 'primaryClient' | 'compactClient' | 'sessionId' | 'approvalMode' | 'autoReasoning' | 'reasoningFloor' | 'turnLevelThinking' | 'songlineEnabled' | 'securityGuidance' | 'hearthObserveEnabled' | 'crossSessionEnabled' | 'antiAnchoring' | 'intentRetrievalRouter' | 'llmSpeculation' | 'autoDelegateEnabled' | 'domainKeywordRouting' | 'defaultDomain' | 'goalJudge' | 'allProviders' | 'permissions' | 'toolGating' | 'prefixCacheStrategy' | 'supportsVision' | 'visionClient' | 'visionModelPrompt' | 'visionModelMaxTokens' | 'visionBridge'
 > {
   const { model, apiKey, cwd, provider } = input
   const capabilities = resolveCapabilities(provider.name, provider.capabilities)
@@ -173,8 +179,11 @@ export function createAgentConfig(input: AgentConfigInput): Pick<
 
   // Optional vision bridge client (agent.visionModel.provider + model).
   // When the primary model is not multimodal, this client describes user images
-  // so the primary model still receives their content as text.
-  const visionBridge = buildVisionClient(input)
+  // so the primary model still receives their content as text. 主模型自己就能看图
+  // 时不建桥——建了也永不使用（loop.ts 的桥接点要求 !supportsVision），只会白建一个
+  // client 并在启动时报一行不实的「已启用识图桥」。
+  const primarySupportsVision = model.supportsVision ?? false
+  const visionBridge = primarySupportsVision ? undefined : buildVisionClient(input)
 
   const modelPricing = provider.models.find(m => m.id === model.id || m.alias === model.id)?.pricing
 
@@ -241,6 +250,7 @@ export function createAgentConfig(input: AgentConfigInput): Pick<
     sessionId: input.sessionId,
     approvalMode: input.approvalMode,
     songlineEnabled: input.songlineEnabled,
+    securityGuidance: input.securityGuidance,
     hearthObserveEnabled: input.hearthObserveEnabled,
     crossSessionEnabled: input.crossSessionEnabled,
     antiAnchoring: input.antiAnchoring,
@@ -285,10 +295,29 @@ function deriveVisionBridgeStatus(
       detail: bridge.source === 'auto' ? `自动选用 ${bridge.ref}` : bridge.ref,
     }
   }
-  const detail = input.visionModel
-    ? `已配置 ${input.visionModel.provider}/${input.visionModel.model} 但桥接起不来（缺 key/模型不存在）`
-    : '未配置 agent.visionModel，且无可自动选用的视觉模型'
+  if (input.visionModel) {
+    return {
+      active: false,
+      source: 'none',
+      detail: `已配置 ${input.visionModel.provider}/${input.visionModel.model} 但桥接起不来（缺 key/模型不存在）`,
+    }
+  }
+  // 未配置：如果仓里确实有声明视觉能力的模型，点名它并告诉用户怎么启用——不替
+  // 用户决定把图片发出去（自动桥是 opt-in，见 agent.visionAutoBridge）。
+  const candidate = firstVisionCandidateRef(input)
+  const detail = candidate
+    ? input.visionAutoBridge
+      ? `未配置 agent.visionModel，自动选桥已开但 ${candidate} 等候选都起不来（缺 key/未登录）`
+      : `未配置 agent.visionModel；检测到可用视觉模型 ${candidate}，在 /config → 识图模型 选定它，`
+        + '或设 agent.visionAutoBridge=true 让它自动选（会把图片发给该 provider）'
+    : '未配置 agent.visionModel，且没有声明视觉能力的模型可用'
   return { active: false, source: 'none', detail }
+}
+
+/** 第一个声明了视觉能力的模型（仅看声明，不试凭据）——给未启用时的提示点名用。 */
+function firstVisionCandidateRef(input: AgentConfigInput): string | undefined {
+  for (const prov of visionCandidates(input)) return `${prov.prov.name}/${prov.spec.id}`
+  return undefined
 }
 
 export function resolveFallbackModel(fp: ProviderConfig): ModelConfig {
@@ -494,15 +523,17 @@ function tryBuildVisionClientFrom(
 }
 
 /**
- * Auto-select a default vision bridge when the user hasn't configured one but the
- * primary model is text-only. Picks the first vision-capable model that has usable
- * credentials, priority: same provider as the primary > minimax > glm > others.
- * Returns undefined when nothing is available (维持现状：图片会被丢弃 + warn 在别处补）。
+ * Vision-capable models across all configured providers, best candidate first:
+ * same provider as the primary > minimax > glm > others. Declaration-only (no
+ * credential probing, no client construction) so callers that just want to *name*
+ * a candidate don't pay for one.
  */
-function autoSelectVisionBridge(input: AgentConfigInput): VisionBridgeBuild | undefined {
+function visionCandidates(input: AgentConfigInput): Array<{ prov: ProviderConfig; spec: ModelConfig }> {
   const providers = input.allProviders
-  if (!providers) return undefined
-  const PRIORITY = [input.provider.name, 'minimax', 'glm']
+  if (!providers) return []
+  // zhipu-vision (glm-4v-flash, 免费) 排末位 —— 有付费视觉模型时优先用付费的
+  // （质量更高），它作为"用户没配其他视觉模型时的免费兜底"。
+  const PRIORITY = [input.provider.name, 'minimax', 'glm', 'zhipu-vision']
   const rank = (name: string): number => {
     const i = PRIORITY.indexOf(name)
     return i === -1 ? PRIORITY.length + 1 : i
@@ -513,12 +544,20 @@ function autoSelectVisionBridge(input: AgentConfigInput): VisionBridgeBuild | un
       if (spec.supportsVision) candidates.push({ prov, spec })
     }
   }
-  candidates.sort((a, b) => rank(a.prov.name) - rank(b.prov.name))
-  for (const { prov, spec } of candidates) {
+  return candidates.sort((a, b) => rank(a.prov.name) - rank(b.prov.name))
+}
+
+/**
+ * Auto-select a vision bridge — only reachable with `agent.visionAutoBridge=true`.
+ * Picks the first vision-capable model that has usable credentials.
+ * Returns undefined when nothing is available (图片照旧被丢弃，提示在别处补）。
+ */
+function autoSelectVisionBridge(input: AgentConfigInput): VisionBridgeBuild | undefined {
+  for (const { prov, spec } of visionCandidates(input)) {
     const built = tryBuildVisionClientFrom(input, prov, spec, 1024)
     if ('client' in built) {
       const ref = `${prov.name}/${spec.id}`
-      console.warn(`[vision] 自动启用识图桥：${ref}（未显式配置 agent.visionModel，已选一个可用视觉模型）`)
+      console.warn(`[vision] 自动选用识图桥：${ref}（agent.visionAutoBridge=true；图片将发送给该 provider）`)
       return { client: built.client, prompt: undefined, maxTokens: built.maxTokens, source: 'auto', ref }
     }
     // 有 key 问题的候选跳过，继续找下一个——自动路径不刷 warn（显式路径才点名）。
@@ -527,17 +566,16 @@ function autoSelectVisionBridge(input: AgentConfigInput): VisionBridgeBuild | un
 }
 
 /**
- * Build the dedicated vision bridge StreamClient.
+ * Build the dedicated vision bridge StreamClient. 只在主模型 text-only 时调用。
  * 1) 显式 agent.visionModel 优先——配了就用它，起不来则点名原因（不静默降级）。
- * 2) 未显式配置但主模型 text-only → 自动选一个可用视觉模型做默认桥（开箱即用）。
+ * 2) 未显式配置 → 仅当 `agent.visionAutoBridge=true` 才自动选一个可用视觉模型。
+ *    默认关：自动桥会把用户的图片发给一个用户从未为此选择过的 provider，那是成本
+ *    与隐私决定，不该由默认值替用户做。关着时候选会被点名（见 deriveVisionBridgeStatus）。
  * 返回 undefined 表示无桥可用（主模型照旧看不到图）。
  */
 function buildVisionClient(input: AgentConfigInput): VisionBridgeBuild | undefined {
   const vm = input.visionModel
-  if (!vm) {
-    // 主模型自身支持视觉时无需桥；否则尝试自动选。
-    return autoSelectVisionBridge(input)
-  }
+  if (!vm) return input.visionAutoBridge ? autoSelectVisionBridge(input) : undefined
   const ref = `${vm.provider}/${vm.model}`
   const prov = input.allProviders?.[vm.provider]
   if (!prov) return warnVisionBridge(`prov:${ref}`, `provider "${vm.provider}" 不在已配置的 provider 列表里`)

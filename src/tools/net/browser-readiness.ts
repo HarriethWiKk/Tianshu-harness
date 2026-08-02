@@ -83,10 +83,11 @@ export function formatBrowserMissingBanner(probe: ChromiumProbe): string {
       probe.reason ? `  （原始错误：${probe.reason}）` : '',
     ].filter(Boolean).join('\n')
   }
-  // browser-missing：给一键命令 + 手动兜底（后者含国内镜像 env）。
+  // browser-missing：给一键命令 + 桌面入口 + 手动兜底（后者含国内镜像 env）。
   return [
     '⚠ 浏览器自动化需要 chromium，尚未安装。一键安装：',
     '  rivet browser install',
+    '  桌面端：设置 → 集成 → 浏览器（截图）→ 安装',
     `  （或手动：${PLAYWRIGHT_MANUAL_INSTALL_HINT}）`,
   ].join('\n')
 }

@@ -65,6 +65,12 @@ export interface EvidenceObligation {
   readonly attempts: number
   readonly lastFailureClass?: string
   readonly evidenceRefs: readonly string[]
+  /** 冗余验证声明（星河收编 #2）：达 k 个独立证据才 satisfied。缺省 =
+   *  单证据关闭（现状语义）。groupId 是语义标签（如 galaxy DP 副本组），
+   *  satisfy 计数不依赖它。 */
+  readonly redundancy?: { kind: 'quorum'; k: number; groupId?: string }
+  /** 冗余模式下已登记的满足次数（单证据模式无此字段）。 */
+  readonly satisfyCount?: number
 }
 
 export interface ObligationStore {
@@ -161,6 +167,10 @@ export interface CreateObligationInput {
   risk?: ObligationRisk
   /** 覆盖矩阵默认第一动作（如 regression 的 baseline 条件臂）。 */
   requiredAction?: EvidenceAction
+  /** 冗余验证声明：达 k 个独立证据才关闭。高风险结论（schema 变更、迁移、
+   *  鉴权、资金路径）创建义务时应显式声明——只有显式声明才启用冗余模式，
+   *  避免静默改变既有单证据关闭语义。 */
+  redundancy?: { kind: 'quorum'; k: number; groupId?: string }
 }
 
 export function createObligation(input: CreateObligationInput): EvidenceObligation {
@@ -175,6 +185,7 @@ export function createObligation(input: CreateObligationInput): EvidenceObligati
     state: 'open',
     attempts: 0,
     evidenceRefs: [],
+    ...(input.redundancy ? { redundancy: input.redundancy } : {}),
   }
 }
 
@@ -189,9 +200,12 @@ export function upsertObligation(store: ObligationStore, input: CreateObligation
     return { obligations: [...store.obligations, fresh] }
   }
   const risk = RISK_RANK[fresh.risk] > RISK_RANK[existing.risk] ? fresh.risk : existing.risk
-  if (risk === existing.risk) return store
+  // redundancy 合并：新声明优先，但 upsert 不撤销已有声明（同 ID 义务的
+  // 冗余模式一旦启用就保持，避免重复 upsert 悄悄关闭它）。
+  const redundancy = fresh.redundancy ?? existing.redundancy
+  if (risk === existing.risk && redundancy === existing.redundancy) return store
   return {
-    obligations: store.obligations.map(o => (o.id === existing.id ? { ...o, risk } : o)),
+    obligations: store.obligations.map(o => (o.id === existing.id ? { ...o, risk, ...(redundancy ? { redundancy } : {}) } : o)),
   }
 }
 
@@ -233,15 +247,24 @@ export function recordAttempt(store: ObligationStore, id: string, input: Attempt
   })
 }
 
-/** 关闭义务。satisfied 是唯一的「证据到位」终态；blocked 义务凭真实证据仍可关闭。 */
+/** 关闭义务。satisfied 是唯一的「证据到位」终态；blocked 义务凭真实证据仍可关闭。
+ *  冗余模式（redundancy 已声明）：每次 satisfy 登记一次满足计数，达 k 才
+ *  satisfied；未达保持 attempted（证据在途，不静默降级）。 */
 export function satisfyObligation(store: ObligationStore, id: string, evidenceRef: string): ObligationStore {
   return mapObligation(store, id, ob => {
     if (ob.state === 'superseded') return ob
-    return {
-      ...ob,
-      state: 'satisfied',
-      evidenceRefs: ob.evidenceRefs.includes(evidenceRef) ? ob.evidenceRefs : [...ob.evidenceRefs, evidenceRef],
+    const isNewEvidence = !ob.evidenceRefs.includes(evidenceRef)
+    const evidenceRefs = isNewEvidence ? [...ob.evidenceRefs, evidenceRef] : ob.evidenceRefs
+    if (!ob.redundancy) {
+      return { ...ob, state: 'satisfied', evidenceRefs }
     }
+    // 冗余计数按独立证据计——同一 ref 重复提交不计数，否则同一条验证命令
+    // 绿两次就能满足 k=2，恰是冗余要防的单证据场景。
+    const satisfyCount = (ob.satisfyCount ?? 0) + (isNewEvidence ? 1 : 0)
+    if (satisfyCount >= ob.redundancy.k) {
+      return { ...ob, state: 'satisfied', satisfyCount, evidenceRefs }
+    }
+    return { ...ob, state: 'attempted', satisfyCount, evidenceRefs }
   })
 }
 

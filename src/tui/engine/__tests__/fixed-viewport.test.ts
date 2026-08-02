@@ -8,7 +8,7 @@
  *     - budget<=0 → 原样返回（空闲塌回）。
  *  2. TuiApp 活动期（thinking/streaming）连续帧的 live region 总 display rows
  *     恒定 —— 输入框屏幕坐标不随字符增长浮动。
- *  3. turn 结束（phase → idle）后塌回 chrome-only（高度小于活动期）。
+ *  3. 首轮完成后 idle 不塌回——保持 ceiling 把输入框压底（首帧欢迎屏仍走自然流）。
  *  4. 小终端（rows=10）预算收缩，live region 不超屏。
  *  5. liveMaxRowsFor 终端高度感知（min(28, rows-1)，下限 4）。
  */
@@ -90,7 +90,20 @@ test('liveMaxRowsFor：高终端封顶 28，小终端 rows-1，下限 4，非法
 const flush = (): Promise<void> => new Promise((resolve) => setImmediate(resolve))
 const liveRows = (app: unknown): number => (app as { live: { lastDisplayRows: number } }).live.lastDisplayRows
 
-test('thinking 逐字增长期间 live region 总高度逐帧恒定（输入框不浮动）', async () => {
+/**
+ * 轮内不缩（非「逐帧恒定」）：动态段按本轮高水位定高，内容增长时抬高、
+ * 永不回缩。回缩才是输入框上抖的成因；单向抬高在满屏后由终端滚动吸收。
+ */
+const assertNoShrink = (heights: readonly number[]): void => {
+  for (let i = 1; i < heights.length; i++) {
+    assert.ok(
+      heights[i]! >= heights[i - 1]!,
+      `第 ${i} 帧回缩（输入框上抖）: ${heights[i]} < ${heights[i - 1]}（heights=${heights.join(',')}）`,
+    )
+  }
+}
+
+test('thinking 逐字增长期间 live region 轮内只涨不缩（输入框不上抖）', async () => {
   const { app } = makeApp({ cols: 80, rows: 40 })
   const heights: number[] = []
   for (let i = 0; i < 12; i++) {
@@ -98,14 +111,17 @@ test('thinking 逐字增长期间 live region 总高度逐帧恒定（输入框�
     await flush()
     heights.push(liveRows(app))
   }
-  const first = heights[0]!
-  assert.ok(first > 5, `活动期视口应有可观高度: ${first}`)
-  for (const [i, h] of heights.entries()) {
-    assert.equal(h, first, `第 ${i} 帧高度漂移: ${h} != ${first}（heights=${heights.join(',')}）`)
-  }
+  assert.ok(heights[0]! > 5, `活动期视口应有可观高度: ${heights[0]}`)
+  assertNoShrink(heights)
+  // 高水位跟随真实内容，不再恒定撑到引擎上限 liveMaxRowsFor(40)=28——撑到上限
+  // 会让轮末塌回落差达 20+ 行，短回复后全部露成输入框下方的空白。
+  assert.ok(
+    heights[heights.length - 1]! < 28,
+    `动态段不应撑到引擎上限: ${heights[heights.length - 1]}（heights=${heights.join(',')}）`,
+  )
 })
 
-test('streaming 文本增长期间高度同样恒定', async () => {
+test('streaming 文本增长期间同样只涨不缩', async () => {
   const { app } = makeApp({ cols: 80, rows: 40 })
   const heights: number[] = []
   for (let i = 0; i < 10; i++) {
@@ -113,12 +129,12 @@ test('streaming 文本增长期间高度同样恒定', async () => {
     await flush()
     heights.push(liveRows(app))
   }
-  const first = heights[0]!
-  assert.ok(first > 5)
-  for (const h of heights) assert.equal(h, first)
+  assert.ok(heights[0]! > 5)
+  assertNoShrink(heights)
+  assert.ok(heights[heights.length - 1]! < 28, `heights=${heights.join(',')}`)
 })
 
-test('turn 结束（isFinal）后塌回 chrome-only，高度小于活动期', async () => {
+test('turn 结束（isFinal）后保持压底——输入框不悬在半空占推理区域', async () => {
   const { app } = makeApp({ cols: 80, rows: 40 })
   app.callbacks.onThinkingDelta('思考中……\n')
   await flush()
@@ -129,7 +145,20 @@ test('turn 结束（isFinal）后塌回 chrome-only，高度小于活动期', as
     .handleTurnComplete({ input_tokens: 10, output_tokens: 5 }, 1, true)
   await flush()
   const idle = liveRows(app)
-  assert.ok(idle < active, `空闲期应塌回: idle=${idle} active=${active}`)
+  // 首轮完成后 idle 不应塌回——ceiling 垫到满屏，输入框保持压底。
+  // 落差无界要求（旧契约 idle < active 废除），允许 idle ≈ ceiling ≥ active。
+  const terminalRows = 40
+  const chromeRows = 6 // GlanceBar(1) + 输入框(3) + 提示行(~2)
+  const ceiling = Math.min(terminalRows - chromeRows - 2, liveMaxRowsFor(terminalRows) - chromeRows)
+  assert.ok(idle >= active || idle >= ceiling - 2,
+    `空闲期应保持压底: idle=${idle} active=${active} ceiling≈${ceiling}`)
+})
+
+test('首帧走自然流，不补空行撑底（凭空造的空白只能堆在欢迎屏某一侧，比自然流更难看）', async () => {
+  const { out } = makeApp({ cols: 80, rows: 40 })
+  await flush()
+  assert.equal(out.chunks.find(c => /^\n{2,}$/.test(c)), undefined,
+    `首帧不应出现成片空行: ${JSON.stringify(out.chunks.slice(0, 4))}`)
 })
 
 test('小终端（rows=10）预算收缩，live region 不超屏', async () => {

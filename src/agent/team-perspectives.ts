@@ -1,4 +1,5 @@
 import { extractJsonCandidates, type WorkerResult } from './work-order.js'
+import { dependencyId } from './work-order.js'
 import type { TeamTask, RiskItem } from './team-plan.js'
 import { mergeRoleFor, type ExpertRole } from './expert-router.js'
 import { starDomainRegistry } from './star-domain-registry.js'
@@ -127,11 +128,14 @@ export function mergePerspectivesByRole(perspectives: TeamPerspectivePlan[]): Me
   const specialists = others.filter(p => roleOf(p) === 'specialist' || roleOf(p) === 'base')
 
   // Step 1: Deep-clone base tasks as the graph (avoid polluting caller's objects)
-  const tasks = base.tasks.map(t => ({
+  // 条件边（收编 #6）：merge 只关心主依赖关系——深拷贝处映射 dependencyId，
+  // 后续集合操作（sameDependencySet/并集/includes）全为 string 语义；条件边
+  // 的运行时分支由 coordinator 处理。
+  const tasks: TeamTask[] = base.tasks.map(t => ({
     ...t,
     files: [...t.files],
     touchSet: [...t.touchSet],
-    dependsOn: [...t.dependsOn],
+    dependsOn: t.dependsOn.map(dependencyId),
     verification: [...t.verification],
   }))
   const taskIndex = new Map(tasks.map(t => [t.id, t]))
@@ -187,13 +191,13 @@ export function mergePerspectivesByRole(perspectives: TeamPerspectivePlan[]): Me
     // Dependency ordering conflicts: challenger proposes a different dependency SET.
     for (const chTask of ch.tasks) {
       const baseTask = base.tasks.find(t => t.id === chTask.id)
-      if (baseTask && !sameDependencySet(chTask.dependsOn, baseTask.dependsOn)) {
+      if (baseTask && !sameDependencySet(chTask.dependsOn.map(dependencyId), baseTask.dependsOn.map(dependencyId))) {
         if (chTask.dependsOn.length > 0 || baseTask.dependsOn.length > 0) {
           conflicts.push({
             description: `Dependency conflict on ${chTask.id}`,
-            tianquan: `depends: [${baseTask.dependsOn.join(', ')}]`,
+            tianquan: `depends: [${baseTask.dependsOn.map(dependencyId).join(', ')}]`,
             tianfu: '(no position)',
-            tianxuan: `depends: [${chTask.dependsOn.join(', ')}]`,
+            tianxuan: `depends: [${chTask.dependsOn.map(dependencyId).join(', ')}]`,
           })
         }
       }
@@ -295,12 +299,12 @@ export function mergePerspectivesByRole(perspectives: TeamPerspectivePlan[]): Me
   // Step 7: validateTaskGraph fail-safe — strip dangling deps introduced by augment.
   const augmentedGraph: TaskGraph = {
     mission: base.summary,
-    nodes: tasks.map(t => ({ id: t.id, title: t.title, objective: t.objective, profile: t.profile, kind: t.kind, files: t.files, dependsOn: t.dependsOn, riskTier: t.riskTier })),
+    nodes: tasks.map(t => ({ id: t.id, title: t.title, objective: t.objective, profile: t.profile, kind: t.kind, files: t.files, dependsOn: t.dependsOn.map(dependencyId), riskTier: t.riskTier })),
     createdAt: 0,
   }
   if (!validateTaskGraph(augmentedGraph).valid) {
     const liveIds = new Set(tasks.map(t => t.id))
-    for (const t of tasks) t.dependsOn = t.dependsOn.filter(d => liveIds.has(d))
+    for (const t of tasks) t.dependsOn = t.dependsOn.filter(d => liveIds.has(dependencyId(d)))
   }
 
   // Build merged risks: base + (constraints ∪ specialists) deduped & name-prefixed.

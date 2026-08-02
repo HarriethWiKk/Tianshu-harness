@@ -2,7 +2,7 @@ import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import { createDelegateBatchTool, type DelegateBatchCoordinator } from '../delegate-batch.js'
 import type { CoordinatorRun, DelegationRequest } from '../../agent/coordinator.js'
-import { aggregationPolicySchema, workOrderKindSchema, type AggregationPolicy } from '../../agent/work-order.js'
+import { aggregationPolicyKinds, workOrderKindSchema, type AggregationPolicy } from '../../agent/work-order.js'
 
 function makeRun(): CoordinatorRun {
   return {
@@ -29,7 +29,7 @@ describe('DELEGATE_BATCH_TOOL', () => {
     const taskProperties = schema.properties.tasks.items.properties
 
     assert.deepEqual(taskProperties.kind.enum, [...workOrderKindSchema.options])
-    assert.deepEqual(schema.properties.policy.enum, [...aggregationPolicySchema.options])
+    assert.deepEqual(schema.properties.policy.enum, [...aggregationPolicyKinds])
     assert.ok(schema.properties.policy.enum.includes('weighted_confidence'))
   })
 
@@ -64,7 +64,11 @@ describe('DELEGATE_BATCH_TOOL', () => {
     const tool = createDelegateBatchTool({ delegateBatch: async () => makeRun() })
     const schema = tool.definition.input_schema as any
     assert.equal(schema.properties.tasks.items.properties.dependsOn.type, 'array')
-    assert.equal(schema.properties.tasks.items.properties.dependsOn.items.type, 'integer')
+    // 收编 #6：dependsOn 支持数字索引或条件边对象
+    const items = schema.properties.tasks.items.properties.dependsOn.items
+    assert.ok(items.anyOf, 'dependsOn items 应为 anyOf（整数索引 | 条件边对象）')
+    assert.equal(items.anyOf[0].type, 'integer')
+    assert.equal(items.anyOf[1].properties.onFailure.enum.join(','), 'skip,alternate')
   })
 
   it('maps dependsOn indices to stable batch:N dependency ids and stable parentTurnId', async () => {
@@ -92,6 +96,80 @@ describe('DELEGATE_BATCH_TOOL', () => {
     assert.equal(reqs[1]?.parentTurnId, 'tu_dep:batch:1')
     assert.equal(reqs[0]?.dependencies, undefined)
     assert.deepEqual(reqs[1]?.dependencies, ['batch:0'])
+  })
+
+  it('maps conditional dependsOn edges to DependencyEdge objects（收编 #6 入口）', async () => {
+    const calls: Array<{ requests: DelegationRequest[] }> = []
+    const coordinator: DelegateBatchCoordinator = {
+      delegateBatch: async (requests) => { calls.push({ requests }); return makeRun() },
+    }
+    const tool = createDelegateBatchTool(coordinator)
+
+    const result = await tool.execute({
+      toolUseId: 'tu_edge',
+      cwd: '/repo',
+      sessionTurnCount: 5,
+      input: {
+        tasks: [
+          { objective: 'Refactor the source module under review.' },
+          { objective: 'Fallback exploration task for alternate routing.' },
+          { objective: 'Write tests for the refactored source module.', dependsOn: [{ index: 0, onFailure: 'alternate', alternateOrderId: 1 }] },
+          { objective: 'Lint the module after upstream completes.', dependsOn: [{ index: 0, onFailure: 'skip' }] },
+        ],
+      },
+    })
+
+    assert.equal(result.isError, false)
+    const reqs = calls[0]!.requests
+    assert.deepEqual(reqs[3]?.dependencies, [{ dependsOn: 'batch:0', onFailure: 'skip' }])
+    assert.deepEqual(reqs[2]?.dependencies, [{ dependsOn: 'batch:0', onFailure: 'alternate', alternateOrderId: 'batch:1' }])
+  })
+
+  it('rejects conditional edges with out-of-range index / self-reference / bad alternateOrderId', async () => {
+    const tool = createDelegateBatchTool({ delegateBatch: async () => makeRun() })
+
+    const badIndex = await tool.execute({
+      toolUseId: 'tu_edge_bad',
+      cwd: '/repo',
+      sessionTurnCount: 5,
+      input: {
+        tasks: [
+          { objective: 'Only task in this batch.' },
+          { objective: 'Depends on nonexistent task.', dependsOn: [{ index: 5, onFailure: 'skip' }] },
+        ],
+      },
+    })
+    assert.equal(badIndex.isError, true)
+    assert.match(String(badIndex.content), /越界/)
+
+    const selfRef = await tool.execute({
+      toolUseId: 'tu_edge_self',
+      cwd: '/repo',
+      sessionTurnCount: 5,
+      input: {
+        tasks: [
+          { objective: 'First task does standalone work here.' },
+          { objective: 'Second task depends on itself.', dependsOn: [{ index: 1, onFailure: 'skip' }] },
+        ],
+      },
+    })
+    assert.equal(selfRef.isError, true)
+    assert.match(String(selfRef.content), /依赖了自身/)
+
+    const badAlt = await tool.execute({
+      toolUseId: 'tu_edge_alt',
+      cwd: '/repo',
+      sessionTurnCount: 5,
+      input: {
+        tasks: [
+          { objective: 'Upstream task that will fail.' },
+          { objective: 'Alternate fallback task.' },
+          { objective: 'Dependent with out-of-range alternate.', dependsOn: [{ index: 0, onFailure: 'alternate', alternateOrderId: 9 }] },
+        ],
+      },
+    })
+    assert.equal(badAlt.isError, true)
+    assert.match(String(badAlt.content), /越界/)
   })
 
   it('rejects 越界索引 dependsOn indices', async () => {

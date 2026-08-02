@@ -41,6 +41,23 @@ describe('detectPointerPlaceholder', () => {
     }
   })
 
+  it('detects the current (post-2026-08) pointer format with success reassurance copy', () => {
+    // 现行 render 文案：前缀 + 中文「已成功落盘…不要重写」说明 + 机器 tag。
+    // tag 仍是检测锚点，旧格式（上方用例）也必须继续命中——存量会话历史里两种并存。
+    const samples: Record<string, string> = {
+      '[file written to': '[file written to /x/y.md — 5 lines, 100 chars. 已成功落盘，勿重写——历史正常截断，查看用 read_file。#RIVET-POINTER-DISPLAY-ONLY# display-only pointer]',
+      '[edit on': '[edit on /x/y.md: replaced 100-char block, preview: "abc". 已成功落盘，勿重做——历史正常截断，查看用 read_file。#RIVET-POINTER-DISPLAY-ONLY# display-only pointer]',
+      '[hash_edit applied to': '[hash_edit applied to /x/y.md — new block 5 lines, 100 chars. 已成功落盘，勿重做——历史正常截断，查看用 read_file。#RIVET-POINTER-DISPLAY-ONLY# display-only pointer]',
+      '[new block': '[new block 100 chars — 已落盘，勿重做。#RIVET-POINTER-DISPLAY-ONLY# display-only pointer]',
+      '[plan persisted to': '[plan persisted to .rivet/plans/x.md — 5 lines, 100 chars. 已成功落盘，勿重贴——历史正常截断，查看用 read_file。#RIVET-POINTER-DISPLAY-ONLY# display-only pointer]',
+    }
+    for (const prefix of POINTER_PLACEHOLDER_PREFIXES) {
+      const sample = samples[prefix]
+      assert.ok(sample, `missing test sample for prefix ${prefix}`)
+      assert.equal(detectPointerPlaceholder(sample), prefix, prefix)
+    }
+  })
+
   it('detects a pointer behind leading whitespace', () => {
     assert.equal(
       detectPointerPlaceholder('\n  [file written to /a.md — 5 lines, 10 chars. Display placeholder — never emit this as content; use read_file to review.]'),

@@ -14,13 +14,19 @@
 import type { Usage } from '../api/types.js'
 import type { WorkerResult } from './work-order.js'
 
-/** 一个 order 最多自动续跑几次（不含首轮）。总运行次数 = 1 + 本值。 */
-export const MAX_BUDGET_CONTINUATIONS = 2
+/** 一个 order 最多自动续跑几次（不含首轮）。总运行次数 = 1 + 本值。
+ *
+ *  原值 2（稠密模型保守估计）；2026-08-01 提升至 4——DeepSeek V3/V4 的 MLA
+ *  KV-cache 压缩将每轮上下文成本降至传统 attention 的约 1/5–1/10，4 轮续跑基本
+ *  不会因 KV cache 膨胀导致退化。收益：减少 hard-fail（blocked），增加 partial
+ *  result salvage 概率。外层 timeout 相应增大（3x → 5x）。
+ */
+export const MAX_BUDGET_CONTINUATIONS = 4
 
 /**
  * 一次 hands 会话里，首轮之外最多再跑几次 agent。**续跑、JSON 解析修复、写闸门
  * 修复共用这一本账**——三条路径都可能在同一次会话里触发，各记各的会叠乘成
- * 「2 续跑 × 2 解析修复 + 1 闸门修复」。共用总账把最坏情况钉死在 1 + 3 = 4 轮。
+ * 「N 续跑 × 2 解析修复 + 1 闸门修复」。共用总账把最坏情况钉死在 1 + (MAX+1) = MAX+2 轮。
  */
 export const MAX_HANDS_EXTRA_RUNS = MAX_BUDGET_CONTINUATIONS + 1
 

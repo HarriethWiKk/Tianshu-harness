@@ -28,8 +28,8 @@ function assertNoHit(filePath: string, content: string, ruleName: string): void 
 
 // ── 表结构完整性 ────────────────────────────────────────────────────
 
-test('SECURITY_PATTERNS 有 25 条规则', () => {
-  assert.equal(SECURITY_PATTERNS.length, 25)
+test('SECURITY_PATTERNS 有 27 条规则', () => {
+  assert.equal(SECURITY_PATTERNS.length, 27)
 })
 
 test('每条规则名唯一', () => {
@@ -219,6 +219,64 @@ test('github_actions_workflow: .github/workflows/*.yml 命中', () => {
 
 test('github_actions_workflow: 普通 yaml 不命中', () => {
   assertNoHit('config/app.yml', 'foo: bar', 'github_actions_workflow')
+})
+
+// ── SQL 注入类（本仓库补充，官方规则表无） ──────────────────────────
+
+test('sql_string_interpolation: 模板字符串插值命中', () => {
+  assertHit('a.ts', 'db.query(`SELECT * FROM users WHERE id = ${userId}`)', 'sql_string_interpolation')
+})
+
+test('sql_string_interpolation: Python %s 拼接与 f-string 命中', () => {
+  assertHit('a.py', 'cur.execute("SELECT name FROM t WHERE id = %s" % uid)', 'sql_string_interpolation')
+  assertHit('a.py', 'cur.execute(f"DELETE FROM logs WHERE day < {cutoff}")', 'sql_string_interpolation')
+})
+
+test('sql_string_interpolation: 字符串 + 变量拼接命中', () => {
+  assertHit('a.js', 'const q = "UPDATE t SET a = 1 WHERE id = " + id', 'sql_string_interpolation')
+})
+
+test('sql_string_interpolation: 参数化查询不命中（正确写法不该被告警）', () => {
+  assertNoHit('a.ts', "db.query('SELECT * FROM users WHERE id = ?', [userId])", 'sql_string_interpolation')
+  // %s 是 Python DB-API 的占位符本身，不是危险信号——危险的是引号外的 % 运算。
+  assertNoHit('a.py', 'cur.execute("SELECT * FROM t WHERE id = %s", (uid,))', 'sql_string_interpolation')
+  assertNoHit('a.ts', 'db.query("INSERT INTO t (a) VALUES ($1)", [a])', 'sql_string_interpolation')
+})
+
+test('sql_string_interpolation: 裸 SQL 动词的同名方法调用不命中', () => {
+  // 要求成对语法（UPDATE…SET）的原因：裸 UPDATE + `{` 会把这类调用全部误报。
+  assertNoHit('a.ts', 'store.update({ name: input })', 'sql_string_interpolation')
+  assertNoHit('a.ts', 'await repo.update({ id }, { title: t })', 'sql_string_interpolation')
+})
+
+test('sql_string_interpolation: 文档与含 SQL 词的散文不命中', () => {
+  assertNoHit('README.md', 'SELECT * FROM users WHERE id = ${id}', 'sql_string_interpolation')
+  assertNoHit('a.ts', 'log(`selected ${count} rows`)', 'sql_string_interpolation')
+})
+
+// ── 硬编码密钥类（本仓库补充，官方规则表无） ────────────────────────
+
+test('hardcoded_secret: 密钥字段赋长字面量命中', () => {
+  assertHit('a.ts', 'const apiKey = "a1b2c3d4e5f6g7h8i9j0k1l2"', 'hardcoded_secret')
+  assertHit('a.py', 'client_secret = "8f14e45fceea167a5a36dedd4bea2543"', 'hardcoded_secret')
+})
+
+test('hardcoded_secret: 可辨识的 token 前缀命中', () => {
+  assertHit('a.ts', 'const t = "sk-abcdefghijklmnopqrstuvwxyz12"', 'hardcoded_secret')
+  assertHit('a.js', 'const gh = "ghp_abcdefghijklmnopqrstuvwxyz1234567"', 'hardcoded_secret')
+  assertHit('a.go', 'key := "AKIAIOSFODNN7EXAMPLE"', 'hardcoded_secret')
+})
+
+test('hardcoded_secret: 占位符与环境变量读取不命中（误报会让规则被无视）', () => {
+  assertNoHit('a.ts', 'const apiKey = process.env.API_KEY', 'hardcoded_secret')
+  assertNoHit('a.ts', 'const apiKey = "your-api-key-here"', 'hardcoded_secret')
+  assertNoHit('a.ts', 'const apiKey = "xxxxxxxxxxxxxxxxxxxx"', 'hardcoded_secret')
+  assertNoHit('a.ts', 'const apiKey = `${process.env.KEY}`', 'hardcoded_secret')
+  assertNoHit('a.py', 'password = "changeme"', 'hardcoded_secret')
+})
+
+test('hardcoded_secret: 文档不命中（pathFilter）', () => {
+  assertNoHit('README.md', 'api_key = "a1b2c3d4e5f6g7h8i9j0k1l2"', 'hardcoded_secret')
 })
 
 // ── 干净代码零命中 ──────────────────────────────────────────────────

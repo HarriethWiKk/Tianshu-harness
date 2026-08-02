@@ -57,7 +57,45 @@ function injectVerificationNudge(results: WorkerResult[], nudge: string): Worker
   })
 }
 
-function applyPolicy(results: WorkerResult[], policy: AggregationPolicy): WorkerResult[] {
+/**
+ * quorum 一等聚合：按派发侧 groupId 分组，组内 passed >= k 组通过，跨组
+ * all_required。无 groupId 的 worker 独立判定（等同一个 k=1 的单成员组）。
+ * 组未达 k → 组内全部标 failed（passed 成员降级并注记）——下游（deliver_task、
+ * team 验收）看到的是「组结论不可采信」，不是藏在 risks 里的 caveat。
+ * 组阈值解析：quorumGroups.get(groupId) ?? policy.k（组级显式声明优先）。
+ */
+function applyQuorum(
+  results: WorkerResult[],
+  policy: { kind: 'quorum'; k: number },
+  quorumGroups?: Map<string, number>,
+): WorkerResult[] {
+  const byGroup = new Map<string | undefined, WorkerResult[]>()
+  for (const r of results) {
+    const list = byGroup.get(r.groupId)
+    if (list) list.push(r)
+    else byGroup.set(r.groupId, [r])
+  }
+  const out: WorkerResult[] = []
+  for (const [groupId, members] of byGroup) {
+    const k = groupId === undefined ? 1 : (quorumGroups?.get(groupId) ?? policy.k)
+    const passed = members.filter(r => r.status === 'passed')
+    if (passed.length >= k) {
+      out.push(...members)
+      continue
+    }
+    const note = `quorum: group ${groupId ?? '(independent)'} not reached — ${passed.length}/${members.length} passed, need ${k}; group conclusion not trustworthy`
+    out.push(...members.map(r =>
+      r.status === 'passed'
+        ? { ...r, status: 'failed' as const, risks: [...r.risks, note] }
+        : { ...r, risks: [...r.risks, note] },
+    ))
+  }
+  return out
+}
+
+function applyPolicy(results: WorkerResult[], policy: AggregationPolicy, quorumGroups?: Map<string, number>): WorkerResult[] {
+  if (typeof policy === 'object') return applyQuorum(results, policy, quorumGroups)
+
   if (policy === 'primary_decides') return results
 
   if (policy === 'all_required') {
@@ -127,6 +165,7 @@ export function aggregateResults(
   policy: AggregationPolicy,
   profiles?: Map<string, string>,
   transcripts?: Map<string, WorkerTranscript>,
+  quorumGroups?: Map<string, number>,
 ): WorkerResult[] {
   // Step 1: gate each result through evidence verification
   const gated = results.map(r => verifyWorkerEvidence(r, profiles?.get(r.workOrderId), transcripts?.get(r.workOrderId)))
@@ -135,7 +174,7 @@ export function aggregateResults(
   const nudge = detectVerificationGap(gated, profiles)
 
   // Step 3: apply aggregation policy
-  const aggregated = applyPolicy(gated, policy)
+  const aggregated = applyPolicy(gated, policy, quorumGroups)
 
   // Step 4: inject soft nudge if verification gap detected
   if (nudge) {

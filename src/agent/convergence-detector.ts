@@ -270,9 +270,9 @@ const WINDOW_TIER_200K: WindowTier = {
 
 const WINDOW_TIER_1M: WindowTier = {
   maxTurns: 50,
-  nLow: 12,
-  nMid: 22,
-  nHigh: 35,
+  nLow: 25,
+  nMid: 34,
+  nHigh: 42,
   signalWindow: 10,
   label: '1M',
 }

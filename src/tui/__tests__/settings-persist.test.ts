@@ -84,11 +84,39 @@ describe('settings persist', () => {
     }
     saveSettings({ draft: withVision, blocks: dirtyBlocks(before, withVision) })
     const saved = loadSettingsDraft()
-    assert.deepEqual(saved.vision, { provider: 'minimax', model: 'MiniMax-M3', prompt: undefined, maxTokens: 2048 })
+    assert.deepEqual(saved.vision, {
+      provider: 'minimax', model: 'MiniMax-M3', prompt: undefined, maxTokens: 2048, fallback: undefined,
+    })
 
     const cleared: SettingsDraft = { ...saved, vision: null }
     saveSettings({ draft: cleared, blocks: dirtyBlocks(saved, cleared) })
     assert.equal(loadSettingsDraft().vision, null)
+  })
+
+  // 备用识图桥必须在 draft 里往返：面板不显示的字段一保存就消失，等于两个界面
+  // （桌面端 / 面板 / 手写配置）互相抹配置。
+  it('备用识图模型能存能读能清', () => {
+    const before = loadSettingsDraft()
+    const withFallback: SettingsDraft = {
+      ...before,
+      vision: {
+        provider: 'minimax', model: 'MiniMax-M3', maxTokens: 1024,
+        fallback: { provider: 'glm', model: 'glm-5.2' },
+      },
+    }
+    saveSettings({ draft: withFallback, blocks: dirtyBlocks(before, withFallback) })
+    const saved = loadSettingsDraft()
+    assert.deepEqual(saved.vision?.fallback, { provider: 'glm', model: 'glm-5.2' })
+
+    // 只改 maxTokens 不该带走备用桥。
+    const bumped: SettingsDraft = { ...saved, vision: { ...saved.vision!, maxTokens: 512 } }
+    saveSettings({ draft: bumped, blocks: dirtyBlocks(saved, bumped) })
+    assert.deepEqual(loadSettingsDraft().vision?.fallback, { provider: 'glm', model: 'glm-5.2' })
+
+    // 面板里清掉备用桥要真的清掉（省略即保留的语义下必须显式发 null）。
+    const dropped: SettingsDraft = { ...bumped, vision: { ...bumped.vision!, fallback: undefined } }
+    saveSettings({ draft: dropped, blocks: dirtyBlocks(bumped, dropped) })
+    assert.equal(loadSettingsDraft().vision?.fallback, undefined)
   })
 
   it('搜索后端清空 = 回落默认链，而不是写一个空数组', () => {

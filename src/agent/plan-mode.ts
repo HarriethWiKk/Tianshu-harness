@@ -166,7 +166,7 @@ export function formatActivePlanDraftReceipt(
 ): string | null {
   if (!activePlanFilePath) return null
   if (!pathsMatch(cwd, targetFilePath, activePlanFilePath)) return null
-  return `已写入活动计划文件 \`${activePlanFilePath}\`（${charCount} chars）`
+  return `已写入活动计划文件 \`${activePlanFilePath}\`（${charCount} chars）——内容与你提交的一致；历史消息里显示为 "[file written to …]" 指针是正常截断（省 token），草稿内容完好，不要重写`
 }
 
 /** 检查工具是否在 plan-mode 下被允许 */

@@ -1,4 +1,6 @@
 import { describe, it } from 'node:test'
+// 注：本文件用 describe/it 包裹——顶层裸 test() 在 runner 的 --test-force-exit 下
+// 会被随机截断（跑一部分就退出且仍报 pass）。
 import assert from 'node:assert/strict'
 import { createSecurityPatternHook } from '../security-pattern-hook.js'
 import type { AdvisoryEntry } from '../../advisory-bus.js'
@@ -99,5 +101,114 @@ describe('createSecurityPatternHook', () => {
     assert.equal(hook.getSecurityTracker().hitsByFile.size, 1)
     hook.resetSecurityTracker()
     assert.equal(hook.getSecurityTracker().hitsByFile.size, 0)
+  })
+
+  it('写失败不告警（内容没落盘，告警是纯噪音）', () => {
+    const submitted: AdvisoryEntry[] = []
+    const hook = createSecurityPatternHook({
+      advisoryBus: { submit: (e: AdvisoryEntry) => { submitted.push(e) } },
+    })
+    const failed = {
+      name: 'write_file', success: false,
+      input: { file_path: 'a.js', content: 'eval(x)\n' },
+    } as unknown as RuntimeToolEvent
+    hook.run(makeCtx(1), failed)
+
+    assert.equal(submitted.length, 0)
+    assert.equal(hook.getSecurityTracker().hitsByFile.size, 0)
+  })
+
+  it('同一 (文件, 规则) 只提醒一次（跨轮不重发长文案）', () => {
+    const submitted: AdvisoryEntry[] = []
+    const hook = createSecurityPatternHook({
+      advisoryBus: { submit: (e: AdvisoryEntry) => { submitted.push(e) } },
+    })
+    hook.run(makeCtx(1), makeWriteTool('write_file', 'a.js', 'eval(x)\n'))
+    hook.run(makeCtx(2), makeWriteTool('write_file', 'a.js', 'eval(y)\n'))
+    hook.run(makeCtx(3), makeWriteTool('edit_file', 'a.js', 'eval(z)\n'))
+
+    assert.equal(submitted.length, 1, 'AdvisoryBus 只在同轮去重，跨轮抑制得靠 tracker')
+    // 已提醒的规则仍留在 tracker 里，供交付前复扫。
+    assert.ok(hook.getSecurityTracker().hitsByFile.get('a.js')!.has('eval_injection'))
+  })
+
+  it('同一文件出现新规则仍然提醒（去重是按规则粒度）', () => {
+    const submitted: AdvisoryEntry[] = []
+    const hook = createSecurityPatternHook({
+      advisoryBus: { submit: (e: AdvisoryEntry) => { submitted.push(e) } },
+    })
+    hook.run(makeCtx(1), makeWriteTool('write_file', 'a.js', 'eval(x)\n'))
+    hook.run(makeCtx(2), makeWriteTool('write_file', 'a.js', 'eval(x)\nel.innerHTML = y\n'))
+
+    assert.equal(submitted.length, 2)
+    assert.ok(submitted[1]!.content.includes('innerHTML'), '第二条只讲新规则')
+    assert.ok(!submitted[1]!.content.includes('eval()'), '不该复述已提醒过的 eval')
+  })
+
+  it('advisory 带 file_touched 核销谓词（否则只计送达、不进采纳率）', () => {
+    const submitted: AdvisoryEntry[] = []
+    const hook = createSecurityPatternHook({
+      advisoryBus: { submit: (e: AdvisoryEntry) => { submitted.push(e) } },
+    })
+    hook.run(makeCtx(1), makeWriteTool('write_file', 'src/api.js', 'eval(x)\n'))
+
+    const expect = submitted[0]!.expect
+    assert.ok(expect && expect.kind === 'file_touched')
+    assert.deepEqual(expect.paths, ['src/api.js'])
+  })
+
+  describe('apply_patch 覆盖', () => {
+    function makePatchTool(diff: string, checkOnly = false): RuntimeToolEvent {
+      return {
+        name: 'apply_patch', success: true,
+        input: { diff, ...(checkOnly ? { check_only: true } : {}) },
+      } as unknown as RuntimeToolEvent
+    }
+
+    const dangerousDiff = [
+      'diff --git a/src/db.ts b/src/db.ts',
+      '--- a/src/db.ts',
+      '+++ b/src/db.ts',
+      '@@ -1 +1,2 @@',
+      ' const x = 1',
+      '+db.query(`SELECT * FROM users WHERE id = ${id}`)',
+    ].join('\n')
+
+    it('扫描 diff 里的新增行（换个写工具不该绕过检测）', () => {
+      const submitted: AdvisoryEntry[] = []
+      const hook = createSecurityPatternHook({
+        advisoryBus: { submit: (e: AdvisoryEntry) => { submitted.push(e) } },
+      })
+      hook.run(makeCtx(1), makePatchTool(dangerousDiff))
+
+      assert.equal(submitted.length, 1)
+      assert.ok(submitted[0]!.content.includes('src/db.ts'))
+      assert.ok(hook.getSecurityTracker().hitsByFile.get('src/db.ts')!.has('sql_string_interpolation'))
+    })
+
+    it('check_only 不扫描（只校验不落盘）', () => {
+      const submitted: AdvisoryEntry[] = []
+      const hook = createSecurityPatternHook({
+        advisoryBus: { submit: (e: AdvisoryEntry) => { submitted.push(e) } },
+      })
+      hook.run(makeCtx(1), makePatchTool(dangerousDiff, true))
+      assert.equal(submitted.length, 0)
+    })
+
+    it('context 行里的既有问题不告警（只看新增行）', () => {
+      const submitted: AdvisoryEntry[] = []
+      const hook = createSecurityPatternHook({
+        advisoryBus: { submit: (e: AdvisoryEntry) => { submitted.push(e) } },
+      })
+      const contextOnly = [
+        '--- a/src/old.js',
+        '+++ b/src/old.js',
+        '@@ -1,2 +1,3 @@',
+        ' eval(legacyInput)',
+        '+const safe = 1',
+      ].join('\n')
+      hook.run(makeCtx(1), makePatchTool(contextOnly))
+      assert.equal(submitted.length, 0, '未被本次改动引入的问题不该记在这次写入头上')
+    })
   })
 })
