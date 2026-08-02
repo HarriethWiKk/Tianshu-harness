@@ -190,4 +190,66 @@ describe('RuntimeHookPipeline', () => {
     assert.deepEqual(thetaRequests, ['elm'])
     assert.deepEqual(phases, [{ phase: 'tianshu-encore', detail: { reason: 'kick' } }])
   })
+
+  it('publishes a manifest and skips explicitly disabled hooks', async () => {
+    const ran: string[] = []
+    const disabled: PreTurnRuntimeHook = { phase: 'preTurn', name: 'disabled', run: () => { ran.push('disabled') } }
+    const enabled: PostTurnRuntimeHook = { phase: 'postTurn', name: 'enabled', run: () => { ran.push('enabled') } }
+    const pipeline = new RuntimeHookPipeline([disabled, enabled], { disabledHookIds: ['disabled'] })
+
+    assert.deepEqual(pipeline.getManifest(), [
+      { id: 'disabled', phase: 'preTurn', enabled: false },
+      { id: 'enabled', phase: 'postTurn', enabled: true },
+    ])
+
+    await pipeline.runPreTurn(makeContext())
+    await pipeline.runPostTurn(makeContext())
+
+    assert.deepEqual(ran, ['enabled'])
+    assert.deepEqual(pipeline.getStats(), [
+      {
+        id: 'disabled', phase: 'preTurn', runs: 0, skipped: 1, failures: 0, timeouts: 0,
+        slowRuns: 0, totalDurationMs: 0, maxDurationMs: 0,
+      },
+      {
+        id: 'enabled', phase: 'postTurn', runs: 1, skipped: 0, failures: 0, timeouts: 0,
+        slowRuns: 0, totalDurationMs: 0, maxDurationMs: 0,
+      },
+    ])
+  })
+
+  it('reports hook timeouts and continues later hooks', async () => {
+    const errors: RuntimeHookError[] = []
+    const order: string[] = []
+    const pipeline = new RuntimeHookPipeline([
+      { phase: 'preTurn', name: 'stalled', run: () => new Promise<void>(() => {}) },
+      { phase: 'preTurn', name: 'later', run: () => { order.push('later') } },
+    ], { hookTimeoutMs: 10, onError: error => errors.push(error) })
+
+    await pipeline.runPreTurn(makeContext())
+
+    assert.deepEqual(order, ['later'])
+    assert.equal(errors.length, 1)
+    assert.equal(errors[0]!.hookName, 'stalled')
+    assert.match(errors[0]!.message, /timed out after 10ms/)
+    assert.equal(pipeline.getStats()[0]!.timeouts, 1)
+  })
+
+  it('marks completed hooks above the slow threshold', async () => {
+    const events: Array<{ id: string; slow: boolean }> = []
+    const pipeline = new RuntimeHookPipeline([{
+      phase: 'preTurn',
+      name: 'slow',
+      run: async () => { await new Promise(resolve => setTimeout(resolve, 15)) },
+    }], {
+      hookTimeoutMs: 100,
+      hookSlowMs: 1,
+      onRun: event => events.push({ id: event.id, slow: event.slow }),
+    })
+
+    await pipeline.runPreTurn(makeContext())
+
+    assert.deepEqual(events, [{ id: 'slow', slow: true }])
+    assert.equal(pipeline.getStats()[0]!.slowRuns, 1)
+  })
 })

@@ -858,6 +858,19 @@ export function createRuntimeHooksPipeline(self: AgentLoop): RuntimeHookPipeline
     onError: (err) => {
       runOnErrorHooks(userBridgeDeps, err.message)
     },
+    onRun: event => {
+      if (event.outcome === 'completed' && !event.slow) return
+      self.telemetryWriter.write({
+        kind: 'runtime-hook-health',
+        hook: event.id,
+        phase: event.phase,
+        outcome: event.outcome,
+        durationMs: event.durationMs,
+        slow: event.slow,
+        message: event.message,
+        turn: self.session.getTurnCount(),
+      })
+    },
   })
 }
 

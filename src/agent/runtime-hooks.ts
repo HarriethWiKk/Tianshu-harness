@@ -138,9 +138,49 @@ export interface RuntimeHookError {
   error: unknown
 }
 
+export type RuntimeHookRunOutcome = 'completed' | 'failed' | 'timed_out' | 'skipped'
+
+export interface RuntimeHookManifestEntry {
+  id: string
+  phase: RuntimeHookPhase
+  enabled: boolean
+}
+
+export interface RuntimeHookRunEvent {
+  id: string
+  phase: RuntimeHookPhase
+  outcome: RuntimeHookRunOutcome
+  durationMs: number
+  slow: boolean
+  message?: string
+}
+
+export interface RuntimeHookStats {
+  id: string
+  phase: RuntimeHookPhase
+  runs: number
+  skipped: number
+  failures: number
+  timeouts: number
+  slowRuns: number
+  totalDurationMs: number
+  maxDurationMs: number
+}
+
 export interface RuntimeHookPipelineOptions {
   onError?: (error: RuntimeHookError) => void
+  /** Receives one event per registered hook invocation, including skipped hooks. */
+  onRun?: (event: RuntimeHookRunEvent) => void
+  /** Hook ids to retain in the manifest but exclude from execution. */
+  disabledHookIds?: Iterable<string>
+  /** Per-hook wall-clock budget. Set to 0 to disable timeout handling. */
+  hookTimeoutMs?: number
+  /** Report completed hooks at or above this duration as slow. */
+  hookSlowMs?: number
 }
+
+const DEFAULT_HOOK_TIMEOUT_MS = 10_000
+const DEFAULT_HOOK_SLOW_MS = 2_000
 
 function noop(): void {}
 
@@ -187,15 +227,20 @@ export class RuntimeHookPipeline {
   private postToolHooks: PostToolRuntimeHook[] = []
   private postTurnHooks: PostTurnRuntimeHook[] = []
   private postSessionHooks: PostSessionRuntimeHook[] = []
+  private registeredHooks: RuntimeHook[] = []
+  private stats = new Map<string, RuntimeHookStats>()
+  private disabledHookIds: ReadonlySet<string>
 
   constructor(
     hooks: RuntimeHook[] = [],
     private options: RuntimeHookPipelineOptions = {},
   ) {
+    this.disabledHookIds = new Set(options.disabledHookIds ?? [])
     for (const hook of hooks) this.register(hook)
   }
 
   register(hook: RuntimeHook): void {
+    this.registeredHooks.push(hook)
     switch (hook.phase) {
       case 'preTurn':
         this.preTurnHooks.push(hook)
@@ -213,6 +258,18 @@ export class RuntimeHookPipeline {
         this.postSessionHooks.push(hook)
         break
     }
+  }
+
+  getManifest(): RuntimeHookManifestEntry[] {
+    return this.registeredHooks.map(hook => ({
+      id: hook.name,
+      phase: hook.phase,
+      enabled: !this.disabledHookIds.has(hook.name),
+    }))
+  }
+
+  getStats(): RuntimeHookStats[] {
+    return [...this.stats.values()].map(stat => ({ ...stat }))
   }
 
   async runPreTurn(ctx: RuntimeHookContext): Promise<void> {
@@ -241,16 +298,95 @@ export class RuntimeHookPipeline {
     invoke: (hook: T) => Promise<void> | void,
   ): Promise<void> {
     for (const hook of hooks) {
+      if (this.disabledHookIds.has(hook.name)) {
+        this.publishRun({
+          id: hook.name,
+          phase,
+          outcome: 'skipped',
+          durationMs: 0,
+          slow: false,
+          message: 'disabled',
+        })
+        continue
+      }
+
+      const startedAt = Date.now()
+      const timeoutMs = this.options.hookTimeoutMs ?? DEFAULT_HOOK_TIMEOUT_MS
+      const slowMs = this.options.hookSlowMs ?? DEFAULT_HOOK_SLOW_MS
+      let timeout: ReturnType<typeof setTimeout> | undefined
+      let timedOut = false
+      let outcome: RuntimeHookRunOutcome = 'completed'
+      let message: string | undefined
+
       try {
-        await invoke(hook)
+        const pending = Promise.resolve().then(() => invoke(hook))
+        if (timeoutMs > 0) {
+          await Promise.race([
+            pending,
+            new Promise<never>((_, reject) => {
+              timeout = setTimeout(() => {
+                timedOut = true
+                reject(new Error(`Runtime hook '${hook.name}' timed out after ${timeoutMs}ms`))
+              }, timeoutMs)
+            }),
+          ])
+        } else {
+          await pending
+        }
       } catch (error) {
+        outcome = timedOut ? 'timed_out' : 'failed'
+        message = toMessage(error)
         this.options.onError?.({
           phase,
           hookName: hook.name,
-          message: toMessage(error),
+          message,
           error,
         })
+      } finally {
+        if (timeout) clearTimeout(timeout)
+        const durationMs = Date.now() - startedAt
+        this.publishRun({
+          id: hook.name,
+          phase,
+          outcome,
+          durationMs,
+          slow: outcome === 'completed' && durationMs >= slowMs,
+          message,
+        })
       }
+    }
+  }
+
+  private publishRun(event: RuntimeHookRunEvent): void {
+    const key = `${event.phase}:${event.id}`
+    const stat = this.stats.get(key) ?? {
+      id: event.id,
+      phase: event.phase,
+      runs: 0,
+      skipped: 0,
+      failures: 0,
+      timeouts: 0,
+      slowRuns: 0,
+      totalDurationMs: 0,
+      maxDurationMs: 0,
+    }
+
+    if (event.outcome === 'skipped') {
+      stat.skipped += 1
+    } else {
+      stat.runs += 1
+      stat.totalDurationMs += event.durationMs
+      stat.maxDurationMs = Math.max(stat.maxDurationMs, event.durationMs)
+      if (event.outcome === 'failed') stat.failures += 1
+      if (event.outcome === 'timed_out') stat.timeouts += 1
+      if (event.slow) stat.slowRuns += 1
+    }
+
+    this.stats.set(key, stat)
+    try {
+      this.options.onRun?.(event)
+    } catch {
+      // Instrumentation must never interrupt agent execution.
     }
   }
 }
