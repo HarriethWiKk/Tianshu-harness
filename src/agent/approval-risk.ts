@@ -337,10 +337,11 @@ export function assessToolRisk(
     level = level === 'none' ? 'low' : level
     const policy = evaluateMcpPolicy({
       toolName,
+      declaredCapability: 'unknown',
       trustedServers: [],
       blockedTools: [],
       allowedTools: [],
-      mustConfirmCapabilities: ['write', 'execute'],
+      mustConfirmCapabilities: ['write', 'execute', 'network'],
     })
     reasons.push(`MCP policy: ${policy.action} (${policy.reason})`)
     if (policy.action === 'block') level = 'high'
