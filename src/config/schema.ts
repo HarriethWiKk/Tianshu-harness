@@ -5,6 +5,8 @@ import { THEME_NAMES } from '../tui/theme.js'
 export const modelConfigSchema = z.object({
   id: z.string(),
   alias: z.string().optional(),
+  /** 擅长场景 — 展示在模型选择器（ModelPicker），预设定义处填充。 */
+  description: z.string().optional(),
   contextWindow: z.number().int().positive(),
   maxTokens: z.number().int().positive(),
   reasoningEffort: z.enum(['off', 'low', 'medium', 'high', 'max']).optional(),
@@ -267,6 +269,10 @@ export const agentSchema = z.object({
    *  与其他 advisory hook 同档。设 false 或 RIVET_SECURITY_GUIDANCE=0 关闭。
    *  配置项存在的意义是让桌面端用户也能关——GUI 启动的 sidecar 继承不到 shell 环境变量。 */
   securityGuidance: z.boolean().default(true),
+  /** 证据防火墙 Phase 2（jidoka 硬门禁）：deliver_task commit 时引用未经本会话
+   *  独立核验的 delegate/scout file:line 断言 → isError 拦截。默认关（opt-in，
+   *  Phase 1 诚实标注数据决定是否默认开）。env RIVET_SCOUT_FIREWALL 优先。 */
+  scoutEvidenceFirewall: z.boolean().default(false),
   /** Enable cross-session knowledge loading (memory block, playbook, companion presence).
    *  Default true — injects distilled project knowledge from .rivet/knowledge/.
    *  Set false for fully isolated sessions. Env RIVET_NO_CROSS_SESSION=1 overrides as force-off. */
@@ -297,6 +303,10 @@ export const agentSchema = z.object({
   autoDelegateEnabled: z.boolean().default(false),
   /** Max nesting depth for delegation (a worker delegating to a sub-worker). Default 2. */
   maxDelegationDepth: z.number().int().positive().default(2),
+  /** 全局 worker 并发闸上限（P1-6，coordinator 信号量）。顶层 delegate/
+   *  batch/background 统一入闸；嵌套委派豁免（否则 planner 持槽等子工死锁）。
+   *  缺省 3；RIVET_MAX_WORKERS env 可覆盖。 */
+  maxWorkers: z.number().int().min(1).optional(),
   /** Default max concurrent workers per team wave when input.maxParallel is unset. Clamped 1..5. */
   maxTeamParallel: z.number().int().min(1).max(5).default(3),
   /** council_convene seat configuration — custom seats with optional per-seat
@@ -395,17 +405,17 @@ export const compactSchema = z.object({
    *  Retained for config compatibility; not read by the runtime. */
   autoFloor: z.number().int().positive().default(500_000),
   /** Model that performs the compaction summarization (LLM compact / partial
-   *  compact). ONLY takes effect together with `provider`: when both are set
-   *  and resolve to a real provider+model with credentials, compaction runs on
-   *  that dedicated client (its own server-side cache), so a cheap model (e.g.
-   *  a Flash) does the distillation WITHOUT spending the main model's tokens or
-   *  evicting its hot prefix cache. Without `provider`, this is inert and
-   *  compaction uses the session's primary model (backward compatible). */
+   *  compact). When the model exists on the primary (or any configured)
+   *  provider, a dedicated cheap client is built even if `provider` is unset
+   *  — see resolveCompactProviderName(). Pair with `provider` to force a
+   *  specific host. Without a resolvable provider+credentials, compaction
+   *  uses the session's primary model (backward compatible). */
   model: z.string().default('deepseek-v4-flash'),
   /** Provider hosting the compaction model (must exist in provider.providers).
-   *  Set together with `model` to route compaction onto an isolated cheap model.
-   *  Unknown provider / missing model / no credentials → silent fallback to the
-   *  session primary (same rule as agent.review / council seat routing). */
+   *  Optional: when omitted, the runtime infers a provider that lists `model`
+   *  (preferring the session primary). Set explicitly to pin compaction onto
+   *  an isolated cheap model. Unknown provider / missing model / no
+   *  credentials → silent fallback to the session primary. */
   provider: z.string().optional(),
   /** T9 turn-0 quality-compaction trigger ratios (provider cost-aware).
    *  Only the turn-0, phase-gated quality lever — mid-turn delay guards are
@@ -437,6 +447,15 @@ export const searchSchema = z.object({
   braveApiKeyEnv: z.string().default('BRAVE_API_KEY'),
   /** Env var holding the Tavily Search API key. */
   tavilyApiKeyEnv: z.string().default('TAVILY_API_KEY'),
+  /** Env var holding the Bocha (博查) Search API key — 国内直连 AI 搜索（Tavily 国内替代）。 */
+  bochaApiKeyEnv: z.string().default('BOCHA_API_KEY'),
+  /** Inline API key（明文存 config，与 provider.apiKey 同构）。桌面端 UI 可填，
+   *  解析优先级：inline config > apiKeyEnv 指向的 env > 标准 BOCHA_API_KEY。 */
+  bochaApiKey: z.string().optional(),
+  /** Inline Brave Search API key（明文存 config）。 */
+  braveApiKey: z.string().optional(),
+  /** Inline Tavily Search API key（明文存 config）。 */
+  tavilyApiKey: z.string().optional(),
   /** Per-backend request timeout (ms). */
   timeoutMs: z.number().int().positive().default(15_000),
   /** Optional region/country hint passed to backends that support it (Brave). */
@@ -462,6 +481,10 @@ export const fetchSchema = z.object({
   renderWaitMs: z.number().int().nonnegative().default(0),
   /** 抓取缓存读取有效期（ms，默认 2 天；0 = 禁读仍写）。 */
   cacheMaxAgeMs: z.number().int().nonnegative().default(172_800_000),
+  /** Jina Reader 基础地址。默认 https://r.jina.ai。
+   *  国内可填自建反代域名（如 Cloudflare Worker 转发）规避直连不稳。
+   *  仅 host 替换，路径 `/` 拼接目标 URL 的语义不变。 */
+  jinaBaseUrl: z.string().default('https://r.jina.ai'),
 }).default({})
 
 export type FetchConfig = z.infer<typeof fetchSchema>
@@ -503,9 +526,9 @@ export const workerRoutingSchema = z.record(z.string(), z.string()).default({
   code_edit: 'cheap-flash',
   test_failure_diagnosis: 'cheap-flash',
   risky_refactor: 'cheap-flash',
-  // 规划模型独立路由：默认走强档（capable/deepseek-v4-pro）。base planner
-  // 产出即执行分片图，规划质量决定并行拆分好坏，故默认强、可在此键改 provider。
-  planning: 'capable',
+  // 规划模型独立路由：2026-08-02 起默认走 cheap-flash（deepseek-v4-flash）——
+  // v4-flash 能力实测已超 v4-pro，成本仅 1/3；需更强可在此键改 capable。
+  planning: 'cheap-flash',
 })
 
 export const workersSchema = z.object({

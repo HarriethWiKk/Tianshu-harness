@@ -74,6 +74,7 @@ export function createMcpToolWrapper(
     definition: {
       name: rivetName,
       description: desc,
+      capability: securityPolicy?.capability,
       input_schema: {
         type: 'object',
         properties: mcpDef.inputSchema.properties ?? {},

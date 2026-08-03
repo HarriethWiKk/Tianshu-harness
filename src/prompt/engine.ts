@@ -193,6 +193,8 @@ export class PromptEngine {
   private mentionContextBlock?: string | null
   private harnessAdvisoryBlock?: string | null
   private controlPlaneBlock?: string | null
+  /** Doom-loop / storm turns: force terse output-style in dynamic appendix. */
+  private tersenessEscalate = false
   private decisions?: string[]
   private activeDomain?: VolatileContext['activeDomain']
   private activeClaims?: VolatileContext['activeClaims']
@@ -550,7 +552,7 @@ export class PromptEngine {
               this.gitDirty = false
               this.userMessagesSinceGitRefresh = 0
             }
-            const dynamicCtx: VolatileContext = { ...this.config.volatileCtx, toolHistory, taskProgress: this.taskProgress, toolContext: this.toolContext, planCacheAdvisory: this.planCacheAdvisory, planTraceAppendix: this.planTraceAppendix, activePlanPointer: this.activePlanPointer, intentRetrievalRoute: this.intentRetrievalRoute, taskDepthAdvisory: this.taskDepthAdvisory, planMethodologyAdvisory: this.planMethodologyAdvisory, skillAdvisoryBlock: this.skillAdvisoryBlock ?? undefined, invokedSkillsBlock: skillRegistry.renderInvokedSkillsBlock([...this.invokedSkillNames], this.config.volatileCtx.cwd) ?? undefined, crossSessionMemoryBlock: this.crossSessionMemoryBlock ?? undefined, mentionContextBlock: this.mentionContextBlock ?? undefined, harnessAdvisoryBlock: this.harnessAdvisoryBlock, controlPlaneBlock: this.controlPlaneBlock, decisions: this.decisions, activeClaims: this.activeClaims, playbookLessons: this.playbookLessons, onLessonsRendered: this.onLessonsRendered, sessionMemoryBlock: this.sessionMemoryOverride ?? this.config.volatileCtx.sessionMemoryBlock, crossSessionEvents: this.crossSessionEvents, companionPresence: this.companionPresence, sessionState: this.sessionStateText, worktreeReality: this.worktreeReality, planModeState: this.planModeState, askModeState: this.askModeState, activePlanFilePath: this.activePlanFilePath, planExitReminderPending: this.planExitReminderPending, cognitiveProjection: this.cognitiveProjection, ...(refreshGit ? { gitStatus: undefined } : {}) } as VolatileContext
+            const dynamicCtx: VolatileContext = { ...this.config.volatileCtx, toolHistory, taskProgress: this.taskProgress, toolContext: this.toolContext, planCacheAdvisory: this.planCacheAdvisory, planTraceAppendix: this.planTraceAppendix, activePlanPointer: this.activePlanPointer, intentRetrievalRoute: this.intentRetrievalRoute, taskDepthAdvisory: this.taskDepthAdvisory, planMethodologyAdvisory: this.planMethodologyAdvisory, skillAdvisoryBlock: this.skillAdvisoryBlock ?? undefined, invokedSkillsBlock: skillRegistry.renderInvokedSkillsBlock([...this.invokedSkillNames], this.config.volatileCtx.cwd) ?? undefined, crossSessionMemoryBlock: this.crossSessionMemoryBlock ?? undefined, mentionContextBlock: this.mentionContextBlock ?? undefined, harnessAdvisoryBlock: this.harnessAdvisoryBlock, controlPlaneBlock: this.controlPlaneBlock, tersenessEscalate: this.tersenessEscalate, decisions: this.decisions, activeClaims: this.activeClaims, playbookLessons: this.playbookLessons, onLessonsRendered: this.onLessonsRendered, sessionMemoryBlock: this.sessionMemoryOverride ?? this.config.volatileCtx.sessionMemoryBlock, crossSessionEvents: this.crossSessionEvents, companionPresence: this.companionPresence, sessionState: this.sessionStateText, worktreeReality: this.worktreeReality, planModeState: this.planModeState, askModeState: this.askModeState, activePlanFilePath: this.activePlanFilePath, planExitReminderPending: this.planExitReminderPending, cognitiveProjection: this.cognitiveProjection, ...(refreshGit ? { gitStatus: undefined } : {}) } as VolatileContext
             // One-shot: the plan-mode exit reminder is snapshotted into dynamicCtx
             // above; clear it so it renders on this turn only, not every subsequent turn.
             if (this.planExitReminderPending) this.planExitReminderPending = false
@@ -956,6 +958,16 @@ export class PromptEngine {
   getCachedAppendixLength(): number {
     return this.cachedAppendix?.length ?? 0
   }
+
+  /**
+   * The appendix text as actually rendered this request. Nothing downstream of here
+   * persists it — the session JSONL keeps what the user typed, not what was injected
+   * alongside it — so without this accessor there is no way to answer "what did the
+   * model actually see" after the fact. Read by the (gated) appendix trace recorder.
+   */
+  getCachedAppendix(): string | undefined {
+    return this.cachedAppendix
+  }
   updateSessionMemory(block: string): void {
     this.sessionMemoryOverride = block
     this.rebuildFrozenBase()
@@ -1032,16 +1044,6 @@ export class PromptEngine {
 
   getToolContextLength(): number {
     return this.toolContext?.length ?? 0
-  }
-
-  /** @deprecated Use setToolContext. Kept for backward compat. */
-  setAffordanceHint(hint: string | null): void {
-    // noop — merged into setToolContext
-  }
-
-  /** @deprecated Use setToolContext. Kept for backward compat. */
-  setPolicyGuidance(guidance: string | null): void {
-    // noop — merged into setToolContext
   }
 
   setPlanCacheAdvisory(advisory: string | null): void {
@@ -1146,6 +1148,14 @@ export class PromptEngine {
 
   setHarnessAdvisoryBlock(block: string | null): void {
     this.harnessAdvisoryBlock = block ?? undefined
+  }
+
+  /**
+   * When true, the next dynamic appendix render enables the terseness nudge in
+   * escalate mode (doom-loop / storm). Cache-safe: dynamic appendix only.
+   */
+  setTersenessEscalate(escalate: boolean): void {
+    this.tersenessEscalate = escalate
   }
 
   setDecisions(decisions: string[]): void {

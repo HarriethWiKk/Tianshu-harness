@@ -173,9 +173,9 @@ export interface RuntimeHookPipelineOptions {
   onRun?: (event: RuntimeHookRunEvent) => void
   /** Hook ids to retain in the manifest but exclude from execution. */
   disabledHookIds?: Iterable<string>
-  /** Async hook wall-clock budget. Set to 0 to disable timeout handling. */
+  /** Per-hook wall-clock budget. Set to 0 to disable timeout handling. */
   hookTimeoutMs?: number
-  /** Hook duration threshold for slow events and legacy onError reporting. */
+  /** Report completed hooks at or above this duration as slow. */
   hookSlowMs?: number
 }
 
@@ -297,8 +297,6 @@ export class RuntimeHookPipeline {
     hooks: T[],
     invoke: (hook: T) => Promise<void> | void,
   ): Promise<void> {
-    const timeoutMs = this.options.hookTimeoutMs ?? DEFAULT_HOOK_TIMEOUT_MS
-    const slowMs = this.options.hookSlowMs ?? DEFAULT_HOOK_SLOW_MS
     for (const hook of hooks) {
       if (this.disabledHookIds.has(hook.name)) {
         this.publishRun({
@@ -313,7 +311,9 @@ export class RuntimeHookPipeline {
       }
 
       const startedAt = Date.now()
-      let timer: ReturnType<typeof setTimeout> | undefined
+      const timeoutMs = this.options.hookTimeoutMs ?? DEFAULT_HOOK_TIMEOUT_MS
+      const slowMs = this.options.hookSlowMs ?? DEFAULT_HOOK_SLOW_MS
+      let timeout: ReturnType<typeof setTimeout> | undefined
       let timedOut = false
       let outcome: RuntimeHookRunOutcome = 'completed'
       let message: string | undefined
@@ -324,9 +324,9 @@ export class RuntimeHookPipeline {
           await Promise.race([
             pending,
             new Promise<never>((_, reject) => {
-              timer = setTimeout(() => {
+              timeout = setTimeout(() => {
                 timedOut = true
-                reject(new Error(`[hook-timeout] "${hook.name}" exceeded ${timeoutMs}ms in phase ${phase} - skipped`))
+                reject(new Error(`Runtime hook '${hook.name}' timed out after ${timeoutMs}ms`))
               }, timeoutMs)
             }),
           ])
@@ -343,23 +343,14 @@ export class RuntimeHookPipeline {
           error,
         })
       } finally {
-        if (timer !== undefined) clearTimeout(timer)
+        if (timeout) clearTimeout(timeout)
         const durationMs = Date.now() - startedAt
-        const slow = !timedOut && durationMs >= slowMs
-        if (slow) {
-          this.options.onError?.({
-            phase,
-            hookName: hook.name,
-            message: `[hook-slow] "${hook.name}" took ${durationMs}ms in phase ${phase}`,
-            error: undefined,
-          })
-        }
         this.publishRun({
           id: hook.name,
           phase,
           outcome,
           durationMs,
-          slow,
+          slow: outcome === 'completed' && durationMs >= slowMs,
           message,
         })
       }

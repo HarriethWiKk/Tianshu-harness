@@ -5,6 +5,7 @@ import type { Sensorium, StrategyProfile } from './sensorium.js'
 import { TurnHeartbeat } from './turn-heartbeat.js'
 import { wrapCallbacksWithHeartbeat } from './turn-orchestrator.js'
 import { debugLog } from '../utils/debug.js'
+import { recordAppendixTrace } from './appendix-trace.js'
 import { createTraceStore } from './trace-store.js'
 import { createPredictionAccumulator, computeEFE } from './prediction-error.js'
 import { RepairHintTracker } from './repair-hint.js'
@@ -824,6 +825,9 @@ export class TurnStepProducer {
     if (this.self.sessionStateManager) {
       this.self.config.promptEngine.setSessionState(this.self.sessionStateManager.renderForVolatile())
     }
+    // Doom-loop / storm → escalate terseness in dynamic appendix (cost + anti-ramble).
+    // Opt out with RIVET_TERSE=0. Does not touch frozenBase.
+    this.self.config.promptEngine.setTersenessEscalate(this.self.getDoomLoopLevel() !== 'none')
     // Pre-refresh git status so buildOaiRequest doesn't return stale cached data
     _tb = Date.now()
     await this.self.config.promptEngine.refreshGitContextIfNeeded(this.self.cwd)
@@ -849,6 +853,15 @@ export class TurnStepProducer {
     for (const { source, chars } of this.self.config.promptEngine.drainAppendixLedger()) {
       this.self.pressureMonitor.recordCvmInjection(Math.ceil(chars / 4), source)
     }
+
+    // Appendix audit trail (gated). Placed after the request is built so it records
+    // what was actually sent, not what the setters intended.
+    recordAppendixTrace(this.self.config.promptEngine.getCachedAppendix(), {
+      cwd: this.self.cwd,
+      sessionId: this.self.config.sessionId,
+      turn,
+      model: this.self.config.promptEngine.getModel(),
+    })
 
     return { action: 'proceed', request }
   }

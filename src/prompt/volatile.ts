@@ -168,8 +168,11 @@ export function renderAskModeBlock(): string {
 /**
  * Phase 2B: output verbosity steering nudge.
  *
- * OPT-IN via RIVET_TERSE=1 (or ctx.tersenessEnabled) — OFF by default, so the
- * default session is byte-for-byte unchanged. Cache-safe: this is only ever
+ * Base mode: OPT-IN via RIVET_TERSE=1 (or ctx.tersenessEnabled) — OFF by default
+ * so quiet sessions stay byte-stable.
+ *
+ * Escalate mode: when ctx.tersenessEscalate is true (doom-loop / storm), the
+ * nudge is enabled automatically unless RIVET_TERSE=0 opts out. Still only
  * pushed into the DYNAMIC appendix, never the frozen base.
  *
  * Scope discipline: the nudge governs OUTPUT PROSE ONLY. It must never be read
@@ -182,6 +185,20 @@ export function renderTersenessNudge(escalate = false): string {
     ? ' 你似乎在重复工作或打转——本轮尤其简洁：一段短文，不复述上下文。'
     : ''
   return `<output-style>文字要精炼。跳过开场白、自我陈述和收尾总结。不要复述已展示的代码、文件内容或上下文——引用即可。直接给答案或动作。${strict} 本指令只约束输出文字——绝不因此削减验证、测试、取证或交付报告的严谨度。</output-style>`
+}
+
+/** Resolve whether terseness steering is active for this appendix render. */
+export function resolveTersenessFlags(ctx: {
+  tersenessEnabled?: boolean
+  tersenessEscalate?: boolean
+}, env: NodeJS.ProcessEnv = process.env): { enabled: boolean; escalate: boolean } {
+  const raw = env['RIVET_TERSE']
+  const v = raw?.trim().toLowerCase()
+  const optOut = v === '0' || v === 'false' || v === 'off' || v === 'no'
+  if (optOut) return { enabled: false, escalate: false }
+  const optIn = v === '1' || v === 'true' || v === 'on' || v === 'yes' || ctx.tersenessEnabled === true
+  const escalate = Boolean(ctx.tersenessEscalate)
+  return { enabled: optIn || escalate, escalate }
 }
 
 export interface ToolHistoryEntry {
@@ -569,13 +586,7 @@ export function buildDynamicAppendixParts(ctx: VolatileContext, maxChars?: numbe
 
   // Unified progress block: merges session-state, task-progress, and decisions
   // into a single <progress> to eliminate triple repetition in the prompt.
-  // C3 fix: only dedup the objective when the projection ACTUALLY carries it.
-  // The projection is non-empty in many cases without an objective (verification
-  // gap / cognitive mirror / one-shot hints, or a non-actionable contract which
-  // renders ''). Gating on mere non-emptiness silently dropped the objective from
-  // both progress AND projection. Gate on the real <objective> marker instead.
-  const projHasObjective = !!ctx.cognitiveProjection && ctx.cognitiveProjection.includes('<objective>')
-  const progressBlock = renderProgressBlock(ctx, projHasObjective)
+  const progressBlock = renderProgressBlock(ctx)
   if (progressBlock) push(progressBlock)
 
   // tool-history block removed (2026-07-06): redundant with message history —
@@ -720,12 +731,12 @@ export function buildDynamicAppendixParts(ctx: VolatileContext, maxChars?: numbe
     push(renderAskModeBlock())
   }
 
-  // Phase 2B: output verbosity steering (opt-in via RIVET_TERSE=1, off by default).
-  // Cache-safe: dynamic appendix only — default sessions are byte-for-byte
-  // unchanged. Escalates on doom-loop/storm turns when the caller signals it.
-  const tersenessEnabled = ctx.tersenessEnabled ?? (process.env['RIVET_TERSE'] === '1')
+  // Phase 2B: output verbosity steering.
+  // Base: opt-in via RIVET_TERSE=1 / ctx.tersenessEnabled.
+  // Escalate: doom-loop turns auto-enable (unless RIVET_TERSE=0).
+  const { enabled: tersenessEnabled, escalate: tersenessEscalate } = resolveTersenessFlags(ctx)
   if (tersenessEnabled) {
-    push(renderTersenessNudge(ctx.tersenessEscalate ?? false))
+    push(renderTersenessNudge(tersenessEscalate))
   }
 
   const toPart = (p: { content: string; source?: CvmInjectionSource }): AppendixPart =>
@@ -781,63 +792,41 @@ export interface SalientBlock {
  * into a single `<progress>` XML block. Eliminates triple repetition where
  * these three independent blocks each reported overlapping objective/status/decisions.
  */
-function renderProgressBlock(ctx: VolatileContext, hasProjection?: boolean): string | null {
-  // When sessionState is available, it's the richest source (objective + plan step
-  // + modified files + decisions + failed tests). Extract its content and wrap as <progress>.
-  // P0-1: also merge taskProgress (current/done/next) so the model sees its todo list
-  // even when sessionState is active — taskProgress is NOT included in sessionState
-  // (SessionStateManager.renderForVolatile covers task contract, not todo store).
-  if (ctx.sessionState) {
-    // sessionState is pre-rendered as `<session-state>...\n</session-state>`
-    // Re-wrap as <progress> to unify the tag namespace
-    let inner = ctx.sessionState
-      .replace(/^<session-state>\n?/, '')
-      .replace(/\n?<\/session-state>$/, '')
-    // C1+C3: when cognitive projection carries the objective, strip it from progress
-    // to avoid duplicated objective lines (saves ~60-80 chars per boundary).
-    if (hasProjection) {
-      inner = inner.replace(/^Objective:.*\n?/m, '')
-    }
+function renderProgressBlock(ctx: VolatileContext): string | null {
+  // sessionState arrives pre-rendered as `<session-state>...</session-state>`; strip the
+  // tags and judge it by CONTENT, not truthiness. An empty wrapper is still a non-empty
+  // string, so the old `if (ctx.sessionState)` gate was permanently true for any session
+  // with a sessionId — which is what killed the branch that read `ctx.decisions`.
+  // No objective dedup here: session-state no longer renders an objective line at all
+  // (see SessionStateManager.renderForVolatile), so there is nothing to duplicate.
+  const trimmed = (ctx.sessionState ?? '')
+    .replace(/^<session-state>\n?/, '')
+    .replace(/\n?<\/session-state>$/, '')
+    .trim()
 
-    // Merge taskProgress lines into the progress block
-    const tpLines: string[] = []
-    if (ctx.taskProgress?.current) {
-      tpLines.push(`current: ${escapeXml(ctx.taskProgress.current)}`)
-    }
-    if (ctx.taskProgress?.completed && ctx.taskProgress.completed.length > 0) {
-      tpLines.push(`done: ${ctx.taskProgress.completed.map(escapeXml).join(', ')}`)
-    }
-    if (ctx.taskProgress?.remaining && ctx.taskProgress.remaining.length > 0) {
-      tpLines.push(`next: ${ctx.taskProgress.remaining.map(escapeXml).join(', ')}`)
-    }
-
-    const trimmed = inner.trim()
-    const hasSessionContent = trimmed.length > 0
-    const hasTaskProgress = tpLines.length > 0
-    if (!hasSessionContent && !hasTaskProgress) return null
-
-    const combined = [
-      hasSessionContent ? trimmed : null,
-      hasTaskProgress ? tpLines.join('\n') : null,
-    ].filter(Boolean).join('\n')
-    return `<progress>\n${combined}\n</progress>`
-  }
-
-  // Fallback: build from individual fields (early turns before sessionStateManager is ready)
+  // One pass over all three sources instead of a rich branch plus a fallback that had
+  // to mirror it. The mirrored pair is what let the bug hide: `ctx.decisions` was only
+  // ever read in the fallback, so it went dark the moment session-state had content —
+  // and once the wrapper made that permanently true, it went dark for good.
   const lines: string[] = []
 
-  if (ctx.taskProgress) {
-    if (ctx.taskProgress.current) {
-      lines.push(`current: ${escapeXml(ctx.taskProgress.current)}`)
-    }
-    if (ctx.taskProgress.completed.length > 0) {
-      lines.push(`done: ${ctx.taskProgress.completed.map(escapeXml).join(', ')}`)
-    }
-    if (ctx.taskProgress.remaining.length > 0) {
-      lines.push(`next: ${ctx.taskProgress.remaining.map(escapeXml).join(', ')}`)
-    }
+  if (trimmed) lines.push(trimmed)
+
+  if (ctx.taskProgress?.current) {
+    lines.push(`current: ${escapeXml(ctx.taskProgress.current)}`)
+  }
+  if (ctx.taskProgress?.completed && ctx.taskProgress.completed.length > 0) {
+    lines.push(`done: ${ctx.taskProgress.completed.map(escapeXml).join(', ')}`)
+  }
+  if (ctx.taskProgress?.remaining && ctx.taskProgress.remaining.length > 0) {
+    lines.push(`next: ${ctx.taskProgress.remaining.map(escapeXml).join(', ')}`)
   }
 
+  // Whether decisions reach this renderer at all is decided per session by the holdout
+  // experiment (decisions-experiment.ts, applied at the producer in turn-end.ts): an
+  // off/holdout session simply carries none. Keeping that split at the producer means
+  // one decision point instead of a renderer switch that cannot see the session — and
+  // means the treatment arm's exposure doesn't depend on whether files were modified yet.
   if (ctx.decisions && ctx.decisions.length > 0) {
     lines.push('Decisions:')
     for (const d of ctx.decisions) {

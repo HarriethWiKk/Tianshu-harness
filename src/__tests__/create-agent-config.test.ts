@@ -32,6 +32,7 @@ const testConfig = {
     verificationSnapshot: 'auto',
     songlineEnabled: true,
     securityGuidance: true,
+    scoutEvidenceFirewall: false,
     desktopTools: false,
     hearthObserveEnabled: false,
     crossSessionEnabled: true,
@@ -260,6 +261,39 @@ describe('createAgentConfig', () => {
     const cfg = createAgentConfig({ ...baseInput, allProviders: { deepseek: testProvider } })
     assert.equal(cfg.visionClient, undefined)
     assert.match(cfg.visionBridge?.detail ?? '', /没有声明视觉能力的模型/)
+  })
+
+  it('infers compact provider so default flash model builds a dedicated client', async () => {
+    const { resolveCompactProviderName } = await import('../agent/create-agent-config.js')
+    const deepseekWithFlash: ProviderConfig = {
+      ...testProvider,
+      models: [
+        { id: 'deepseek-v4-pro', contextWindow: 1_000_000, maxTokens: 384_000 },
+        { id: 'deepseek-v4-flash', contextWindow: 1_000_000, maxTokens: 384_000 },
+      ],
+    }
+    assert.equal(
+      resolveCompactProviderName({
+        compact: { model: 'deepseek-v4-flash' },
+        provider: deepseekWithFlash,
+        allProviders: { deepseek: deepseekWithFlash },
+      }),
+      'deepseek',
+    )
+    assert.equal(
+      resolveCompactProviderName({
+        compact: { model: 'deepseek-v4-flash', provider: 'deepseek' },
+        provider: deepseekWithFlash,
+      }),
+      'deepseek',
+    )
+    assert.equal(
+      resolveCompactProviderName({
+        compact: { model: 'missing-model' },
+        provider: deepseekWithFlash,
+      }),
+      undefined,
+    )
   })
 
   // 主控自己能看图时不建桥：建了也永不使用（loop.ts 桥接点要求 !supportsVision），
