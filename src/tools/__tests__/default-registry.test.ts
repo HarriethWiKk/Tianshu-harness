@@ -1,6 +1,7 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import { createDefaultToolRegistry } from '../default-registry.js'
+import { computerUseModulePresent } from '../computer-use/bridge.js'
 import { TodoStore } from '../todo-store.js'
 import { defaultStore } from '../todo.js'
 import type { Tool, ToolCallParams } from '../types.js'
@@ -117,9 +118,14 @@ describe('createDefaultToolRegistry', () => {
 
   it('registers computer_use when computerUse and proEnabled are both true', () => {
     const registry = createDefaultToolRegistry([], { computerUse: true, proEnabled: true })
+    if (!computerUseModulePresent()) {
+      // 公开构建（无 src/pro/）：实现缺席 → 不注册（不可见即不可配）
+      assert.equal(registry.has('computer_use'), false)
+      return
+    }
     const tool = registry.getAll().find(t => t.definition.name === 'computer_use')
     assert.ok(tool, 'computer_use should be registered')
-    assert.equal(tool!.isEnabled!(), true)
+    assert.equal(tool!.isEnabled!(), process.platform === 'darwin' || process.platform === 'win32')
   })
 
   it('does not register computer_use when proEnabled is false', () => {

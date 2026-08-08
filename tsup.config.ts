@@ -15,6 +15,9 @@ const pkgScripts = pkgJson.scripts ?? {}
 // 条件存在：公开仓经 sync 同步后没有 src/pro/（--exclude 'pro/'），
 // 硬编码 entry 会让开源构建报 entry not found——存在才加入。
 const proEntry = existsSync('src/pro/index.ts') ? ['src/pro/index.ts'] : []
+// pro computer-use 同理：产物 dist/pro/computer-use/index.js，供
+// tools/computer-use/bridge.ts 的 dist 形态候选路径加载。
+const proComputerUseEntry = existsSync('src/pro/computer-use/index.ts') ? ['src/pro/computer-use/index.ts'] : []
 
 // better-sqlite3 is kept `external` (below) and never imported as a bare
 // specifier at runtime — the live consumers (session-registry, meridian-db) load
@@ -26,7 +29,7 @@ const proEntry = existsSync('src/pro/index.ts') ? ['src/pro/index.ts'] : []
 export default defineConfig({
   // src/pro/index.ts 作为独立 entry：闭源模块产物 dist/pro/index.js，
   // 供 loadProModule 的 dist 形态候选路径加载（桌面 sidecar 运行时）。
-  entry: ['src/main.ts', 'src/workers/cpu-worker.ts', ...proEntry],
+  entry: ['src/main.ts', 'src/workers/cpu-worker.ts', ...proEntry, ...proComputerUseEntry],
   format: ['esm'],
   target: 'node24',
   // Inject the package version as a build-time constant so the packaged sidecar

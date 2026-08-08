@@ -89,7 +89,7 @@ import { queryDeepSeekBalance, type BalanceResult } from '../api/balance-client.
 import { probeProviderKey } from '../api/key-probe.js'
 import { getDeepSeekUserSummary, getDeepSeekCostReport } from '../api/deepseek-platform-client.js'
 import { listGrantedApps, revokeApp } from '../tools/computer-use/app-grants.js'
-import { createPlatformDriver, isComputerUsePlatform } from '../tools/computer-use/platform-driver.js'
+import { computerUseModulePresent, isComputerUseSupportedPlatform, loadComputerUseImpl } from '../tools/computer-use/bridge.js'
 import { isProFeatureEnabled } from '../config/pro-license.js'
 import { starDomainRegistry } from '../agent/star-domain-registry.js'
 
@@ -612,7 +612,9 @@ export function buildConfigRoutes(apiToken?: string): Record<string, RouteHandle
     // platform availability, Pro gating, system permission probe, and per-app grants.
     'GET /config/computer-use': withAuth(async () => {
       const cfg = loadConfig()
-      const platformOk = isComputerUsePlatform(process.platform) && process.env.RIVET_COMPUTER_USE !== '0'
+      // pro 实现缺席（公开构建无 src/pro/）时一律报不可用——不暴露半个功能。
+      const moduleOk = computerUseModulePresent()
+      const platformOk = isComputerUseSupportedPlatform(process.platform) && process.env.RIVET_COMPUTER_USE !== '0' && moduleOk
       const proEnabled = isProFeatureEnabled(cfg, 'computerUse')
       const proRequired = platformOk && !proEnabled
       const available = platformOk && proEnabled
@@ -622,7 +624,8 @@ export function buildConfigRoutes(apiToken?: string): Record<string, RouteHandle
       }
       let permissions: { accessibility: boolean; screenRecording: boolean; detail: string } | null = null
       try {
-        permissions = await createPlatformDriver().checkPermissions()
+        const impl = await loadComputerUseImpl()
+        if (impl) permissions = await impl.createPlatformDriver().checkPermissions()
       } catch { /* probe failure → permissions unknown, UI shows a hint */ }
       return { status: 200, body: { available: true, proRequired: false, platform: process.platform, permissions, grants } }
     }, apiToken),

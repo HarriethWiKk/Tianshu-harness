@@ -364,8 +364,9 @@ describe('assembly audit — env registry completeness', () => {
     const codeVars = collectRivetVars(allFilesIncludingTests)
 
     let registryVars: string[]
+    let regContent: string
     try {
-      const regContent = readFileSync(join(SRC_ROOT, 'config', 'env-registry.ts'), 'utf8')
+      regContent = readFileSync(join(SRC_ROOT, 'config', 'env-registry.ts'), 'utf8')
       registryVars = []
       const regPattern = /name:\s*'(RIVET_[A-Z_]+)'/g
       let rm
@@ -377,7 +378,16 @@ describe('assembly audit — env registry completeness', () => {
       return
     }
 
-    const stale = registryVars.filter(v => !codeVars.has(v)).sort()
+    // pro 专属变量（files 指向 pro/ 的条目）在公开构建中天然无源码引用——
+    // src/pro 不进公开仓；它们在 dev 仓（有 src/pro）已被本测试覆盖。
+    const proScoped = new Set<string>()
+    const entryPattern = /name:\s*'(RIVET_[A-Z_]+)'[\s\S]*?files:\s*\[([^\]]*)\]/g
+    let em
+    while ((em = entryPattern.exec(regContent)) !== null) {
+      if (/(^|')pro\//.test(em[2]!)) proScoped.add(em[1]!)
+    }
+
+    const stale = registryVars.filter(v => !codeVars.has(v) && !proScoped.has(v)).sort()
     assert.equal(stale.length, 0,
       `Registry entries with no RIVET_* reference in source code (stale entries):\n${stale.map(v => `  ${v}`).join('\n')}\n\nRun: npx tsx scripts/gen-env-registry.ts`)
   })

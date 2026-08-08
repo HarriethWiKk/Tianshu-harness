@@ -15,7 +15,8 @@ import { OPEN_PATH_TOOL } from './open-path.js'
 import { REQUEST_PATH_ACCESS_TOOL } from './request-path-access.js'
 import { SKILL_TOOL } from './skill.js'
 import { BROWSER_TOOL } from './browser.js'
-import { createComputerUseTool } from './computer-use/tool.js'
+import { createComputerUseStubTool } from './computer-use/stub.js'
+import { computerUseModulePresent } from './computer-use/bridge.js'
 import { BASH_TOOL } from './bash.js'
 import { JOB_TOOL } from './job-tool.js'
 import { MONITOR_TOOL } from './monitor-tool.js'
@@ -179,8 +180,10 @@ export function createDefaultToolRegistry(extraTools: Tool[] = [], options: Defa
   if (options.browserTool) {
     registry.register(BROWSER_TOOL)
   }
-  if (options.computerUse && options.proEnabled) {
-    registry.register(createComputerUseTool({ proEnabled: options.proEnabled }))
+  if (options.computerUse && options.proEnabled && computerUseModulePresent()) {
+    // 懒加载桩：定义（模型可见接口）在开源侧，执行实现经 bridge 懒载
+    // pro 模块（闭源）。模块缺席（公开构建）时工具根本不注册——不可见即不可配。
+    registry.register(createComputerUseStubTool({ proEnabled: options.proEnabled }))
   }
   for (const tool of extraTools) registry.register(tool)
   return registry

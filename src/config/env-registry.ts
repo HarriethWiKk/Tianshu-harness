@@ -3,7 +3,7 @@
  *
  * name/defaultHint/files 由 scripts/gen-env-registry.ts 生成，勿手改；
  * description 字段人工维护，重新生成时按 name 保留。
- * 最后生成：2026-08-08T07:22:20.351Z
+ * 最后生成：2026-08-08T13:52:47.926Z
  * 共 149 个变量。
  *
  * 每个条目含：名称 / 默认值提示 / 引用文件 / 简要说明。
@@ -182,31 +182,31 @@ export const ENV_REGISTRY: EnvRegistryEntry[] = [
   {
     name: 'RIVET_CU_CDP',
     defaultHint: '',
-    files: ['tools/computer-use/tool.ts', 'tools/computer-use/__tests__/tool.test.ts'],
+    files: ['pro/computer-use/tool.ts', 'pro/computer-use/__tests__/tool.test.ts'],
     description: '',
   },
   {
     name: 'RIVET_CU_CDP_URL',
     defaultHint: '',
-    files: ['tools/computer-use/cdp/chrome.ts'],
+    files: ['pro/computer-use/cdp/chrome.ts'],
     description: '',
   },
   {
     name: 'RIVET_CU_COM',
     defaultHint: '',
-    files: ['tools/computer-use/windows-uia-com.ts', 'tools/computer-use/__tests__/windows-driver.test.ts', 'tools/computer-use/__tests__/windows-uia-com.test.ts'],
+    files: ['pro/computer-use/windows-uia-com.ts', 'pro/computer-use/__tests__/windows-driver.test.ts', 'pro/computer-use/__tests__/windows-uia-com.test.ts'],
     description: '',
   },
   {
     name: 'RIVET_CU_FEEDBACK',
     defaultHint: '',
-    files: ['tools/computer-use/tool.ts'],
+    files: ['pro/computer-use/tool.ts'],
     description: '',
   },
   {
     name: 'RIVET_CU_HOST',
     defaultHint: '',
-    files: ['tools/computer-use/script-host.ts'],
+    files: ['pro/computer-use/script-host.ts'],
     description: '',
   },
   {
