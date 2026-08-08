@@ -55,6 +55,32 @@ function lastSentence(text: string): string {
   return ''
 }
 
+/** 按句切分（。！？!?\n），返回非空句子列表。 */
+function splitSentences(text: string): string[] {
+  return text.split(/[。！？!?\n]+/).map(s => s.trim()).filter(s => s.length > 0)
+}
+
+/**
+ * 承诺词与工具动词是否在同一句内共现。
+ *
+ * 回归（2026-08-08）：旧逻辑对承诺词与工具动词各自在全文（尾部 600 字符）匹配，
+ * 跨句共现即判定——总结/列举类文本里"现在/让我"与"读/写/查看"分属不同句子时
+ * 被误判为悬空行动承诺（"你现在应该看到…"+"UIA 读不到…"），纯总结轮被连续
+ * 注入 action-intent reminder。承诺关系必须落在同一句内：
+ * "接下来修改 loop.ts" 是承诺（同句），
+ * "我现在汇报结果。之前我读取了那个文件" 是陈述（跨句）。
+ */
+function hasSameSentencePair(
+  text: string,
+  promisePattern: RegExp,
+  verbPattern: RegExp,
+): boolean {
+  for (const sentence of splitSentences(text)) {
+    if (promisePattern.test(sentence) && verbPattern.test(sentence)) return true
+  }
+  return false
+}
+
 /** 尾句是否为祈使式行动宣布（动词开头、非完成态汇报、非问句）。 */
 export function hasImperativeActionTail(text: string): boolean {
   if (!text) return false
@@ -104,7 +130,8 @@ export function hasActionIntent(text: string): boolean {
   // 也属于假设性表述（如"不需要改，除非你想让我也查一下 X"），不应触发提醒。
   // 查全文尾部（600 字符），非仅 120——条件前缀可能离承诺词很远（引用中）。
   if (CONDITIONAL_PREFIX_RE.test(tail)) return false
-  if (ACTION_PROMISE_PATTERN.test(tail) && TOOL_VERB_PATTERN.test(tail)) return true
+  // 承诺关系必须在同一句内成立（跨句共现是总结/列举误报的根源，见 hasSameSentencePair）。
+  if (hasSameSentencePair(tail, ACTION_PROMISE_PATTERN, TOOL_VERB_PATTERN)) return true
   return hasImperativeActionTail(text)
 }
 
@@ -120,7 +147,8 @@ export function hasWriteActionIntent(text: string): boolean {
   if (/[？?]$/.test(tail.trimEnd())) return false
   // 条件/否定守卫：同 hasActionIntent
   if (CONDITIONAL_PREFIX_RE.test(tail)) return false
-  if (ACTION_PROMISE_PATTERN.test(tail) && WRITE_VERB_PATTERN.test(tail)) return true
+  // 承诺关系必须在同一句内成立（同 hasActionIntent 的跨句误报回归）。
+  if (hasSameSentencePair(tail, ACTION_PROMISE_PATTERN, WRITE_VERB_PATTERN)) return true
   return hasImperativeActionTail(text)
 }
 

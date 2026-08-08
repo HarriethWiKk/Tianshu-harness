@@ -3187,12 +3187,27 @@ export class RuntimeSessionManager {
     try {
       const { extractSessionTitle } = await import('../agent/title-extract.js')
       const { completionFromClient, buildCheapClient } = await import('../agent/goal-criteria.js')
-      if (!handles.cheapProfile || !handles.allProviders) return
-      const cheap = buildCheapClient(
-        handles.cheapProfile,
-        handles.allProviders as Parameters<typeof buildCheapClient>[1],
-      )
-      if (!cheap) return // provider not configured or no API key — leave title unset
+      if (!handles.allProviders) return
+      const providers = handles.allProviders as Parameters<typeof buildCheapClient>[1]
+      // 先试 cheap profile（默认 minimax）；没配 key 时回退到任一已配 key 的主 provider。
+      // 大多数用户只配了主模型（DeepSeek/GLM 等），不会专门配 minimax——此前 cheap 失败
+      // 就静默 return，标题永远空，侧边栏显示 ID 截断。标题生成 token 消耗极小（<=256），
+      // 用主 provider 做这个 cheap 任务完全可接受。
+      let cheap = handles.cheapProfile
+        ? buildCheapClient(handles.cheapProfile, providers)
+        : null
+      if (!cheap) {
+        // 回退：遍历所有已配 provider，找第一个能构建 client 的。标题生成对模型能力
+        // 要求极低，任意已配 provider + 它的第一个 model 即可。
+        for (const [providerName, prov] of Object.entries(providers)) {
+          const models = (prov as { models?: Array<{ id?: string; alias?: string }> })?.models
+          const firstModel = models?.[0]?.id ?? models?.[0]?.alias
+          if (!firstModel) continue
+          cheap = buildCheapClient({ provider: providerName, model: firstModel }, providers)
+          if (cheap) break
+        }
+      }
+      if (!cheap) return // 确实一个 key 都没配——leave title unset
       const title = await extractSessionTitle(
         firstMessage,
         completionFromClient(cheap.client, cheap.model, 256),

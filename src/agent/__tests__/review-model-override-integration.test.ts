@@ -102,9 +102,9 @@ describe('review model override — schema → resolve → card path', () => {
     assert.equal(parsed.agent.review?.profiles.adversarial_verifier?.model, 'deepseek-v4-flash')
   })
 
-  it('review.skipAuto defaults to true and profiles to empty', () => {
+  it('review.skipAuto defaults to false and profiles to empty', () => {
     const parsed = agentSchema.parse({})
-    assert.equal(parsed.review.skipAuto, true)
+    assert.equal(parsed.review.skipAuto, false)
     assert.deepEqual(parsed.review.profiles, {})
   })
 

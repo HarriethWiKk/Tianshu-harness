@@ -114,6 +114,22 @@ describe('hasActionIntent', () => {
     assert.ok(hasActionIntent('这样对吗？先假设对。接下来修改 loop.ts'))
   })
 
+  // ── 总结/列举句式误报回归（2026-08-08 现场：纯总结轮被连续注入 action-intent reminder）──
+  // 根因：承诺词与工具动词各自在全文匹配即判定，跨句共现误报——
+  // "你现在应该看到"（"现在"）与 "UIA 读不到"（"读"）分属不同句子，却判定为行动宣言。
+  it('总结句式不触发：「你现在应该看到…」+「UIA 读不到…」跨句共现', () => {
+    assert.ok(!hasActionIntent('状态判定：UIA 读不到 Electron 渲染内容，改用 OCR 识别截图。你现在应该看到：屏幕上的 QQ 主窗口，聊天列表正常显示。'))
+  })
+  it('总结句式不触发：「你的屏幕上现在应该有…」+「写入一段话…读回文本」跨句共现', () => {
+    assert.ok(!hasActionIntent('完成。你的屏幕上现在应该有一个打开的 Word 窗口。新建文档，写入一段话（118 字），保存为 docx。保存后从 Word 读回文本，内容与写入一致。'))
+  })
+  it('列举能力选项不触发：「让我先看一下目录里有什么」+「查看或理解」', () => {
+    assert.ok(!hasActionIntent('有什么需要我做的？比如：查看或理解这个目录下的某个项目、跑测试。先告诉我想做什么，或者让我先看一下目录里有什么。'))
+  })
+  it('跨句共现不触发：承诺词与工具动词分属不同句子', () => {
+    assert.ok(!hasActionIntent('我现在把结果汇报完。之前我读取了那个文件，也写入了一段内容。'))
+  })
+
   // ── Edge cases ──
   it('仅"看"不触发（已从动词列表移除，误报太高）', () => {
     assert.ok(!hasActionIntent('让我看一下这个问题'))
@@ -179,6 +195,9 @@ describe('hasWriteActionIntent（只读轮闸门用的写侧承诺）', () => {
   })
   it('问句收尾不触发（同 hasActionIntent 的 ca63f970 守卫）：「要我改吗？」', () => {
     assert.ok(!hasWriteActionIntent('方案已列出。我可以直接修改 loop.ts，要我改吗？'))
+  })
+  it('跨句共现不触发：承诺词与工具动词分属不同句子', () => {
+    assert.ok(!hasWriteActionIntent('我现在把结果汇报完。之前修改了那个文件。'))
   })
 })
 

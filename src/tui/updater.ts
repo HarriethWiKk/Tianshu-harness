@@ -22,6 +22,7 @@ import { WinStreamDecoder } from '../platform.js'
 import { ProxyAgent } from 'undici'
 import type { Dispatcher } from 'undici'
 import { resolveProxyForUrl } from '../tools/net/proxy-resolver.js'
+import { NPM_MIRRORS } from '../tools/mirror-env.js'
 
 const NPM_REGISTRY_URL = 'https://registry.npmjs.org'
 const GITHUB_API_URL = 'https://api.github.com/repos'
@@ -303,9 +304,28 @@ async function fetchWithRetry(
   retries = UPDATE_RETRIES,
 ): Promise<Response | null> {
   const proxy = resolveProxyForUrl(url)
-  const dispatcher = proxy ? new ProxyAgent(proxy) : undefined
-  const init = { ...options, dispatcher } as RequestInit & { dispatcher?: Dispatcher }
+  const withProxy = proxy ? new ProxyAgent(proxy) : undefined
+  // 代理连不上时回退直连：用户开着系统代理（Clash/V2Ray 写入注册表）但代理软件
+  // 实际没运行时，走死代理会全部超时，更新检查彻底失效。先带代理试一轮，全失败
+  // 再不带代理直连试一轮——既尊重用户「确实开了代理」的意图，又不被僵尸代理拖死。
+  const direct: Dispatcher | undefined = undefined
 
+  // 第一轮：按解析出的代理（可能为 undefined = 直连）
+  const r1 = await attemptFetch(url, options, retries, withProxy)
+  if (r1 || !proxy) return r1 // 直连模式（proxy 本来就 undefined）不需要第二轮回退
+
+  // 第二轮：代理全失败 → 回退直连
+  return attemptFetch(url, options, retries, direct)
+}
+
+/** 单一 dispatcher 下的重试循环。429/5xx 与网络异常重试，4xx 直接返回。 */
+async function attemptFetch(
+  url: string,
+  options: RequestInit | undefined,
+  retries: number,
+  dispatcher: Dispatcher | undefined,
+): Promise<Response | null> {
+  const init = { ...options, dispatcher } as RequestInit & { dispatcher?: Dispatcher }
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
       const controller = new AbortController()
@@ -333,26 +353,55 @@ async function fetchWithRetry(
 export async function fetchNpmLatestVersion(
   packageName: string,
 ): Promise<LatestVersionInfo | null> {
-  const url = `${NPM_REGISTRY_URL}/${encodeURIComponent(packageName)}/latest`
-  const res = await fetchWithRetry(url, { headers: { Accept: 'application/json' } })
-  if (!res || !res.ok) return null
-  // 代理/网关可能以 200 返回非 JSON 错误页（如 GBK 编码的 HTML 拦截页，Windows 代码页 936 常见），
-  // 此时 res.json() 抛 SyntaxError —— 按「任何失败返回 null」契约吞掉。
-  let data: { version?: string; time?: Record<string, string> }
-  try {
-    data = await res.json() as { version?: string; time?: Record<string, string> }
-  } catch {
-    return null
+  // 多源回退：registry.npmjs.org（原始源）→ registry.npmmirror.com（淘宝镜像，国内 CDN）。
+  // 国内裸连用户访问 npmjs.org 经常超时，回退的 api.github.com 也常被限，导致更新检查
+  // 静默失败（checkForUpdate 返回 null）。淘宝镜像由阿里维护、自动同步 npmjs（~10 分钟
+  // 延迟），/<pkg>/latest 的 JSON 结构与 npmjs 完全一致，解析逻辑零改动可复用。
+  // 海外用户不受影响——npmjs 仍是第一源，通常首轮即命中。
+  for (const base of npmRegistryUrls()) {
+    const url = `${base}/${encodeURIComponent(packageName)}/latest`
+    const res = await fetchWithRetry(url, { headers: { Accept: 'application/json' } })
+    if (!res || !res.ok) continue
+    // 代理/网关可能以 200 返回非 JSON 错误页（如 GBK 编码的 HTML 拦截页，Windows 代码页 936 常见），
+    // 此时 res.json() 抛 SyntaxError —— 跳到下一个源继续试。
+    let data: { version?: string; time?: Record<string, string> }
+    try {
+      data = await res.json() as { version?: string; time?: Record<string, string> }
+    } catch {
+      continue
+    }
+    if (typeof data.version === 'string') {
+      return { version: data.version, publishedAt: data.time?.[data.version], source: 'npm' }
+    }
   }
-  if (typeof data.version !== 'string') return null
-  return { version: data.version, publishedAt: data.time?.[data.version], source: 'npm' }
+  return null
+}
+
+/**
+ * npm registry 源列表，按优先级排序：原始源在前，国内镜像兜底。
+ * 复用 mirror-env 的 NPM_MIRRORS（taobao/tencent/huawei），避免重复维护镜像 URL。
+ */
+function npmRegistryUrls(): string[] {
+  // npmjs.org 永远第一——海外用户首选，也是版本最及时的源（镜像有同步延迟）。
+  const urls = [NPM_REGISTRY_URL]
+  // 淘宝镜像是国内 npm 事实标准（CHINA_PRESET 也默认选它），紧跟 npmjs 放第二位。
+  // 其余镜像（腾讯/华为）作为更后的兜底，多一个回退机会。
+  for (const mirror of Object.values(NPM_MIRRORS)) {
+    // 镜像 URL 末尾可能带斜杠（tencent/huawei），统一去尾斜杠再拼 /pkg/latest。
+    urls.push(mirror.replace(/\/+$/, ''))
+  }
+  return urls
 }
 
 export async function npmPackageExists(packageName: string): Promise<boolean> {
-  const url = `${NPM_REGISTRY_URL}/${encodeURIComponent(packageName)}/latest`
+  // 与 fetchNpmLatestVersion 同口径的多源回退——任一源确认包存在即可。
   // 部分企业代理/安全软件会拦截 HEAD，改用 GET；registry /latest 负载很小。
-  const res = await fetchWithRetry(url, { method: 'GET', headers: { Accept: 'application/json' } })
-  return res !== null && res.ok
+  for (const base of npmRegistryUrls()) {
+    const url = `${base}/${encodeURIComponent(packageName)}/latest`
+    const res = await fetchWithRetry(url, { method: 'GET', headers: { Accept: 'application/json' } })
+    if (res !== null && res.ok) return true
+  }
+  return false
 }
 
 export function parseGitHubRepoFromUrl(url: string): { owner: string; repo: string } | null {
