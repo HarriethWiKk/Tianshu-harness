@@ -2,7 +2,8 @@
 # dispose-community-pr.sh — 社区 PR 处置四步流程（sync-merge 形态）固化
 #
 # 社区活跃后，每个社区 PR 按同一四步处置（2026-08-03 PR #20 首例沉淀）：
-#   ① 收录 CONTRIBUTORS.md（fetch PR 分支后调 update-contributors.sh 重生成）
+#   ① 收录 CONTRIBUTORS.md（手工维护；生成器 update-contributors.sh 已退役——
+#      它扫 merge commit，sync-merge 流程提取不到，且依赖 macOS 没有的 bash 4）
 #   ② 附注 + sync-merged 标记 + 关闭（公开仓不走 merge 按钮——dev 主仓是唯一事实源）
 #   ③ credit commit：Co-authored-by trailer 署名落账（GitHub 贡献者图谱按 trailer 计入）
 #   ④ --push 时推送公开仓（默认只做到本地，打印推送命令由人确认）
@@ -90,19 +91,11 @@ if [[ "$DRY" == "1" ]]; then
 fi
 
 # ── ① 收录 CONTRIBUTORS.md ──
+# 2026-08-08 起改为手工核对：update-contributors.sh 是 merge-commit 时代的生成器
+# （扫 "Merge PR #" 合并提交），sync-merge 流程的 PR 提取不到，且全量再生成会
+# 回退手工维护的三列内容；另有 bash 4 语法（declare -A）在 macOS 3.2 跑不了。
 echo "==> ① 更新 CONTRIBUTORS.md"
-( cd "$PUB_DIR" && git fetch origin "pull/${PR}/head:pr-${PR}" >/dev/null 2>&1 || true )
-if [[ -f "$PUB_DIR/scripts/update-contributors.sh" ]]; then
-  ( cd "$PUB_DIR" && bash scripts/update-contributors.sh )
-  if ! ( cd "$PUB_DIR" && git diff --quiet -- CONTRIBUTORS.md ); then
-    ( cd "$PUB_DIR" && git add CONTRIBUTORS.md && git commit -m "docs(contributors): 收录 @${login}（PR #${PR}）" )
-    echo "    CONTRIBUTORS.md 已更新并提交"
-  else
-    echo "    CONTRIBUTORS.md 无变化（可能已收录）"
-  fi
-else
-  echo "    ⚠ $PUB_DIR/scripts/update-contributors.sh 不存在，跳过（请手工收录）"
-fi
+echo "    ⚠ 手工核对 $PUB_DIR/CONTRIBUTORS.md 是否已收录 @${login}（PR #${PR}）——生成器已退役"
 
 # ── ② 附注 + 标记 + 关闭 ──
 echo "==> ② 附注 + sync-merged 标记 + 关闭"
