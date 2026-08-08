@@ -83,7 +83,73 @@ export function generateReportFromStore(
     rows.push(computeMatrixRow(groupRuns, provider!, model!, suiteId))
   }
 
-  return generateMarkdownReport(rows, suiteId)
+  return generateMarkdownReport(rows, suiteId) + renderSessionSections(runs)
+}
+
+/**
+ * Session-telemetry sections (2026-08-07 测量回路 Phase 1)：speculation observe
+ * 各臂命中率 + provider 维度缓存对照。runs 里没有 session 数据时输出空串——
+ * 旧报告字节不变。
+ */
+export function renderSessionSections(runs: BenchmarkRun[]): string {
+  const parts: string[] = []
+
+  // ── Speculation observe：按 provider×model×arm 聚合 would-hit 率 ──
+  const armGroups = new Map<string, { enqueued: number; hits: number }>()
+  for (const run of runs) {
+    for (const [arm, stats] of Object.entries(run.session?.speculationStats ?? {})) {
+      if (stats.enqueued === 0 && stats.hits === 0) continue
+      const key = `${run.provider}\x00${run.model}\x00${arm}`
+      const acc = armGroups.get(key) ?? { enqueued: 0, hits: 0 }
+      acc.enqueued += stats.enqueued
+      acc.hits += stats.hits
+      armGroups.set(key, acc)
+    }
+  }
+  if (armGroups.size > 0) {
+    parts.push(
+      '',
+      '## Speculation Observe (would-hit / enqueued)',
+      '',
+      '| Provider | Model | Arm | Enqueued | Would-Hit | Rate |',
+      '|----------|-------|-----|----------|-----------|------|',
+    )
+    for (const [key, { enqueued, hits }] of [...armGroups.entries()].sort(([a], [b]) => a.localeCompare(b))) {
+      const [provider, model, arm] = key.split('\x00') as [string, string, string]
+      const rate = enqueued > 0 ? `${(hits / enqueued * 100).toFixed(1)}%` : '—'
+      parts.push(`| ${provider} | ${model} | ${arm} | ${enqueued} | ${hits} | ${rate} |`)
+    }
+  }
+
+  // ── Provider-dimension cache：spark 与官方同 wire 模型 id 的对照主体 ──
+  const cacheGroups = new Map<string, { requests: number; input: number; cacheRead: number }>()
+  for (const run of runs) {
+    for (const bucket of run.session?.cache?.byProviderModel ?? []) {
+      const key = `${bucket.provider ?? '(unknown)'}\x00${bucket.model}`
+      const acc = cacheGroups.get(key) ?? { requests: 0, input: 0, cacheRead: 0 }
+      acc.requests += bucket.requests
+      acc.input += bucket.input
+      acc.cacheRead += bucket.cacheRead
+      cacheGroups.set(key, acc)
+    }
+  }
+  if (cacheGroups.size > 0) {
+    parts.push(
+      '',
+      '## Session Cache by Provider (main-turn rows)',
+      '',
+      '| Provider | Model | Requests | Input | Cache Read | Hit Rate |',
+      '|----------|-------|----------|-------|------------|----------|',
+    )
+    for (const [key, { requests, input, cacheRead }] of [...cacheGroups.entries()].sort(([a], [b]) => a.localeCompare(b))) {
+      const [provider, model] = key.split('\x00') as [string, string]
+      const rate = input > 0 ? `${(cacheRead / input * 100).toFixed(1)}%` : '—'
+      parts.push(`| ${provider} | ${model} | ${requests} | ${input} | ${cacheRead} | ${rate} |`)
+    }
+  }
+
+  if (parts.length === 0) return ''
+  return '\n' + parts.join('\n') + '\n'
 }
 
 /**

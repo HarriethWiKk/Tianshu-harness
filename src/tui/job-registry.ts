@@ -70,6 +70,11 @@ export class JobRegistry {
     if (row && row.unread) this.jobs.set(id, { ...row, unread: false })
   }
 
+  /** 按 id 取单行（等待区 join 用；查不到返回 undefined，调用方走降级文案）。 */
+  get(id: string): JobRow | undefined {
+    return this.jobs.get(id)
+  }
+
   /** Running jobs first, then terminal; newest startedAt first within each group. */
   rows(): JobRow[] {
     return [...this.jobs.values()].sort((a, b) => {

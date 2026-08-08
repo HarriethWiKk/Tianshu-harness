@@ -81,6 +81,44 @@ describe('P3Integration', () => {
     assert.equal(p3.checkSpeculativeCache('read_file', 'src/next.ts'), undefined)
   })
 
+  it('observe mode (T5b): enqueue arms open for stats, serving stays sealed', async () => {
+    const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs')
+    const { tmpdir } = await import('node:os')
+    const { join } = await import('node:path')
+    const dir = mkdtempSync(join(tmpdir(), 'p3-observe-'))
+    try {
+      const target = join(dir, 'next.ts')
+      writeFileSync(target, 'content')
+      // production observe shape: speculativeObserve only, execute 缺省 no-op
+      // cwd 必须等于会话目录——P2-1 归一化后观察臂只统计会话 cwd 内的可索引目标
+      const p3 = new P3Integration({ speculativeObserve: true, cwd: dir })
+
+      p3.enqueueLlmPredictions([{ tool: 'read_file', likelyTarget: target, probability: 0.9, source: 'llm' }])
+      const deadline = Date.now() + 2_000
+      while (p3.queue.cachedCount === 0 && Date.now() < deadline) {
+        await new Promise(r => setTimeout(r, 10))
+      }
+      assert.equal(p3.queue.statsBySource().llm.enqueued, 1, 'observe mode must enqueue for stats')
+
+      // serving 恒封存：即便条目在队里也不得供内容
+      assert.equal(p3.checkSpeculativeCache('read_file', target), undefined,
+        'serving must stay sealed in observe-only mode')
+
+      // 窥视路径记 hit（mtime 新鲜 → would-hit），仍不返回任何内容
+      p3.observeSpeculativeCache('read_file', target)
+      assert.equal(p3.queue.statsBySource().llm.hits, 1, 'observe peek must record the would-hit')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('observe peek is a no-op when sealed (default shape)', () => {
+    const p3 = new P3Integration()
+    p3.observeSpeculativeCache('read_file', 'src/a.ts')
+    const stats = p3.queue.statsBySource()
+    assert.equal(Object.values(stats).every(s => s.hits === 0), true)
+  })
+
   it('enqueues physarum file predictions as read_file speculation (opt-in only)', () => {
     const executed: string[] = []
     const p3 = new P3Integration({
@@ -251,5 +289,111 @@ describe('P3Integration', () => {
       [{ status: 'passed', turn: 1 }, { status: 'failed', turn: 2 }, { status: 'passed', turn: 3 }],
       4, 'flash',
     ), 'healthy')
+  })
+
+  // ─── P2-1 路径同形不变量（2026-08-08）───────────────────────────────
+
+  async function waitForCached(p3: P3Integration, expected = 1): Promise<void> {
+    const deadline = Date.now() + 2_000
+    while (p3.queue.cachedCount < expected && Date.now() < deadline) {
+      await new Promise(r => setTimeout(r, 10))
+    }
+    assert.ok(p3.queue.cachedCount >= expected, `enqueue did not settle: ${p3.queue.cachedCount}`)
+  }
+
+  it('P2-1: physarum 相对预测 + 绝对窥视 would-hit（sidecar 形态：会话 cwd ≠ 进程 cwd）', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'p3-rel-'))
+    try {
+      mkdirSync(join(dir, 'src'), { recursive: true })
+      writeFileSync(join(dir, 'src', 'a.ts'), 'export const a = 1\n')
+      // cwd = 会话目录（tmp），process.cwd() = 仓库根——stat 若错走进程 cwd 则永远 miss
+      const p3 = new P3Integration({ speculativeObserve: true, cwd: dir })
+
+      p3.enqueuePhysarumFilePredictions({
+        afterToolName: 'read_file',
+        predictions: [{ file: 'src/a.ts', score: 2 }],
+      })
+      await waitForCached(p3)
+
+      p3.observeSpeculativeCache('read_file', join(dir, 'src', 'a.ts')) // 绝对入参
+      assert.equal(p3.queue.statsBySource()['physarum-file'].hits, 1,
+        '绝对窥视必须命中相对入队的预测（同形归一化）')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('P2-1: physarum 入队侧绝对路径兜底 → 相对窥视 would-hit', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'p3-rel2-'))
+    try {
+      mkdirSync(join(dir, 'src'), { recursive: true })
+      writeFileSync(join(dir, 'src', 'a.ts'), 'export const a = 1\n')
+      const p3 = new P3Integration({ speculativeObserve: true, cwd: dir })
+
+      p3.enqueuePhysarumFilePredictions({
+        afterToolName: 'read_file',
+        predictions: [{ file: join(dir, 'src', 'a.ts'), score: 2 }], // 绝对预测（防御兜底）
+      })
+      await waitForCached(p3)
+
+      p3.observeSpeculativeCache('read_file', 'src/a.ts') // 相对窥视
+      assert.equal(p3.queue.statsBySource()['physarum-file'].hits, 1,
+        '绝对入队必须被兜底为相对形，与相对窥视同形')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('P2-1: 非索引/逃逸目标不入统计（口径：观察臂只统计可索引文件类目标）', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'p3-rel3-'))
+    try {
+      mkdirSync(join(dir, 'src'), { recursive: true })
+      writeFileSync(join(dir, 'src', 'a.ts'), 'export const a = 1\n')
+      const p3 = new P3Integration({ speculativeObserve: true, cwd: dir })
+
+      p3.enqueueLlmPredictions([
+        { tool: 'read_file', likelyTarget: join(dir, 'notes.md'), probability: 0.9, source: 'llm' },
+        { tool: 'read_file', likelyTarget: '../escape.ts', probability: 0.9, source: 'llm' },
+      ])
+      await new Promise(r => setTimeout(r, 50))
+
+      assert.equal(p3.queue.statsBySource().llm.enqueued, 0,
+        '非索引（.md）与逃逸（../）目标必须被归一化过滤')
+
+      // 窥视非索引目标：跳过统计，不消耗任何计数
+      p3.observeSpeculativeCache('read_file', join(dir, 'notes.md'))
+      assert.equal(p3.queue.statsBySource().llm.hits, 0)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('P2-2: enqueueImportGraphPredictions 入队 import-graph 桶（归一化 + 概率 + 过滤）', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'p3-ig-'))
+    try {
+      mkdirSync(join(dir, 'src'), { recursive: true })
+      writeFileSync(join(dir, 'src', 'b.ts'), 'export const b = 1\n')
+      const p3 = new P3Integration({ speculativeObserve: true, cwd: dir })
+
+      p3.enqueueImportGraphPredictions({
+        afterToolName: 'read_file',
+        predictions: [
+          { file: 'src/b.ts', score: 1 },
+          { file: join(dir, 'src', 'c.ts'), score: 1 }, // 绝对路径兜底
+          { file: 'src/notes.md', score: 1 }, // 非索引过滤
+        ],
+      })
+      await waitForCached(p3, 2)
+
+      const stats = p3.queue.statsBySource()['import-graph']
+      assert.equal(stats.enqueued, 2, '相对+绝对入队，非索引 .md 被过滤')
+      assert.ok(stats.enqueued >= 0)
+
+      // score=1 → min(0.9, 1/2)=0.5 > minProbability 0.4 → 入队；窥视命中
+      p3.observeSpeculativeCache('read_file', 'src/b.ts')
+      assert.equal(p3.queue.statsBySource()['import-graph'].hits, 1)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 })

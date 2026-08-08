@@ -69,6 +69,13 @@ export type SessionEventType =
   | 'todo_state'
   // T3 — mid-run user guidance accepted into the steer buffer.
   | 'steer_queued'
+  // Phase 1.3 — steer 内容在工具边界实际注入模型的送达回执。data: { count }，
+  // count 为本次 drain 的条数。UI 据此把回声卡片标记为「模型已收」。
+  | 'steer_delivered'
+  // Phase 2 queue lane — busy 期间排队跟进消息：入队 echo（data: { laneId, text }）
+  // 与状态迁移（data: { laneId, status: 'steered'|'retracted'|'merged' }）。
+  | 'queue_pending'
+  | 'queue_status'
   // Plan mode — state toggle (off|planning) + a plan was submitted to disk.
   | 'plan_mode'
   | 'plan_submitted'
@@ -85,6 +92,7 @@ export type SessionEventType =
   // PlusMenu — per-session model / star-domain / skill selection changes.
   | 'model_switched'
   | 'domain_changed'
+  | 'domain_resolved'
   | 'skills_changed'
   // I4 — user-defined .rivet/hooks.json script results.
   | 'hook_result'
@@ -117,12 +125,25 @@ export type SessionEventType =
   // diskLastSeq } — diskFirstSeq < floorSeq 时前端显示「加载更早的历史」，
   // 经 GET /events?before= 分页直读磁盘回填被内存环截掉的头部。
   | 'replay_window'
+  // 后台任务建连快照 — /stream 回放最前发出的合成事件（同 replay_window：
+  // 不落盘、不入内存环、seq 恒为 0）。data: { jobs: JobSnapshot[] }，内容为
+  // 服务端注册表当前仍 running 的任务全集。内存环截尾会丢掉长寿 job 的
+  // started 事件、sidecar 重启后注册表更是全空——前端据此 upsert 并摘除
+  // 本地仍 running 但服务端已消失的任务（重启悬挂对账）。
+  | 'job_snapshot'
 
 export interface SessionEvent {
   seq: number
   ts: number
   type: SessionEventType
   data: Record<string, unknown>
+}
+
+export interface ResolvedDomainRecord {
+  key: string
+  name: string
+  matchedKeywords: string[]
+  reason: 'keyword' | 'fallback'
 }
 
 export interface SessionRecord {
@@ -178,6 +199,18 @@ export interface SessionRecord {
    * live ActiveStarDomain. Absent → 'auto'.
    */
   domain?: string
+  /**
+   * First resolved Auto domain display payload. This is restoration-only
+   * metadata: `domain` remains `auto`, and this value never enters prompts,
+   * messages, or frozen snapshots. Unknown ids are discarded during rehydrate.
+   */
+  resolvedDomain?: ResolvedDomainRecord
+  /**
+   * Per-session 工具白名单（蒸馏回放等自动化场景）。有值时 LLM 的工具列表
+   * 收窄到这个集合（经 gateToolDefinitions 的 coreOverride 通路）。缺省 /
+   * undefined = 默认全量工具集（行为不变）。空数组 = 空白名单。
+   */
+  allowedTools?: string[]
   /** Visual glyph for the current star-domain selection (for UI badges). */
   domainGlyph?: string
   /** Semantic accent color key for the current star-domain selection. */

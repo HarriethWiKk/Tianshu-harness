@@ -147,6 +147,7 @@ export function buildWorkerDetailContent(
       summary: result.summary,
       findingsCount: result.findings?.length ?? 0,
       changedFilesCount: result.changedFiles?.length ?? 0,
+      sourcesReviewedCount: result.sourcesReviewed,
       failureReason: result.failureReason,
       evidenceStatus: result.evidenceStatus,
     }))

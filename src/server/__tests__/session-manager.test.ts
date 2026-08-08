@@ -22,7 +22,15 @@ const waitUntil = async (cond: () => boolean, timeoutMs = 3000): Promise<void> =
   }
   throw new Error(`条件在 ${timeoutMs}ms 内未成立`)
 }
-import { RuntimeSessionManager, extractObjective, type ManagedAgent, type ModelOption, type DelegateActivityUpdate } from '../session-manager.js'
+import {
+  RuntimeSessionManager,
+  extractObjective,
+  type ManagedAgent,
+  type ModelOption,
+  type DelegateActivityUpdate,
+  type SessionPersistenceAdapter,
+  type SessionRecord,
+} from '../session-manager.js'
 import type { AgentCallbacks } from '../../agent/loop-types.js'
 import type { Artifact } from '../../artifact/types.js'
 import type { OaiMessage } from '../../api/oai-types.js'
@@ -185,6 +193,30 @@ test('getEvents(since) replays only newer events with monotonic seq', async () =
   assert.equal(tail.events.length, 1)
   assert.equal(tail.events[0]!.data.text, '!')
   assert.ok(tail.events[0]!.seq > since)
+})
+
+test('domain resolution callback appends a redacted replayable event', () => {
+  const { manager, agents } = makeManager()
+  const s = manager.createSession({ prompt: 'go', domain: 'auto' })
+  const cb = agents[0]!.callbacks!
+
+  cb.onDomainResolved!({
+    key: 'kaiyang',
+    name: '开阳 token=server-secret',
+    matchedKeywords: ['对账', 'token=keyword-secret', '插桩', '不得保留'],
+    reason: 'keyword',
+  })
+
+  const replay = manager.getEvents(s.id, 0)!
+  const event = replay.events.find((candidate) => candidate.type === 'domain_resolved')
+  assert.ok(event, 'domain_resolved must be retained in normal event replay')
+  assert.deepEqual(event.data, {
+    key: 'kaiyang',
+    name: '开阳 token=[REDACTED]',
+    matchedKeywords: ['对账', 'token=[REDACTED]', '插桩'],
+    reason: 'keyword',
+  })
+  assert.equal(manager.getSession(s.id)!.domain, 'auto', 'observability must not replace the Auto selection key')
 })
 
 // Redaction now lives ONLY here (the legacy /prompt route forwards manager
@@ -450,6 +482,47 @@ test('R1: a finished run releases the session claims', async () => {
   assert.deepEqual(calls.released, [s.id], 'terminal state must release claims')
 })
 
+test('R1: idle-agent eviction waits for async shutdown before releasing claims', async () => {
+  const { manager, calls } = makeManagerWithRegistry()
+  const s = manager.createSession({ cwd: '/tmp/proj' })
+  const internal = manager['sessions'].get(s.id)!
+  let finishShutdown!: () => void
+  const shutdownDone = new Promise<void>(resolve => { finishShutdown = resolve })
+  internal.agent = { shutdown: () => shutdownDone } as ManagedAgent
+
+  manager['releaseAgent'](internal)
+  assert.deepEqual(calls.released, [], 'claims stay held while the old coordinator shuts down')
+  finishShutdown()
+  await shutdownDone
+  await new Promise<void>(resolve => setImmediate(resolve))
+  assert.deepEqual(calls.released, [s.id])
+})
+
+test('R1: idle-agent eviction keeps claims when shutdown reports a timeout', () => {
+  const { manager, calls } = makeManagerWithRegistry()
+  const s = manager.createSession({ cwd: '/tmp/proj' })
+  const internal = manager['sessions'].get(s.id)!
+  internal.agent = { shutdown: () => false } as ManagedAgent
+
+  manager['releaseAgent'](internal)
+  assert.deepEqual(calls.released, [], 'a timed-out coordinator may still be writing')
+})
+
+test('R1: shutdownAll releases claims for idle sessions after agent shutdown', async () => {
+  const { manager, calls } = makeManagerWithRegistry()
+  const s = manager.createSession({ cwd: '/tmp/proj' })
+  const internal = manager['sessions'].get(s.id)!
+  let finishShutdown!: () => void
+  const shutdownDone = new Promise<void>(resolve => { finishShutdown = resolve })
+  internal.agent = { shutdown: () => shutdownDone } as ManagedAgent
+
+  const allShutdown = manager.shutdownAll()
+  assert.deepEqual(calls.released, [], 'shutdown must await the idle agent before releasing claims')
+  finishShutdown()
+  await allShutdown
+  assert.deepEqual(calls.released, [s.id])
+})
+
 test('R1: two concurrent sessions register & release independently', async () => {
   const { manager, agents, calls } = makeManagerWithRegistry()
   const a = manager.createSession({ prompt: 'a' })
@@ -647,15 +720,130 @@ test('T3: steer on an idle session returns idle; missing returns not_found', asy
   assert.equal(manager.steer('nope', 'hi'), 'not_found')
 })
 
-test('T3: a fresh run drops guidance left over from a previous run', async () => {
+// Phase 1.1 — run 结束后没赶上工具边界的 steer 残留不再被静默清除：下次
+// prompt 时按 TUI idle 提交语义归并进新消息前部（原始文本，\n\n 分隔）。
+test('Phase 1.1: steer residue from a finished run merges into the next prompt', async () => {
   const { manager, agents } = makeManager()
   const s = manager.createSession({ prompt: 'go' })
-  manager.steer(s.id, 'stale')
+  manager.steer(s.id, 'stale one')
+  manager.steer(s.id, 'stale two')
   agents[0]!.finish() // run resolves → session idle
   await new Promise((r) => setTimeout(r, 0)) // let the run's finally flip running=false
   assert.equal(manager.run(s.id, 'go again'), true) // reuses the same agent, fresh callbacks
-  // The new run cleared the buffer, so the first drain sees nothing stale.
+  // 残留拼在新 prompt 前面，模型实际收到的就是归并后的文本。
+  assert.equal(agents[0]!.prompts[1], 'stale one\n\nstale two\n\ngo again')
+  // user 回声事件同样反映归并后的文本（UI 显示与模型收到的一致）。
+  const users = manager.getEvents(s.id, 0)!.events.filter((e) => e.type === 'user')
+  assert.equal(users[users.length - 1]!.data.text, 'stale one\n\nstale two\n\ngo again')
+  // buffer 已随归并清空——本轮首个 drain 不再看到上轮残留。
   assert.equal(agents[0]!.callbacks!.onSteerDrain!(), null)
+})
+
+// Phase 1.3 — drain 出内容时写 steer_delivered，count 为本次 drain 条数。
+test('Phase 1.3: steer_delivered fires on drain with the drained entry count', async () => {
+  const { manager, agents } = makeManager()
+  const s = manager.createSession({ prompt: 'go' })
+  const cb = agents[0]!.callbacks!
+
+  cb.onSteerDrain!() // 空 buffer drain → 无事件
+  manager.steer(s.id, 'one')
+  manager.steer(s.id, 'two')
+  const drained = cb.onSteerDrain!()
+  assert.match(String(drained), /one/)
+  const delivered = manager.getEvents(s.id, 0)!.events.filter((e) => e.type === 'steer_delivered')
+  assert.equal(delivered.length, 1)
+  assert.equal(delivered[0]!.data.count, 2)
+
+  assert.equal(cb.onSteerDrain!(), null, 'second drain is empty')
+  const after = manager.getEvents(s.id, 0)!.events.filter((e) => e.type === 'steer_delivered')
+  assert.equal(after.length, 1, 'empty drain emits nothing')
+})
+
+// ── Phase 2: queue lane ─────────────────────────────────────────────
+
+test('Phase 2: queue gates on running and echoes queue_pending', async () => {
+  const { manager } = makeManager()
+  const idle = manager.createSession({})
+  assert.equal(manager.queue(idle.id, 'hi'), 'idle')
+  assert.equal(manager.queue('nope', 'hi'), 'not_found')
+
+  const s = manager.createSession({ prompt: 'go' })
+  const r = manager.queue(s.id, 'follow up later')
+  assert.ok(typeof r === 'object' && typeof r.laneId === 'string' && r.laneId.length > 0)
+  const echoed = manager.getEvents(s.id, 0)!.events.filter((e) => e.type === 'queue_pending')
+  assert.equal(echoed.length, 1)
+  assert.equal(echoed[0]!.data.laneId, (r as { laneId: string }).laneId)
+  assert.equal(echoed[0]!.data.text, 'follow up later')
+})
+
+test('Phase 2: steer { laneId } upgrades a queued entry into the steer buffer', async () => {
+  const { manager, agents } = makeManager()
+  const s = manager.createSession({ prompt: 'go' })
+  const cb = agents[0]!.callbacks!
+  const { laneId } = manager.queue(s.id, 'upgrade me') as { laneId: string }
+
+  assert.equal(manager.steer(s.id, { laneId }), 'queued')
+  // 状态迁移事件 + 文本进了 SteerBuffer（drain 可见）；升级路径不再重复 echo steer_queued。
+  const status = manager.getEvents(s.id, 0)!.events.filter((e) => e.type === 'queue_status')
+  assert.deepEqual(status.map((e) => [e.data.laneId, e.data.status]), [[laneId, 'steered']])
+  assert.equal(manager.getEvents(s.id, 0)!.events.filter((e) => e.type === 'steer_queued').length, 0)
+  assert.match(String(cb.onSteerDrain!()), /upgrade me/)
+
+  // 已非 queued：重复升级 / 撤回都拒绝。
+  assert.equal(manager.steer(s.id, { laneId }), 'lane_not_queued')
+  assert.equal(manager.retractQueued(s.id, laneId), 'lane_not_queued')
+  assert.equal(manager.steer(s.id, { laneId: 'ghost' }), 'lane_not_found')
+})
+
+test('Phase 2: retractQueued flips a queued entry and echoes queue_status', async () => {
+  const { manager } = makeManager()
+  const s = manager.createSession({ prompt: 'go' })
+  const { laneId } = manager.queue(s.id, 'take it back') as { laneId: string }
+
+  assert.equal(manager.retractQueued(s.id, laneId), 'retracted')
+  const status = manager.getEvents(s.id, 0)!.events.filter((e) => e.type === 'queue_status')
+  assert.deepEqual(status.map((e) => [e.data.laneId, e.data.status]), [[laneId, 'retracted']])
+  // 重复撤回 / 再升级均拒绝；不存在的 laneId / 会话 → not_found 家族。
+  assert.equal(manager.retractQueued(s.id, laneId), 'lane_not_queued')
+  assert.equal(manager.steer(s.id, { laneId }), 'lane_not_queued')
+  assert.equal(manager.retractQueued(s.id, 'ghost'), 'lane_not_found')
+  assert.equal(manager.retractQueued('nope', laneId), 'not_found')
+})
+
+test('Phase 2: queued entries merge into the next prompt with a section header', async () => {
+  const { manager, agents } = makeManager()
+  const s = manager.createSession({ prompt: 'go' })
+  const a = manager.queue(s.id, 'lane one') as { laneId: string }
+  const b = manager.queue(s.id, 'lane two') as { laneId: string }
+  // 混合场景：一条 steer 残留 + 两条 lane queued + 一条已 retracted（不参与归并）。
+  manager.steer(s.id, 'steer residue')
+  const c = manager.queue(s.id, 'retracted one') as { laneId: string }
+  manager.retractQueued(s.id, c.laneId)
+  agents[0]!.finish()
+  await new Promise((r) => setTimeout(r, 0))
+
+  assert.equal(manager.run(s.id, 'next prompt'), true)
+  const expected =
+    'steer residue\n\n' +
+    '[排队跟进 — 上轮运行期间排队，请一并处理]\n' +
+    'lane one\n\nlane two\n\n' +
+    'next prompt'
+  assert.equal(agents[0]!.prompts[1], expected)
+  // 归并后两条 queued 全部置 merged（逐条 queue_status），retracted 不再动。
+  const status = manager.getEvents(s.id, 0)!.events.filter((e) => e.type === 'queue_status')
+  assert.deepEqual(
+    status.map((e) => [e.data.laneId, e.data.status]),
+    [
+      [c.laneId, 'retracted'],
+      [a.laneId, 'merged'],
+      [b.laneId, 'merged'],
+    ],
+  )
+  // lane 已清空（无 queued 残留）：再次 run 不会重复归并。
+  agents[0]!.finish()
+  await new Promise((r) => setTimeout(r, 0))
+  assert.equal(manager.run(s.id, 'third'), true)
+  assert.equal(agents[0]!.prompts[2], 'third')
 })
 
 // ── T4: structured per-worker delegation ────────────────────────────
@@ -746,6 +934,25 @@ class PlusFakeAgent implements ManagedAgent {
   }
 }
 
+class AutoResolvingFakeAgent extends PlusFakeAgent {
+  constructor(private readonly autoKey: string, private readonly autoName: string) {
+    super()
+  }
+
+  override run(prompt: string, callbacks: AgentCallbacks): Promise<void> {
+    const pending = super.run(prompt, callbacks)
+    if (this.domain === undefined) {
+      callbacks.onDomainResolved?.({
+        key: this.autoKey,
+        name: this.autoName,
+        matchedKeywords: ['自动路由'],
+        reason: 'keyword',
+      })
+    }
+    return pending
+  }
+}
+
 function makePlusManager() {
   const agents: PlusFakeAgent[] = []
   const models: ModelOption[] = [
@@ -793,6 +1000,217 @@ test('PlusMenu: domain selection applies to a lazily-built agent', async () => {
   manager.setDomain(s.id, 'tianshu') // before any agent exists
   manager.run(s.id, 'go')            // builds the agent → applySelections runs
   assert.equal(agents[0]!.domain?.id, 'tianshu')
+})
+
+test('Auto resolution survives agent rebuild without a second domain_resolved event', async () => {
+  const agents: AutoResolvingFakeAgent[] = []
+  const saved: SessionRecord[] = []
+  const persistence: SessionPersistenceAdapter = {
+    saveRecord: (record) => { saved.push(structuredClone(record)) },
+    appendEvent: () => {},
+    loadAll: () => [],
+  }
+  const manager = new RuntimeSessionManager({
+    createAgent: () => {
+      const candidate = agents.length === 0
+        ? new AutoResolvingFakeAgent('kaiyang', '开阳')
+        : new AutoResolvingFakeAgent('tianliang', '天梁')
+      agents.push(candidate)
+      return candidate
+    },
+    defaultCwd: '/tmp/work',
+    persistence,
+  })
+
+  const session = manager.createSession({ prompt: '首次自动路由', domain: 'auto' })
+  const firstRecord = manager.getSession(session.id)!
+  assert.equal(firstRecord.domain, 'auto')
+  assert.deepEqual(firstRecord.resolvedDomain, {
+    key: 'kaiyang',
+    name: '开阳',
+    matchedKeywords: ['自动路由'],
+    reason: 'keyword',
+  })
+  assert.deepEqual(saved.at(-1)?.resolvedDomain, firstRecord.resolvedDomain)
+  assert.equal(
+    manager.getEvents(session.id, 0)!.events.filter((event) => event.type === 'domain_resolved').length,
+    1,
+  )
+
+  agents[0]!.finish()
+  await settle()
+  manager['sessions'].get(session.id)!.agent = null
+  assert.equal(manager.run(session.id, '重建后的新消息'), true)
+
+  assert.equal(agents[1]!.domain?.id, 'kaiyang', 'rebuild must restore the first resolved domain')
+  assert.equal(
+    manager.getEvents(session.id, 0)!.events.filter((event) => event.type === 'domain_resolved').length,
+    1,
+    'restored resolution must suppress a second Auto bind event',
+  )
+  assert.equal(manager.getSession(session.id)!.domain, 'auto')
+})
+
+test('setDomain clears a persisted Auto resolution before any new selection', async () => {
+  const agents: AutoResolvingFakeAgent[] = []
+  const manager = new RuntimeSessionManager({
+    createAgent: () => {
+      const agent = new AutoResolvingFakeAgent('kaiyang', '开阳')
+      agents.push(agent)
+      return agent
+    },
+    defaultCwd: '/tmp/work',
+  })
+  const session = manager.createSession({ prompt: '首次自动路由', domain: 'auto' })
+  assert.deepEqual(manager.getSession(session.id)?.resolvedDomain, {
+    key: 'kaiyang',
+    name: '开阳',
+    matchedKeywords: ['自动路由'],
+    reason: 'keyword',
+  })
+
+  agents[0]!.finish()
+  await settle()
+  assert.equal(manager.setDomain(session.id, 'tianshu'), true)
+  assert.equal(manager.getSession(session.id)?.resolvedDomain, undefined)
+  assert.equal(manager.setDomain(session.id, 'auto'), true)
+  assert.equal(manager.getSession(session.id)?.resolvedDomain, undefined)
+  assert.equal(agents[0]!.domain, undefined, 'selecting Auto must allow the next run to resolve again')
+})
+
+test('unknown persisted selection normalizes to Auto, resolves once, and survives rebuild', async () => {
+  const persisted = {
+    id: 'auto-unknown',
+    status: 'idle',
+    createdAt: 1,
+    updatedAt: 1,
+    cwd: '/tmp/work',
+    lastSeq: 0,
+    pendingApprovals: 0,
+    domain: 'removed-custom-domain',
+    resolvedDomain: 'kaiyang',
+  } as unknown as SessionRecord
+  const agents: AutoResolvingFakeAgent[] = []
+  const saved: SessionRecord[] = []
+  const persistence: SessionPersistenceAdapter = {
+    saveRecord: (record) => { saved.push(structuredClone(record)) },
+    appendEvent: () => {},
+    loadAll: () => [{ record: persisted, events: [] }],
+  }
+  const manager = new RuntimeSessionManager({
+    createAgent: () => {
+      const agent = agents.length === 0
+        ? new AutoResolvingFakeAgent('tianliang', '天梁')
+        : new AutoResolvingFakeAgent('kaiyang', '开阳')
+      agents.push(agent)
+      return agent
+    },
+    defaultCwd: '/tmp/work',
+    persistence,
+  })
+
+  assert.equal(manager.getSession(persisted.id)?.domain, 'auto')
+  assert.equal(manager.getSession(persisted.id)?.resolvedDomain, undefined)
+  assert.equal(manager.run(persisted.id, '重新匹配'), true)
+  assert.equal(agents[0]!.domain, undefined, 'unknown metadata must not pin a false domain')
+  assert.deepEqual(manager.getSession(persisted.id)?.resolvedDomain, {
+    key: 'tianliang',
+    name: '天梁',
+    matchedKeywords: ['自动路由'],
+    reason: 'keyword',
+  })
+  assert.equal(saved.at(-1)?.domain, 'auto')
+  assert.deepEqual(saved.at(-1)?.resolvedDomain, manager.getSession(persisted.id)?.resolvedDomain)
+
+  agents[0]!.finish()
+  await settle()
+  manager['sessions'].get(persisted.id)!.agent = null
+  assert.equal(manager.run(persisted.id, '重建后不应重算'), true)
+  assert.equal(agents[1]!.domain?.id, 'tianliang')
+  assert.equal(
+    manager.getEvents(persisted.id, 0)!.events.filter((event) => event.type === 'domain_resolved').length,
+    1,
+  )
+})
+
+test('legacy string resolvedDomain migrates to a displayable fallback payload', () => {
+  const persisted = {
+    id: 'auto-legacy-string',
+    status: 'idle',
+    createdAt: 1,
+    updatedAt: 1,
+    cwd: '/tmp/work',
+    lastSeq: 0,
+    pendingApprovals: 0,
+    domain: 'auto',
+    resolvedDomain: 'kaiyang',
+  } as unknown as SessionRecord
+  const agents: AutoResolvingFakeAgent[] = []
+  const persistence: SessionPersistenceAdapter = {
+    saveRecord: () => {},
+    appendEvent: () => {},
+    loadAll: () => [{ record: persisted, events: [] }],
+  }
+  const manager = new RuntimeSessionManager({
+    createAgent: () => {
+      const agent = new AutoResolvingFakeAgent('tianliang', '天梁')
+      agents.push(agent)
+      return agent
+    },
+    defaultCwd: '/tmp/work',
+    persistence,
+  })
+
+  assert.deepEqual(manager.getSession(persisted.id)?.resolvedDomain, {
+    key: 'kaiyang',
+    name: '开阳',
+    matchedKeywords: [],
+    reason: 'fallback',
+  })
+  assert.equal(manager.run(persisted.id, '恢复旧记录'), true)
+  assert.equal(agents[0]!.domain?.id, 'kaiyang')
+  assert.equal(
+    manager.getEvents(persisted.id, 0)!.events.filter((event) => event.type === 'domain_resolved').length,
+    0,
+  )
+})
+
+test('unknown object resolvedDomain is discarded and reroutes Auto', () => {
+  const persisted = {
+    id: 'auto-unknown-object',
+    status: 'idle',
+    createdAt: 1,
+    updatedAt: 1,
+    cwd: '/tmp/work',
+    lastSeq: 0,
+    pendingApprovals: 0,
+    domain: 'auto',
+    resolvedDomain: {
+      key: 'removed-domain',
+      name: '已删除',
+      matchedKeywords: ['旧词'],
+      reason: 'keyword',
+    },
+  } as unknown as SessionRecord
+  const persistence: SessionPersistenceAdapter = {
+    saveRecord: () => {},
+    appendEvent: () => {},
+    loadAll: () => [{ record: persisted, events: [] }],
+  }
+  const manager = new RuntimeSessionManager({
+    createAgent: () => new AutoResolvingFakeAgent('tianliang', '天梁'),
+    defaultCwd: '/tmp/work',
+    persistence,
+  })
+
+  assert.equal(manager.getSession(persisted.id)?.resolvedDomain, undefined)
+  assert.equal(manager.run(persisted.id, '重新路由'), true)
+  assert.deepEqual(manager.getSession(persisted.id)?.resolvedDomain, {
+    key: 'tianliang',
+    name: '天梁',
+    matchedKeywords: ['自动路由'],
+    reason: 'keyword',
+  })
 })
 
 test('PlusMenu: listModels flags current; switchModel updates record + emits', async () => {
@@ -1373,4 +1791,81 @@ test('extractObjective: delegate_batch tasks[] summarized', () => {
 test('extractObjective: empty when no usable fields', () => {
   assert.equal(extractObjective({}), '')
   assert.equal(extractObjective({ tasks: [{ profile: 'code_scout' }] }), '')
+})
+
+test('N3: delegate_batch parent node carries toolName + taskCount (group-head identity)', async () => {
+  const { manager, agents } = makeManager()
+  const s = manager.createSession({ prompt: 'go' })
+  const cb = agents[0]!.callbacks!
+  cb.onToolUse('tool-1', 'delegate_batch', {
+    tasks: [{ objective: 'scout A' }, { objective: 'scout B' }, { objective: 'scout C' }],
+  })
+  const evs = manager.getEvents(s.id, 0)!.events.filter((e) => e.type === 'delegation')
+  assert.equal(evs.length, 1)
+  assert.equal(evs[0]!.data.workerId, 'tool-1')
+  assert.equal(evs[0]!.data.toolName, 'delegate_batch')
+  assert.equal(evs[0]!.data.taskCount, 3)
+  assert.equal(evs[0]!.data.status, 'running')
+})
+
+test('N3: non-batch delegation tools omit taskCount; result event closes the group', async () => {
+  const { manager, agents } = makeManager()
+  const s = manager.createSession({ prompt: 'go' })
+  const cb = agents[0]!.callbacks!
+  cb.onToolUse('tool-2', 'council_convene', { seats: [{ authority: 'tianquan' }] })
+  const evs = manager.getEvents(s.id, 0)!.events.filter((e) => e.type === 'delegation')
+  assert.equal(evs[0]!.data.toolName, 'council_convene')
+  assert.equal(evs[0]!.data.taskCount, undefined)
+  cb.onToolResult('tool-2', 'council_convene', 'ok', false)
+  const evs2 = manager.getEvents(s.id, 0)!.events.filter((e) => e.type === 'delegation')
+  assert.equal(evs2.length, 2)
+  assert.equal(evs2[1]!.data.status, 'completed')
+})
+
+test('idle sweep forgets session stores via the registered forgetter (Wave 3)', async () => {
+  const agents: FakeAgent[] = []
+  const forgotten: string[] = []
+  const manager = new RuntimeSessionManager({
+    createAgent: () => {
+      const a = new FakeAgent()
+      agents.push(a)
+      return a
+    },
+    defaultCwd: '/tmp/work',
+    idleAgentTtlMs: 5,
+  })
+  manager.setStoresForgetter((id) => forgotten.push(id))
+
+  const s = manager.createSession({ prompt: 'go' })
+  agents[0]!.finish()
+  await new Promise((r) => setTimeout(r, 20))
+
+  manager.sweepIdleAgents()
+  assert.deepEqual(forgotten, [s.id], 'idle-swept session must drop its stores entry')
+})
+
+test('archive and hardDelete both forget session stores (Wave 3)', async () => {
+  const agents: FakeAgent[] = []
+  const forgotten: string[] = []
+  const manager = new RuntimeSessionManager({
+    createAgent: () => {
+      const a = new FakeAgent()
+      agents.push(a)
+      return a
+    },
+    defaultCwd: '/tmp/work',
+  })
+  manager.setStoresForgetter((id) => forgotten.push(id))
+
+  const s = manager.createSession({ prompt: 'go' })
+  agents[0]!.finish()
+  await new Promise((r) => setTimeout(r, 20))
+
+  // archive → unloadSession → releaseAgent → forget
+  assert.equal(manager.archiveSession(s.id), true)
+  assert.deepEqual(forgotten, [s.id], 'archived session must drop its stores entry')
+
+  // delete requires archived; hardDelete forgets again (idempotent).
+  assert.equal(manager.deleteSession(s.id).ok, true)
+  assert.deepEqual(forgotten, [s.id, s.id], 'hard-deleted session forgets unconditionally')
 })

@@ -24,6 +24,13 @@ import type { WorkerResult } from './work-order.js'
 export const MAX_BUDGET_CONTINUATIONS = 4
 
 /**
+ * 停滞判据：一轮预算耗尽时，工具调用数 ≤ 此值的轮次视为「产出停滞」——墙钟基本
+ * 花在等首字节/空转而非干活，原样续跑只会再烧一轮墙钟（2026-08-07 议事会分析：
+ * 文档实测活跃轮 tool 31–47，远高于此值；600s 里 ≤3 次工具调用即「等首字节空转」）。
+ */
+export const STALL_TOOL_CALL_THRESHOLD = 3
+
+/**
  * 一次 hands 会话里，首轮之外最多再跑几次 agent。**续跑、JSON 解析修复、写闸门
  * 修复共用这一本账**——三条路径都可能在同一次会话里触发，各记各的会叠乘成
  * 「N 续跑 × 2 解析修复 + 1 闸门修复」。共用总账把最坏情况钉死在 1 + (MAX+1) = MAX+2 轮。
@@ -48,6 +55,13 @@ export interface ContinuationInput {
   sharedWorktree: boolean
   /** 上一轮是否交回了会话消息——续跑靠它承接上下文。 */
   hasSessionMessages: boolean
+  /** 上一轮的产出度量。缺席时不判（旧调用点）。
+   *
+   *  `waitingFirstByteMs` / `ttftSamples` 目前**只采集不判据**：绝对阈值需要健康
+   *  环境下的基线，而现有样本全部采自一次性能风暴期间（席位平均每次工具调用间隔
+   *  15–36s，非席位中位数 10.3s），拿它标定会把病态固化成标准。等积累到干净基线
+   *  再决定判据形态——大概率是「相对该 profile 历史中位数退化 N 倍」而非绝对秒数。 */
+  productivity?: { toolCalls: number; waitingFirstByteMs?: number; ttftSamples?: number }
 }
 
 export type ContinuationDecision =
@@ -78,9 +92,19 @@ export function decideContinuation(input: ContinuationInput): ContinuationDecisi
   if (!input.hasSessionMessages) {
     return { proceed: false, skipReason: '上一轮没有会话消息可承接，续跑等于从零重来' }
   }
+  // 写工的架构边界排在停滞判据之前：写工在这一层本来就不续（无论产出多少），
+  // 让停滞判据先返回会把 skipReason 说成「产出停滞」，把排查引向模型速度而不是
+  // 「这层不该续」这个真实原因。
   if (input.isWrite) {
     const mode = input.sharedWorktree ? '共享 worktree' : '隔离 worktree'
     return { proceed: false, skipReason: `${mode}写工：续跑由 hands-session 在工作树内处理，coordinator 层不重复续` }
+  }
+  if (input.productivity && reason === 'timeout' && input.productivity.toolCalls <= STALL_TOOL_CALL_THRESHOLD) {
+    // 只拦墙钟空转（timeout）：600s 里 ≤3 次工具调用 = 等首字节，原样续跑只会再烧
+    // 一轮墙钟。max_turns 撞顶时调用少是正常形态（轮次本就少），不拦——否则集成测试
+    // 里 2 轮撞顶的 mock worker 会被误判停滞（2026-08-07 分析文档点名的是「墙钟被
+    // 首字节等待吃光」，不是轮次预算耗尽）。
+    return { proceed: false, skipReason: `上轮产出停滞（仅 ${input.productivity.toolCalls} 次工具调用即耗尽墙钟预算）——原样续跑只会再烧一轮墙钟` }
   }
   return { proceed: true, reason: reason as 'max_turns' | 'timeout' }
 }

@@ -14,7 +14,7 @@ import {
   toBudgetOverride,
 } from './delegate-budget.js'
 import type { Tool, ToolCallParams, ToolResult } from './types.js'
-import { createActivityStreamer, createDelegationActivityMapper, progressSnippet } from './worker-activity-stream.js'
+import { createActivityStreamer, createDelegationActivityMapper, terminalActivity } from './worker-activity-stream.js'
 import type { WorkerActivityEvent } from '../agent/coordinator.js'
 
 export interface DelegateBatchCoordinator {
@@ -23,8 +23,30 @@ export interface DelegateBatchCoordinator {
     policy?: AggregationPolicy,
     abortSignal?: AbortSignal,
     onProgress?: (completed: number, total: number) => void,
-    onWorkerSettled?: (result: import('../agent/work-order.js').WorkerResult) => void,
+    onWorkerSettled?: (result: CoordinatorRun['results'][number]) => void,
   ): Promise<CoordinatorRun>
+}
+
+/** 适配器目标的最低结构要求（生产端是 DelegationCoordinator）。 */
+export interface CoordinatorBatchDelegateLike {
+  delegateBatch: DelegateBatchCoordinator['delegateBatch']
+}
+
+/**
+ * 生产接线适配器（bootstrap）：同 createCoordinatorDelegateAdapter 的动机——
+ * 内联适配器丢参编译期零报警。delegate_batch 曾丢第五参 onWorkerSettled：
+ * 工具侧 settledIds 恒空，「已 settle 不补发」的防翻转守卫在生产整体失效。
+ */
+export function createCoordinatorBatchDelegateAdapter(
+  getCoordinator: () => CoordinatorBatchDelegateLike | null | undefined,
+): DelegateBatchCoordinator {
+  return {
+    delegateBatch: (requests, policy, abortSignal, onProgress, onWorkerSettled) => {
+      const coordinator = getCoordinator()
+      if (!coordinator) return Promise.reject(new Error('DelegationCoordinator not initialized'))
+      return coordinator.delegateBatch(requests, policy, abortSignal, onProgress, onWorkerSettled)
+    },
+  }
 }
 
 /** Dynamic profile validation — accepts built-in + user-loaded profiles */
@@ -338,37 +360,19 @@ export function createDelegateBatchTool(
       // T4: per-worker terminal status for the subagent panel. Emitted TWICE by
       // design: once per worker the moment it settles (onWorkerSettled — a fast
       // worker must flip to ✓/✗ immediately instead of waiting for the slowest
-      // sibling), and once more below after the batch resolves as a backstop
-      // (FleetRegistry dedupes terminal→terminal replays, freezing elapsed).
+      // sibling), and once more below after the batch resolves as a backstop.
+      // The mapper's finish() makes the duplicate terminal emission idempotent.
       const emitTerminal = params.onWorkerActivity
-        ? (r: import('../agent/work-order.js').WorkerResult) => {
-            params.onWorkerActivity!({
-              workOrderId: r.workOrderId,
-              parentToolId: params.toolUseId,
-              objective: objectiveById.get(r.workOrderId),
-              // 终态也带派发侧盖章的身份（星域/职能）——否则完成后面板星域信息断流。
-              profile: r.profile,
-              authority: r.authority,
-              status: r.status,
-              progressLine: progressSnippet(r.summary),
-              summary: r.summary,
-              failureReason: r.failureReason,
-              model: r.model,
-              provider: r.provider,
-              usage: r.usage,
-              artifactId: r.diffArtifactId,
-              changedFiles: r.changedFiles.length > 0 ? r.changedFiles : undefined,
-              findingsCount: r.findings.length > 0 ? r.findings.length : undefined,
-              topFinding: r.findings[0]?.claim,
-              verificationBrief: r.verification
-                ? { status: r.verification.status, passed: r.verification.passed, failed: r.verification.failed }
-                : undefined,
-              evidenceStatus: r.evidenceStatus,
-            })
+        ? (r: CoordinatorRun['results'][number]) => {
+            // 已 settle 的 order 记账：异常补发（catch）必须跳过它们，
+            // 否则 passed→blocked 翻转（审查门 35f459b8f LOW-1）。
+            settledIds.add(r.workOrderId)
+            activityMapper?.finish(terminalActivity(r, params.toolUseId, objectiveById.get(r.workOrderId)))
           }
         : undefined
 
       let progressReported = 0
+      const settledIds = new Set<string>()
       let run: CoordinatorRun
       try {
         run = await coordinator.delegateBatch(
@@ -384,7 +388,42 @@ export function createDelegateBatchTool(
           emitTerminal ?? undefined,
         )
       } catch (err) {
+        activityMapper?.dispose()
         const msg = err instanceof Error ? err.message : String(err)
+        // 异常路径也必须为每个已派发 worker 补发终态（blocked）——否则
+        // FleetRegistry 里这些 worker 永远停在 running、时间一直走（CLI TUI
+        // 无 session-manager 的 sweepStaleDelegationNodes 兜底，2026-08 调研）。
+        // workOrderId 用与建单同口径的 finalIdOf 派生，终态可被 fleet 正确归并冻结。
+        if (params.onWorkerActivity) {
+          for (let i = 0; i < dispatched.length; i++) {
+            const orderId = finalIdOf(i)
+            // 已 settle（passed 等终态已发）的 worker 不再补发——防翻转。
+            if (settledIds.has(orderId)) continue
+            params.onWorkerActivity({
+              workOrderId: orderId,
+              parentToolId: params.toolUseId,
+              objective: objectiveById.get(orderId),
+              profile: dispatched[i]?.profile,
+              authority: dispatched[i]?.authority,
+              status: 'blocked',
+              progressLine: `派发失败：${msg}`,
+              failureReason: 'delegate_batch_error',
+              summary: `Worker dispatch failed: ${msg}`,
+            })
+          }
+        }
+        // 用户取消不是批次失败：补完终态后 rethrow（统一捏成 AbortError 形态，
+        // 管道的 [interrupted] 特判只认 name）——吞掉会把 Esc 记成持续性失败，
+        // 还附「不要重试」的误导文案。与 delegate-task 同款修复。
+        const isAbort = params.abortSignal?.aborted === true
+          || (err instanceof Error && err.name === 'AbortError')
+          || msg.includes('Delegation aborted')
+        if (isAbort) {
+          if (err instanceof Error && err.name === 'AbortError') throw err
+          const abortErr = new Error(msg)
+          abortErr.name = 'AbortError'
+          throw abortErr
+        }
         return {
           content: [
             `delegate_batch 失败：${msg}`,
@@ -401,35 +440,39 @@ export function createDelegateBatchTool(
         }
       }
 
-      // H4-D4 producer：worker 完成即打点精确 orderId（passed 才算完成，
-      // failed/blocked 不得作为 attack_case supported 证据来源）。
-      const attackStore = getProblemAttackStore?.()
-      if (attackStore) {
-        for (const r of run.results) {
-          if (r.status === 'passed') attackStore.markWorkerCompleted(r.workOrderId)
+      try {
+        // H4-D4 producer：worker 完成即打点精确 orderId（passed 才算完成，
+        // failed/blocked 不得作为 attack_case supported 证据来源）。
+        const attackStore = getProblemAttackStore?.()
+        if (attackStore) {
+          for (const r of run.results) {
+            if (r.status === 'passed') attackStore.markWorkerCompleted(r.workOrderId)
+          }
         }
-      }
 
-      // Extract worker findings into claim store
-      if (run.status === 'completed') {
-        const claimStore = getClaimStore?.()
-        const sid = getSessionId?.()
-        if (claimStore && sid) {
-          extractClaimsFromRun(run, params.toolUseId, claimStore, sid)
+        // Extract worker findings into claim store
+        if (run.status === 'completed') {
+          const claimStore = getClaimStore?.()
+          const sid = getSessionId?.()
+          if (claimStore && sid) {
+            extractClaimsFromRun(run, params.toolUseId, claimStore, sid)
+          }
         }
-      }
 
-      // T4: terminal per-worker status for the subagent panel (backstop loop —
-      // per-worker settle events were already emitted via onWorkerSettled).
-      if (emitTerminal) {
-        for (const r of run.results) emitTerminal(r)
-      }
+        // T4: terminal per-worker status for the subagent panel (backstop loop —
+        // per-worker settle events were already emitted via onWorkerSettled).
+        if (emitTerminal) {
+          for (const r of run.results) emitTerminal(r)
+        }
 
-      const passed = run.results.filter(r => r.status === 'passed').length
-      return {
-        content: run.packet + trimmedNote,
-        uiContent: `delegate_batch：${passed}/${run.results.length} 通过`,
-        isError: false,
+        const passed = run.results.filter(r => r.status === 'passed').length
+        return {
+          content: run.packet + trimmedNote,
+          uiContent: `delegate_batch：${passed}/${run.results.length} 通过`,
+          isError: false,
+        }
+      } finally {
+        activityMapper?.dispose()
       }
     },
     requiresApproval: () => false,

@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { createDelegateBatchTool, type DelegateBatchCoordinator } from '../delegate-batch.js'
+import { createCoordinatorBatchDelegateAdapter, createDelegateBatchTool, type DelegateBatchCoordinator } from '../delegate-batch.js'
 import type { CoordinatorRun, DelegationRequest } from '../../agent/coordinator.js'
 import { aggregationPolicyKinds, workOrderKindSchema, type AggregationPolicy } from '../../agent/work-order.js'
 
@@ -22,7 +22,46 @@ function makeRun(): CoordinatorRun {
   }
 }
 
+const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms))
+
 describe('DELEGATE_BATCH_TOOL', () => {
+  it('settle-time and backstop terminals share mapper.finish without late running replay', async () => {
+    const events: Array<{ status: string; eventKind?: string; eventDetail?: string }> = []
+    const coordinator: DelegateBatchCoordinator = {
+      delegateBatch: async (requests, _policy, _signal, _progress, onWorkerSettled) => {
+        requests[0]!.onActivity?.({
+          workOrderId: 'batch:0',
+          profile: 'code_scout',
+          kind: 'text',
+          detail: 'tail',
+        })
+        const base = makeRun()
+        const run: CoordinatorRun = {
+          ...base,
+          results: [{ ...base.results[0]!, workOrderId: 'batch:0' }],
+        }
+        onWorkerSettled?.(run.results[0]!)
+        return run
+      },
+    }
+    const tool = createDelegateBatchTool(coordinator)
+
+    await tool.execute({
+      toolUseId: 'tu_batch_mapper_finish',
+      cwd: '/repo',
+      sessionTurnCount: 5,
+      input: { tasks: [{ objective: 'flush the batch tail' }] },
+      onWorkerActivity: (event: any) => events.push(event),
+    } as any)
+
+    assert.deepEqual(events.map(event => [event.status, event.eventKind, event.eventDetail]), [
+      ['running', 'text', 'tail'],
+      ['passed', undefined, undefined],
+    ])
+    await sleep(150)
+    assert.equal(events.length, 2)
+  })
+
   it('exposes work-order kind and aggregation policy enums from the work-order schema', () => {
     const tool = createDelegateBatchTool({ delegateBatch: async () => makeRun() })
     const schema = tool.definition.input_schema as any
@@ -104,6 +143,149 @@ describe('DELEGATE_BATCH_TOOL', () => {
     assert.ok(terminalEvents.length >= 1, '必须发出终态事件')
     assert.ok(terminalEvents.every(e => e.authority === 'yaoguang'), '终态事件必须透传 authority')
     assert.ok(terminalEvents.every(e => e.profile === 'verifier'), '终态事件必须透传 profile')
+  })
+
+  it('异常路径（coordinator 抛错）补发终态——已派发 worker 不得永远卡 running', async () => {
+    // 回归锚点：delegate-batch 的 catch 此前直接 return isError，不发终态事件。
+    // FleetRegistry 里这些 worker 永远停在 running、时间一直走（CLI TUI 无
+    // session-manager 的 sweepStaleDelegationNodes 兜底，见 2026-08 调研）。
+    const activities: Array<{ workOrderId?: string; status?: string }> = []
+    const coordinator: DelegateBatchCoordinator = {
+      delegateBatch: async () => {
+        throw new Error('simulated coordinator failure')
+      },
+    }
+    const tool = createDelegateBatchTool(coordinator)
+
+    const result = await tool.execute({
+      toolUseId: 'tu_abort',
+      cwd: '/repo',
+      sessionTurnCount: 5,
+      input: {
+        tasks: [
+          { objective: 'Task one.' },
+          { objective: 'Task two.' },
+        ],
+      },
+      onWorkerActivity: (ev: any) => activities.push(ev),
+    } as any)
+
+    assert.equal(result.isError, true)
+    assert.ok(activities.length >= 2,
+      `异常路径必须为每个已派发 worker 补发终态，实际 ${activities.length} 条`)
+    for (const a of activities) {
+      assert.notEqual(a.status, 'running', '异常路径补发的必须是终态，不是 running')
+    }
+  })
+
+  it('异常路径不覆盖已 settle 的 worker（passed 后不补发 blocked 翻转）', async () => {
+    // 审查门（35f459b8f）LOW-1：onWorkerSettled 快路径在 coordinator 内部先发
+    // passed，delegateBatch 尾段抛错时 catch 若对同一 orderId 补发 blocked，
+    // 事件流出现 passed→blocked 翻转（fleet 端虽免疫，SSE/日志层会记录怪序列）。
+    const events: Array<{ workOrderId?: string; status?: string }> = []
+    const coordinator: DelegateBatchCoordinator = {
+      delegateBatch: async (_requests, _policy, _signal, _onProgress, onWorkerSettled) => {
+        // worker 0 已 settle（passed 快路径已发）
+        onWorkerSettled?.({
+          workOrderId: 'batch:0',
+          status: 'passed',
+          summary: 'done',
+          findings: [],
+          artifacts: [],
+          changedFiles: [],
+          risks: [],
+          nextActions: [],
+          evidenceStatus: 'verified',
+        } as any)
+        throw new Error('tail failure after settle')
+      },
+    }
+    const tool = createDelegateBatchTool(coordinator)
+
+    const result = await tool.execute({
+      toolUseId: 'tu_flip',
+      cwd: '/repo',
+      sessionTurnCount: 5,
+      input: {
+        tasks: [
+          { objective: 'Task one.' },
+          { objective: 'Task two.' },
+        ],
+      },
+      onWorkerActivity: (ev: any) => events.push(ev),
+    } as any)
+
+    assert.equal(result.isError, true)
+    const w0 = events.filter(e => e.workOrderId === 'batch:0')
+    assert.ok(w0.length >= 1, 'settled worker 必须收到终态')
+    // batch:0 的终态序列不得出现 passed→blocked 翻转：最后一个状态仍是 passed。
+    const lastW0 = w0[w0.length - 1]!
+    assert.equal(lastW0.status, 'passed', '已 settle 的 worker 不被异常补发覆盖（防翻转）')
+    // 未 settle 的 worker 1 仍要补发终态（不卡 running）。
+    const w1 = events.filter(e => e.workOrderId === 'batch:1')
+    assert.ok(w1.length >= 1, '未 settle 的 worker 必须补发终态')
+    assert.equal(w1[0]!.status, 'blocked')
+  })
+
+  it('abort 路径：补发终态后 rethrow AbortError——用户取消不得记成批次失败', async () => {
+    // 与 delegate-task 同款：catch 曾把 Esc 吞成 isError + 「不要重试」误导文案。
+    const activities: Array<{ workOrderId?: string; status?: string }> = []
+    const coordinator: DelegateBatchCoordinator = {
+      delegateBatch: async () => {
+        throw new Error('Delegation aborted: user cancelled')
+      },
+    }
+    const tool = createDelegateBatchTool(coordinator)
+
+    const controller = new AbortController()
+    controller.abort()
+    await assert.rejects(
+      tool.execute({
+        toolUseId: 'tu_batch_abort',
+        cwd: '/repo',
+        sessionTurnCount: 5,
+        input: { tasks: [{ objective: 'Task one.' }, { objective: 'Task two.' }] },
+        abortSignal: controller.signal,
+        onWorkerActivity: (ev: any) => activities.push(ev),
+      } as any),
+      (err: unknown) => {
+        assert.equal((err as Error).name, 'AbortError', '管道 [interrupted] 特判只认 name')
+        return true
+      },
+    )
+    // 终态照发：两个已派发 worker 都不许卡 running
+    assert.ok(activities.length >= 2, 'abort 也要先补发终态再 rethrow')
+    for (const a of activities) assert.equal(a.status, 'blocked')
+  })
+
+  it('生产接线适配器：五参全透传（onWorkerSettled 不得再静默丢失）', async () => {
+    // bootstrap 内联适配器曾丢第五参——settledIds 恒空，防翻转守卫在生产失效。
+    const seen: Array<{ hasSignal: boolean; hasProgress: boolean; hasSettled: boolean }> = []
+    const adapter = createCoordinatorBatchDelegateAdapter(() => ({
+      delegateBatch: async (_requests, _policy, signal, onProgress, onWorkerSettled) => {
+        seen.push({
+          hasSignal: signal !== undefined,
+          hasProgress: typeof onProgress === 'function',
+          hasSettled: typeof onWorkerSettled === 'function',
+        })
+        return makeRun()
+      },
+    }))
+
+    const controller = new AbortController()
+    await adapter.delegateBatch(
+      [],
+      'primary_decides',
+      controller.signal,
+      () => {},
+      () => {},
+    )
+    assert.deepEqual(seen, [{ hasSignal: true, hasProgress: true, hasSettled: true }])
+
+    await assert.rejects(
+      createCoordinatorBatchDelegateAdapter(() => null).delegateBatch([]),
+      /not initialized/,
+    )
   })
 
   it('exposes dependsOn in the task schema', () => {

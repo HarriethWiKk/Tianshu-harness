@@ -48,6 +48,10 @@ export interface TurnStreamDeps {
   prewarmFile?: (filePath: string) => void
   addUsage: (usage: Partial<Usage>) => void
   recordTurnCache: (turn: number, usage: Usage, observability?: StreamCacheObservability) => void
+  /** 记录本轮等首字节的毫秒数。独立于 `recordTurnCache`——后者被 provider 是否返回
+   *  缓存字段 gate 住（延迟指标不该挂在成本字段的存在性上），worker 常用的模型响应
+   *  里没有那两个字段时，TTFT 会连同整行一起被丢弃。 */
+  recordTtft?: (ttftMs: number) => void
   /** Optional: record a failed stream attempt (partial output discarded) for diagnostics. */
   recordStreamAttemptAborted?: (info: StreamAttemptAbortedInfo) => void
   /** Monotonic-enough clock for TTFT measurement; injectable for deterministic tests. */
@@ -190,6 +194,7 @@ export class TurnStreamController {
       onStopReason: (reason, usage) => {
         stopReason = reason
         this.deps.addUsage(usage)
+        if (ttftMs !== undefined) this.deps.recordTtft?.(ttftMs)
         if (usage.cache_read_input_tokens !== undefined || usage.cache_creation_input_tokens !== undefined) {
           this.deps.recordTurnCache(input.turn, {
             input_tokens: usage.input_tokens ?? 0,

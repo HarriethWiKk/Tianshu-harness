@@ -31,6 +31,9 @@ const testConfig = {
     domainKeywordRouting: true,
     verificationSnapshot: 'auto',
     songlineEnabled: true,
+    constellationEnabled: false,
+    companionPresenceEnabled: false,
+    dreamEnabled: true,
     securityGuidance: true,
     scoutEvidenceFirewall: false,
     desktopTools: false,
@@ -50,13 +53,14 @@ const testConfig = {
     modelRoutingGatedEnabled: false,
     banditPromotion: { modelTier: 'shadow', teamScheduler: 'shadow', modelRouting: 'shadow', effort: 'shadow', killSwitch: false },
     permissions: { allow: [], deny: [], bash: { allowlist: [], denylist: [] }, additionalReadDirs: [], additionalWriteDirs: [] },
-    review: { profiles: {}, skipAuto: false, mechanicalFastPath: true },
+    review: { profiles: {}, skipAuto: false, skipAutoSpark: false, mechanicalFastPath: true },
     visionAutoBridge: false,
     goal: { judge: { enabled: true, maxRuns: 3, browser: false } },
     delivery: { autoCommit: true },
   },
   compact: { enabled: true, autoThreshold: 800_000, autoFloor: 500_000, model: 'flash', qualityCompact: { perTokenThreshold: 0.55, subscriptionThreshold: 0.45, subscriptionCeiling: 0.6 } },
-} satisfies Pick<Config, 'agent' | 'compact'>
+  runtime: { lean: false },
+} satisfies Pick<Config, 'agent' | 'compact' | 'runtime'>
 
 describe('createAgentConfig', () => {
   const baseInput: AgentConfigInput = {
@@ -182,7 +186,7 @@ describe('createAgentConfig', () => {
       config: {
         ...testConfig,
         agent: { ...testConfig.agent, visionModel: { provider: 'vprov', model: 'v-cap', maxTokens: 1024 } },
-      } as Pick<Config, 'agent' | 'compact'>,
+      } as Pick<Config, 'agent' | 'compact' | 'runtime'>,
       sessionId: 'session-1',
       toolDefinitions: [],
       provider: testProvider,

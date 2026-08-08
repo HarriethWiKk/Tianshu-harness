@@ -24,6 +24,7 @@ import { buildModelCards } from './model/capability.js'
 import type { ModelCapabilityCard } from './model/capability.js'
 
 import { loadConfig as loadLayeredConfig } from './config/manager.js'
+import { isRuntimeLeanAspect } from './config/runtime-lean.js'
 import { isProFeatureEnabled } from './config/pro-license.js'
 import { lastSessionPointerDir, rivetHome, stateDir } from './config/paths.js'
 import { setTargetConventions, applyConfiguredGitBashPath } from './platform.js'
@@ -44,11 +45,11 @@ import { presetIncludes, resolveToolPreset } from './tools/tool-preset.js'
 import { BROWSER_DEBUG_TOOL } from './tools/browser-debug/tool.js'
 import { defaultStore as defaultTodoStore } from './tools/todo.js'
 import { TodoStore } from './tools/todo-store.js'
-import { createDelegateTaskTool } from './tools/delegate-task.js'
+import { createCoordinatorDelegateAdapter, createDelegateTaskTool } from './tools/delegate-task.js'
 import { createUndoTool } from './tools/undo.js'
 import { maybeWarnNoSandbox, applySandboxPolicyForApprovalMode } from './tools/sandbox-profile.js'
 import { applyConfiguredPathGrants, applyDefaultDependencyReadGrants, applyRivetRuntimeReadGrants, loadPersistedGrants } from './tools/path-grants.js'
-import { createDelegateBatchTool } from './tools/delegate-batch.js'
+import { createCoordinatorBatchDelegateAdapter, createDelegateBatchTool } from './tools/delegate-batch.js'
 import { createGalaxyTool } from './tools/galaxy.js'
 import { createStarflowTool } from './tools/starflow.js'
 import { createTeamOrchestrateTool } from './tools/team-orchestrate.js'
@@ -73,6 +74,8 @@ import { createWorktreeBaseline } from './agent/worktree-baseline.js'
 import { createVerificationSnapshotManager, reapOrphanSnapshots, reapOrphanHandsWorktrees } from './agent/verification-snapshot-manager.js'
 import { cleanupStaleHandsBranches } from './agent/worktree.js'
 import { initializePlugins } from './plugins/plugin-loader.js'
+import { loadProModule, proRegistry } from './api/pro-registry.js'
+import { anchorsFromMessages } from './agent/reasoning-anchors.js'
 import { createProviderClient, resolveApiKey } from './api/factory.js'
 import { buildReviewOverrideState } from './agent/review-model-override.js'
 import type { ResolvedReviewOverride } from './agent/review-model-override.js'
@@ -215,13 +218,17 @@ export interface BootstrapContext {
   domainKnowledgeStore: DomainKnowledgeStore
   meridianIndexer: MeridianIndexer
   cwd: string
-  shutdown: () => void
+  shutdown: () => Promise<void>
   /** Persist the final TUI perf summary through the existing telemetry writer. */
   flushTuiPerfSummary: (summary: TuiPerfSummary) => Promise<void>
   heartbeatInterval: ReturnType<typeof setInterval>
   /** True when first-run template init is pending — TUI layer handles the
    *  AGENTS.md prompt. Set by needsTemplatesInit() during bootstrap. */
   templatesPendingAgents?: boolean
+  /** 资源压力状态行 sink——TUI 层在创建 TuiApp 后回填（agent 早于 TUI 创建，
+   *  agent 的 onStatusLine 经闭包晚绑定读此字段）。缺省 undefined（sidecar/
+   *  worker 无 TUI）时 agent 侧回调为 no-op。 */
+  setStatusLine?: (text: string | null) => void
 }
 
 // ── HTTP Proxy ─────────────────────────────────────────────────
@@ -453,7 +460,9 @@ export function createInteractiveToolRegistry(
   config: Config,
   cwd: string,
 ): { registry: ReturnType<typeof createDefaultToolRegistry> } {
-  const toolPreset = resolveToolPreset(cwd)
+  // 域工具档位：defaultDomain 钉定某域且该域配置了 toolPreset 时按域装配
+  // （如 taiyi 域默认 taiyi 档）。运行期 /domain 切换不改（装配已过）。
+  const toolPreset = resolveToolPreset(cwd, config.agent.defaultDomain)
   const reg = createDefaultToolRegistry([], {
     preset: toolPreset,
     desktopTools: config.agent.desktopTools,
@@ -475,38 +484,35 @@ export function createInteractiveToolRegistry(
     fetchOptions: buildFetchOptions(config),
   })
 
-  // delegate_task
-  reg.register(createDelegateTaskTool(
-    {
-      delegate: async (request, signal) => {
-        if (!refs.coordinator) throw new Error('DelegationCoordinator not initialized')
-        // 第二参必须透传（审查 H3）：delegate_task 传了 params.abortSignal，
-        // 丢了它主路径 parentSignal 恒 undefined——abort 守卫/等槽取消全变死代码。
-        return refs.coordinator.delegate(request, signal)
-      },
-    },
-    () => refs.claimStore ?? undefined,
-    () => refs.sessionId ?? undefined,
-    () => refs.getProblemAttackStore?.() ?? null,
-  ))
+  // delegate_task —— taiyi 评测档排除（编排类不在 16 核心集；TAIYI_EXCLUDES），
+  // 其余档位照旧无条件注册。
+  if (presetIncludes(toolPreset, 'delegate_task')) {
+    reg.register(createDelegateTaskTool(
+      // 三参（signal / onOrderCreated）全透传的适配器——丢参史：H3 丢 signal、
+      // 35f459b8f 复评发现丢 onOrderCreated（补发终态变死代码）。
+      createCoordinatorDelegateAdapter(() => refs.coordinator),
+      () => refs.claimStore ?? undefined,
+      () => refs.sessionId ?? undefined,
+      () => refs.getProblemAttackStore?.() ?? null,
+    ))
+  }
 
   // undo — preset full 才含（全会话零使用）。
   if (presetIncludes(toolPreset, 'undo')) {
     reg.register(createUndoTool(() => refs.fileHistory ?? undefined))
   }
 
-  // delegate_batch
-  reg.register(createDelegateBatchTool(
-    {
-      delegateBatch: async (requests, policy, abortSignal, onProgress) => {
-        if (!refs.coordinator) throw new Error('DelegationCoordinator not initialized')
-        return refs.coordinator.delegateBatch(requests, policy, abortSignal, onProgress)
-      },
-    },
-    () => refs.claimStore ?? undefined,
-    () => refs.sessionId ?? undefined,
-    () => refs.getProblemAttackStore?.() ?? null,
-  ))
+  // delegate_batch —— taiyi 排除（同 delegate_task）。
+  if (presetIncludes(toolPreset, 'delegate_batch')) {
+    reg.register(createDelegateBatchTool(
+      // 五参全透传——第五参 onWorkerSettled 曾丢失，防翻转守卫（settledIds）
+      // 在生产失效（同 35f459b8f 复评的丢参事故形态）。
+      createCoordinatorBatchDelegateAdapter(() => refs.coordinator),
+      () => refs.claimStore ?? undefined,
+      () => refs.sessionId ?? undefined,
+      () => refs.getProblemAttackStore?.() ?? null,
+    ))
+  }
 
   // galaxy — 星河集群派发（子 Agent 内部分子 Agent 并行）
   // 实例同时喂给 starflow（星流状态机的攻坚阶段复用同一工具）。
@@ -516,13 +522,25 @@ export function createInteractiveToolRegistry(
         if (!refs.coordinator) throw new Error('DelegationCoordinator not initialized')
         return refs.coordinator.delegateBatch(requests, policy, abortSignal, onProgress, onWorkerSettled)
       },
+      getRuntimeSnapshot: () => refs.coordinator?.getRuntimeSnapshot() ?? {
+        activeWorkers: 0,
+        maxWorkers: 0,
+        pendingWorkers: 0,
+        stalledWorkers: 0,
+        inFlightFileScopes: 0,
+        backgroundRunning: 0,
+        activeClaims: 0,
+        providerDegradation: 0,
+        shuttingDown: true,
+      },
       // 路由学习（收编 #5）存取口——getter 惰性读取，/cd 换 store 后自动指向新实例。
       get domainKnowledgeStore() { return refs.domainKnowledgeStoreRef?.current ?? undefined },
       // DP 证据冗余（收编 #2）——agent 构建后经 createAgentRuntime 回写。
       get obligationTracker() { return refs.obligationTrackerRef?.current ?? undefined },
     },
   )
-  reg.register(galaxyTool)
+  // galaxy 实例恒构造（starflow 复用同一实例）；注册按档位——taiyi 排除。
+  if (presetIncludes(toolPreset, 'galaxy')) reg.register(galaxyTool)
 
   // Shared plan-execution kernel deps: team_orchestrate and plan_task(execute:true)
   // run the SAME closed loop through executePlan (dispatch + scope-health +
@@ -610,26 +628,29 @@ export function createInteractiveToolRegistry(
   // starflow — 星流代码级编排（council→team→galaxy 硬门禁状态机，替代纯 prompt 注入）。
   // minimal/frontend 档 preset 排除 council_convene 注册，但 preset 只挡注册可见性
   // 不挡工具构造——星流缺失的实例按相同参数等价自构，行为与注册实例一致。
-  reg.register(createStarflowTool({
-    councilTool: councilConveneTool ?? createCouncilConveneTool(councilCoordinator, councilDefaultSeats, councilOptions),
-    teamTool: teamOrchestrateTool ?? createTeamOrchestrateTool(planExecutorDeps, {
-      defaultMaxParallel: config.agent.maxTeamParallel,
-      teamMaxEnabled: isProFeatureEnabled(config, 'teamMax'),
-    }),
-    galaxyTool,
-    cwd,
-  }))
+  // taiyi 排除（编排类；TAIYI_EXCLUDES）。
+  if (presetIncludes(toolPreset, 'starflow')) {
+    reg.register(createStarflowTool({
+      councilTool: councilConveneTool ?? createCouncilConveneTool(councilCoordinator, councilDefaultSeats, councilOptions),
+      teamTool: teamOrchestrateTool ?? createTeamOrchestrateTool(planExecutorDeps, {
+        defaultMaxParallel: config.agent.maxTeamParallel,
+        teamMaxEnabled: isProFeatureEnabled(config, 'teamMax'),
+      }),
+      galaxyTool,
+      cwd,
+    }))
+  }
 
-  // recall_capsule
-  reg.register(createRecallCapsuleTool(() => cwd))
+  // recall_capsule —— taiyi 排除（不在 16 核心集）。
+  if (presetIncludes(toolPreset, 'recall_capsule')) reg.register(createRecallCapsuleTool(() => cwd))
 
   // 将星账本（B1/B2）：recall_general 读战绩，record_general_finding 追加战绩。
   // 胶囊 = 方法论基因，账本 = 跨会话战绩记忆。preset full 才含。
   if (presetIncludes(toolPreset, 'recall_general')) reg.register(createRecallGeneralTool(() => cwd))
   if (presetIncludes(toolPreset, 'record_general_finding')) reg.register(createRecordGeneralFindingTool(() => cwd))
 
-  // ask_user_question
-  reg.register(ASK_USER_QUESTION_TOOL)
+  // ask_user_question —— taiyi 排除（评测无人在环，注册只会诱发无效调用）。
+  if (presetIncludes(toolPreset, 'ask_user_question')) reg.register(ASK_USER_QUESTION_TOOL)
 
   // browser_debug — persistent browser for local frontend/backend联调 (CDP route).
   // preset frontend/full 含；RIVET_BROWSER_DEBUG=1 强制开启。
@@ -651,7 +672,8 @@ export function createInteractiveToolRegistry(
   if (presetIncludes(toolPreset, 'semantic_search')) reg.register(SEMANTIC_SEARCH_TOOL)
   // APPLY_PATCH: EXTENDED layer — overlap with hash_edit covers >90% of
   // use cases; kept here (interactive) for edge cases (e.g. git-format patches).
-  reg.register(APPLY_PATCH_TOOL)
+  // taiyi 排除（16 核心集已有 edit_file/hash_edit 覆盖编辑面）。
+  if (presetIncludes(toolPreset, 'apply_patch')) reg.register(APPLY_PATCH_TOOL)
   // W5 session_vitals: EXTENDED layer（interactive 装配，不占 kernel budget）。
   // 只读自查工具——模型写"系统状态"类结论前的取证入口（incident 20b9714e）。
   // 工具定义跟版本发布上车（新定义 = 前缀一次性 miss，绝不热更）。
@@ -670,13 +692,16 @@ export function createInteractiveToolRegistry(
   // web_search is now in the kernel default-registry (CORE layer).
   // Remove the interactive registration to avoid double-registration.
   // PLAN_MODE_ALLOWED_TOOLS already references web_search alongside recall.
-  reg.register(createPlanTaskTool({
-    getCoordinator: () => refs.coordinator,
-    getExecutorDeps: () => planExecutorDeps,
-    getSessionId: () => refs.sessionId ?? undefined,
-    // 多会话隔离：plan_task 写本会话 store（TUI 即 defaultStore，行为不变）。
-    writeTodos: todos => refs.todoStore.write(todos),
-  }))
+  // plan_task —— taiyi 排除（编排类；16 核心集保留 plan_submit/plan_close 轻量对）。
+  if (presetIncludes(toolPreset, 'plan_task')) {
+    reg.register(createPlanTaskTool({
+      getCoordinator: () => refs.coordinator,
+      getExecutorDeps: () => planExecutorDeps,
+      getSessionId: () => refs.sessionId ?? undefined,
+      // 多会话隔离：plan_task 写本会话 store（TUI 即 defaultStore，行为不变）。
+      writeTodos: todos => refs.todoStore.write(todos),
+    }))
+  }
 
   // B1 deliver_task
   // sidecar 多 session 路径必须用 refs.sessionId（每个 session 独立装配），
@@ -810,10 +835,16 @@ export function createAgentRuntime(deps: {
   sharedProviderHealth?: ProviderHealthTracker
   /** I4: optional callback to surface user hook results to the desktop event stream. */
   emitHookResult?: import('./agent/loop-types.js').AgentConfig['emitHookResult']
+  /** 资源压力状态行回调（透传 AgentConfig.onStatusLine；TUI 经 ctx.setStatusLine
+   *  晚绑定，sidecar/worker 不传即 no-op）。 */
+  onStatusLine?: (text: string | null) => void
   /** /cd: previous PromptEngine whose frozen snapshots the new engine inherits
    *  (keeps the historical prefix byte-stable across the cwd switch).
    *  resume 场景传盘存 FrozenSnapshotData（<id>.frozen.json），同语义。 */
   inheritFrozenFrom?: import('./prompt/engine.js').PromptEngine | import('./prompt/frozen-snapshot.js').FrozenSnapshotData
+  /** Per-session 工具白名单（蒸馏回放等自动化场景）。有值时 LLM 的工具列表
+   *  收窄到这个集合（覆盖 config.agent.toolGating.coreOverride）。缺省 = 默认。 */
+  allowedTools?: string[]
 }): { agent: AgentLoop } {
   const {
     provider, apiKey, auth, config, sessionId, cwd,
@@ -824,6 +855,19 @@ export function createAgentRuntime(deps: {
   const currentModel = modelId
     ? (provider.models.find(m => m.id === modelId || m.alias === modelId) ?? provider.models[0]!)
     : provider.models[0]!
+
+  // wire 上下文会话固化（2026-08-07 spark T1）：meta 已有值 → 恒用之（resume/
+  // 跨端字节稳定）；无值且 provider 注册了默认（spark 的 env 解析 N）→ 取默认
+  // 冻结进 meta。非 spark / 开源构建：defaults 恒 undefined → 恒不写不传，零差异。
+  // TUI 与 sidecar（serve-agent assembleAgentLoop）都经本函数，单点覆盖两端。
+  let wireContext = persist.loadMetadata()?.wireContext
+  if (!wireContext) {
+    const defaults = proRegistry.getWireContextDefaults(provider.name)?.()
+    if (defaults) {
+      wireContext = defaults
+      try { persist.updateMetadata({ wireContext }) } catch { /* best-effort——写失败退化为下次再冻结 */ }
+    }
+  }
 
   const agentCfg = createAgentConfig(createMainAgentConfigInput({
     apiKey,
@@ -845,6 +889,9 @@ export function createAgentRuntime(deps: {
     sessionMemoryBlock: persist.buildMemoryBlock(),
     auth,
     inheritFrozenFrom: deps.inheritFrozenFrom,
+    onStatusLine: deps.onStatusLine,
+    allowedTools: deps.allowedTools,
+    wireContext,
   }))
 
   // Model capability cards（统一口径在 model/capability.ts——v4-flash 特例也在那里）
@@ -1197,6 +1244,8 @@ export function createAgentRuntime(deps: {
     // 该值同时是 CoordinatorState 的并发上限与 WorkOrderQueue 的容量基准——
     // 全局信号量（activeWorkerCount ≤ maxWorkers）在 coordinator 层实施。
     maxWorkers: resolveCoordinatorMaxWorkers(config),
+    ...resolveCoordinatorPoolCaps(config),
+    providers: config.provider.providers,
     runtimeFactory,
     routing: workerRouting,
     providerHealth,
@@ -1399,46 +1448,62 @@ function makeAttackEvidenceVerifier(agent: AgentLoop): import('./tools/attack-ca
   }
 }
 
-export function createShutdownHandler(ctx: BootstrapContext): () => void {
-  let isShuttingDown = false
+export function createShutdownHandler(ctx: BootstrapContext): () => Promise<void> {
+  let shutdownPromise: Promise<void> | undefined
   return () => {
-    if (isShuttingDown) return
-    isShuttingDown = true
-
-    try {
-      // Mark a clean exit. Next startup mints a fresh session by default;
-      // returning here requires explicit --continue / --resume <id> (R1).
-      try { ctx.persist.updateMetadata({ cleanExit: true }) } catch { /* best-effort */ }
-      // resume 缓存继承的 shutdown flush：覆盖 collapse watermark 等不经
-      // commit 钩子的漂移（边界写由 wireFrozenSnapshotPersist 已覆盖）。
-      try { ctx.persist.writeFrozenSnapshot(ctx.agent.config.promptEngine.exportFrozenSnapshot()) } catch { /* best-effort */ }
-      ctx.persist.compactOai(ctx.session.getMessages())
-      if (ctx.fileHistory) {
-        persistFileHistory(
-          join(getSessionDir(ctx.cwd), ctx.sessionId, 'file-history.json'),
-          ctx.fileHistory.getAllSnapshots(),
-        )
+    if (shutdownPromise) return shutdownPromise
+    shutdownPromise = (async () => {
+      try {
+        // Mark a clean exit. Next startup mints a fresh session by default;
+        // returning here requires explicit --continue / --resume <id> (R1).
+        try { ctx.persist.updateMetadata({ cleanExit: true }) } catch { /* best-effort */ }
+        // resume 缓存继承的 shutdown flush：覆盖 collapse watermark 等不经
+        // commit 钩子的漂移（边界写由 wireFrozenSnapshotPersist 已覆盖）。
+        try { ctx.persist.writeFrozenSnapshot(ctx.agent.config.promptEngine.exportFrozenSnapshot()) } catch { /* best-effort */ }
+        ctx.persist.compactOai(ctx.session.getMessages())
+        if (ctx.fileHistory) {
+          persistFileHistory(
+            join(getSessionDir(ctx.cwd), ctx.sessionId, 'file-history.json'),
+            ctx.fileHistory.getAllSnapshots(),
+          )
+        }
+        ctx.agent.flushStigmergySync()
+        ctx.agent.abort()
+      } catch (err) {
+        try { process.stderr.write(`[shutdown] callback error: ${(err as Error)?.message}\n`) } catch { /* noop */ }
+      } finally {
+        if (ctx.heartbeatInterval) clearInterval(ctx.heartbeatInterval)
+        try { ctx.refs.lspManager?.dispose() } catch { /* best-effort */ }
+        try { ctx.refs.mcpManager?.killChildrenSync?.() } catch { /* best-effort */ }
+        void ctx.refs.mcpManager?.shutdown?.()
+        // Wait for coordinator finally blocks so session claims are released
+        // before a handoff or the next process can enter this workspace.  Do
+        // not unregister on a timeout: an abort is advisory for providers that
+        // ignore AbortSignal, and their worker may still be writing files.
+        let workersSettled = !ctx.refs.coordinator
+        try {
+          if (ctx.refs.coordinator?.shutdownAndWait) {
+            workersSettled = await ctx.refs.coordinator.shutdownAndWait()
+          } else if (ctx.refs.coordinator) {
+            ctx.refs.coordinator.shutdown()
+            workersSettled = false
+          }
+        } catch {
+          workersSettled = false
+        }
+        let mainRunSettled = false
+        try { mainRunSettled = !ctx.agent.isRunning() } catch { /* fail closed */ }
+        if (workersSettled && mainRunSettled) {
+          try { ctx.refs.sessionRegistry?.unregister(ctx.sessionId) } catch { /* best-effort */ }
+        }
+        if (process.stdin.isTTY && process.stdin.setRawMode) {
+          process.stdin.setRawMode(false)
+        }
+        killAllSync()
+        // Note: does NOT call process.exit — callers should do so after additional cleanup
       }
-      ctx.agent.flushStigmergySync()
-      ctx.agent.abort()
-    } catch (err) {
-      try { process.stderr.write(`[shutdown] callback error: ${(err as Error)?.message}\n`) } catch { /* noop */ }
-    } finally {
-      if (ctx.heartbeatInterval) clearInterval(ctx.heartbeatInterval)
-      try { ctx.refs.lspManager?.dispose() } catch { /* best-effort */ }
-      try { ctx.refs.mcpManager?.killChildrenSync?.() } catch { /* best-effort */ }
-      void ctx.refs.mcpManager?.shutdown?.()
-      // Wave K (P0): clear stallSweep interval + abort in-flight workers.
-      // 进程退出时 OS 会回收，但显式 shutdown 让语义清晰、并对齐 sidecar 的
-      // switchModel 路径。同时让 unit test 退出更干净（unref 的 timer 不必依赖
-      // process 真退出来释放）。
-      try { ctx.refs.coordinator?.shutdown() } catch { /* best-effort */ }
-      if (process.stdin.isTTY && process.stdin.setRawMode) {
-        process.stdin.setRawMode(false)
-      }
-      killAllSync()
-      // Note: does NOT call process.exit — callers should do so after additional cleanup
-    }
+    })()
+    return shutdownPromise
   }
 }
 
@@ -1535,6 +1600,7 @@ export function switchAgentRuntime(ctx: BootstrapContext, modelId: string): Swit
       domainKnowledgeStore: ctx.domainKnowledgeStore,
       modelId: resolved.modelId,
       session: ctx.session,
+      onStatusLine: text => ctx.setStatusLine?.(text),
     })
 
     // 搬运后台 job 注册表到新 agent：不搬则新 AgentLoop 自建空 SessionJobs，
@@ -1715,6 +1781,7 @@ export function switchAgentSession(ctx: BootstrapContext, targetId: string): Swi
     modelId: resumeTarget?.modelId ?? currentModelId,
     session: ctx.session,
     inheritFrozenFrom: targetPersist.readFrozenSnapshot(),
+    onStatusLine: text => ctx.setStatusLine?.(text),
   })
 
   // 原地更新 ctx —— 持有 ctx 引用的闭包(onSubmit/onAbort/handlerCtx)即时一致。
@@ -1978,8 +2045,22 @@ export async function switchAgentCwd(ctx: BootstrapContext, target: string): Pro
  */
 function resolveCoordinatorMaxWorkers(config: Config): number {
   const raw = (config.agent as { maxWorkers?: unknown }).maxWorkers
-  const n = typeof raw === 'number' ? raw : Number(process.env['RIVET_MAX_WORKERS'])
-  return Number.isInteger(n) && n >= 1 ? n : 3
+  if (typeof raw === 'number' && Number.isInteger(raw) && raw >= 1) return raw
+  const envN = Number(process.env['RIVET_MAX_WORKERS'])
+  if (Number.isInteger(envN) && envN >= 1) return envN
+  return isRuntimeLeanAspect('pool', config.runtime?.lean) ? 1 : 3
+}
+
+/** S1 分池并发帽：只读/写工各自的可选池帽，缺省 undefined（= maxWorkers）。
+ *  非法值回退缺省——fail-closed 保守侧。 */
+function resolveCoordinatorPoolCaps(config: Config): { maxExploreWorkers?: number; maxWriteWorkers?: number } {
+  const agent = config.agent as { maxExploreWorkers?: unknown; maxWriteWorkers?: unknown }
+  const cap = (raw: unknown): number | undefined =>
+    typeof raw === 'number' && Number.isInteger(raw) && raw >= 1 ? raw : undefined
+  return {
+    ...(cap(agent.maxExploreWorkers) !== undefined ? { maxExploreWorkers: cap(agent.maxExploreWorkers) } : {}),
+    ...(cap(agent.maxWriteWorkers) !== undefined ? { maxWriteWorkers: cap(agent.maxWriteWorkers) } : {}),
+  }
 }
 
 export interface BootstrapOptions {
@@ -2039,7 +2120,21 @@ export async function bootstrapInteractiveSession(opts: BootstrapOptions = {}): 
   applyRivetRuntimeReadGrants()
 
   // 3. Provider + Auth
-  const { provider, apiKey, auth } = resolveProviderAndAuth(config, opts.providerName, {
+  // 默认启动模型（config 驱动的一键启动）：`agent.defaultModel` 为
+  // "provider:modelId" 格式——拆出 provider（作默认 provider 选择）与
+  // modelId（作默认模型选择）。显式启动参数（--model/--provider）恒优先。
+  // defaultDomain 的钉定在 bindSessionDomain（loop.ts）消费，无需在此处理。
+  const defaultModelRef = config.agent.defaultModel
+  const defaultModelParts = defaultModelRef && defaultModelRef.includes(':')
+    ? {
+        provider: defaultModelRef.slice(0, defaultModelRef.indexOf(':')),
+        modelId: defaultModelRef.slice(defaultModelRef.indexOf(':') + 1),
+      }
+    : null
+  const effectiveProviderName = opts.providerName ?? defaultModelParts?.provider
+  const effectiveModelId = opts.modelId ?? defaultModelParts?.modelId
+
+  const { provider, apiKey, auth } = resolveProviderAndAuth(config, effectiveProviderName, {
     ...(opts.allowMissingKey ? { allowMissingKey: true } : {}),
   })
 
@@ -2133,9 +2228,11 @@ export async function bootstrapInteractiveSession(opts: BootstrapOptions = {}): 
 
   // 6. Meridian indexer
   const meridianIndexer = new MeridianIndexer(cwd)
-  // 后台闲时全量索引——懒建只覆盖 agent 读过的文件，backfill 逐步补齐全项目
-  // （hash 幂等，与懒建重叠零成本）；进程退出自然终止，半成品 hash 已落库。
-  setImmediate(() => { scheduleMeridianBackfill(meridianIndexer, cwd) })
+  // 启动全量回填改为 opt-in（RIVET_MERIDIAN_BACKFILL=1）。默认只靠 read_file 懒索引；
+  // 首次 repo_graph / repo_map 等工具会 on-demand 调度 backfill（见 scheduleMeridianBackfill）。
+  setImmediate(() => {
+    scheduleMeridianBackfill(meridianIndexer, cwd, { reason: 'startup' })
+  })
 
   // Memory epoch reset — 首次/升级后启动时一次性清空中毒的跨会话学习存量
   // （playbook.jsonl / recovery-journal / advisory-efficacy / mistake_entries），
@@ -2211,7 +2308,7 @@ export async function bootstrapInteractiveSession(opts: BootstrapOptions = {}): 
   // 启动 resume 模型亲和（决策见 decideStartupResumeModel 注释）。
   const startupResume = decideStartupResumeModel({
     resumed: wasSessionResumed(),
-    explicitModel: opts.modelId,
+    explicitModel: effectiveModelId,
     explicitProvider: opts.providerName,
     originalModel: wasSessionResumed() ? persist.loadMetadata()?.model : undefined,
     fallbackModelId: config.agent?.resumeFallbackModel,
@@ -2224,12 +2321,25 @@ export async function bootstrapInteractiveSession(opts: BootstrapOptions = {}): 
     auth: startupResume.target ? startupResume.target.auth : auth,
     config, sessionId, cwd,
     toolRegistry, persist, claimStore, fileHistory, refs,
-    domainKnowledgeStore, modelId: startupResume.target?.modelId ?? opts.modelId,
+    domainKnowledgeStore, modelId: startupResume.target?.modelId ?? effectiveModelId,
     session,
     inheritFrozenFrom: resumedFrozen,
+    // 晚绑定：ctx.setStatusLine 由 TUI 层在 TuiApp 创建后回填（agent 早于
+    // TUI 创建，资源压力提醒发生在运行期，届时已就绪）。
+    onStatusLine: text => ctx.setStatusLine?.(text),
   })
   refs.promptEngine = agent.config.promptEngine
   wireFrozenSnapshotPersist(persist, agent.config.promptEngine)
+  // 锚点补课（spec 3c 动作 B · 缺口 3）：恢复会话的历史消息在 wire 上
+  // 同样被截断，惰性重建锚点（与逐轮增量同粒度，并集确定性等价）。
+  // 非 spark / 开源构建：extractor 恒 undefined → 零行为差异。
+  if (existingMessages.length > 0 && wasSessionResumed()) {
+    const extractor = proRegistry.getAnchorExtractor(effectiveProviderName ?? '')
+    if (extractor) {
+      const anchors = anchorsFromMessages(existingMessages, extractor, agent.config.promptEngine.getModel(), agent.config.wireContext)
+      if (anchors.length > 0) agent.config.promptEngine.appendExcludedPathAnchors(anchors)
+    }
+  }
   // 兜底模型续跑：meta + JSONL 审计，对齐 switchAgentSession/桌面 resume-fallback 语义。
   if (startupResume.fallbackUsed && startupResume.target) {
     try {
@@ -2309,12 +2419,17 @@ export async function bootstrapInteractiveSession(opts: BootstrapOptions = {}): 
     agent.updateTools()
   }
 
+  // Pro 扩展点加载（spec 3b）：闭源模块（src/pro/）动态 import，失败静默降级。
+  // 必须在 server / config-routes 首次查询之前完成——否则 spark 节点不可见
+  // （sidecar 时序缝隙：先查后载则合并视图查不到注册项）。
+  await loadProModule()
+
   // 14. Shutdown handler
   const shutdown = createShutdownHandler({
     config, provider, apiKey, auth, sessionId, session, persist,
     claimStore, fileHistory, toolRegistry, agent, refs,
     domainKnowledgeStore, meridianIndexer, cwd,
-    shutdown: () => {}, // placeholder, replaced below
+    shutdown: async () => {}, // placeholder, replaced below
     flushTuiPerfSummary: async () => {}, // placeholder; TUI bridge is attached on final context
     heartbeatInterval,
   })

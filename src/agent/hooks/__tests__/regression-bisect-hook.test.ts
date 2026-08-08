@@ -26,11 +26,12 @@ function edit(file: string): RuntimeToolEvent {
   return { name: 'edit_file', success: true, input: { file_path: file } } as unknown as RuntimeToolEvent
 }
 
-function harness(objective: string | null = '排查设置页导航消失的回归') {
+function harness(objective: string | null = '排查设置页导航消失的回归', getContextWindow?: () => number) {
   const submitted: AdvisoryEntry[] = []
   const hook = createRegressionBisectHook({
     advisoryBus: { submit: (e: AdvisoryEntry) => { submitted.push(e) } },
     getObjective: () => objective,
+    ...(getContextWindow ? { getContextWindow } : {}),
   })
   return { submitted, hook }
 }
@@ -109,5 +110,15 @@ describe('regression-bisect hook', () => {
       hook.run(ctx, { name: 'bash', success: true, input: { command: 'npm test' } } as unknown as RuntimeToolEvent)
     }
     assert.equal(submitted.length, 1)
+  })
+
+  it('1M 窗口阈值放大到 12 轮（200K 基准 5 轮线性插值）', () => {
+    const { submitted, hook } = harness(undefined, () => 1_000_000)
+    // 11 轮纯诊断 < 12 → 不触发（旧 5 轮阈值下会误触发）
+    runDiagnosisTurns(hook, 1, 11)
+    assert.equal(submitted.length, 0, '1M 窗口 11 轮诊断空转不触发')
+    // 第 12 轮 → 触发
+    runDiagnosisTurns(hook, 100, 1)
+    assert.equal(submitted.length, 1, '1M 窗口第 12 轮触发')
   })
 })

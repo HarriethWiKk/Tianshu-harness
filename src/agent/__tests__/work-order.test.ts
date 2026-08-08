@@ -11,6 +11,7 @@ import {
   parseWorkerResult,
   READ_ONLY_WORKER_TOOLS,
   salvageWorkerResult,
+  WORKER_RESULT_SUBMIT_SCHEMA,
   WorkerResultParseError,
   WRITE_WORKER_TOOLS,
 } from '../work-order.js'
@@ -97,6 +98,26 @@ describe('work-order contract', () => {
     assert.deepEqual(result.changedFiles, [])
   })
 
+  it('ingest schema 保留 sourcesReviewed（双 schema 同步回归：裸 z.object strip 陷阱）', () => {
+    // 反证 1（计划 §瑶光）：只改 result schema 不改 ingest → worker 自报字段
+    // 在 parseWorkerResult 入口被 zod strip 静默剥掉。这条红说明双 schema 没同步。
+    const raw = JSON.stringify({
+      workOrderId: 'wo_src',
+      status: 'passed',
+      summary: 'checked sources',
+      findings: [],
+      artifacts: [],
+      changedFiles: [],
+      risks: [],
+      nextActions: [],
+      sourcesReviewed: 5,
+    })
+    const ingest = WORKER_RESULT_SUBMIT_SCHEMA.parse(JSON.parse(raw))
+    assert.equal(ingest.sourcesReviewed, 5, 'ingest 侧必须收下该键')
+    const result = parseWorkerResult(raw, 'wo_src')
+    assert.equal(result.sourcesReviewed, 5, 'parse 后 result 保留该键')
+  })
+
   it('skips non-result JSON before the WorkerResult packet', () => {
     const result = parseWorkerResult(`I inspected this scope {"note":"not the result"} and found:\n{
   "workOrderId": "wo_1",
@@ -164,6 +185,35 @@ describe('work-order contract', () => {
     }), 'wo_1')
     assert.equal(result.workOrderId, 'wo_1')
     assert.equal(result.status, 'passed')
+  })
+
+  it('rejects summary-only results without workOrderId (no fabricated green)', () => {
+    // A summary-only object (e.g. {"summary":"done","status":"passed"}) is NOT
+    // a worker packet — patching an id onto it would fabricate a fake passed.
+    // Must throw so the caller's repair loop fires instead of a green.
+    assert.throws(
+      () => parseWorkerResult(JSON.stringify({
+        summary: 'done',
+        status: 'passed',
+      }), 'wo_1'),
+      WorkerResultParseError,
+    )
+  })
+
+  it('defaults missing status to blocked only for real packets with workOrderId', () => {
+    // Fault tolerance applies to genuine worker packets: a real workOrderId
+    // with a missing status defaults to 'blocked' (never fabricated 'passed').
+    const result = parseWorkerResult(JSON.stringify({
+      workOrderId: 'wo_1',
+      summary: 'real packet without status',
+      findings: [],
+      artifacts: [],
+      changedFiles: [],
+      risks: [],
+      nextActions: [],
+    }), 'wo_1')
+    assert.equal(result.status, 'blocked')
+    assert.equal(result.workOrderId, 'wo_1')
   })
 
   it('builds a blocked result without leaking raw transcript content', () => {

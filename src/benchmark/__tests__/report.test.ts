@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { computeMatrixRow, generateMarkdownReport } from '../report.js'
+import { computeMatrixRow, generateMarkdownReport, renderSessionSections } from '../report.js'
 import type { BenchmarkRun, CapabilityMatrixRow } from '../types.js'
 
 function makeRun(
@@ -100,5 +100,55 @@ describe('generateMarkdownReport', () => {
     const md = generateMarkdownReport([], 'empty-suite')
     assert.ok(md.includes('empty-suite'))
     assert.ok(md.includes('No benchmark runs recorded'))
+  })
+})
+
+describe('renderSessionSections（测量回路 Phase 1）', () => {
+  it('returns empty string when no run carries session data（旧报告字节不变）', () => {
+    assert.equal(renderSessionSections([makeRun('t1', 'passed', 1, 1, 0)]), '')
+    assert.equal(renderSessionSections([]), '')
+  })
+
+  it('renders speculation arms and provider-dimension cache tables', () => {
+    const sparkRun: BenchmarkRun = {
+      ...makeRun('t1', 'passed', 2, 3, 0.001),
+      provider: 'deepseek-spark',
+      model: 'deepseek-v4-flash',
+      session: {
+        sessionId: 's1',
+        speculationStats: {
+          'tool-pattern': { enqueued: 8, hits: 2 },
+          llm: { enqueued: 4, hits: 3 },
+          combined: { enqueued: 0, hits: 0 }, // 全零臂不出行
+        },
+        cache: {
+          requests: 5, input: 5000, cacheRead: 4500, hitRatePct: 90,
+          byProviderModel: [
+            { provider: 'deepseek-spark', model: 'deepseek-v4-flash', requests: 5, input: 5000, cacheRead: 4500, hitRatePct: 90 },
+          ],
+        },
+      },
+    }
+    const officialRun: BenchmarkRun = {
+      ...makeRun('t1', 'passed', 2, 3, 0.001),
+      session: {
+        cache: {
+          requests: 5, input: 5000, cacheRead: 3000, hitRatePct: 60,
+          byProviderModel: [
+            { provider: 'deepseek', model: 'deepseek-v4-flash', requests: 5, input: 5000, cacheRead: 3000, hitRatePct: 60 },
+          ],
+        },
+      },
+    }
+
+    const md = renderSessionSections([sparkRun, officialRun])
+    assert.ok(md.includes('## Speculation Observe'))
+    assert.ok(md.includes('| deepseek-spark | deepseek-v4-flash | llm | 4 | 3 | 75.0% |'))
+    assert.ok(md.includes('| deepseek-spark | deepseek-v4-flash | tool-pattern | 8 | 2 | 25.0% |'))
+    assert.ok(!md.includes('| combined |'), '全零臂不渲染')
+    // spark 与官方同 wire 模型 id 各自成行——对照主体
+    assert.ok(md.includes('## Session Cache by Provider'))
+    assert.ok(md.includes('| deepseek-spark | deepseek-v4-flash | 5 | 5000 | 4500 | 90.0% |'))
+    assert.ok(md.includes('| deepseek | deepseek-v4-flash | 5 | 5000 | 3000 | 60.0% |'))
   })
 })

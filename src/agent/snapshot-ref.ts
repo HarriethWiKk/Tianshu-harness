@@ -34,7 +34,9 @@ export function computeSnapshotRef(baselineHead: string, ownedDiff: string): str
  * any failure or when there are no owned files, which still yields a stable ref.
  */
 export function computeOwnedDiff(baseCwd: string, baselineHead: string, ownedFiles: string[]): string {
-  if (!baselineHead || ownedFiles.length === 0) return ''
+  // baselineHead 来自快照元数据（磁盘读取）；拒绝 `-` 开头防止被 git 解析为选项
+  // （与 git.ts sanitizeBaseRef 同款防御，来源：codex-security targets.ts 调研）。
+  if (!baselineHead || baselineHead.startsWith('-') || ownedFiles.length === 0) return ''
   const result = spawnGitSync(['diff', '--no-color', baselineHead, '--', ...ownedFiles], {
     cwd: baseCwd,
     encoding: 'utf-8',

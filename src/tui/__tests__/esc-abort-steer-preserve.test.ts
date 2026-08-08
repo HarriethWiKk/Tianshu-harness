@@ -9,6 +9,14 @@ import { SteerBuffer } from '../steer-buffer.js'
 // updates the display ledger). The single real consumption point is
 // onSteerDrain → tool_result. So the buffer must survive an interrupt intact
 // and be consumed (once) only at the next tool-using turn.
+//
+// 补充（2026-08-08，ESC 回填）：用户主动 ESC 的 run settle 之后还有一个
+// 第二消费点——notifyRunSettled → backfillSteerToInput（输入框为空时把排队
+// 原文拉回输入框，Claude Code 风格）。它刻意用 getPendingEntries()+clear()
+// 而不是 drain()：drain 会把文本包进 [User guidance] 注入格式，回填要的是
+// 原文。这不违反上面的 peek-only 契约——契约锁的是 interrupt 路径本身
+// （abort 时 run 还活着，drain 会丢消息）；回填发生在 run 已 settle、队列
+// 再没有工具边界可 drain 之后，此时消费是唯一不丢消息的出路。
 describe('SteerBuffer: interrupt preserves messages (peek, not drain)', () => {
   it('getPending() returns queued messages WITHOUT emptying the buffer', () => {
     const buf = new SteerBuffer()

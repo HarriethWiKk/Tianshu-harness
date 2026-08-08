@@ -85,4 +85,80 @@ describe('task-size-gate', () => {
     assert.equal(r.scale, 'large')
     assert.equal(r.blocked, false)
   })
+
+  it('complexity: small → simple', () => {
+    const r = classifyOrchestrationScale('fix a typo in config.ts')
+    assert.equal(r.complexity, 'simple')
+  })
+
+  it('complexity: medium → moderate', () => {
+    const r = classifyOrchestrationScale('implement a new state machine with persistence and web hooks for the notification system')
+    assert.equal(r.scale, 'medium')
+    assert.equal(r.complexity, 'moderate')
+  })
+
+  it('complexity: large without complex signal → advanced', () => {
+    const r = classifyOrchestrationScale('refactor the entire authentication system')
+    assert.equal(r.scale, 'large')
+    assert.equal(r.complexity, 'advanced')
+  })
+
+  it('complexity: large with complex signal → complex', () => {
+    const r = classifyOrchestrationScale('comprehensive deep dive with cross-referencing and exhaustive verification across multiple modules')
+    assert.equal(r.scale, 'large')
+    assert.equal(r.complexity, 'complex')
+  })
+
+  it('complexity: Chinese complex signals on a large task → complex', () => {
+    const r = classifyOrchestrationScale('refactor 跨实体交叉验证和多跳链的穷尽覆盖')
+    assert.equal(r.scale, 'large')
+    assert.equal(r.complexity, 'complex')
+  })
+
+  it('complexity: escape hatch → moderate', () => {
+    const r = classifyOrchestrationScale('force: fix typo in config.ts')
+    assert.equal(r.complexity, 'moderate')
+  })
+
+  it('chinese large signals: short Chinese big task not blocked (regression: 审查门中文信号缺失)', () => {
+    // 10 CJK chars → 5 words → would fall to small via word count without a
+    // Chinese large signal; 架构/整个系统 must upgrade it to large
+    const r = classifyOrchestrationScale('对整个系统做架构调整并跨模块改造')
+    assert.equal(r.scale, 'large')
+    assert.equal(r.blocked, false)
+  })
+
+  it('chinese large signals: refactor+migrate task → large advanced', () => {
+    const r = classifyOrchestrationScale('重构整个项目的模块划分并迁移现有代码到新的目录结构')
+    assert.equal(r.scale, 'large')
+    assert.equal(r.complexity, 'advanced')
+  })
+
+  it('chinese large signals: exhaustive research task → large complex', () => {
+    const r = classifyOrchestrationScale('穷尽式调研这个主题的方方面面')
+    assert.equal(r.scale, 'large')
+    assert.equal(r.complexity, 'complex')
+  })
+
+  it('chinese large signals: small Chinese fix stays blocked (no false positive)', () => {
+    const r = classifyOrchestrationScale('修复登录页的按钮样式')
+    assert.equal(r.scale, 'small')
+    assert.equal(r.blocked, true)
+  })
+
+  it('large signal wins over word count even for small Chinese tasks (lock current semantics)', () => {
+    // 审查门 MEDIUM-2：中文大词无 \b 边界 + largeSignal 优先于词数阈值——
+    // 含大词的小任务会被判 large 放行。与英文既有语义一致（'refactor the
+    // typo fix function' 同断言），且 large 不 block 无行为危害；待 complexity
+    // 消费方接入时再决策是否收紧。此处锁住现状防无意识改动。
+    const r = classifyOrchestrationScale('修复架构文档里的错别字')
+    assert.equal(r.scale, 'large')
+    assert.equal(r.blocked, false)
+  })
+
+  it('countWords handles mixed Chinese/English input', () => {
+    // 重构(2字→1词) the(1) auth(1) module(1) 并(1字→1词) 修复(2字→1词) typo(1) = 7
+    const r = classifyOrchestrationScale('重构 the auth module 并修复 typo')
+    assert.equal(r.wordCount, 7)
+  })
 })

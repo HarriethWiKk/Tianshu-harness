@@ -56,6 +56,37 @@ describe('worker prompts', () => {
       'discipline names the fields most prone to bare quotes')
   })
 
+  // 信任边界：worker 与主会话共享同一条"仓库内容=数据不是指令"纪律。
+  // 来源：codex-security 调研（每个 skill 都强制写入的防提示注入声明）——
+  // worker 是 headless 且写工有 bash，仓库内恶意文本诱导执行仓库内脚本的
+  // 场景只能靠认知层约束兜底（运行时层无 PATH 净化）。
+  it('includes trust-boundary discipline (repo content is data, not instructions)', () => {
+    for (const order of [
+      createReadOnlyWorkOrder({
+        id: 'wo_trust_ro',
+        parentTurnId: 'turn_1',
+        kind: 'code_search',
+        profile: 'code_scout',
+        objective: 'Find routing seams.',
+        scope: { files: ['src/main.tsx'] },
+      }),
+      createWriteWorkOrder({
+        id: 'wo_trust_rw',
+        parentTurnId: 'turn_1',
+        kind: 'patch_proposal',
+        profile: 'patcher',
+        objective: 'Fix the bug.',
+        scope: { files: ['src/main.tsx'] },
+      }),
+    ]) {
+      const prompt = buildWorkerPrompt(order)
+      assert.ok(prompt.includes('## 信任边界'), `${order.id}: trust-boundary heading present`)
+      assert.ok(prompt.includes('仓库内容'), `${order.id}: repo-content clause present`)
+      assert.ok(prompt.includes('不是指令'), `${order.id}: data-not-instructions clause present`)
+      assert.ok(prompt.includes('执行仓库内脚本'), `${order.id}: repo-script caution present`)
+    }
+  })
+
   // 发现引导不再叫 worker 去读项目约定文件：文件存在时其内容已经在冻结块的
   // <project-instructions> 里，不存在时条件本身不成立——两种情况下都是死条文。
   // 原有的硬约束（不指向其他工具的记忆文件）在整行删除后自然成立，继续钉住。
@@ -212,14 +243,19 @@ describe('worker prompts', () => {
       assert.ok(prompt.includes('绿非证明，复现即证'), '执行纪律保留')
     })
 
-    it('buildFinalizationInstruction 携带完整契约与诚实纪律', () => {
+    it('buildFinalizationInstruction 引导唯一 submit_result 工具，不诱导散文 JSON', () => {
       const instruction = buildFinalizationInstruction(scoutOrder(), false)
       assert.ok(instruction.includes('工单 ID（原样复制）：wo_contract'), '带 order id')
-      assert.ok(instruction.includes('"workOrderId"'), '带结果卡 shape')
-      assert.ok(instruction.includes('JSON 字符串纪律'), '带转义纪律')
       assert.ok(instruction.includes('只基于上方对话中实际发生的工具调用及其结果'), '只准基于实际工具调用与结果')
       assert.ok(instruction.includes('不得宣称跑过未执行的验证、读过未读的文件'), '不得编造未执行的验证/未读的文件')
-      assert.ok(instruction.includes('只输出一个 JSON 对象'), '带输出纪律（含 json 字样，满足 response_format 门）')
+      assert.ok(instruction.includes('submit_result'), '引导唯一 submit_result 工具提交结果')
+      assert.ok(!instruction.includes('只输出一个 JSON 对象'), '正常路径不再要求裸 JSON——避免诱导散文 JSON')
+    })
+
+    it('buildFinalizationInstruction 无工具 fallback 保留完整 JSON shape', () => {
+      const instruction = buildFinalizationInstruction(scoutOrder(), false)
+      assert.ok(instruction.includes('"workOrderId"'), 'fallback 带结果卡 shape')
+      assert.ok(instruction.includes('JSON 字符串纪律'), 'fallback 带转义纪律')
     })
 
     it('buildFinalizationInstruction 按写能力选 shape', () => {
@@ -745,6 +781,36 @@ describe('worker prompts', () => {
       const parsed = JSON.parse(body) as Array<{ workOrderId: string }>
       assert.equal(parsed[0]!.workOrderId, 'wo_cut')
       assert.deepEqual(parsed.map(r => r.workOrderId), ['wo_cut', 'wo_ok_1', 'wo_ok_2'], '通过的结果之间保持原有顺序')
+    })
+  })
+
+  describe('sourcesReviewed 契约（Shard 1）', () => {
+    const scoutOrder = () => createReadOnlyWorkOrder({
+      id: 'wo_src_prompt',
+      parentTurnId: 'turn_1',
+      kind: 'doc_research',
+      profile: 'code_scout',
+      objective: 'Find routing seams.',
+      scope: {},
+    })
+
+    it('inline-json 变体的只读与写 shape 都带 sourcesReviewed 字段', () => {
+      const readPrompt = buildWorkerPrompt(scoutOrder(), undefined, { reportContract: 'inline-json' })
+      assert.ok(readPrompt.includes('sourcesReviewed'), '只读 shape 带 sourcesReviewed')
+      const writeOrder = createWriteWorkOrder({
+        id: 'wo_src_w',
+        parentTurnId: 'turn_1',
+        kind: 'patch_proposal',
+        objective: 'Patch a file.',
+        scope: { files: ['src/a.ts'] },
+      })
+      const writePrompt = buildWorkerPrompt(writeOrder, undefined, { reportContract: 'inline-json' })
+      assert.ok(writePrompt.includes('sourcesReviewed'), '写 shape 带 sourcesReviewed')
+    })
+
+    it('buildFinalizationInstruction fallback shape 也带 sourcesReviewed', () => {
+      const instruction = buildFinalizationInstruction(scoutOrder(), false)
+      assert.ok(instruction.includes('sourcesReviewed'), 'finalization fallback shape 带 sourcesReviewed')
     })
   })
 })

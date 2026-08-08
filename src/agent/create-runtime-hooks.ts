@@ -19,6 +19,7 @@ import { createRadioHook, type RadioHookDeps } from './hooks/radio-hook.js'
 import { createConsistencyCheckHook } from './hooks/consistency-check-hook.js'
 import { createMeridianHook, type MeridianHookDeps } from './hooks/meridian-hook.js'
 import { createPhysarumFileAccessHook, type PhysarumFileAccessHookDeps } from './hooks/physarum-file-access-hook.js'
+import { createImportGraphPredictHook, type ImportGraphPredictHookDeps } from './hooks/import-graph-predict-hook.js'
 import { createSonglineRuntimeHook } from './hooks/songline-hook.js'
 import { createConstellationRuntimeHook } from './hooks/constellation-hook.js'
 import { createHearthObserveHook } from './hooks/hearth-observe-hook.js'
@@ -52,6 +53,7 @@ import { createExternalClaimTrackingHook } from './hooks/external-claim-tracking
 import { createGeneralLedgerHook } from './hooks/general-ledger-hook.js'
 import { createGitClearAfterFailHook } from './hooks/git-clear-after-fail-hook.js'
 import { createDeadEndDetectorHook } from './hooks/dead-end-detector.js'
+import { createProbeDisciplineHook } from './hooks/probe-discipline-hook.js'
 import { createScriptIterationDetectorHook } from './hooks/script-iteration-detector.js'
 import { createBatchConvergenceHook } from './hooks/batch-convergence-hook.js'
 import { createRegressionBisectHook } from './hooks/regression-bisect-hook.js'
@@ -160,6 +162,8 @@ export interface RuntimeHookDeps {
   meridianIndexer?: MeridianIndexer | null
   /** Physarum topology learner for canonical file access sequences. */
   physarumFileAccess?: PhysarumFileAccessHookDeps
+  /** 经络 import-graph 观察臂（P2-2）：装配门控在 loop-factory（RIVET_SPEC_OBSERVE=1 且 meridianIndexer 存在）。 */
+  importGraphPredict?: ImportGraphPredictHookDeps
   /** Explicit opt-in for Songline substrate post-session deposit. Default: false. */
   songlineEnabled?: boolean
   /** 安全模式告警（层1）。config `agent.securityGuidance`；undefined = 默认开。 */
@@ -480,6 +484,10 @@ export function createDefaultRuntimeHooks(deps: RuntimeHookDeps): RuntimeHook[] 
     hooks.push(createPhysarumFileAccessHook(deps.physarumFileAccess))
   }
 
+  if (deps.importGraphPredict) {
+    hooks.push(createImportGraphPredictHook(deps.importGraphPredict))
+  }
+
   if (deps.songlineEnabled && deps.getTaskSummary) {
     hooks.push(createSonglineRuntimeHook({
       enabled: true,
@@ -676,6 +684,13 @@ export function createDefaultRuntimeHooks(deps: RuntimeHookDeps): RuntimeHook[] 
     }))
   }
 
+  // Probe Discipline: postTool hook — 诊断轮连续 ≥3 个只读工具而零探针 →
+  // 提示「30 秒探针能否杀死当前假设」。太一域洞察机制化（2026-08-07）。
+  // 冷却 8 次工具调用（防狂轰滥炸）；env RIVET_PROBE_DISCIPLINE=0 可关。
+  if (deps.advisoryBus && process.env.RIVET_PROBE_DISCIPLINE !== '0') {
+    hooks.push(createProbeDisciplineHook({ advisoryBus: deps.advisoryBus }))
+  }
+
   // Script-Iteration Detector: postTool hook — 同一脚本文件 edit→bash(run)→truncated→edit
   // 迭代 ≥3 次且无诊断工具 → 脚本迭代停滞。与 dead-end-detector 互补：
   // 那边抓 edit→verify-fail（需工具失败），这边抓 edit→bash→edit（工具全成功）。
@@ -702,6 +717,7 @@ export function createDefaultRuntimeHooks(deps: RuntimeHookDeps): RuntimeHook[] 
     hooks.push(createRegressionBisectHook({
       advisoryBus: deps.advisoryBus,
       getObjective: deps.getIntentObjective,
+      getContextWindow: deps.getContextWindow,
     }))
   }
 

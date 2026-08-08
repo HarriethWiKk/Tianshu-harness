@@ -165,6 +165,11 @@ async function overlayOwnedDiff(
 
   let appliedDiff = false
   if (rels.length > 0) {
+    // baselineHead 来自快照元数据（磁盘读取）；拒绝 `-` 开头防止被 git 解析为选项
+    // （与 git.ts sanitizeBaseRef 同款防御，来源：codex-security targets.ts 调研）。
+    if (baselineHead.startsWith('-')) {
+      throw new Error(`VSW overlay: invalid baseline head ${JSON.stringify(baselineHead)}`)
+    }
     // Diff baseline.head against the live working tree for owned paths only.
     // Captures tracked modifications and deletions; untracked-new files do not
     // appear here (git diff ignores untracked) — they go through materializeScope.

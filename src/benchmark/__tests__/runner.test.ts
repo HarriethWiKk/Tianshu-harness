@@ -141,4 +141,39 @@ describe('runBenchmark (dry-run)', () => {
       teardown()
     }
   })
+
+  it('passes harvested session telemetry through to the stored run（测量回路 Phase 1）', async () => {
+    setup()
+    try {
+      const session = {
+        sessionId: 'sess-x',
+        model: 'deepseek-v4-flash',
+        speculationStats: { llm: { enqueued: 5, hits: 3 } },
+        cache: {
+          requests: 4, input: 4000, cacheRead: 3600, hitRatePct: 90,
+          byProviderModel: [{ provider: 'deepseek-spark', model: 'deepseek-v4-flash', requests: 4, input: 4000, cacheRead: 3600, hitRatePct: 90 }],
+        },
+      }
+      const report = await runBenchmark({
+        suite: { tasks: [suite.tasks[0]!] },
+        suiteId: 'suite-session',
+        provider: 'deepseek-spark',
+        model: 'deepseek-v4-flash',
+        storeFile,
+        dryRun: false,
+        executor: {
+          async execute() {
+            return { status: 'passed', metrics: { turns: 1, toolCalls: 1, retries: 0 }, session }
+          },
+        },
+      })
+
+      assert.deepEqual(report.runs[0]!.session, session)
+      // 落盘行同样携带（report 侧从 store 读回时可用）
+      const stored = JSON.parse(readFileSync(storeFile, 'utf-8').trim()) as { session?: unknown }
+      assert.deepEqual(stored.session, session)
+    } finally {
+      teardown()
+    }
+  })
 })

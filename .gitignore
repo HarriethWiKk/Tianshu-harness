@@ -49,6 +49,13 @@ docs/research/*.md
 .rivet/artifacts/
 .rivet/sessions/
 .rivet/cache-log.jsonl
+.rivet/cache/
+.rivet/benchmark/
+.rivet/skills/deep-brainstorm/
+desktop/.rivet/
+.cc-switch/
+.rivet/check2.txt
+.rivet/*.txt
 .rivet/frames.jsonl
 .rivet/tool-stream.jsonl
 .rivet/meridian.db*

@@ -67,4 +67,20 @@ Here is the result:
     assert.equal(result.workOrderId, 'wo-test')
     assert.equal(result.status, 'passed')
   })
+
+  it('透传 sourcesReviewed——ingest schema 与 result schema 必须同步（否则 zod strip 剥掉）', () => {
+    const validOutput = `
+\`\`\`json
+{
+  "workOrderId": "wo-src",
+  "status": "passed",
+  "summary": "checked 7 sources",
+  "sourcesReviewed": 7
+}
+\`\`\`
+`
+    const result = parseWorkerResult(validOutput, 'wo-src')
+    assert.equal(result.workOrderId, 'wo-src')
+    assert.equal(result.sourcesReviewed, 7)
+  })
 })

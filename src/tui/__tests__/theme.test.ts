@@ -38,7 +38,7 @@ describe('getTheme', () => {
     const theme = getTheme(3)
     assert.equal(theme.primary, '#5aa9ff') // cool azure
     assert.equal(theme.error, '#f76b6b')   // coral red
-    assert.equal(theme.userColor, '#38bdf8')
+    assert.equal(theme.userColor, '#d8e2ee') // 冷调近白（原 #38bdf8 与 primary 撞色）
   })
 
   it('slate still available via explicit switch (cool teal accent)', () => {

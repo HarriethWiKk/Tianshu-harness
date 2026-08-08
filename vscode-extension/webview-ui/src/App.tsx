@@ -113,6 +113,17 @@ export function App() {
   }, [chat.items])
 
   const running = chat.status === 'running'
+  // 输入框历史召回（终端式 ↑/↓）的消息源：从 chat.items 过滤用户消息、最新在前。
+  // 与桌面端 ThreadView 的 historyTexts 同一语义；回放的历史事件同样入列，
+  // 所以 webview 重载/会话切换后仍可翻回早先发过的消息。
+  const promptHistory = useMemo(() => {
+    const out: string[] = []
+    for (let i = chat.items.length - 1; i >= 0; i--) {
+      const it = chat.items[i]!
+      if (it.kind === 'user' && it.text) out.push(it.text)
+    }
+    return out
+  }, [chat.items])
   // 有任何一个 provider 有可用 key 即视为已配置；null（旧内核）不挡对话
   const needsSetup =
     providerConfig !== undefined &&
@@ -211,6 +222,8 @@ export function App() {
         onClearFiles={() => setFileHits([])}
         onSubmit={submit}
         onAbort={() => activeId && send({ type: 'abort', sessionId: activeId })}
+        history={promptHistory}
+        sessionKey={activeId}
       />
     </div>
   )
@@ -882,10 +895,47 @@ function Composer(props: {
   onClearFiles: () => void
   onSubmit: (text: string) => void
   onAbort: () => void
+  /** 历史消息（最新在前），↑/↓ 终端式召回。 */
+  history: string[]
+  /** 会话标识——切换会话时重置历史浏览态（历史属于会话）。 */
+  sessionKey?: string
 }) {
   const [text, setText] = useState('')
   const debounceRef = useRef<ReturnType<typeof setTimeout>>()
   const textareaRef = useRef<HTMLTextAreaElement>(null)
+  // 历史浏览下标：null=正常输入；number=当前显示的是 history 中第几条。
+  // stashedDraft：首次按 ↑ 时暂存在输草稿，↓ 越过最新一条时恢复（shell 式往返）。
+  const histIdx = useRef<number | null>(null)
+  const stashedDraft = useRef('')
+  useEffect(() => { histIdx.current = null }, [props.sessionKey])
+
+  const recallHistory = (dir: 'prev' | 'next') => {
+    const n = props.history.length
+    if (n === 0) return
+    const cur = histIdx.current
+    if (dir === 'prev') {
+      const next = cur === null ? 0 : Math.min(cur + 1, n - 1)
+      if (cur === null) stashedDraft.current = text
+      histIdx.current = next
+      setText(props.history[next] ?? '')
+    } else {
+      if (cur === null) return
+      const next = cur - 1
+      if (next < 0) {
+        histIdx.current = null
+        setText(stashedDraft.current)
+        stashedDraft.current = ''
+      } else {
+        histIdx.current = next
+        setText(props.history[next] ?? '')
+      }
+    }
+    // 召回后光标落到末尾（shell parity）。
+    requestAnimationFrame(() => {
+      const ta = textareaRef.current
+      if (ta) ta.setSelectionRange(ta.value.length, ta.value.length)
+    })
+  }
 
   // 编辑器右键「发送到天枢」→ 追加到草稿
   useEffect(() => {
@@ -904,6 +954,9 @@ function Composer(props: {
   }
 
   const onChange = (value: string) => {
+    // 浏览态下编辑 = 退出浏览、编辑内容即新草稿（recallHistory 走裸 setText
+    // 不经此路）——否则继续翻页会把用户的改动静默丢掉。
+    histIdx.current = null
     setText(value)
     const q = mentionQuery(value)
     if (debounceRef.current) clearTimeout(debounceRef.current)
@@ -926,6 +979,8 @@ function Composer(props: {
     props.onSubmit(t)
     setText('')
     props.onClearFiles()
+    histIdx.current = null
+    stashedDraft.current = ''
   }
 
   const onDropFiles = (e: DragEvent) => {
@@ -980,6 +1035,23 @@ function Composer(props: {
         placeholder={props.running ? '运行中——输入将作为插话在下一工具边界注入' : '给天枢一个任务…（@ 提及文件，拖拽文件，Enter 发送，Shift+Enter 换行）'}
         onChange={(e) => onChange(e.target.value)}
         onKeyDown={(e) => {
+          // 历史召回（终端式 ↑/↓，与桌面端 lib/input-history.ts 同一语义）：
+          // 浏览态（已翻进历史）下 ↑/↓ 无条件继续翻——否则召回多行消息后光标
+          // 落在中间行，守卫会把后续 ↑/↓ 当成文本内移动，翻页被卡死；非浏览态
+          // 仅光标在首行/末行才触发，多行草稿内光标仍可自由移动。
+          if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+            const browsing = histIdx.current !== null
+            const hit = e.key === 'ArrowUp'
+              ? browsing || e.currentTarget.value.slice(0, e.currentTarget.selectionStart).indexOf('\n') === -1
+              : browsing || e.currentTarget.value.slice(e.currentTarget.selectionEnd).indexOf('\n') === -1
+            // 历史为空时不拦按键——否则浏览态 + 空历史会把 ↑/↓ 困死（preventDefault
+            // 了但 recallHistory 无可召回），光标动弹不得。
+            if (hit && props.history.length > 0) {
+              e.preventDefault()
+              recallHistory(e.key === 'ArrowUp' ? 'prev' : 'next')
+              return
+            }
+          }
           if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
             e.preventDefault()
             fire()

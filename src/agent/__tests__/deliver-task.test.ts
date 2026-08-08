@@ -675,7 +675,7 @@ describe('deliver-task — semantic task delivery tool', () => {
       routeReviewWorkflow: async () => { routeCalls++; return { tier: 'auto', verdict: 'verified', evidence: 'ok', rounds: 1 } },
       reviewDeps: {} as ReviewRouterDeps,
       commitOwnedFiles: () => ({ ok: true, output: 'commit abc123' }),
-      reviewConfig: { profiles: {}, skipAuto: true, mechanicalFastPath: true },
+      reviewConfig: { profiles: {}, skipAuto: true, skipAutoSpark: false, mechanicalFastPath: true },
     })
 
     const result = await tool.execute({ ...params, input: { commit: true, message: 'feat: scoped delivery' } })
@@ -696,7 +696,7 @@ describe('deliver-task — semantic task delivery tool', () => {
       routeReviewWorkflow: async () => { routeCalls++; return { tier: 'L2', verdict: 'verified', evidence: 'ran: npx tsc --noEmit → ok', rounds: 1 } },
       reviewDeps: {} as ReviewRouterDeps,
       commitOwnedFiles: () => ({ ok: true, output: 'commit abc123' }),
-      reviewConfig: { profiles: {}, skipAuto: true, mechanicalFastPath: true },
+      reviewConfig: { profiles: {}, skipAuto: true, skipAutoSpark: false, mechanicalFastPath: true },
     })
 
     const result = await tool.execute({ ...params, input: { commit: true, message: 'fix: scoped delivery', review_level: 'L2' } })
@@ -755,7 +755,7 @@ describe('deliver-task — semantic task delivery tool', () => {
       routeReviewWorkflow: async () => { routeCalls++; return { tier: 'L3', verdict: 'verified', evidence: 'ok', rounds: 0 } },
       reviewDeps: {} as ReviewRouterDeps,
       commitOwnedFiles: () => ({ ok: true, output: 'commit abc123' }),
-      reviewConfig: { profiles: {}, skipAuto: true, mechanicalFastPath: true },
+      reviewConfig: { profiles: {}, skipAuto: true, skipAutoSpark: false, mechanicalFastPath: true },
       goalAchieved: true,
     })
 
@@ -3125,5 +3125,51 @@ Do not declare a streamed response duplicate in the middle of the stream.
         else process.env.RIVET_SCOUT_FIREWALL = prev
       }
     })
+  })
+})
+
+// ── 提交卡死诊断插桩（2026-08-06，deliver_task isError 结果卡死排查）─────
+// RIVET_DEBUG=1 时 execute 关键阶段打时间戳标记；卡死时日志最后一个
+// stage 即卡点（execute 内 vs harness 结果回传层可区分）。
+describe('deliver-task stage markers', () => {
+  it('emits execute:start / report:done markers on the fast path (RIVET_DEBUG=1)', async () => {
+    const prevDebug = process.env.RIVET_DEBUG
+    process.env.RIVET_DEBUG = '1'
+    const warns: string[] = []
+    const origWarn = console.warn
+    console.warn = (...args: unknown[]) => { warns.push(args.join(' ')) }
+    try {
+      const { tool, params } = makeContext({
+        taskId: 't1',
+        ownedFiles: ['src/a.ts'],
+        verifications: [{ command: 'npx tsc --noEmit', status: 'passed' }],
+      })
+      const result = await tool.execute(params)
+      assert.equal(result.isError ?? false, false)
+      assert.ok(result.content.includes('GREEN'))
+    } finally {
+      console.warn = origWarn
+      if (prevDebug === undefined) delete process.env.RIVET_DEBUG
+      else process.env.RIVET_DEBUG = prevDebug
+    }
+    const markers = warns.filter(w => w.includes('[deliver-task]'))
+    assert.ok(markers.some(m => m.includes('execute:start')), `missing execute:start in: ${markers.join(' | ')}`)
+    assert.ok(markers.some(m => m.includes('report:done')), `missing report:done in: ${markers.join(' | ')}`)
+  })
+
+  it('stays silent without RIVET_DEBUG (zero production overhead)', async () => {
+    const prevDebug = process.env.RIVET_DEBUG
+    delete process.env.RIVET_DEBUG
+    const warns: string[] = []
+    const origWarn = console.warn
+    console.warn = (...args: unknown[]) => { warns.push(args.join(' ')) }
+    try {
+      const { tool, params } = makeContext({ taskId: 't2', ownedFiles: [] })
+      await tool.execute(params)
+    } finally {
+      console.warn = origWarn
+      if (prevDebug !== undefined) process.env.RIVET_DEBUG = prevDebug
+    }
+    assert.equal(warns.some(w => w.includes('[deliver-task]')), false)
   })
 })

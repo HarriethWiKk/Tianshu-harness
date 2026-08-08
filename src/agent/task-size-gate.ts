@@ -8,8 +8,14 @@
 
 export type OrchestrationScale = 'small' | 'medium' | 'large'
 
+// Four-tier complexity mapped from the research orchestration protocol §1
+// (极简/中等/进阶/复杂): simple↔极简, moderate↔中等, advanced↔进阶,
+// complex↔复杂. Only the 'large' scale is subdivided by COMPLEX_TASK_SIGNALS.
+export type TaskComplexity = 'simple' | 'moderate' | 'advanced' | 'complex'
+
 export interface ScaleResult {
   scale: OrchestrationScale
+  complexity: TaskComplexity
   reason: string
   wordCount: number
   blocked: boolean
@@ -48,6 +54,35 @@ const LARGE_TASK_SIGNALS: RegExp[] = [
   /\bend[\s-]to[\s-]end\b/i,
   /\boverhaul\b/i,
   /\bcomprehensive\b/i,
+  // 中文等价信号（与上方英文一一映射；中文没有 \b 单词边界，直接按字面匹配）：
+  // 架构↔architect、重构↔refactor、迁移↔migrate、跨模块↔cross-cutting、
+  // 整个系统↔entire system、多个模块↔multiple modules、系统级↔system-wide、
+  // 端到端↔end-to-end、全面↔comprehensive、穷尽↔exhaustive（研究类大任务）
+  /架构/,
+  /重构/,
+  /迁移/,
+  /跨模块|跨服务|跨系统/,
+  /整个\s*(系统|项目|代码库|仓库)/,
+  /多个\s*(文件|模块|组件|服务)/,
+  /系统级|全局/,
+  /端到端/,
+  /全面/,
+  /穷尽/,
+]
+
+// Complex-task signals from the research orchestration protocol §1 four-level
+// definition of "复杂" (跨实体类型交叉验证、多跳链、穷尽覆盖、语义过滤).
+// A 'large' task hitting one of these upgrades from 'advanced' to 'complex'.
+const COMPLEX_TASK_SIGNALS: RegExp[] = [
+  /\bmulti[\s-]hop\b/i,
+  /\bcross[\s-]referenc(e|ing|es)\b/i,
+  /\bexhaustive\b/i,
+  /\bcomprehensive\b/i,
+  /\bdeep[\s-]dive\b/i,
+  /跨实体/,
+  /多跳/,
+  /穷尽/,
+  /交叉验证/,
 ]
 
 /**
@@ -74,6 +109,7 @@ export function classifyOrchestrationScale(text: string): ScaleResult {
   if (ESCAPE_HATCH_RE.test(text)) {
     return {
       scale: 'medium',
+      complexity: 'moderate',
       reason: 'escape hatch prefix — gate bypassed',
       wordCount: countWords(text),
       blocked: false,
@@ -86,9 +122,13 @@ export function classifyOrchestrationScale(text: string): ScaleResult {
 
   // Large signal takes priority (unless escape hatch, already handled)
   if (largeSignal) {
+    const complexSignal = COMPLEX_TASK_SIGNALS.find(r => r.test(text))
     return {
       scale: 'large',
-      reason: `large task signal: ${largeSignal.source}`,
+      complexity: complexSignal ? 'complex' : 'advanced',
+      reason: complexSignal
+        ? `large task signal: ${largeSignal.source}; complex signal: ${complexSignal.source}`
+        : `large task signal: ${largeSignal.source}`,
       wordCount,
       blocked: false,
     }
@@ -98,6 +138,7 @@ export function classifyOrchestrationScale(text: string): ScaleResult {
   if (smallSignal && wordCount <= SMALL_SIGNAL_BOOST_LIMIT) {
     return {
       scale: 'small',
+      complexity: 'simple',
       reason: `Task appears small (${wordCount} words, signal: ${smallSignal.source}). Use inline execution instead of team_orchestrate.`,
       wordCount,
       blocked: true,
@@ -108,6 +149,7 @@ export function classifyOrchestrationScale(text: string): ScaleResult {
   if (wordCount <= SMALL_WORD_LIMIT) {
     return {
       scale: 'small',
+      complexity: 'simple',
       reason: `Task appears small (${wordCount} words). Use inline execution instead of team_orchestrate.`,
       wordCount,
       blocked: true,
@@ -116,6 +158,7 @@ export function classifyOrchestrationScale(text: string): ScaleResult {
 
   return {
     scale: 'medium',
+    complexity: 'moderate',
     reason: `${wordCount} words`,
     wordCount,
     blocked: false,

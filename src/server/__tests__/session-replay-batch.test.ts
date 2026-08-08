@@ -40,8 +40,8 @@ function mockRes() {
 }
 
 /** Parse SSE frames from accumulated writes into seq numbers.
- *  跳过 seq=0——那是 /stream 回放最前的 replay_window 合成元事件（冷热
- *  双通道窗口信息），不属于回放主体（见 session-history-page.test.ts）。 */
+ *  跳过 seq=0——那是 /stream 回放最前的合成元事件（replay_window 窗口信息 +
+ *  job_snapshot 任务建连快照），不属于回放主体（见 session-history-page.test.ts）。 */
 function parseSeqs(writes: string[]): number[] {
   const seqs: number[] = []
   for (const w of writes) {
@@ -310,7 +310,7 @@ test('replay stops writing and uncorks when the peer dies mid-slice', async () =
   let uncorkCalls = 0
   res.write = ((chunk: string) => {
     writeCalls++
-    if (writeCalls === 3) throw new Error('EPIPE')
+    if (writeCalls === 4) throw new Error('EPIPE')
     return originalWrite(chunk)
   }) as typeof res.write
   res.uncork = (() => {
@@ -321,8 +321,9 @@ test('replay stops writing and uncorks when the peer dies mid-slice', async () =
   const handler = routes['GET /sessions/:id/stream']!
   await handler({}, { id, since: '0' }, AUTH, res)
 
-  assert.equal(writeCalls, 3, 'closed replay must stop attempting writes')
+  assert.equal(writeCalls, 4, 'closed replay must stop attempting writes')
   assert.equal(uncorkCalls, 1, 'the interrupted slice must still be uncorked')
-  // 第 1 次 write 是 replay_window 元事件，第 2 次是 seq 1，第 3 次抛 EPIPE。
+  // 第 1 次 write 是 replay_window 元事件，第 2 次是 job_snapshot 建连快照
+  // （同为 seq=0 合成事件），第 3 次是 seq 1，第 4 次抛 EPIPE。
   assert.deepEqual(parseSeqs(writes), [1])
 })

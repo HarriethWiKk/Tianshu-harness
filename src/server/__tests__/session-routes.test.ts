@@ -168,6 +168,81 @@ test('T3: POST /steer validates the text field and is Bearer-gated', async () =>
   assert.equal(missing.status, 404)
 })
 
+// ── Phase 2: queue lane routes ──────────────────────────────────────
+
+test('Phase 2: POST /queue queues on a running session; 409 idle; 404 missing; 400 empty', async () => {
+  const { router } = setup()
+  const created = await router('POST', '/sessions', { prompt: 'go' }, AUTH)
+  const id = (created.body as { id: string }).id
+
+  const res = await router('POST', `/sessions/${id}/queue`, { text: 'follow up' }, AUTH)
+  assert.equal(res.status, 200)
+  const body = res.body as { queued: boolean; laneId: string }
+  assert.equal(body.queued, true)
+  assert.ok(typeof body.laneId === 'string' && body.laneId.length > 0)
+
+  const empty = await router('POST', `/sessions/${id}/queue`, { text: '  ' }, AUTH)
+  assert.equal(empty.status, 400)
+
+  const unauth = await router('POST', `/sessions/${id}/queue`, { text: 'x' }, {})
+  assert.equal(unauth.status, 401)
+
+  const missing = await router('POST', '/sessions/nope/queue', { text: 'x' }, AUTH)
+  assert.equal(missing.status, 404)
+
+  const idleCreated = await router('POST', '/sessions', {}, AUTH)
+  const idleId = (idleCreated.body as { id: string }).id
+  const idle = await router('POST', `/sessions/${idleId}/queue`, { text: 'x' }, AUTH)
+  assert.equal(idle.status, 409)
+})
+
+test('Phase 2: POST /steer accepts { laneId } and upgrades the queued entry', async () => {
+  const { router } = setup()
+  const created = await router('POST', '/sessions', { prompt: 'go' }, AUTH)
+  const id = (created.body as { id: string }).id
+
+  const queued = await router('POST', `/sessions/${id}/queue`, { text: 'upgrade via route' }, AUTH)
+  const { laneId } = queued.body as { laneId: string }
+
+  const upgraded = await router('POST', `/sessions/${id}/steer`, { laneId }, AUTH)
+  assert.equal(upgraded.status, 200)
+  assert.equal((upgraded.body as { queued: boolean }).queued, true)
+
+  // 已升级（非 queued）→ 409；未知 laneId → 404。
+  const again = await router('POST', `/sessions/${id}/steer`, { laneId }, AUTH)
+  assert.equal(again.status, 409)
+  const ghost = await router('POST', `/sessions/${id}/steer`, { laneId: 'ghost' }, AUTH)
+  assert.equal(ghost.status, 404)
+  // 既无 text 也无 laneId → 400。
+  const neither = await router('POST', `/sessions/${id}/steer`, {}, AUTH)
+  assert.equal(neither.status, 400)
+})
+
+test('Phase 2: POST /queue/retract retracts a queued entry; 404 unknown; 409 settled', async () => {
+  const { router } = setup()
+  const created = await router('POST', '/sessions', { prompt: 'go' }, AUTH)
+  const id = (created.body as { id: string }).id
+
+  const queued = await router('POST', `/sessions/${id}/queue`, { text: 'retract via route' }, AUTH)
+  const { laneId } = queued.body as { laneId: string }
+
+  const ok = await router('POST', `/sessions/${id}/queue/retract`, { laneId }, AUTH)
+  assert.equal(ok.status, 200)
+  assert.equal((ok.body as { ok: boolean }).ok, true)
+
+  const again = await router('POST', `/sessions/${id}/queue/retract`, { laneId }, AUTH)
+  assert.equal(again.status, 409)
+
+  const ghost = await router('POST', `/sessions/${id}/queue/retract`, { laneId: 'ghost' }, AUTH)
+  assert.equal(ghost.status, 404)
+
+  const missingSession = await router('POST', '/sessions/nope/queue/retract', { laneId }, AUTH)
+  assert.equal(missingSession.status, 404)
+
+  const noField = await router('POST', `/sessions/${id}/queue/retract`, {}, AUTH)
+  assert.equal(noField.status, 400)
+})
+
 test('@Computer mention in prompt mounts computer_use before the run', async () => {
   const { router, agents } = setup()
   const created = await router('POST', '/sessions', {}, AUTH) // idle

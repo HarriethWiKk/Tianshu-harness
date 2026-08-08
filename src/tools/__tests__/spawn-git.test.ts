@@ -146,6 +146,50 @@ describe('gitEnv', () => {
     const env = gitEnv(process.cwd())
     assert.ok(typeof env === 'object' && env !== null)
   })
+
+  it('strips unsafe GIT_* variables that can redirect git behavior', () => {
+    const prev: Record<string, string | undefined> = {}
+    const unsafeKeys = [
+      'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY',
+      'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_COMMON_DIR', 'GIT_REPLACE_REF_BASE',
+    ]
+    // GIT_SSH is a benign variable that must survive sanitization; note
+    // GIT_EDITOR is intentionally overwritten by ANTI_INTERACTIVE_ENV (not
+    // part of this test's contract).
+    const benign = ['GIT_SSH']
+    for (const k of [...unsafeKeys, ...benign]) {
+      prev[k] = process.env[k]
+      process.env[k] = k === 'GIT_SSH' ? '/usr/bin/ssh' : `/attacker/${k.toLowerCase()}`
+    }
+    try {
+      const env = gitEnv()
+      for (const k of unsafeKeys) {
+        assert.equal(env[k], undefined, `${k} must be stripped from git env`)
+      }
+      assert.equal(env['GIT_SSH'], '/usr/bin/ssh', 'benign GIT_SSH must be preserved')
+    } finally {
+      for (const k of [...unsafeKeys, ...benign]) {
+        if (prev[k] !== undefined) process.env[k] = prev[k]
+        else delete process.env[k]
+      }
+    }
+  })
+
+  it('strips unsafe GIT_* even when merged back via spawnGitSync opts.env', () => {
+    const prev = process.env['GIT_DIR']
+    try {
+      process.env['GIT_DIR'] = undefined
+      const r = spawnGitSync(['--version'], {
+        encoding: 'utf-8',
+        timeout: 5000,
+        env: { ...process.env, GIT_DIR: '/attacker/git', GIT_WORK_TREE: '/attacker/wt' },
+      })
+      assert.equal(r.status, 0, `git --version should succeed despite env GIT_DIR, got: ${r.stderr}`)
+    } finally {
+      if (prev !== undefined) process.env['GIT_DIR'] = prev
+      else delete process.env['GIT_DIR']
+    }
+  })
 })
 
 describe('spawnGitSync', () => {

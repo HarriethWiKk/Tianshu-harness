@@ -27,6 +27,31 @@ export interface ResolveGitCommandDeps {
 }
 
 /**
+ * Git 环境变量中能改变 git 行为指向攻击者控制位置的危险子集。
+ * 来源：codex-security targets.ts 调研（UNSUPPORTED_GIT_ENVIRONMENT，2026-08）。
+ * 只剥危险子集、保留 GIT_SSH/GIT_EDITOR 等良性变量——天枢是开发工具，
+ * 用户合法的 git 配置（如 GIT_SSH 自定义）必须保留。
+ */
+const UNSAFE_GIT_ENV = new Set([
+  'GIT_DIR',
+  'GIT_WORK_TREE',
+  'GIT_INDEX_FILE',
+  'GIT_OBJECT_DIRECTORY',
+  'GIT_ALTERNATE_OBJECT_DIRECTORIES',
+  'GIT_COMMON_DIR',
+  'GIT_REPLACE_REF_BASE',
+])
+
+/** 返回移除了危险 GIT_* 变量的环境拷贝（toUpperCase 比较覆盖 Windows 大小写不敏感）。 */
+export function sanitizeGitEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const copy = { ...env }
+  for (const name of Object.keys(copy)) {
+    if (UNSAFE_GIT_ENV.has(name.toUpperCase())) delete copy[name]
+  }
+  return copy
+}
+
+/**
  * Resolve the git executable path synchronously.
  *
  * Probe order:
@@ -70,7 +95,7 @@ export function resolveGitCommand(
 
 /** Resolved env for subprocess execution. Mirrors bash.ts / git.ts / run-tests.ts. */
 export function gitEnv(cwd?: string): NodeJS.ProcessEnv {
-  return getResolvedEnv(cwd)
+  return sanitizeGitEnv(getResolvedEnv(cwd))
 }
 
 /**
@@ -89,7 +114,7 @@ export function spawnGitSync(
 } {
   const cwd = typeof opts?.cwd === 'string' ? opts.cwd : undefined
   const command = resolveGitCommand(opts?.env)
-  const env = { ...gitEnv(cwd), ...opts?.env }
+  const env = sanitizeGitEnv({ ...gitEnv(cwd), ...opts?.env })
   return spawnSync(command, args, {
     encoding: 'utf-8',
     ...opts,
@@ -112,7 +137,7 @@ export function spawnGit(
 ): ReturnType<typeof spawn> {
   const cwd = typeof opts?.cwd === 'string' ? opts.cwd : undefined
   const command = resolveGitCommand(opts?.env)
-  const env = { ...gitEnv(cwd), ...opts?.env }
+  const env = sanitizeGitEnv({ ...gitEnv(cwd), ...opts?.env })
   return spawn(command, args, { ...opts, env, windowsHide: true })
 }
 
@@ -129,7 +154,7 @@ export function execFileGit(
 ): ReturnType<typeof execFile> {
   const cwd = typeof opts?.cwd === 'string' ? opts.cwd : undefined
   const command = resolveGitCommand(opts?.env)
-  const env = { ...gitEnv(cwd), ...opts?.env }
+  const env = sanitizeGitEnv({ ...gitEnv(cwd), ...opts?.env })
   const mergedOpts = { ...opts, encoding: 'utf-8' as const, env, windowsHide: true }
   if (cb) {
     return execFile(command, args, mergedOpts, cb)

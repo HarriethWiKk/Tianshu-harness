@@ -173,7 +173,19 @@ export class FleetRegistry {
     if (existing) {
       // 终态重放（settle 即时事件 + 批末兜底循环双发是设计使然）：冻结终态
       // 时刻与状态——不重算 elapsed、不重复标 unread，只补缺 model/usage。
+      // 例外（审查门 ee4134c5a HIGH）：worker_gone 是 CLI reconcile 的**推断**
+      // 终态（isWorkerRunning 弱代理在 controller 清理→终态发布间隙短暂为
+      // false，5s 扫描可能误补）。真实终态到达时必须覆盖它，否则成功 worker
+      // 被永久误标 failed。非 worker_gone 终态维持冻结语义（迟到事件不覆盖）。
       if (existing.terminal && terminal) {
+        if (existing.failureReason === 'worker_gone' && activity.failureReason !== 'worker_gone') {
+          existing.status = activity.status
+          existing.failureReason = activity.failureReason
+          existing.updatedAt = now
+          if (activity.progressLine) existing.activity = activity.progressLine
+          this.stateVersion++
+          return
+        }
         let filled = false
         if (activity.model && !existing.model) { existing.model = activity.model; filled = true }
         if (activity.usage && !existing.usage) { existing.usage = activity.usage; filled = true }
@@ -408,12 +420,33 @@ export class FleetRegistry {
     return this.records.size === 0 && this.terminalRecords.size === 0
   }
 
-  /** 是否有任一 worker 仍在跑（auto-collapse 判据）。 */
+  /** 是否已有任一 worker 仍在跑（auto-collapse 判据）。 */
   hasActive(): boolean {
     for (const r of this.records.values()) {
       if (!r.terminal) return true
     }
     return false
+  }
+
+  /**
+   * CLI reconcile 判定（sweepStaleDelegationNodes 的 TUI 等价物，2026-08）：
+   * 返回「fleet 里 running 但实际已不在跑」的 worker——终态事件漏发的兜底
+   * （worker 进程死亡/会话丢失但 delegate 工具异常路径未触发补发）。调用方
+   * 对返回的每个 worker 补发 failed 终态；补发后记录转 terminal，再次扫描
+   * 不再返回（幂等）。isRunning 由调用方注入（CLI 端 = coordinator.isWorkerRunning）。
+   */
+  findGoneWorkers(
+    isRunning: (workerId: string) => boolean,
+    now: number = Date.now(),
+  ): FleetWorkerView[] {
+    const gone: FleetWorkerView[] = []
+    for (const r of this.records.values()) {
+      if (r.terminal) continue
+      if (isRunning(r.workerId)) continue
+      gone.push(this.toView(r, now))
+    }
+    // view 无 startedAt；同一 now 下 elapsedMs 升序 = startedAt 升序。
+    return gone.sort((a, b) => a.elapsedMs - b.elapsedMs)
   }
 
   clear(): void {

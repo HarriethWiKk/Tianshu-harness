@@ -7,6 +7,66 @@ function running(workOrderId: string, parentToolId: string, profile?: string, pr
   return { workOrderId, parentToolId, profile, status: 'running', progressLine }
 }
 
+test('FleetRegistry: worker_gone 推断终态可被真实终态覆盖（误杀窗口修复）', () => {
+  // 审查门（ee4134c5a）HIGH：isWorkerRunning 弱代理在「controller 清理→终态
+  // 发布」间隙短暂为 false，5s reconcile 可能补发 failed(worker_gone)；
+  // 随后真实 passed 到达时，终态重放分支若不覆盖 status，成功 worker 被永久误标。
+  const fleet = new FleetRegistry()
+  fleet.apply(running('wo_w', 'tool_a', 'patcher'), 1000)
+  // reconcile 误杀：补发推断终态
+  fleet.apply({ workOrderId: 'wo_w', parentToolId: 'tool_a', status: 'failed', failureReason: 'worker_gone' }, 6000)
+  assert.equal(fleet.getWorkerById('wo_w')!.status, 'failed')
+  // 真实终态到达：必须覆盖 worker_gone 占位
+  fleet.apply({ workOrderId: 'wo_w', parentToolId: 'tool_a', status: 'passed', progressLine: 'real done' }, 7000)
+  const w = fleet.getWorkerById('wo_w')!
+  assert.equal(w.status, 'passed', '真实终态必须覆盖 worker_gone 推断终态')
+  assert.equal(w.panelStatus, 'done')
+  assert.equal(w.failureReason, undefined)
+  assert.equal(w.activity, 'real done')
+  // elapsed 冻结在新终态时刻
+  assert.equal(w.elapsedMs, 6000)
+})
+
+test('FleetRegistry: 非 worker_gone 终态不被后续事件覆盖（终态冻结语义不变）', () => {
+  const fleet = new FleetRegistry()
+  fleet.apply(running('wo_r', 'tool_a', 'reviewer'), 1000)
+  fleet.apply({ workOrderId: 'wo_r', parentToolId: 'tool_a', status: 'failed', failureReason: 'review-findings' }, 2000)
+  // 迟到 passed 不覆盖真实失败终态
+  fleet.apply({ workOrderId: 'wo_r', parentToolId: 'tool_a', status: 'passed' }, 3000)
+  const w = fleet.getWorkerById('wo_r')!
+  assert.equal(w.status, 'failed', '真实失败终态保持冻结')
+  assert.equal(w.elapsedMs, 1000)
+})
+
+test('FleetRegistry: findGoneWorkers 只返回 running 且已不在跑的 worker（CLI reconcile 判定）', () => {
+  const fleet = new FleetRegistry()
+  fleet.apply(running('wo_gone', 'tool_a', 'patcher'), 1000)
+  fleet.apply(running('wo_alive', 'tool_b', 'reviewer'), 1000)
+  fleet.apply(running('wo_done', 'tool_c', 'verifier'), 1000)
+  fleet.apply({ workOrderId: 'wo_done', parentToolId: 'tool_c', status: 'passed' }, 2000)
+
+  const isRunning = (id: string) => id === 'wo_alive'
+  const gone = fleet.findGoneWorkers(isRunning, 3000)
+  const ids = gone.map(v => v.workerId)
+  // wo_gone：running 但 isRunning=false → 补发候选
+  // wo_alive：running 且 isRunning=true → 不是
+  // wo_done：已终态 → 不是
+  assert.deepEqual(ids, ['wo_gone'])
+  const g = gone[0]!
+  assert.equal(g.terminal, false)
+  assert.equal(g.parentToolId, 'tool_a', '补发需要原 parentToolId 归组')
+})
+
+test('FleetRegistry: findGoneWorkers 补发后不再重复返回（幂等）', () => {
+  const fleet = new FleetRegistry()
+  fleet.apply(running('wo_g2', 'tool_a', 'patcher'), 1000)
+  const isRunning = () => false
+  assert.equal(fleet.findGoneWorkers(isRunning, 2000).length, 1)
+  // 模拟补发终态后：fleet 已 terminal，再次扫不返回
+  fleet.apply({ workOrderId: 'wo_g2', parentToolId: 'tool_a', status: 'failed', failureReason: 'worker_gone' }, 2500)
+  assert.equal(fleet.findGoneWorkers(isRunning, 3000).length, 0)
+})
+
 test('FleetRegistry: 首见 running 进入 active，elapsed 自 startedAt 计', () => {
   const fleet = new FleetRegistry()
   fleet.apply(running('wo_team:T1', 'tool_a', 'reviewer', '⚙ read_file'), 1000)

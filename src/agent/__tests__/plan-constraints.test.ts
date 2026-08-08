@@ -1,8 +1,9 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
-import { extractPlanConstraints, renderPlanConstraints, resolvePlanConstraints, type PlanConstraint } from '../plan-constraints.js'
+import { extractPlanConstraints, renderPlanConstraints, resolvePlanConstraints, constraintsFromUnifiedPlan, findApprovedPlanConstraints, resetApprovedPlanCache, type PlanConstraint } from '../plan-constraints.js'
 import { withPlanConstraints } from '../coordinator.js'
 
 /** D5 计划「## 反目标」真实片段。 */
@@ -119,6 +120,15 @@ function makeTempPlan(): string {
   return plan
 }
 
+/** 隔离 cwd —— 断言「解析不到 → []」时必须用空仓库。解析链最后一环是回落到
+ *  最近 APPROVED 计划（有意设计），拿真实仓库 cwd 会读到 .rivet/plans/ 里的
+ *  真计划而返回非空，把「路径没读成」误判成「逃逸守卫失效」。 */
+function makeIsolatedCwd(): string {
+  const cwd = mkdtempSync(join(tmpdir(), 'plan-constraints-cwd-'))
+  mkdirSync(join(cwd, '.rivet', 'plans'), { recursive: true })
+  return cwd
+}
+
 test('优先级：markdown 与 planPath 不同 → 取 markdown 那份', () => {
   const plan = makeTempPlan()
   const md = '# P\n\n## 反目标\n\n- 来自 markdown\n'
@@ -128,17 +138,27 @@ test('优先级：markdown 与 planPath 不同 → 取 markdown 那份', () => {
 })
 
 test('objective 识别：<绝对路径> 命中；路径不存在 → [] 不抛错', () => {
-  const plan = makeTempPlan()
-  const hit = resolvePlanConstraints(process.cwd(), { objective: `做 X 的落地实施 <${plan}>` })
-  assert.equal(hit.length, 1)
-  assert.ok(hit[0]!.includes('[计划反目标]'))
-  const miss = resolvePlanConstraints(process.cwd(), { objective: `做 X <${join(process.cwd(), '.rivet', 'no-such-plan.md')}>` })
-  assert.deepEqual(miss, [])
+  const cwd = makeIsolatedCwd()
+  try {
+    const plan = join(cwd, 'plan.md')
+    writeFileSync(plan, '# P\n\n## 反目标\n\n- 不扩展范围\n')
+    const hit = resolvePlanConstraints(cwd, { objective: `做 X 的落地实施 <${plan}>` })
+    assert.equal(hit.length, 1)
+    assert.ok(hit[0]!.includes('[计划反目标]'))
+    const miss = resolvePlanConstraints(cwd, { objective: `做 X <${join(cwd, '.rivet', 'no-such-plan.md')}>` })
+    assert.deepEqual(miss, [])
+  } finally {
+    rmSync(cwd, { recursive: true, force: true })
+  }
 })
 
 test('路径逃逸：objective 塞 ../../etc/passwd.md → 不读，返回 []', () => {
-  const res = resolvePlanConstraints(process.cwd(), { objective: '落地 <../../etc/passwd.md>' })
-  assert.deepEqual(res, [])
+  const cwd = makeIsolatedCwd()
+  try {
+    assert.deepEqual(resolvePlanConstraints(cwd, { objective: '落地 <../../etc/passwd.md>' }), [])
+  } finally {
+    rmSync(cwd, { recursive: true, force: true })
+  }
 })
 
 test('RIVET_PLAN_CONSTRAINTS=0 → 恒返回 []，测试后恢复', () => {
@@ -175,4 +195,179 @@ test('withPlanConstraints：getPlanConstraints 返回空 → 只用 request', ()
   const cfg = { getPlanConstraints: () => [] }
   assert.deepEqual(withPlanConstraints(['任务级约束'], 'x', cfg), ['任务级约束'])
   assert.equal(withPlanConstraints(undefined, 'x', cfg), undefined)
+})
+
+// ── 双源防冲突（D8 接线后）：request 已含计划级条目 → 兜底让位 ──
+
+test('withPlanConstraints：request 已含 [计划反目标] → 跳过 getPlanConstraints（双源防冲突）', () => {
+  let calls = 0
+  const cfg = { getPlanConstraints: (objective: string) => { calls++; assert.equal(objective, 'x'); return ['[计划反目标] 兜底条目'] } }
+  const out = withPlanConstraints(['[计划反目标] 议事会条目'], 'x', cfg)
+  assert.deepEqual(out, ['[计划反目标] 议事会条目'])
+  assert.equal(calls, 0, '已含计划级条目时兜底不应被调用')
+})
+
+test('withPlanConstraints：request 已含 [计划约束] → 同样跳过（不只反目标前缀）', () => {
+  let calls = 0
+  const cfg = { getPlanConstraints: () => { calls++; return [] } }
+  const out = withPlanConstraints(['[计划约束] 暂缓项'], 'x', cfg)
+  assert.deepEqual(out, ['[计划约束] 暂缓项'])
+  assert.equal(calls, 0)
+})
+
+test('withPlanConstraints：request 只有任务级 → 仍追加计划级（任务级不触发跳过，兜底保留）', () => {
+  let calls = 0
+  const cfg = { getPlanConstraints: () => { calls++; return ['[计划反目标] 兜底条目'] } }
+  const out = withPlanConstraints(['任务级约束'], 'x', cfg)
+  assert.deepEqual(out, ['任务级约束', '[计划反目标] 兜底条目'])
+  assert.equal(calls, 1)
+})
+
+// ── 真实语料形态回归 ──
+//
+// 上面那批用例喂的是手工裁剪过的干净片段，所以照不到下面三个形状——它们只在整份
+// 计划文档里出现，而条目是**逐字**渲染进 worker 提示词的。
+
+/** 复刻真实计划的排版：加粗标签段、非标签的加粗行、分割线、约束段。 */
+const REAL_SHAPES = `# P
+
+**非目标：**
+
+- 不动 X
+
+**技术栈：** TypeScript strict / ESM
+
+---
+
+## 机制
+
+**约束**
+
+- 通过环境变量 RIVET_TERSE=0 可关闭
+`
+
+test('分割线不是列表条目：--- / *** / - - - 均不产出条目', () => {
+  for (const rule of ['---', '***', '___', '- - -', '* * *']) {
+    const items = extractPlanConstraints(`## 反目标\n\n- 真条目\n\n${rule}\n`)
+    assert.deepEqual(items.map(i => i.text), ['真条目'], `分割线 ${rule} 被当成了条目`)
+  }
+})
+
+test('未命中标签名的加粗行：不产出残缺条目，且终止加粗列表', () => {
+  const items = extractPlanConstraints(REAL_SHAPES)
+  // `**技术栈：** …` 曾被 `*` 当成项目符号，吐出 `*技术栈：** TypeScript strict`
+  assert.ok(!items.some(i => i.text.startsWith('*')), `残缺加粗行进了产出：${JSON.stringify(items.map(i => i.text))}`)
+  // 且它之后的内容不再算在「非目标」名下
+  assert.ok(!items.some(i => i.section === '非目标' && i.text.includes('TypeScript')))
+})
+
+test('**约束** 是 constraint 而非 anti-goal——不给实现约束打禁令前缀', () => {
+  const items = extractPlanConstraints(REAL_SHAPES)
+  const item = items.find(i => i.text.includes('RIVET_TERSE'))
+  assert.ok(item, '约束段未被提取')
+  assert.equal(item!.kind, 'constraint')
+  assert.equal(item!.section, '约束')
+  const rendered = renderPlanConstraints([item!])
+  assert.ok(rendered[0]!.startsWith('[计划约束] '), `前缀错了：${rendered[0]}`)
+})
+
+test('渲染排序：anti-goal → constraint → assumption', () => {
+  const items: PlanConstraint[] = [
+    { kind: 'assumption', text: 'H', section: '待验证假设' },
+    { kind: 'constraint', text: 'C', section: '约束' },
+    { kind: 'anti-goal', text: 'G', section: '反目标' },
+  ]
+  const rendered = renderPlanConstraints(items)
+  assert.deepEqual(rendered, ['[计划反目标] G', '[计划约束] C', '[计划待验证假设·执行期先验证] H'])
+})
+
+test('整份文档不变量：产出里没有分割线残渣、没有 markdown 残缺标记', () => {
+  const items = extractPlanConstraints(REAL_SHAPES)
+  assert.equal(items.length, 2, `产出条数意外：${JSON.stringify(items.map(i => i.text))}`)
+  for (const item of items) {
+    assert.ok(!/^[-*_\s]+$/.test(item.text), `纯符号条目：${JSON.stringify(item.text)}`)
+    assert.ok(!item.text.startsWith('*'), `残缺加粗标记：${JSON.stringify(item.text)}`)
+  }
+})
+
+// ── constraintsFromUnifiedPlan（starflow/team 的 planJson 契约 → 计划约束）──
+
+test('constraintsFromUnifiedPlan：nonGoals → [计划反目标]，obligations 两 kind → [计划约束]', () => {
+  const out = constraintsFromUnifiedPlan({
+    nonGoals: ['不动 team 归层', '不做运行时动态挂载'],
+    obligations: [
+      { kind: 'deferred_decision', text: '暂缓项「备选方案B」——交付前需有着落' },
+      { kind: 'high_risk_mitigation', text: '高危风险「缓存失效」的缓解承诺：加字节稳定测试' },
+    ],
+  })
+  assert.deepEqual(out, [
+    '[计划反目标] 不动 team 归层',
+    '[计划反目标] 不做运行时动态挂载',
+    '[计划约束] 暂缓项「备选方案B」——交付前需有着落',
+    '[计划约束] 高危风险「缓存失效」的缓解承诺：加字节稳定测试',
+  ])
+})
+
+test('constraintsFromUnifiedPlan：advisory_gate 跳过（走 verification 通道），空输入 → []', () => {
+  assert.deepEqual(constraintsFromUnifiedPlan({
+    nonGoals: [],
+    obligations: [{ kind: 'advisory_gate', text: 'npx tsc --noEmit' }],
+  }), [])
+  assert.deepEqual(constraintsFromUnifiedPlan({}), [])
+  assert.deepEqual(constraintsFromUnifiedPlan({ nonGoals: ['  '], obligations: [{ kind: 'deferred_decision', text: '  ' }] }), [])
+})
+
+// ── findApprovedPlanConstraints 缓存（TTL + 目录 mtime 双重失效，非计时断言）──
+
+/** 建一个带 .rivet/plans 的隔离 cwd，写入一份 APPROVED 计划（含反目标条目）。 */
+function makeApprovedPlanCwd(antiGoal: string): string {
+  const cwd = mkdtempSync(join(tmpdir(), 'plan-cache-cwd-'))
+  mkdirSync(join(cwd, '.rivet', 'plans'), { recursive: true })
+  writeFileSync(join(cwd, '.rivet', 'plans', 'p1.md'),
+    `# P\n\n> **Status: APPROVED** — ${new Date().toISOString()}\n\n## 反目标\n\n- ${antiGoal}\n`)
+  return cwd
+}
+
+test('缓存：TTL 内原地改写（目录 mtime 不变）→ 仍读到旧值；新增计划 → 立即失效', () => {
+  const cwd = makeApprovedPlanCwd('旧条目')
+  try {
+    const first = findApprovedPlanConstraints(cwd)
+    assert.deepEqual(first, ['[计划反目标] 旧条目'])
+
+    // 原地改写同一文件（改内容不更新父目录 mtime）→ TTL 内应命中缓存读旧值。
+    writeFileSync(join(cwd, '.rivet', 'plans', 'p1.md'),
+      `# P\n\n> **Status: APPROVED** — ${new Date().toISOString()}\n\n## 反目标\n\n- 新条目（原地改写）\n`)
+    const stale = findApprovedPlanConstraints(cwd)
+    assert.deepEqual(stale, ['[计划反目标] 旧条目'], 'TTL 内原地改写应读到缓存旧值（目录 mtime 未变）')
+
+    // 新增计划文件（改变目录 mtime）→ 立即失效重读。
+    writeFileSync(join(cwd, '.rivet', 'plans', 'p2.md'),
+      `# P2\n\n> **Status: APPROVED** — ${new Date().toISOString()}\n\n## 反目标\n\n- 新增计划的条目\n`)
+    const fresh = findApprovedPlanConstraints(cwd)
+    assert.deepEqual(fresh, ['[计划反目标] 新增计划的条目'], '目录 mtime 变化应立即失效')
+
+    // reset 后重新读取（缓存是模块级状态，测试必须能清）。
+    resetApprovedPlanCache()
+    const afterReset = findApprovedPlanConstraints(cwd)
+    assert.deepEqual(afterReset, ['[计划反目标] 新增计划的条目'])
+  } finally {
+    resetApprovedPlanCache()
+    rmSync(cwd, { recursive: true, force: true })
+  }
+})
+
+test('缓存：目录不存在 → 「无计划」也缓存；目录出现（mtime 变化）→ 立即读到', () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'plan-cache-empty-'))
+  try {
+    assert.equal(findApprovedPlanConstraints(cwd), undefined)
+    // 目录尚不存在时重复调用不重试（缓存了「无计划」——无法直接观测内部，
+    // 以「目录出现后立即失效」验证 mtime 通道仍工作）。
+    mkdirSync(join(cwd, '.rivet', 'plans'), { recursive: true })
+    writeFileSync(join(cwd, '.rivet', 'plans', 'p1.md'),
+      `# P\n\n> **Status: APPROVED** — ${new Date().toISOString()}\n\n## 反目标\n\n- 出现后的条目\n`)
+    assert.deepEqual(findApprovedPlanConstraints(cwd), ['[计划反目标] 出现后的条目'])
+  } finally {
+    resetApprovedPlanCache()
+    rmSync(cwd, { recursive: true, force: true })
+  }
 })

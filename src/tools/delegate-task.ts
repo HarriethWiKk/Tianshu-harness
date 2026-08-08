@@ -15,11 +15,39 @@ import {
   toBudgetOverride,
 } from './delegate-budget.js'
 import type { Tool, ToolCallParams, ToolResult } from './types.js'
-import { createActivityStreamer, createDelegationActivityMapper, progressSnippet } from './worker-activity-stream.js'
+import { createActivityStreamer, createDelegationActivityMapper, terminalActivity } from './worker-activity-stream.js'
 import type { WorkerActivityEvent } from '../agent/coordinator.js'
 
 export interface DelegateTaskCoordinator {
-  delegate(request: DelegationRequest, abortSignal?: AbortSignal): Promise<CoordinatorRun>
+  delegate(
+    request: DelegationRequest,
+    abortSignal?: AbortSignal,
+    onOrderCreated?: (orderId: string) => void,
+  ): Promise<CoordinatorRun>
+}
+
+/** 适配器目标的最低结构要求（生产端是 DelegationCoordinator）。 */
+export interface CoordinatorDelegateLike {
+  delegate: DelegateTaskCoordinator['delegate']
+}
+
+/**
+ * 生产接线适配器（bootstrap）：把「按需取 coordinator」的 getter 包装成工具
+ * 要的 DelegateTaskCoordinator。独立导出是因为适配器丢参不会触发任何编译
+ * 错误（少参函数可赋多参签名）——第二参 signal 丢过（审查 H3），第三参
+ * onOrderCreated 也丢过：工具侧拿不到 dispatchedOrderId，异常路径补发终态
+ * 在生产整体失效（35f459b8f 复评）。
+ */
+export function createCoordinatorDelegateAdapter(
+  getCoordinator: () => CoordinatorDelegateLike | null | undefined,
+): DelegateTaskCoordinator {
+  return {
+    delegate: (request, signal, onOrderCreated) => {
+      const coordinator = getCoordinator()
+      if (!coordinator) return Promise.reject(new Error('DelegationCoordinator not initialized'))
+      return coordinator.delegate(request, signal, onOrderCreated)
+    },
+  }
 }
 
 /** Dynamic profile validation — accepts built-in + user-loaded profiles */
@@ -76,6 +104,7 @@ export function formatUiContent(run: CoordinatorRun): string {
       summary: r.summary,
       findingsCount: r.findings?.length ?? 0,
       changedFilesCount: r.changedFiles?.length ?? 0,
+      sourcesReviewedCount: r.sourcesReviewed,
       failureReason: r.failureReason,
       evidenceStatus: r.evidenceStatus,
     })
@@ -156,106 +185,129 @@ export function createDelegateTaskTool(
           }
         : undefined
 
-      const run = await coordinator.delegate({
-        parentTurnId: params.toolUseId,
-        objective: taskObjective,
-        kind: parsed.data.kind ?? 'code_search',
-        profile: (parsed.data.profile ?? DEFAULT_DELEGATE_PROFILE) as import('../agent/work-order.js').WorkerProfile,
-        authority: parsed.data.authority,
-        scope: {
-          files: parsed.data.files,
-          symbols: parsed.data.symbols,
-        },
-        reviewDepth: params.reviewDepth,
-        delegationDepth: params.delegationDepth ?? 0,
-        sessionTurn: params.sessionTurnCount,
-        onActivity,
-        // 嵌套委派透传：本 worker 再派 sub-worker 时，sub-worker 的活动
-        // （coordinator 已盖 parentWorkerId）直通同一条 UI 通道。
-        onNestedActivity: params.onWorkerActivity,
-        resumeWorkOrderId: parsed.data.resume,
-        budget: toBudgetOverride(parsed.data),
-      }, params.abortSignal)
+      let dispatchedOrderId: string | undefined
+      let run: CoordinatorRun
+      try {
+        run = await coordinator.delegate({
+          parentTurnId: params.toolUseId,
+          objective: taskObjective,
+          kind: parsed.data.kind ?? 'code_search',
+          profile: (parsed.data.profile ?? DEFAULT_DELEGATE_PROFILE) as import('../agent/work-order.js').WorkerProfile,
+          authority: parsed.data.authority,
+          scope: {
+            files: parsed.data.files,
+            symbols: parsed.data.symbols,
+          },
+          reviewDepth: params.reviewDepth,
+          delegationDepth: params.delegationDepth ?? 0,
+          sessionTurn: params.sessionTurnCount,
+          onActivity,
+          // 嵌套委派透传：本 worker 再派 sub-worker 时，sub-worker 的活动
+          // （coordinator 已盖 parentWorkerId）直通同一条 UI 通道。
+          onNestedActivity: params.onWorkerActivity,
+          resumeWorkOrderId: parsed.data.resume,
+          budget: toBudgetOverride(parsed.data),
+        }, params.abortSignal, (orderId) => { dispatchedOrderId = orderId })
 
-      // T4: terminal per-worker status for the subagent panel.
-      if (params.onWorkerActivity) {
-        for (const r of run.results) {
-          params.onWorkerActivity({
-            workOrderId: r.workOrderId,
-            parentToolId: params.toolUseId,
-            authority: parsed.data.authority,
-            objective: taskObjective,
-            status: r.status,
-            progressLine: progressSnippet(r.summary),
-            summary: r.summary,
-            failureReason: r.failureReason,
-            model: r.model,
-            provider: r.provider,
-            usage: r.usage,
-            artifactId: r.diffArtifactId,
-            changedFiles: r.changedFiles.length > 0 ? r.changedFiles : undefined,
-            findingsCount: r.findings.length > 0 ? r.findings.length : undefined,
-            topFinding: r.findings[0]?.claim,
-            verificationBrief: r.verification
-              ? { status: r.verification.status, passed: r.verification.passed, failed: r.verification.failed }
-              : undefined,
-            evidenceStatus: r.evidenceStatus,
-          })
+        // T4: finish flushes any coalesced tail before the terminal event and
+        // seals the worker so a queued timer cannot resurrect it.
+        for (const result of run.results) {
+          activityMapper?.finish(terminalActivity(result, params.toolUseId, taskObjective, { omitProfile: true, authority: parsed.data.authority }))
         }
-      }
 
-      // H4-D4 producer：worker 完成即打点精确 orderId——attack_case 的
-      // worker: 证据验真依赖此记录（passed 才算完成；failed/blocked 的
-      // worker 结果不得作为 supported 证据来源）。
-      const attackStore = getProblemAttackStore?.()
-      if (attackStore) {
-        for (const r of run.results) {
-          if (r.status === 'passed') attackStore.markWorkerCompleted(r.workOrderId)
+        // H4-D4 producer：worker 完成即打点精确 orderId——attack_case 的
+        // worker: 证据验真依赖此记录（passed 才算完成；failed/blocked 的
+        // worker 结果不得作为 supported 证据来源）。
+        const attackStore = getProblemAttackStore?.()
+        if (attackStore) {
+          for (const r of run.results) {
+            if (r.status === 'passed') attackStore.markWorkerCompleted(r.workOrderId)
+          }
         }
-      }
 
-      // Extract worker findings into claim store
-      if (run.status === 'completed') {
-        const claimStore = getClaimStore?.()
-        const sid = getSessionId?.()
-        if (claimStore && sid) {
-          const createdAt = Date.now()
-          for (const result of run.results) {
-            if (result.status !== 'passed') continue
-            const evidencePaths = result.changedFiles.slice(0, 3)
-            for (const finding of result.findings) {
-              const claimText = typeof finding === 'string' ? finding : finding.claim
-              const confidence = typeof finding === 'string' ? 0.7
-                : finding.confidence === 'high' ? 0.85
-                : finding.confidence === 'medium' ? 0.7
-                : 0.55
-              const proposal: ClaimProposal = {
-                kind: 'worker_finding',
-                scope: 'session',
-                text: claimText,
-                confidence,
-                fitness: confidence >= 0.85 ? 5 : confidence >= 0.7 ? 3 : 2,
-                source: { actor: 'worker', sessionId: sid, turn: params.sessionTurnCount ?? 0, eventId: `${params.toolUseId}:worker` },
-                evidence: [{
-                  id: `${params.toolUseId}:finding`,
-                  kind: 'worker',
-                  summary: typeof finding === 'string' ? finding : finding.evidence,
-                  path: evidencePaths[0],
+        // Extract worker findings into claim store
+        if (run.status === 'completed') {
+          const claimStore = getClaimStore?.()
+          const sid = getSessionId?.()
+          if (claimStore && sid) {
+            const createdAt = Date.now()
+            for (const result of run.results) {
+              if (result.status !== 'passed') continue
+              const evidencePaths = result.changedFiles.slice(0, 3)
+              for (const finding of result.findings) {
+                const claimText = typeof finding === 'string' ? finding : finding.claim
+                const confidence = typeof finding === 'string' ? 0.7
+                  : finding.confidence === 'high' ? 0.85
+                  : finding.confidence === 'medium' ? 0.7
+                  : 0.55
+                const proposal: ClaimProposal = {
+                  kind: 'worker_finding',
+                  scope: 'session',
+                  text: claimText,
+                  confidence,
+                  fitness: confidence >= 0.85 ? 5 : confidence >= 0.7 ? 3 : 2,
+                  source: { actor: 'worker', sessionId: sid, turn: params.sessionTurnCount ?? 0, eventId: `${params.toolUseId}:worker` },
+                  evidence: [{
+                    id: `${params.toolUseId}:finding`,
+                    kind: 'worker',
+                    summary: typeof finding === 'string' ? finding : finding.evidence,
+                    path: evidencePaths[0],
+                    createdAt,
+                  }],
                   createdAt,
-                }],
-                createdAt,
-                tags: ['worker', result.workOrderId],
+                  tags: ['worker', result.workOrderId],
+                }
+                claimStore.propose(proposal)
               }
-              claimStore.propose(proposal)
             }
           }
         }
-      }
 
-      return {
-        content: run.packet,
-        uiContent: formatUiContent(run),
-        isError: false,
+        return {
+          content: run.packet,
+          uiContent: formatUiContent(run),
+          isError: false,
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        // 异常路径（abort/内部错误）补发终态——否则 FleetRegistry 里该 worker
+        // 永远停在 running、时间一直走（CLI TUI 无 session-manager 兜底）。
+        // dispatchedOrderId 在建单后即得：有值 = worker 已派发（running 事件
+        // 可能已发），必须补终态；无值 = 建单前失败，fleet 无记录，无需补。
+        // 走 mapper.finish：终态排在合并尾沿之后且幂等（35f459b8f 移植进
+        // PR 的 mapper 框架）。
+        if (activityMapper && dispatchedOrderId) {
+          activityMapper.finish({
+            workOrderId: dispatchedOrderId,
+            parentToolId: params.toolUseId,
+            objective: taskObjective,
+            status: 'blocked',
+            progressLine: `派发失败：${msg}`,
+            failureReason: 'delegate_error',
+            summary: `Worker dispatch failed: ${msg}`,
+          })
+        }
+        // 用户取消不是工具失败：补完终态后 rethrow，交给管道走 [interrupted]
+        // 语义（is_error=false、不计失败记账，tool-pipeline AbortError 特判）——
+        // 吞掉会把 abort 记成 runtime_gate 失败，喂给 vigor/doom-loop 指纹。
+        // 注意 coordinator 的 abort 抛的是 Error('Delegation aborted: …')，
+        // name 不是 AbortError，而管道只认 name——rethrow 前统一捏成 AbortError。
+        const isAbort = params.abortSignal?.aborted === true
+          || (err instanceof Error && err.name === 'AbortError')
+          || msg.includes('Delegation aborted')
+        if (isAbort) {
+          if (err instanceof Error && err.name === 'AbortError') throw err
+          const abortErr = new Error(msg)
+          abortErr.name = 'AbortError'
+          throw abortErr
+        }
+        return {
+          content: `delegate_task 失败：${msg}`,
+          isError: true,
+          errorKind: 'runtime_gate',
+        }
+      } finally {
+        activityMapper?.dispose()
       }
     },
     requiresApproval: () => false,

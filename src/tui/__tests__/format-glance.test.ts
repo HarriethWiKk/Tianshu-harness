@@ -107,14 +107,14 @@ describe('formatGlanceBar', () => {
     assert.ok(plain.includes('160k/200k'), `has Xk/Yk: ${plain}`)
   })
 
-  // 过半成本提示（2026-07-25）：≥50% 常驻建议开新会话，70%+ 压缩成本高。
-  it('shows new-session hint at ≥50% context (full + compact), hides below', () => {
-    const over = stripAnsi(formatGlanceBar({ width: 140, estimatedTokens: 104_000, maxTokens: 200_000 }, theme))
-    assert.ok(over.includes('过半建议开新会话'), `full density 52% shows hint: ${over}`)
-    const under = stripAnsi(formatGlanceBar({ width: 140, estimatedTokens: 60_000, maxTokens: 200_000 }, theme))
-    assert.ok(!under.includes('建议新会话'), `30% hides hint: ${under}`)
-    const compactOver = stripAnsi(formatGlanceBar({ width: 140, density: 'compact', estimatedTokens: 104_000, maxTokens: 200_000 }, theme))
-    assert.ok(compactOver.includes('建议新会话'), `compact 52% shows short hint: ${compactOver}`)
+  // 高占用成本提示：≥70% 常驻建议开新会话（压缩成本高），与 HANDOFF_NUDGE_RATIO 同档。
+  it('shows new-session hint at ≥70% context (full + compact), hides below', () => {
+    const over = stripAnsi(formatGlanceBar({ width: 140, estimatedTokens: 146_000, maxTokens: 200_000 }, theme))
+    assert.ok(over.includes('上下文偏高建议开新会话'), `full density 73% shows hint: ${over}`)
+    const under = stripAnsi(formatGlanceBar({ width: 140, estimatedTokens: 104_000, maxTokens: 200_000 }, theme))
+    assert.ok(!under.includes('建议新会话'), `52% hides hint: ${under}`)
+    const compactOver = stripAnsi(formatGlanceBar({ width: 140, density: 'compact', estimatedTokens: 146_000, maxTokens: 200_000 }, theme))
+    assert.ok(compactOver.includes('建议新会话'), `compact 73% shows short hint: ${compactOver}`)
   })
 
   it('renders 1.0M for 1M-context windows instead of 1000k', () => {
@@ -224,7 +224,11 @@ describe('formatPermissionModeLine（输入框下方权限模式行，CC parity�
   it('默认 auto-safe，含 shift+tab 提示', () => {
     const plain = stripAnsi(formatPermissionModeLine({}, theme))
     assert.ok(plain.includes('⏵ auto-safe'), `should show auto-safe: ${plain}`)
-    assert.ok(plain.includes('shift+tab'), 'should hint cycle key')
+    assert.ok(
+      plain.includes('(shift+tab plan · /ask 问答)'),
+      `should keep the shortcut hint compact: ${plain}`,
+    )
+    assert.ok(!plain.includes('切换'), 'persistent chrome should avoid tutorial-style copy')
   })
 
   it('plan mode 优先于权限模式，含 shift+tab 提示', () => {

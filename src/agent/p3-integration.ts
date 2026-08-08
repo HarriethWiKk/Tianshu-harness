@@ -9,6 +9,10 @@ import { Nightcrawler, type BackgroundTask } from './nightcrawler.js'
 import { LinUCBBandit } from './linucb-bandit.js'
 import { AgentJIT } from './agent-jit.js'
 import {
+  canonicalizePhysarumFileTarget,
+  relativizePhysarumFileTarget,
+} from './hooks/physarum-file-access-hook.js'
+import {
   computeEffortReward,
   buildEffortContext,
   isBanditGateOpen,
@@ -19,18 +23,37 @@ import {
 export type { EffortShadowRecord, RewardInput }
 
 export interface P3Config {
+  /**
+   * 会话 cwd（P2-1）：相对 target 的 stat 基准与归一化基准。缺省 process.cwd()
+   * ——桌面 sidecar 单进程多会话必须由构造方传会话 cwd（loop.ts 构造点传 this.cwd）。
+   */
+  cwd?: string
   execute?: (tool: string, target: string) => Promise<string>
   /**
    * Master switch for the speculative pre-execution chain (miner→IdleSpec,
    * physarum/LLM predictions→ShadowQueue). Default OFF — SEALED 2026-07-07.
-   * Serving was already cut on 2026-07-06 (ShadowQueue has no mtime/TTL
-   * validation and served pre-edit file content as a live read_file result);
-   * with serving gone the background pre-reads were pure cost, so the whole
-   * chain is now inert unless explicitly enabled (unit tests only).
-   * Re-enable in production only after ShadowQueue entries record mtime and
-   * checkHit re-stats before returning.
+   * Serving was cut on 2026-07-06 after the stale-read incident (ShadowQueue
+   * then had no mtime/TTL validation and served pre-edit file content as a
+   * live read_file result).
+   *
+   * ⚠ 状态更新（2026-08-07 spark v2 T5a）：当年的重启契约——「ShadowQueue 记录
+   * mtime、checkHit 返回前重新 stat」——**已全部实现**（shadow-queue.ts P3-P4
+   * 修复：enqueue 并行 stat 留痕 + checkHit 重 stat 比对 + 不可验证 fail-closed
+   * + TTL 兜底 + 写后整队 clear，均有测试）。封存**维持**的原因是经济性而非
+   * 安全性：解封前影子遥测的结论是「预执行纯耗资源、命中率不高」。重启决策
+   * 依据 = speculativeObserve 观察态采回的新命中率数据（flash 能力升级后预测
+   * 质量前提已变）+ 用户确认。
    */
   speculativeEnabled?: boolean
+  /**
+   * 观察态（2026-08-07 spark v2 T5b · RIVET_SPEC_OBSERVE=1）：打开 enqueue 各臂
+   * 与命中统计，**绝不 serve**（checkSpeculativeCache 仍由 speculativeEnabled
+   * 单独把门）。execute 保持缺省 no-op —— 观察只需要 target 匹配 + mtime 新鲜度
+   * 就能测「会不会命中」，不必真读文件（真预读正是当年被判纯耗资源的成本）。
+   * 每条预测的代价 ≈ 一次 stat()。stats 经 statsBySource → postSession 落
+   * meta.speculationStats，跨会话累积成解封依据。
+   */
+  speculativeObserve?: boolean
   /** Background agent task executor */
   backgroundExecute?: (task: BackgroundTask) => Promise<string>
   /** JIT tool executor */
@@ -38,6 +61,11 @@ export interface P3Config {
 }
 
 export interface PhysarumFilePredictionInput {
+  afterToolName: string
+  predictions: Array<{ file: string; score: number }>
+}
+
+export interface ImportGraphPredictionInput {
   afterToolName: string
   predictions: Array<{ file: string; score: number }>
 }
@@ -79,15 +107,21 @@ export class P3Integration {
   readonly effortBandit: LinUCBBandit
   readonly jit: AgentJIT
   private readonly speculativeEnabled: boolean
+  /** enqueue 各臂的总闸：全量启用或观察态任一为真即开。serving 只看 speculativeEnabled。 */
+  private readonly observeEnabled: boolean
+  private readonly cwd: string
   private lastTool: string | null = null
   private _effortShadowRecords = new Map<string, EffortShadowRecord>()
 
   constructor(config: P3Config = {}) {
     this.speculativeEnabled = config.speculativeEnabled === true
+    this.observeEnabled = this.speculativeEnabled || config.speculativeObserve === true
+    this.cwd = config.cwd ?? process.cwd()
     this.miner = new ToolPatternMiner()
     this.queue = new ShadowQueue({
       execute: config.execute ?? (async () => ''),
       minProbability: 0.4,
+      cwd: this.cwd,
     })
     this.idleSpec = new IdleSpec({ miner: this.miner, queue: this.queue })
     this.notebook = process.env['RIVET_MISTAKE_NOTEBOOK'] === '1' ? new MistakeNotebook() : undefined
@@ -113,30 +147,49 @@ export class P3Integration {
     if (this.lastTool) {
       this.miner.record(this.lastTool, toolName, { targetPath: currentTarget })
     }
-    // Speculative pre-execution SEALED by default — see P3Config.speculativeEnabled.
-    if (this.speculativeEnabled) this.idleSpec.onToolStart(toolName)
+    // Speculative enqueue SEALED by default; observe mode opens it for stats.
+    if (this.observeEnabled) this.idleSpec.onToolStart(toolName)
   }
 
-  /** SEALED 2026-07-07 (no production caller) — results are NEVER served to the
-   *  model (2026-07-06 stale-read incident: ShadowQueue entries carry no
-   *  mtime/TTL, so a pre-edit read was served after three file mutations).
-   *  Re-enable only after checkHit gains an mtime re-stat comparison. */
+  /** Serving 仍封存（无生产调用方）——观察态也**不经这里**取内容。
+   *  历史脉络：2026-07-06 stale-read 事故切 serving；mtime 重启契约现已实现
+   *  （shadow-queue.ts），封存维持原因 = 经济性待证，见 P3Config.speculativeEnabled。 */
   checkSpeculativeCache(toolName: string, target: string): string | undefined {
     if (!this.speculativeEnabled) return undefined
     return this.idleSpec.checkCache(toolName, target)
   }
 
+  /** T5b 观察态窥视：真实工具执行时按 tool+target 记 would-hit/miss 统计
+   *  （经 checkHit 的 mtime/TTL 校验——陈旧条目如实计 miss），**恒不返回内容**。
+   *  封存态 no-op。与 checkSpeculativeCache 分离：serving 的门不因观察被碰。
+   *  P2-1 路径同形：read_file 目标归一化为仓库相对形（canonicalize，含存在性
+   *  校验）——归一化失败（非索引文件/文件瞬逝/逃逸路径）跳过统计，口径 =
+   *  「观察臂只统计可索引文件类目标」。miner 臂的 grep/glob 模式类 target 原样。 */
+  observeSpeculativeCache(toolName: string, target: string): void {
+    if (!this.observeEnabled) return
+    if (toolName === 'read_file') {
+      const rel = canonicalizePhysarumFileTarget(this.cwd, target)
+      if (!rel) return
+      target = rel
+    }
+    this.idleSpec.checkCache(toolName, target)
+  }
+
   enqueuePhysarumFilePredictions(input: PhysarumFilePredictionInput): void {
-    if (!this.speculativeEnabled) return
+    if (!this.observeEnabled) return
     const toolPredictions = this.miner.predict(input.afterToolName, 0)
     const topToolPrediction = toolPredictions[0]
     if (topToolPrediction && topToolPrediction.tool !== 'read_file') return
 
     for (const prediction of input.predictions) {
+      // P2-1 入队侧兜底：绝对预测转仓库相对形（不做存在性校验——预测可能指向
+      // 尚未读取的文件，stat 失败由队列如实记 miss）
+      const rel = relativizePhysarumFileTarget(this.cwd, prediction.file)
+      if (!rel) continue
       const probability = physarumScoreToProbability(prediction.score)
       this.queue.enqueue({
         tool: 'read_file',
-        likelyTarget: prediction.file,
+        likelyTarget: rel,
         probability: topToolPrediction
           ? Math.min(0.95, probability + topToolPrediction.probability * 0.2)
           : probability,
@@ -145,13 +198,37 @@ export class P3Integration {
     }
   }
 
+  /** 经络出边观察臂（P2-2）：imports 边 top-5 入队。score = 边 weight（导入边
+   *  固定 1.0）→ probability 沿 physarum 公式 min(0.9, s/(s+1)) = 0.5。
+   *  纯测量：不 serve、不预热，封存态 observe 门 no-op。 */
+  enqueueImportGraphPredictions(input: ImportGraphPredictionInput): void {
+    if (!this.observeEnabled) return
+    for (const prediction of input.predictions) {
+      const rel = relativizePhysarumFileTarget(this.cwd, prediction.file)
+      if (!rel) continue
+      this.queue.enqueue({
+        tool: 'read_file',
+        likelyTarget: rel,
+        probability: physarumScoreToProbability(prediction.score),
+        source: 'import-graph',
+      })
+    }
+  }
+
   /** Tier 2 LLM speculation: predictions from a shared-prefix side-path LLM call.
    *  ShadowQueue re-applies the read-only whitelist and minProbability gate, so
-   *  this is a thin pass-through that just tags the source. */
+   *  this is a thin pass-through that just tags the source. P2-1: read_file
+   *  预测同样做相对形归一化（口径：只统计可索引文件类目标）。 */
   enqueueLlmPredictions(predictions: ToolPrediction[]): void {
-    if (!this.speculativeEnabled) return
+    if (!this.observeEnabled) return
     for (const prediction of predictions) {
-      this.queue.enqueue({ ...prediction, source: 'llm' })
+      if (prediction.tool === 'read_file' && prediction.likelyTarget) {
+        const rel = relativizePhysarumFileTarget(this.cwd, prediction.likelyTarget)
+        if (!rel) continue
+        this.queue.enqueue({ ...prediction, likelyTarget: rel, source: 'llm' })
+      } else {
+        this.queue.enqueue({ ...prediction, source: 'llm' })
+      }
     }
   }
 

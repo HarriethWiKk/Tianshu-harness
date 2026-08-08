@@ -16,7 +16,7 @@ import type { ToolDefinition } from '../../api/types.js'
  *  The sub-agent refactor must never move this: the main-controller prompt is
  *  the frozen head of every prefix-cached request, and a byte change
  *  invalidates every session. */
-const MAIN_PROMPT_SHA256 = '51d59d18ec279e0d0f3600298962b19d45ab9eeba7d5853081bbff5952c81c65'
+const MAIN_PROMPT_SHA256 = 'ae6f69f30b942c775e30b92d370ed0efe10dcb973b2269faf4f175fab4e3ae1e'
 
 function tool(name: string): ToolDefinition {
   return { name, description: '', input_schema: { type: 'object', properties: {} } } as ToolDefinition

@@ -115,12 +115,31 @@ export function parseEventsTailRaw(text: string, maxEvents: number): RawEventsTa
     if (e.type === 'artifact') artifactIds.push(String(e.data.id))
   }
   return {
-    events: all.length > maxEvents ? all.slice(all.length - maxEvents) : all,
+    // delegation 事件豁免截尾（M1：stale 对账与回放依赖它们完整；被截尾的
+    // 早期 running 节点对账不可见，回放永久卡「运行中」）。与
+    // session-manager.trimEventRing 同语义——尾部窗口 + 保留 delegation。
+    events: tailExemptDelegation(all, maxEvents),
     diskFirstSeq: all[0]!.seq,
     lastSeq: all[all.length - 1]!.seq,
     artifactIds,
     total: all.length,
   }
+}
+
+/** 保留尾部 maxEvents 条，但 delegation 事件永远保留（从头部淘汰普通事件）。 */
+function tailExemptDelegation(events: RawSessionEvent[], maxEvents: number): RawSessionEvent[] {
+  if (events.length <= maxEvents) return events
+  const overflow = events.length - maxEvents
+  const kept: RawSessionEvent[] = []
+  let dropped = 0
+  for (const e of events) {
+    if (dropped < overflow && e.type !== 'delegation') {
+      dropped++
+      continue
+    }
+    kept.push(e)
+  }
+  return kept
 }
 
 export function parseEventsJsonlRaw(text: string): RawSessionEvent[] {

@@ -51,7 +51,10 @@ import { getPaletteCommands } from '../tui/command-palette.js'
 import { RECOMMENDED_MAX_SKILLS } from '../skills/skill-loader.js'
 import { validatePath } from '../tools/path-validate.js'
 import { readFileSync, statSync, writeFileSync, mkdirSync } from 'node:fs'
+import { mkdtempSync, rmSync } from 'node:fs'
 import { extname, relative, join } from 'node:path'
+import { tmpdir } from 'node:os'
+import { extractDocumentText, EXTRACTION_CAVEAT } from '../tools/doc-extract.js'
 import type { HookEntry, HookEvent, HooksConfig } from '../hooks/user-hooks-runner.js'
 import { loadHooksConfig, VALID_EVENTS } from '../hooks/user-hooks-runner.js'
 import { buildDistillPrompt } from '../prompt/rpa-distill.js'
@@ -77,6 +80,9 @@ type SessionRouteDependencies = {
 
 /** Vision upload guards — provider-safe formats and a per-image byte ceiling. */
 const MAX_IMAGES = 4
+/** Document attachment guards (word/excel/pdf — extracted server-side). */
+const MAX_DOCUMENTS = 4
+const MAX_DOCUMENT_BYTES = 8 * 1024 * 1024
 
 /** Cap on a single CI check log payload returned to the desktop (tail-kept). */
 const MAX_CHECK_LOG_CHARS = 200_000
@@ -487,8 +493,15 @@ export function buildSessionRoutes(
       if (typeof data.key !== 'string' || !data.key.trim()) {
         return { status: 400, body: { error: 'Missing or invalid "key"' } }
       }
+      const session = manager.getSession(params!.id!)
+      if (!session) {
+        return { status: 404, body: { error: 'Session not found' } }
+      }
+      if (session.status === 'running') {
+        return { status: 409, body: { error: 'Cannot switch domain while session is running' } }
+      }
       if (!manager.setDomain(params!.id!, data.key.trim())) {
-        return { status: 404, body: { error: 'Session not found or unknown domain key' } }
+        return { status: 404, body: { error: 'Unknown domain key' } }
       }
       return { status: 200, body: { id: params!.id!, domain: data.key.trim() } }
     }, apiToken),
@@ -717,7 +730,7 @@ export function buildSessionRoutes(
     }, apiToken),
 
     'POST /sessions/:id/prompt': withAuth(async (body, params) => {
-      const data = (body ?? {}) as { prompt?: string; images?: unknown }
+      const data = (body ?? {}) as { prompt?: string; images?: unknown; documents?: unknown }
       if (!data.prompt || typeof data.prompt !== 'string' || !data.prompt.trim()) {
         return { status: 400, body: { error: 'Missing or empty "prompt" field' } }
       }
@@ -741,6 +754,29 @@ export function buildSessionRoutes(
           }
         }
         images = data.images as string[]
+      }
+
+      // Validate documents: array of { name, dataUrl } for office/pdf files.
+      // Server extracts text via doc-extract (pdftotext/textutil/soffice/exceljs)
+      // and prepends to prompt — same injection pattern as the vision bridge.
+      let documents: Array<{ name: string; dataUrl: string }> | undefined
+      if (data.documents !== undefined) {
+        if (!Array.isArray(data.documents) || data.documents.length === 0) {
+          return { status: 400, body: { error: '"documents" must be a non-empty array' } }
+        }
+        if (data.documents.length > MAX_DOCUMENTS) {
+          return { status: 400, body: { error: `Max ${MAX_DOCUMENTS} documents allowed` } }
+        }
+        for (const doc of data.documents) {
+          if (typeof doc !== 'object' || doc === null || typeof (doc as { name?: unknown }).name !== 'string' || typeof (doc as { dataUrl?: unknown }).dataUrl !== 'string') {
+            return { status: 400, body: { error: 'Each document must be { name: string, dataUrl: string }' } }
+          }
+          const dataUrl = (doc as { dataUrl: string }).dataUrl
+          if (decodedBase64Bytes(dataUrl) > MAX_DOCUMENT_BYTES) {
+            return { status: 400, body: { error: `Each document must be <= ${Math.round(MAX_DOCUMENT_BYTES / 1024 / 1024)}MB` } }
+          }
+        }
+        documents = data.documents as Array<{ name: string; dataUrl: string }>
       }
 
       // Slash 翻译层（对齐 TUI 端 resolveAppPromptInput 行为）。
@@ -779,6 +815,17 @@ export function buildSessionRoutes(
         await manager.enableTool(params!.id!, 'computer_use')
       }
 
+      // 文档附件：落盘 → extractDocumentText 抽取文本 → 前置进 prompt。
+      // session-manager.run 是同步入口，抽取是异步——故在 route 层（async handler）
+      // 完成抽取，拼进 prompt 后调 run（签名不变）。和 vision bridge 同模式：
+      // 把非文本附件转成文本注入 prompt。
+      if (documents && documents.length > 0) {
+        const docTexts = await extractDocumentsToText(documents)
+        if (docTexts) {
+          prompt = `${docTexts}\n\n${prompt}`
+        }
+      }
+
       const ok = manager.run(params!.id!, prompt, images)
       if (!ok) return { status: 409, body: { error: 'Session is missing or already running' } }
       return { status: 200, body: manager.getSession(params!.id!) }
@@ -799,17 +846,58 @@ export function buildSessionRoutes(
     // T3 — mid-run steering. Queues user guidance into a RUNNING session's steer
     // buffer; injected at the next tool boundary (no new turn). Idle → 409 so the
     // desktop knows to use /prompt instead. Bearer-gated.
+    // Phase 2 — body 也可为 { laneId }：把 queue lane 里仍 queued 的条目升级为
+    // steer（立即参与本轮 mid-turn 注入）。
     'POST /sessions/:id/steer': withAuth((body, params) => {
+      const data = (body ?? {}) as { text?: string; laneId?: string }
+      const laneId = typeof data.laneId === 'string' && data.laneId.trim() ? data.laneId.trim() : undefined
+      const text = typeof data.text === 'string' && data.text.trim() ? data.text.trim() : undefined
+      if (!laneId && !text) {
+        return { status: 400, body: { error: 'Missing or empty "text" field (or provide "laneId" to upgrade a queued entry)' } }
+      }
+      const result = laneId
+        ? manager.steer(params!.id!, { laneId })
+        : manager.steer(params!.id!, text!)
+      if (result === 'not_found') return { status: 404, body: { error: 'Session not found' } }
+      if (result === 'lane_not_found') return { status: 404, body: { error: 'Queue lane entry not found' } }
+      if (result === 'idle') {
+        return { status: 409, body: { error: 'Session is not running; use /prompt to start a turn' } }
+      }
+      if (result === 'lane_not_queued') {
+        return { status: 409, body: { error: 'Queue lane entry is no longer queued (steered/retracted/merged)' } }
+      }
+      return { status: 200, body: { queued: true } }
+    }, apiToken),
+
+    // Phase 2 queue lane — busy 期间排队跟进消息（不注入本轮）：下次 prompt 时
+    // 归并进消息前部，或经 /steer { laneId } 升级、/queue/retract 撤回。
+    // 与 /steer 同门槛：idle → 409。Bearer-gated。
+    'POST /sessions/:id/queue': withAuth((body, params) => {
       const data = (body ?? {}) as { text?: string }
       if (!data.text || typeof data.text !== 'string' || !data.text.trim()) {
         return { status: 400, body: { error: 'Missing or empty "text" field' } }
       }
-      const result = manager.steer(params!.id!, data.text.trim())
+      const result = manager.queue(params!.id!, data.text.trim())
       if (result === 'not_found') return { status: 404, body: { error: 'Session not found' } }
       if (result === 'idle') {
         return { status: 409, body: { error: 'Session is not running; use /prompt to start a turn' } }
       }
-      return { status: 200, body: { queued: true } }
+      return { status: 200, body: { queued: true, laneId: result.laneId } }
+    }, apiToken),
+
+    // Phase 2 — 撤回一条仍 queued 的 queue lane 条目。
+    'POST /sessions/:id/queue/retract': withAuth((body, params) => {
+      const data = (body ?? {}) as { laneId?: string }
+      if (!data.laneId || typeof data.laneId !== 'string' || !data.laneId.trim()) {
+        return { status: 400, body: { error: 'Missing or empty "laneId" field' } }
+      }
+      const result = manager.retractQueued(params!.id!, data.laneId.trim())
+      if (result === 'not_found') return { status: 404, body: { error: 'Session not found' } }
+      if (result === 'lane_not_found') return { status: 404, body: { error: 'Queue lane entry not found' } }
+      if (result === 'lane_not_queued') {
+        return { status: 409, body: { error: 'Queue lane entry is no longer queued (steered/retracted/merged)' } }
+      }
+      return { status: 200, body: { ok: true } }
     }, apiToken),
 
     'POST /sessions/:id/abort': withAuth((_body, params) => {
@@ -1195,6 +1283,15 @@ export function buildSessionRoutes(
       const win = manager.getReplayWindow(id)
       if (win) {
         sse.send('replay_window', { seq: 0, ts: Date.now(), type: 'replay_window', data: win })
+      }
+      // 后台任务建连快照（seq=0 合成事件，同 replay_window 语义）：服务端权威
+      // running 集。内存环截尾会丢掉长寿 job 的 started 事件（回放不到）、
+      // sidecar 重启后注册表全空（本地仍挂着 running）——前端据此 upsert +
+      // 摘除对账。空集也必须发：那正是「全部悬挂」的清场信号。时序竞争
+      // （快照后 job 起/止）由其真实 seq 的生命周期事件在 gap/live 通道收敛。
+      const runningJobs = manager.listJobs(id)?.filter((j) => j.status === 'running')
+      if (runningJobs) {
+        sse.send('job_snapshot', { seq: 0, ts: Date.now(), type: 'job_snapshot', data: { jobs: runningJobs } })
       }
       // Bound replay slices by both work count and elapsed time so slow
       // serialization/socket writes cannot monopolize the event loop.
@@ -1857,4 +1954,35 @@ export function buildSessionRoutes(
   }
 
   return routes
+}
+
+/** 把文档附件（base64 dataUrl）落盘到临时目录，调 extractDocumentText 抽取文本，
+ *  返回拼好的前置块（含 EXTRACTION_CAVEAT）。失败的单个文档降级为错误提示，
+ *  不阻断整体发送。 */
+async function extractDocumentsToText(
+  documents: Array<{ name: string; dataUrl: string }>,
+): Promise<string | null> {
+  const parts: string[] = []
+  const tmpBase = mkdtempSync(join(tmpdir(), 'rivet-doc-'))
+  try {
+    for (const doc of documents) {
+      const ext = extname(doc.name).toLowerCase() || '.bin'
+      const tmpPath = join(tmpBase, `${doc.name.replace(/[^A-Za-z0-9._-]/g, '_')}`)
+      try {
+        const base64 = doc.dataUrl.split(',')[1] ?? ''
+        writeFileSync(tmpPath, Buffer.from(base64, 'base64'))
+        const result = await extractDocumentText(tmpPath)
+        if (result.ok) {
+          parts.push(`[document: ${doc.name}]\n${EXTRACTION_CAVEAT}\n\n${result.text}`)
+        } else {
+          parts.push(`[document: ${doc.name}]\n(extraction failed: ${result.suggestion})`)
+        }
+      } catch (err) {
+        parts.push(`[document: ${doc.name}]\n(extraction error: ${(err as Error).message})`)
+      }
+    }
+  } finally {
+    rmSync(tmpBase, { recursive: true, force: true })
+  }
+  return parts.length > 0 ? parts.join('\n\n---\n\n') : null
 }

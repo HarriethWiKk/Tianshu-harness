@@ -153,6 +153,8 @@ export interface GlanceBarInput {
   fleetRunning?: number
   /** 终态未读子代理数——无在跑时右区显示 `✓ N`（通知徽章，查看后清除）。 */
   fleetUnread?: number
+  /** 在跑后台任务数（JobRegistry 读模型）——>0 时右区显示 `⚙ N`。 */
+  jobsRunning?: number
   /** team 编队当前波次——team 运行中右区显示 `◆ w2/3`。 */
   teamWave?: { current: number; total: number }
 }
@@ -178,11 +180,11 @@ export function formatGlanceLeft(input: GlanceBarInput, theme: RivetTheme): stri
   return `${glyphPart}${color(domainLabel, accentColor)}${color(branchPart, theme.secondary)}${color(cwdPart, theme.dim)}${workerPart}`
 }
 
-/** 过半成本提示（2026-07-25）：上下文 ≥50% 在底栏常驻建议开新会话——继续推进
- *  到 70%+ 会触发压缩（前缀缓存全量重建，成本高）。compact 档用短文案。 */
+/** 高占用成本提示：上下文 ≥70% 在底栏常驻建议开新会话——继续推进会触发压缩
+ *  （前缀缓存全量重建，成本高）。compact 档用短文案。与 HANDOFF_NUDGE_RATIO 同档。 */
 function contextNewSessionHint(ratio: number, theme: RivetTheme, compact: boolean): string {
-  if (ratio < 0.5) return ''
-  return color(compact ? '·建议新会话' : ' · 过半建议开新会话（70%+ 压缩成本高）', theme.warning)
+  if (ratio < 0.7) return ''
+  return color(compact ? '·建议新会话' : ' · 上下文偏高建议开新会话（压缩成本高）', theme.warning)
 }
 
 export function formatGlanceRight(input: GlanceBarInput, theme: RivetTheme): string {
@@ -201,6 +203,12 @@ export function formatGlanceRight(input: GlanceBarInput, theme: RivetTheme): str
     parts.push(color(`◐ ${input.fleetRunning}`, theme.primary))
   } else if (input.fleetUnread !== undefined && input.fleetUnread > 0) {
     parts.push(color(`✓ ${input.fleetUnread}`, theme.success))
+  }
+
+  // 后台任务徽章：与编排链互斥逻辑独立（后台 job 与子代理可同时存在），
+  // 有 running 即占一席。
+  if (input.jobsRunning !== undefined && input.jobsRunning > 0) {
+    parts.push(color(`⚙ ${input.jobsRunning}`, theme.primary))
   }
 
   // Todo 计数徽章：与编排徽章相邻（cache% 之前），compact `◇2/5` / full 分态计数；
@@ -323,7 +331,7 @@ export function formatPermissionModeLine(
   input: { approvalMode?: string; planMode?: boolean; askMode?: boolean; planDraftPath?: string },
   theme: RivetTheme,
 ): string {
-  const hint = color('(shift+tab 切换 plan · /ask 切换问答)', theme.dim)
+  const hint = color('(shift+tab plan · /ask 问答)', theme.dim)
   if (input.askMode) {
     return `  ${color('⏵ ask mode', theme.warning)} ${hint}`
   }

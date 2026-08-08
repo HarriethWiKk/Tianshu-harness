@@ -13,6 +13,7 @@ import { color } from '../engine/ansi.js'
 import { useAsciiGlyphs } from '../term-caps.js'
 import type { RivetTheme } from '../theme.js'
 import { circleSpinnerFrame } from '../braille-spinner.js'
+import type { JobRow } from '../job-registry.js'
 
 export type SpinnerPhase = 'idle' | 'thinking' | 'streaming' | 'waiting' | 'analyzing'
 
@@ -116,13 +117,70 @@ export function formatTokenCount(n: number): string {
   return `${(n / 1_000_000).toFixed(2)}M`
 }
 
+// ── job(await) 等待区如实化 ──────────────────────────────────────────
+//
+// 根修「琢磨中 8m11s」撒谎：agent 阻塞在 job(action:'await') 期间零 token、
+// 零事件，通用 spinner 却按 8s 时间片轮换思考系动词冒充模型活动。等待区改由
+// 本 formatter 如实回答「在等谁 / 等了多久 / 上限多少」——与 approvalWait
+// 同族（把「失去响应」变成「可见的等待」），且不轮换动词。
+
+/** await 上限与 job-tool.ts 前后端 clamp 同口径：默认 120s，封顶 600s。 */
+const DEFAULT_AWAIT_LIMIT_MS = 120_000
+const MAX_AWAIT_LIMIT_MS = 600_000
+
+/** 从工具 input.timeout 换算阻塞上限（非法/缺省 → 120s，>600s 截到 600s）。 */
+export function jobAwaitLimitMs(timeoutMs: unknown): number {
+  const t = Number(timeoutMs)
+  return Math.min(Number.isFinite(t) && t > 0 ? t : DEFAULT_AWAIT_LIMIT_MS, MAX_AWAIT_LIMIT_MS)
+}
+
+export interface JobAwaitCall {
+  /** await 目标 job id（工具 input.id）。 */
+  jobId: string
+  /** 工具 input.timeout（毫秒，可缺省）。 */
+  timeoutMs?: unknown
+  /** await 调用开始时刻（pending entry startMs）。 */
+  startMs: number
+}
+
+export interface JobAwaitWaitView {
+  /** 主行（未着色，调用方按 warning 上色）：⏳ 等待后台任务 <cmd> · 已等 Xs / 上限 Ys。 */
+  line: string
+  /** 次行（未着色，调用方淡化）：job 最后一行输出（截断），无则缺省。 */
+  detail?: string
+}
+
+/** 压平空白（含 \n\r\t）后按字符截断——live 区行数安全，与 jobs-panel snippet 同口径。 */
+function snippet(text: string, max: number): string {
+  const flat = text.replace(/\s+/g, ' ').trim()
+  return flat.length > max ? `${flat.slice(0, max)}…` : flat
+}
+
+/**
+ * job(await) 等待区纯 formatter。jobRow 缺省（jobsModel 查不到该 jobId，如
+ * 回放截断）时降级为 `等待后台任务 <jobId>` 不带 cmd；已等超过上限时转
+ * 「运行已久 — Ctrl+C 可中断」档（await 已到点，如实说可中断而非继续报上限）。
+ */
+export function formatJobAwaitWait(call: JobAwaitCall, jobRow: JobRow | undefined, nowMs: number): JobAwaitWaitView {
+  const waitMs = Math.max(0, nowMs - call.startMs)
+  const limitMs = jobAwaitLimitMs(call.timeoutMs)
+  const glyph = useAsciiGlyphs() ? '*' : '⏳'
+  if (waitMs > limitMs) {
+    return { line: `${glyph} 后台任务运行已久 — Ctrl+C 可中断 (${formatElapsedHuman(waitMs)})` }
+  }
+  const target = jobRow ? snippet(jobRow.command, 40) : call.jobId
+  const line = `${glyph} 等待后台任务 ${target} · 已等 ${formatElapsedHuman(waitMs)} / 上限 ${formatElapsedHuman(limitMs)}`
+  const detail = jobRow?.lastLine ? snippet(jobRow.lastLine, 60) : undefined
+  return detail ? { line, detail } : { line }
+}
+
 export function formatTurnWorkSummary(input: {
   elapsedMs: number
   inputTokens: number
   outputTokens: number
 }, theme: RivetTheme): string {
   const useAscii = useAsciiGlyphs()
-  const glyph = useAscii ? 'Y' : '◆'
+  const glyph = useAscii ? '*' : '◆' // ASCII 降级原为 'Y'——与 ◆ 无语义关联，'*' 是通用近似
   const elapsed = formatElapsedHuman(input.elapsedMs)
   const tokens = `${formatTokenCount(input.inputTokens)}→${formatTokenCount(input.outputTokens)}`
   // 颜色层级：glyph 是完成指示（accent），耗时/token 是元信息（muted）。

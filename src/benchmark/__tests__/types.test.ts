@@ -71,6 +71,38 @@ describe('benchmark benchmarkRunSchema', () => {
     })
     assert.ok(result.success)
     assert.deepStrictEqual(result.data!.failures, [])
+    assert.equal(result.data!.session, undefined, '旧行无 session 字段照常解析')
+  })
+
+  it('parses harvested session telemetry（测量回路 Phase 1）', () => {
+    const result = benchmarkRunSchema.safeParse({
+      runId: 'run-uuid-3',
+      suiteId: 's1',
+      taskId: 't1',
+      provider: 'deepseek-spark',
+      model: 'deepseek-v4-flash',
+      status: 'passed',
+      startedAt: '2026-08-07T12:00:00.000Z',
+      endedAt: '2026-08-07T12:01:00.000Z',
+      metrics: { turns: 2, toolCalls: 3, retries: 0 },
+      session: {
+        sessionId: 'sess-1',
+        model: 'deepseek-v4-flash',
+        speculationStats: { llm: { enqueued: 4, hits: 3 }, 'tool-pattern': { enqueued: 8, hits: 2 } },
+        llmSpeculationEngine: { fired: 4, enqueued: 4, parseFailures: 0, errors: 0 },
+        cache: {
+          requests: 5, input: 5000, cacheRead: 4500, hitRatePct: 90,
+          byProviderModel: [
+            { provider: 'deepseek-spark', model: 'deepseek-v4-flash', requests: 5, input: 5000, cacheRead: 4500, hitRatePct: 90 },
+            { model: 'deepseek-v4-flash', requests: 1, input: 100, cacheRead: 0, hitRatePct: null },
+          ],
+        },
+      },
+    })
+    assert.ok(result.success)
+    assert.equal(result.data!.session?.speculationStats?.llm?.hits, 3)
+    assert.equal(result.data!.session?.cache?.byProviderModel[0]?.provider, 'deepseek-spark')
+    assert.equal(result.data!.session?.cache?.byProviderModel[1]?.hitRatePct, null)
   })
 })
 

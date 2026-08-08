@@ -4,6 +4,7 @@ import type { SearchBackend, SearchFetch } from './types.js'
 import { DuckDuckGoBackend } from './duckduckgo.js'
 import { runBackendChain } from './chain.js'
 import { createProxyAwareFetch } from './proxy-fetch.js'
+import { lenientPositiveNumber, lenientString } from '../lenient.js'
 
 const MAX_RESULTS = 20
 const DEFAULT_TIMEOUT_MS = 15_000
@@ -65,7 +66,7 @@ export function createWebSearchTool(deps: WebSearchDeps = {}): Tool {
           },
           count: {
             type: 'number',
-            description: '返回结果数量（默认：10，最大：20）',
+            description: '返回结果数量（默认：10，最大：20）。传 0 或负数按默认 10 处理。',
           },
         },
         required: ['query'],
@@ -73,14 +74,13 @@ export function createWebSearchTool(deps: WebSearchDeps = {}): Tool {
     },
 
     async execute(params: ToolCallParams): Promise<ToolResult> {
-      const rawQuery = params.input.query
-      if (typeof rawQuery !== 'string' || rawQuery.trim().length === 0) {
+      const queryCandidate = lenientString(params.input.query)
+      if (queryCandidate === undefined || queryCandidate.trim().length === 0) {
         return { content: '错误：query 必须是非空字符串。', isError: true }
       }
-      const query = rawQuery.trim()
-      const rawCount = params.input.count
+      const query = queryCandidate.trim()
       const count = Math.min(
-        Math.max(1, typeof rawCount === 'number' ? rawCount : 10),
+        Math.max(1, lenientPositiveNumber(params.input.count) ?? 10),
         MAX_RESULTS,
       )
 

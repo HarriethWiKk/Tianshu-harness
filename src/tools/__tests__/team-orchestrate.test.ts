@@ -114,9 +114,11 @@ test('team_orchestrate 透传条件依赖边（收编 #6：markdown → Dependen
     toolUseId: 'tu-edge',
   })
   assert.equal(result.isError, false)
-  // 第一波只派发无依赖任务（T1/T2）；T3/T4 因依赖 T1 在后续波——映射层
-  // 由 teamTasksToDelegationRequests 直接验证。
-  assert.ok(captured.length >= 2, `第一波应至少派发无依赖任务，got ${captured.length}`)
+  // 默认语义（W3C）：无 fromWave 且 autoAdvance 缺省 → 自动推进到末波。
+  // stubRun 返回空 results → priorResults 为空 → 依赖边不被跨波剥离——
+  // 末波（wave1）的 T3/T4 必须带 DependencyEdge 到达派发层。
+  assert.ok(captured.some(r => r.parentTurnId?.includes('team:T3')), `默认自动推进应执行到末波含 T3，got ${captured.map(r => r.parentTurnId).join(',')}`)
+  assert.ok(captured.some(r => r.parentTurnId?.includes('team:T4')), `默认自动推进应执行到末波含 T4，got ${captured.map(r => r.parentTurnId).join(',')}`)
 
   // fromWave 推进第二波：delegateBatch 实收数组必须携带 DependencyEdge 对象。
   captured = []
@@ -214,8 +216,10 @@ test('team_orchestrate blocks a planPath outside the project', async () => {
   const tool = createTeamOrchestrateTool({
     delegateBatch: async () => stubRun(),
   })
+  // force: 前缀绕过 task-size gate——否则 objective 过短会被 gate 先行拦截并
+  // 返回 isError（断言命中的是 gate 输出而非 planPath 越界检查，测试假绿）
   const result = await tool.execute({
-    input: { mode: 'standard', objective: 'x', planPath: '/etc/passwd' },
+    input: { mode: 'standard', objective: 'force: execute this plan', planPath: '/etc/passwd' },
     cwd: process.cwd(),
     toolUseId: 'tu-2',
   })
@@ -931,6 +935,109 @@ test('confirm 缺省（未传）→ 直接派发（向后兼容）', async () =>
   assert.ok(!result.content.includes('调用 team_orchestrate'))
 })
 
+// ── W3C 多波自动推进行为矩阵 ─────────────────────────────────────────────
+
+test('W3C: 无 fromWave 且 autoAdvance 缺省 → 一次调用自动推进全部波', async () => {
+  const wavesSeen: string[][] = []
+  const tool = createTeamOrchestrateTool({
+    delegateBatch: async (requests) => {
+      wavesSeen.push(requests.map(r => r.parentTurnId ?? ''))
+      return stubRun('dispatched')
+    },
+  })
+  // 同文件冲突 → 序列化 3 波（每波一个任务）。
+  const md = [
+    '### T1: 改造',
+    'Modify `src/a.ts`',
+    '### T2: 收尾',
+    'Modify `src/a.ts`',
+    '### T3: 复查',
+    'Modify `src/a.ts`',
+  ].join('\n')
+  const result = await tool.execute({
+    input: { mode: 'standard', objective: 'force: auto-advance multi-wave', planMarkdown: md },
+    cwd: process.cwd(),
+    toolUseId: 'tu-adv',
+  })
+  assert.equal(result.isError, false)
+  assert.equal(wavesSeen.length, 3, `默认应一次调用推进 3 波，got ${wavesSeen.length}`)
+  assert.ok(wavesSeen[2]!.some(p => p.includes('T3')), '末波应含 T3')
+  // 聚合输出：所有波 results 进 summary/panel，completedWaves 与总波数一致。
+  // OrchestrationOutcome 是联合类型——kind 收窄后访问 team 专属字段。
+  if (result.orchestration?.kind === 'team') {
+    assert.equal(result.orchestration.completedWaves, 3)
+    assert.equal(result.orchestration.wave, 2, 'outcome 的 wave 取最后执行波')
+  } else {
+    assert.fail('默认推进应产出 team outcome')
+  }
+})
+
+test('W3C: fromWave:N + autoAdvance:true → 从 N 推进到底', async () => {
+  const wavesSeen: string[][] = []
+  const tool = createTeamOrchestrateTool({
+    delegateBatch: async (requests) => {
+      wavesSeen.push(requests.map(r => r.parentTurnId ?? ''))
+      return stubRun('resumed')
+    },
+  })
+  const md = [
+    '### T1: 改造',
+    'Modify `src/a.ts`',
+    '### T2: 收尾',
+    'Modify `src/a.ts`',
+    '### T3: 复查',
+    'Modify `src/a.ts`',
+  ].join('\n')
+  const result = await tool.execute({
+    input: { mode: 'standard', objective: 'force: resume-and-advance', planMarkdown: md, fromWave: 1, autoAdvance: true },
+    cwd: process.cwd(),
+    toolUseId: 'tu-resume-adv',
+  })
+  assert.equal(result.isError, false)
+  assert.equal(wavesSeen.length, 2, `fromWave:1 + autoAdvance:true 应推进 wave1..wave2 共 2 波，got ${wavesSeen.length}`)
+  assert.ok(wavesSeen[0]!.some(p => p.includes('T2')), '起始波应为 T2（wave1）')
+  assert.ok(wavesSeen[1]!.some(p => p.includes('T3')), '末波应含 T3')
+  if (result.orchestration?.kind === 'team') {
+    assert.equal(result.orchestration.wave, 2)
+  } else {
+    assert.fail('推进执行应产出 team outcome')
+  }
+})
+
+test('W3C: 自动推进在整波门禁失败（零通过）处停止', async () => {
+  const calls: string[][] = []
+  const tool = createTeamOrchestrateTool({
+    delegateBatch: async (requests) => {
+      calls.push(requests.map(r => r.parentTurnId ?? ''))
+      return {
+        status: 'completed',
+        results: [mkResult({ workOrderId: 'team:T1', status: 'failed' })],
+        packet: 'failed-wave',
+      }
+    },
+  })
+  const md = [
+    '### T1: 改造',
+    'Modify `src/a.ts`',
+    '### T2: 收尾',
+    'Modify `src/a.ts`',
+    '### T3: 复查',
+    'Modify `src/a.ts`',
+  ].join('\n')
+  const result = await tool.execute({
+    input: { mode: 'standard', objective: 'force: stop on gated failure', planMarkdown: md },
+    cwd: process.cwd(),
+    toolUseId: 'tu-gate-stop',
+  })
+  assert.equal(result.isError, false)
+  assert.equal(calls.length, 1, 'wave0 零通过 → 停止推进，不得派发后续波')
+  if (result.orchestration?.kind === 'team') {
+    assert.equal(result.orchestration.stoppedReason, 'all-failed')
+  } else {
+    assert.fail('停止路径应产出 team outcome')
+  }
+})
+
 // ── 复盘 D（docs/tasks/2026-08-03-starflow-iteration-plan.md）：blocked 归属 ──
 
 test('D: blocked 且本波次 worker 有 changedFiles → 报告含工作树归属段与下一步建议', () => {
@@ -1158,4 +1265,44 @@ test('D 降级归属 execute 全链路：真实阻塞 + 空自报（共享模式
   assert.match(result.content, /无法逐文件归属/)
   assert.match(result.content, /勿整目录 add/)
   assert.match(result.content, /x\.txt/, '工作树 dirty 行原样列出')
+})
+
+test('team_orchestrate planJson 带 nonGoals/obligations → 派发 request 携带计划约束', async () => {
+  let captured: DelegationRequest[] = []
+  const tool = createTeamOrchestrateTool({
+    delegateBatch: async (requests) => { captured = requests; return stubRun('planjson-constraints') },
+  })
+  const planJson = JSON.stringify({
+    version: 1,
+    objective: 'planJson 约束注入',
+    tasks: [{
+      id: 'T1',
+      title: 'Edit foo',
+      objective: 'Modify src/agent/foo.ts',
+      profile: 'patcher',
+      kind: 'patch_proposal',
+      files: ['src/agent/foo.ts'],
+      dependsOn: [],
+      riskTier: 'low',
+    }],
+    nonGoals: ['不动 team 归层', '不做运行时动态挂载'],
+    obligations: [
+      { id: 'deferred_decision:0', kind: 'deferred_decision', text: '暂缓项「备选方案B」——交付前需有着落', source: 'tianquan' },
+      { id: 'advisory_gate:1', kind: 'advisory_gate', text: 'npx tsc --noEmit', source: 'yaoguang', gate: 'npx tsc --noEmit' },
+    ],
+    source: 'manual',
+    createdAt: Date.now(),
+  })
+  const result = await tool.execute({
+    input: { mode: 'standard', objective: 'force: planJson constraints', planJson },
+    cwd: process.cwd(),
+    toolUseId: 'tu-planjson-constraints',
+  })
+  assert.equal(result.isError, false, result.content)
+  assert.equal(captured.length, 1)
+  const constraints = captured[0]!.constraints ?? []
+  assert.ok(constraints.includes('[计划反目标] 不动 team 归层'), JSON.stringify(constraints))
+  assert.ok(constraints.includes('[计划反目标] 不做运行时动态挂载'), JSON.stringify(constraints))
+  assert.ok(constraints.includes('[计划约束] 暂缓项「备选方案B」——交付前需有着落'), JSON.stringify(constraints))
+  assert.ok(!constraints.some(c => c.includes('npx tsc')), 'advisory_gate 不应注入 constraints（走 verification 通道）')
 })

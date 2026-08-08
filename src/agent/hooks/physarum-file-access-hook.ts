@@ -1,5 +1,5 @@
 import { statSync } from 'node:fs'
-import { relative, resolve, sep } from 'node:path'
+import { relative, resolve, sep, join } from 'node:path'
 import type { PostToolRuntimeHook } from '../runtime-hooks.js'
 import type { PhysarumEngine } from '../../repo/physarum-engine.js'
 import { isIndexablePhysarumFile } from '../../repo/physarum-engine.js'
@@ -18,21 +18,37 @@ export interface PhysarumFileAccessHookDeps {
 
 const FILE_ACCESS_TOOLS = new Set(['read_file', 'write_file', 'edit_file', 'hash_edit'])
 
-export function canonicalizePhysarumFileTarget(cwd: string, target: string | undefined): string | null {
+/**
+ * 纯路径归一化（P2-1 入队侧）：绝对/相对 → 仓库相对形，逃逸与非索引目标拒绝。
+ * **不做存在性校验**——入队侧预测可能指向尚未读取的文件，stat 校验会错误丢弃
+ * 这类预测（其 miss 本应由 enqueue 后 stat 失败如实记录）。
+ */
+export function relativizePhysarumFileTarget(cwd: string, target: string | undefined): string | null {
   if (!target) return null
 
   const validated = validatePathSafe(cwd, target)
   if (!validated.ok) return null
 
-  try {
-    if (!statSync(validated.path).isFile()) return null
-  } catch {
-    return null
-  }
-
   const rel = relative(resolve(cwd), validated.path).split(sep).join('/')
   if (!rel || rel.startsWith('../') || rel === '..') return null
   if (!isIndexablePhysarumFile(rel)) return null
+  return rel
+}
+
+/**
+ * 窥视侧归一化（P2-1）：相对化 + 存在性校验（read_file 成功的文件必然存在）。
+ * 归一化失败（非索引文件/文件瞬逝/逃逸路径）→ 返回 null，调用方跳过统计——
+ * 口径 =「观察臂只统计可索引文件类目标」，解读报告时勿把漏计当假 miss。
+ */
+export function canonicalizePhysarumFileTarget(cwd: string, target: string | undefined): string | null {
+  const rel = relativizePhysarumFileTarget(cwd, target)
+  if (!rel) return null
+
+  try {
+    if (!statSync(join(resolve(cwd), rel)).isFile()) return null
+  } catch {
+    return null
+  }
   return rel
 }
 

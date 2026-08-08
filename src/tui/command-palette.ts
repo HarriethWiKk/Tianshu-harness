@@ -49,6 +49,7 @@ export function getPaletteCommands(): PaletteCommand[] {
     { name: '__surface:chronicle', description: 'Chronicle — 阶段传说', category: 'surface' },
     { name: '/help', description: '显示所有命令及用法说明', category: 'command' },
     { name: '/btw', description: '侧问 — 就当前会话问一句，不进对话历史', argsHint: '<问题>' },
+    { name: '/queue', description: '排队一条消息到下轮——busy 时也可攒，回车随下条一并发送（无参预览队列）', argsHint: '<text>' },
     { name: '/compact', description: '压缩上下文：汇总工具输出、折叠已结讨论、保留关键决策。过半时主动用比等自动压缩更省 token' },
     { name: '/connect', description: '连接模型服务商（选内置或自定义，填写 API 密钥）' },
     { name: '/config', description: '设置面板 — 子代理路由 / 审查子代理 / 识图模型 / 基础项' },

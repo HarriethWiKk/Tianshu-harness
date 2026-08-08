@@ -64,8 +64,8 @@ const PASTEL: ThemePaletteDef = {
   truecolor: {
     primary: '#a8e6cf',   // mint green — search/grep/glob
     secondary: '#d4a5f5', // lavender — edit/write
-    success: '#b5ead7',   // soft green — tests pass
-    warning: '#ffdac1',   // warm peach — delegation/warnings
+    success: '#d0f0a8',   // 粉彩青柠 — 原为 #b5ead7，与 mint 主色同色相 158° 不可分（cr 1.06）
+    warning: '#ffe0a3',   // 粉彩琥珀 — 原为 #ffdac1 蜜桃，与 error 珊瑚粉色相距仅 29°
     error: '#ff9aa2',     // coral pink — errors
     dim: '#8585a0',       // soft gray — secondary info
     pulseQuiet: '#4a4a5a',
@@ -108,14 +108,14 @@ const OBSERVATORY: ThemePaletteDef = {
   background: 'dark',
   description: '五色星辰。传统五行配色体系，天玑星君玄灰底色。',
   truecolor: {
-    primary: '#4f46e5',   // 靛蓝 — 天玑星君主色
+    primary: '#7c78f2',   // 靛蓝 — 天玑星君主色（原 #4f46e5 暗底仅 3.0:1，提亮至 ≥4.5:1）
     secondary: '#a78bfa', // 星云紫
     success: '#34d399',   // 验证翠
     warning: '#f59e0b',   // 星金黄
     error: '#f87171',     // 警报珊
     dim: '#8da0b8',       // 远星灰（深底 ≥4.5:1 提亮档）
     pulseQuiet: '#334155',
-    pulseActive: '#38bdf8',
+    pulseActive: '#7c78f2', // = primary（原 sky #38bdf8 出族；全仓惯例 pulseActive=primary）
     pulseAlert: '#f87171',
   },
   fallback: {
@@ -178,23 +178,25 @@ const TIANSHU: ThemePaletteDef = {
     primary: '#dfb282',   // 星金 accent
     secondary: '#a49ac7', // 墨紫灰
     success: '#75a399',   // 归航青
-    warning: '#c7a767',   // 星金 (提亮暗黄色，提升明度可读性)
-    error: '#c1655c',     // 朱砂赤
+    warning: '#d1914a',   // 琥珀橙金 — 原 #c7a767 与 primary 星金 cr 仅 1.18 撞簇；橙化拉开
+    error: '#bd5f7a',     // 茜草玫瑰 — 原朱砂赤 #c1655c 与用户朱砂印 #d86459 同色相 5°
+                          // 不可分；玫瑰化把唯一的「红」还给用户印（暗底 4.6:1）
     dim: '#8a8fa0',       // 暗墨（深底 ≥4.5:1 提亮档）
     pulseQuiet: '#3a3d4a',
     pulseActive: '#dfb282',
     pulseAlert: '#d86459', // 朱砂印 (柔化提亮朱砂红，降低暗底光晕与眼睛干涩度)
     toolShell: '#a0a3b0',
     toolEdit: '#a49ac7',
-    toolTest: '#9c8a63',
-    toolDelegate: '#c7a767',
+    // toolTest/toolDelegate 不覆盖：回退 success/warning 全局惯例——原 toolTest #9c8a63
+    // 卡其落在金簇里与 delegate/warning 不可分。
   },
   // userColor = 朱砂印 (the one warm point); assistantColor = 亮中性正文;
   // muted/systemColor = 元信息灰对齐。
   overrides: { userColor: '#d86459', assistantColor: '#d2d5dd', muted: '#adb2bf', systemColor: '#adb2bf' },
   fallback: {
-    primary: 'yellow', secondary: 'magenta', success: 'cyan', warning: 'yellow',
-    error: 'red', dim: 'white', pulseQuiet: 'gray', pulseActive: 'yellow', pulseAlert: 'red',
+    primary: 'yellowBright', secondary: 'magenta', success: 'cyan', warning: 'yellow',
+    // error redBright 与 userColor red 分档——同 truecolor 轨朱砂印/茜草玫瑰的分离
+    error: 'redBright', dim: 'gray', pulseQuiet: 'gray', pulseActive: 'yellowBright', pulseAlert: 'red',
   },
   fallbackOverrides: { userColor: 'red', assistantColor: 'white' },
 }
@@ -221,7 +223,8 @@ const ZIWEI: ThemePaletteDef = {
   overrides: { userColor: '#d4453a', assistantColor: '#c9b8ff', muted: '#9aa2b1' },
   fallback: {
     primary: 'magenta', secondary: 'blue', success: 'cyan', warning: 'yellow',
-    error: 'red', dim: 'gray', pulseQuiet: 'gray', pulseActive: 'magenta', pulseAlert: 'red',
+    // error redBright 更贴近荧惑赤 #ff8a9b 的亮粉，并与 userColor red（朱砂印）分档
+    error: 'redBright', dim: 'gray', pulseQuiet: 'gray', pulseActive: 'magenta', pulseAlert: 'red',
   },
   fallbackOverrides: { userColor: 'red', assistantColor: 'magenta', muted: 'white' },
 }
@@ -286,19 +289,18 @@ const DAWN: ThemePaletteDef = {
     primary: '#58d6f5',   // 启明星青蓝：边框 / 图腾 / 重点线
     secondary: '#d8a15c', // 地平金：标题
     success: '#7bbf98',   // 柔和晨曦绿
-    warning: '#d8a15c',   // 琥珀金：状态提示
+    warning: '#e5763a',   // 橘橙 — 原与 secondary 同值 #d8a15c（四 token 撞金），橘化分离
     error: '#e58e98',
     dim: '#8f9aaa',       // 雾灰：副标题 / 标签 / 辅助信息
     pulseQuiet: '#2b3340',
     pulseActive: '#58d6f5',
     pulseAlert: '#e58e98',
-    toolShell: '#d8a15c',
-    toolEdit: '#58d6f5',
-    toolTest: '#7bbf98',
-    toolDelegate: '#d8a15c',
+    // toolX 不覆盖：回退全局默认映射（shell=primary 青 / edit=secondary 金 /
+    // test=success 绿 / delegate=warning 橙）——原四处覆盖把 shell/edit/delegate
+    // 全锁进同一个金 #d8a15c，工具族色编码整个塌掉。
   },
   overrides: {
-    userColor: '#f59e0b',
+    userColor: '#ffb454', // 亮琥珀 — 原 #f59e0b 与标题金 cr 仅 1.07，提亮拉开
     assistantColor: '#dce3ea',
     muted: '#8f9aaa',
     systemColor: '#8f9aaa',
@@ -340,7 +342,7 @@ const ANTIGRAVITY: ThemePaletteDef = {
     toolTest: '#43c463',
     toolDelegate: '#e0a93a',
   },
-  overrides: { userColor: '#38bdf8', assistantColor: '#c4c9d2', muted: '#989aa6' },
+  overrides: { userColor: '#d8e2ee', assistantColor: '#c4c9d2', muted: '#989aa6' }, // userColor 冷调近白——原天青 #38bdf8 与 primary cr 仅 1.15，发言冒充 accent
   fallback: {
     primary: 'blue', secondary: 'cyan', success: 'green', warning: 'yellow',
     error: 'red', dim: 'gray', pulseQuiet: 'gray', pulseActive: 'blue', pulseAlert: 'red',
@@ -477,7 +479,7 @@ const LIGHT_ANSI: ThemePaletteDef = {
   description: '亮色 ANSI。16 色纯净版，跟随终端自身配色方案，亮背景友好。',
   truecolor: {
     primary: '#0550ae',
-    secondary: '#116329',
+    secondary: '#8250df', // 亮色系紫 — 原 #116329 与 success 同值，edit 工具冒充测试通过
     success: '#116329',
     warning: '#7d4e00',
     error: '#a40e26',
@@ -488,7 +490,7 @@ const LIGHT_ANSI: ThemePaletteDef = {
   },
   overrides: { userColor: '#24292f', assistantColor: '#24292f', muted: '#57606a', systemColor: '#57606a' },
   fallback: {
-    primary: 'blue', secondary: 'green', success: 'green', warning: 'yellow',
+    primary: 'blue', secondary: 'magenta', success: 'green', warning: 'yellow',
     error: 'red', dim: 'black', pulseQuiet: 'black', pulseActive: 'blue', pulseAlert: 'red',
   },
   fallbackOverrides: { userColor: 'black', assistantColor: 'black', muted: 'black' },

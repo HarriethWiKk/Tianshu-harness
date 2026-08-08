@@ -3,6 +3,7 @@ import { isAbsolute, relative, join } from 'node:path'
 import { spawn } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import type { LspDiagnostic } from './manager.js'
+import { runTypecheckShared } from './typecheck-cache.js'
 
 export interface LspCheckResult {
   diagnostics: Diagnostic[]
@@ -73,7 +74,7 @@ export async function runTypeCheck(cwd: string, filePath: string, timeoutMs = 12
   // event loop stays free so the TUI render loop keeps animating during commit.
   // --noEmit: type-check only, no output files.
   // --pretty false: machine-parseable format (file(line,col): error TSxxxx: msg).
-  const result = await runTscSubprocess(tscPath, cwd, timeoutMs)
+  const result = await runTscShared(tscPath, cwd, timeoutMs)
 
   // tsc writes diagnostics to stdout when --pretty false (not stderr).
   // Exit code 0 = no errors; exit code 1 = type errors found; exit code 2+ = crash/panic.
@@ -96,6 +97,36 @@ export async function runTypeCheck(cwd: string, filePath: string, timeoutMs = 12
   }
 }
 
+/** tsc 参数。同时用作缓存分桶的 variant，两者共用一个常量才不会漂移——
+ *  参数改了而 variant 没改，会让新旧格式的输出互相回放。 */
+const TSC_GATE_ARGS = ['--noEmit', '--pretty', 'false'] as const
+
+/**
+ * 经跨进程闸门执行 tsc：源码指纹相同则回放别的会话刚跑完的结果，否则排队串行。
+ *
+ * 本仓库常有多个 agent 会话共用一个工作树，而交付门禁与 wave-gate 每次都跑全量。
+ * 并发跑是超线性退化（抢同一批核心），串行加去重的总吞吐显著更高。
+ * `RIVET_TYPECHECK_SHARE=0` 退回逐进程各跑各的。
+ */
+function runTscShared(
+  tscPath: string,
+  cwd: string,
+  timeoutMs: number,
+): Promise<{ status: number | null; stdout: string; stderr: string }> {
+  const direct = () => runTscSubprocess(tscPath, cwd, timeoutMs)
+  if (process.env.RIVET_TYPECHECK_SHARE === '0') return direct()
+  return runTypecheckShared({
+    cwd,
+    run: direct,
+    // 与 npm script 的人读格式分桶：回放另一种格式的原始输出会让 parseDiagnosticOutput 解析错乱。
+    variant: TSC_GATE_ARGS.join(' '),
+    // 等待预算给满 tsc 自己的超时，不打折：持锁者跑的是同一份检查，等它出结果
+    // 几乎总快于自己重跑一遍（后者要付全额时间，还抢走它的核心让两边都更慢）。
+    // 打折的后果实测过——等待者集体超时后并发开跑，负载反而更高。
+    waitBudgetMs: timeoutMs,
+  })
+}
+
 /**
  * Spawn tsc as an async subprocess, collecting stdout/stderr and enforcing a
  * timeout (default 2 minutes; wave-gate passes a longer budget — see
@@ -109,7 +140,7 @@ function runTscSubprocess(tscPath: string, cwd: string, timeoutMs: number): Prom
     // in the project directory (e.g. C:\Users\My Name) survive cmd.exe parsing.
     const useShell = process.platform === 'win32' && tscPath.toLowerCase().endsWith('.cmd')
     const command = useShell ? `"${tscPath}"` : tscPath
-    const child = spawn(command, ['--noEmit', '--pretty', 'false'], {
+    const child = spawn(command, [...TSC_GATE_ARGS], {
       cwd,
       env: { ...process.env },
       stdio: ['ignore', 'pipe', 'pipe'],

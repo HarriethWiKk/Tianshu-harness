@@ -11,21 +11,21 @@ import { clearPlan, consumePlan, storePlan } from '../agent/plan-store.js'
 import { buildTeamPanelModel, encodeTeamPanelModel } from '../tui/team-panel-model.js'
 import { buildTeamOutcome } from '../agent/orchestration-outcome.js'
 import { validatePathSafe } from './path-validate.js'
-import { createActivityStreamer, createDelegationActivityMapper, progressSnippet } from './worker-activity-stream.js'
-import type { WorkerActivityEvent } from '../agent/coordinator.js'
+import { createActivityStreamer, createDelegationActivityMapper, terminalActivity } from './worker-activity-stream.js'
+import type { CoordinatorRun, WorkerActivityEvent } from '../agent/coordinator.js'
 import type { Tool, ToolCallParams, ToolResult } from './types.js'
 // Shared execution kernel — the dispatch + scope-health + review gate + telemetry
 // closure live in the agent layer so plan_task and team_orchestrate share one path.
 import {
-  executePlan,
+  executePlanWaves,
   teamReviewChangedFiles,
   teamReviewForceLevel,
   teamReviewFocusHint,
   type PlanExecutorDeps,
-  type PlanExecutorRun,
   type TeamImpactAnalyzer,
 } from '../agent/plan-executor.js'
-import { resolvePlanConstraints } from '../agent/plan-constraints.js'
+import { resolvePlanConstraints, constraintsFromUnifiedPlan } from '../agent/plan-constraints.js'
+import type { PlanWithObligations } from '../agent/council/council-obligations.js'
 
 // Back-compat re-exports: TeamOrchestrateCoordinator was the tool-layer name for
 // the executor's dependency surface; tests/bootstrap still reference these and the
@@ -43,6 +43,10 @@ const inputSchema = z.object({
   planJson: z.string().optional(),
   maxParallel: z.number().int().min(1).max(5).optional(),
   fromWave: z.number().int().min(0).optional(),
+  /** 多波自动推进：缺省时无 fromWave → 从 wave 0 自动推进到末波/首个阻塞；
+   *  有 fromWave → 只执行该波（人工恢复语义）。显式 true → 从 fromWave
+   *  （缺省 0）推进到底；false → 只执行起始波。 */
+  autoAdvance: z.boolean().optional(),
   /** 两阶段确认（星河收编 #7）：显式 confirm:false → 只展示波次分派方案不派发；
    *  confirm:true → 点火。缺省 undefined → 直接执行（现状行为，向后兼容）。 */
   confirm: z.boolean().optional(),
@@ -155,6 +159,10 @@ export function formatTeamSummary(summary: TeamRunSummary, fromWave = 0, attribu
     lines.push('阻塞：')
     for (const b of summary.blocked) lines.push(`  - ${b}`)
   }
+  if (summary.skipped && summary.skipped.length > 0) {
+    lines.push(`跳过 ${summary.skipped.length}（条件边 onFailure=skip）：`)
+    for (const s of summary.skipped) lines.push(`  - ${s}`)
+  }
   // 归属段独立于阻塞列表：触发面是「有未过 worker」（run.results 非 passed），
   // 与 blocked 调度占位（waiting for wave/deferred）无关——健康全过波不出段，
   // 有 worker 未过的波即使 blocked 列表为空也出段。
@@ -219,7 +227,8 @@ export function createTeamOrchestrateTool(
           planMarkdown: { type: 'string', description: '内联 Markdown 计划（可选）；优先级高于 planPath。' },
           planJson: { type: 'string', description: 'plan_task 输出的 UnifiedPlan JSON。提供时跳过 Markdown 解析与 max planner fanout。' },
           maxParallel: { type: 'number', description: '每波次最大并行 worker 数（1-5，默认 3）。' },
-          fromWave: { type: 'number', description: '整合前序波次 diff 后，派发这个从零开始的波次索引。' },
+          fromWave: { type: 'number', description: '整合前序波次 diff 后，派发这个从零开始的波次索引。缺省 autoAdvance：只执行该波（人工恢复）。' },
+          autoAdvance: { type: 'boolean', description: '多波自动推进：缺省时无 fromWave → 从 wave 0 自动跑到末波/首个阻塞；有 fromWave → 只执行该波。显式 true → 从 fromWave 推进到底；false → 只执行起始波。' },
           confirm: { type: 'boolean', description: '两阶段确认（收编 #7）：显式 false → 只展示波次分派方案不派发；true → 点火。缺省 → 直接执行（兼容）。' },
         },
         required: ['objective'],
@@ -228,7 +237,7 @@ export function createTeamOrchestrateTool(
     async execute(params: ToolCallParams): Promise<ToolResult> {
       const parsed = inputSchema.safeParse(params.input)
       if (!parsed.success) return { content: `无效输入：${parsed.error.message}`, isError: true, errorKind: 'format_error' }
-      const { mode, objective, planPath, planMarkdown, planJson: explicitPlanJson, maxParallel, fromWave } = parsed.data
+      const { mode, objective, planPath, planMarkdown, planJson: explicitPlanJson, maxParallel, fromWave, autoAdvance } = parsed.data
       // Bridge: auto-consume the plan stored by plan_task when planJson is omitted.
       const planJson = explicitPlanJson ?? consumePlan(params.sessionId)
       // Stale-plan hygiene: an explicit planJson takes priority, so drop any plan
@@ -248,9 +257,11 @@ export function createTeamOrchestrateTool(
       // Pre-parsed tasks from plan_task UnifiedPlan JSON
       let tasks: ReturnType<typeof unifiedPlanToTeamTasks> | undefined
       let planAdvisoryNote = ''
+      let planFromJson: ReturnType<typeof deserializeUnifiedPlan> = null
       if (planJson) {
         const plan = deserializeUnifiedPlan(planJson)
         if (!plan) return { content: 'team_orchestrate 已拦截：planJson 不是合法的 UnifiedPlan', isError: true }
+        planFromJson = plan
         const validation = validateUnifiedPlan(plan)
         if (!validation.valid) {
           const errors = [...validation.errors, ...validation.nodeErrors.map(ne => `[${ne.nodeId}] ${ne.error}`)]
@@ -338,36 +349,16 @@ export function createTeamOrchestrateTool(
 
       // T4: per-worker terminal status for the subagent panel. Same dual-emission
       // contract as delegate_batch: settle-time via onWorkerSettled (fast worker
-      // flips to ✓ immediately), batch-end loop below as backstop (fleet dedupes).
+      // flips to ✓ immediately), batch-end loop below as an idempotent backstop.
       const emitTerminal = params.onWorkerActivity
-        ? (r: import('../agent/work-order.js').WorkerResult) => {
-            params.onWorkerActivity!({
-              workOrderId: r.workOrderId,
-              parentToolId: params.toolUseId,
-              objective: objectiveById.get(r.workOrderId),
-              // 终态也带派发侧盖章的身份（星域/职能）——否则完成后面板星域信息断流。
-              profile: r.profile,
-              authority: r.authority,
-              status: r.status,
-              progressLine: progressSnippet(r.summary),
-              summary: r.summary,
-              failureReason: r.failureReason,
-              model: r.model,
-              provider: r.provider,
-              usage: r.usage,
-              artifactId: r.diffArtifactId,
-              changedFiles: r.changedFiles.length > 0 ? r.changedFiles : undefined,
-              findingsCount: r.findings.length > 0 ? r.findings.length : undefined,
-              topFinding: r.findings[0]?.claim,
-              verificationBrief: r.verification
-                ? { status: r.verification.status, passed: r.verification.passed, failed: r.verification.failed }
-                : undefined,
-              evidenceStatus: r.evidenceStatus,
-            })
+        ? (r: CoordinatorRun['results'][number]) => {
+            activityMapper?.finish(terminalActivity(r, params.toolUseId, objectiveById.get(r.workOrderId)))
           }
         : undefined
 
       const effectiveFromWave = fromWave ?? 0
+      // 行为矩阵：缺省时无 fromWave → 自动推进；有 fromWave → 人工恢复只跑该波。
+      const effectiveAutoAdvance = autoAdvance ?? (fromWave === undefined)
 
       // ── Phase 1: Proposal (explicit confirm:false) ─────────────────
       // 星河收编 #7：只展示波次分派方案，不派发任何 worker。缺省/true 直接
@@ -404,22 +395,32 @@ export function createTeamOrchestrateTool(
         return { content: lines.join('\n'), uiContent: `🚀 team 方案 · ${tasks?.length ?? '?'} 任务` }
       }
 
-      // D8 L2：从计划 markdown 解析反目标与待验证假设，自动注入 worker 工单。
-      // 在 planPath 场景下 markdown 已读进内存，零额外 IO。
+      // D8 L2：从计划解析反目标与待验证假设，自动注入 worker 工单。
+      // markdown 路径零额外 IO（已读进内存）；planJson 路径用契约自身的
+      // nonGoals/obligations（议事会「拒绝」裁决与暂缓/高危缓解承诺）。
       const planConstraints = markdown
         ? resolvePlanConstraints(params.cwd, { markdown })
-        : undefined
+        : planFromJson
+          ? constraintsFromUnifiedPlan({
+              nonGoals: planFromJson.nonGoals,
+              obligations: (planFromJson as PlanWithObligations).obligations?.map(o => ({ kind: o.kind, text: o.text })),
+            })
+          : undefined
 
-      let run: PlanExecutorRun
+      let waves: Awaited<ReturnType<typeof executePlanWaves>>
       try {
-        run = await executePlan(
+        // 多波驱动（W3A）：按 fromWave 逐波推进、判定停止（零通过/门禁/review/
+        // abort/末波）、聚合每波结果。review 只在末波运行（executePlan 的
+        // isLastWave 由真实 wave 序号判定）。
+        waves = await executePlanWaves(
           {
             mode: effectiveMode,
             objective,
             tasks,
             planMarkdown: markdown,
             planConstraints: planConstraints && planConstraints.length > 0 ? planConstraints : undefined,
-            fromWave: effectiveFromWave,
+            startWave: effectiveFromWave,
+            autoAdvance: effectiveAutoAdvance,
             maxParallel: maxParallel ?? options?.defaultMaxParallel,
             sessionId: params.sessionId,
             parentTurnId: params.toolUseId,
@@ -447,27 +448,36 @@ export function createTeamOrchestrateTool(
           },
           coordinator,
         )
+        // Backstop terminal emission happens before disposal so the mapper can
+        // flush the final coalesced activity for every worker.
+        if (emitTerminal && waves.run.summary.run) {
+          for (const result of waves.run.summary.run.results) emitTerminal(result)
+        }
       } catch (err) {
+        activityMapper?.dispose()
         const msg = err instanceof Error ? err.message : String(err)
         return { content: `team_orchestrate 失败：${msg}`, isError: true }
+      } finally {
+        activityMapper?.dispose()
       }
 
+      const run = waves.run
       const { summary, reviewVerdict, notes } = run
+      // 聚合视图的 wave 参数取「最后实际执行的波」：formatTeamSummary 的
+      // nextWave 提示、panel 当前波、outcome 的 completedWaves 都以它为基准。
+      const lastExecutedWave = effectiveFromWave + waves.runs.length - 1
 
-      // T4: terminal per-worker status for the subagent panel (backstop loop —
-      // per-worker settle events were already emitted via onWorkerSettled).
-      if (emitTerminal && summary.run) {
+      // H4-D4：标记已完成 worker，供 PAL worker: 引用验真。
+      if (summary.run) {
         const attackStore = getAttackStore?.() ?? null
         for (const r of summary.run.results) {
-          emitTerminal(r)
-          // H4-D4：标记已完成 worker，供 PAL worker: 引用验真
           if (r.status === 'passed' && attackStore) {
             attackStore.markWorkerCompleted(r.workOrderId)
           }
         }
       }
 
-      const panelModel = buildTeamPanelModel(summary, effectiveFromWave, reviewVerdict, undefined, run.gate, run.reviewDetail)
+      const panelModel = buildTeamPanelModel(summary, lastExecutedWave, reviewVerdict, undefined, run.gate, run.reviewDetail)
       // D: 有未过 worker 时收集工作树归属段——git status 过滤本波次 worker 的
       // changedFiles，无改动/非 git 环境自动跳过该段（不猜归属）。
       // 数据源用 teamReviewChangedFiles（diff artifact ∪ 自报）而非裸自报：
@@ -491,10 +501,10 @@ export function createTeamOrchestrateTool(
         }
       }
       return {
-        content: formatTeamSummary(summary, effectiveFromWave, attribution) + notes.reviewNote + notes.scopeHealthNote + notes.impactNote + notes.waveGateNote + notes.deliverySynthesis + planAdvisoryNote + proGateNote,
+        content: formatTeamSummary(summary, lastExecutedWave, attribution) + notes.reviewNote + notes.scopeHealthNote + notes.impactNote + notes.waveGateNote + notes.deliverySynthesis + planAdvisoryNote + proGateNote,
         uiContent: encodeTeamPanelModel(panelModel),
         isError: false,
-        orchestration: buildTeamOutcome(summary, effectiveFromWave, run),
+        orchestration: buildTeamOutcome(summary, lastExecutedWave, run),
       }
     },
     requiresApproval: () => false,

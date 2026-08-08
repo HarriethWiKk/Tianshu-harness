@@ -118,7 +118,7 @@ describe('buildSystemPrompt', () => {
     assert.ok(prompt.includes('<delivery-contract>'), '应有统一的交付契约块')
     assert.ok(prompt.includes('0 passed 当成功'), '诚实门禁内核（未运行=未验证）必须有落点')
     assert.ok(prompt.includes('涉及文件'), '收束必须包含commit+文件信息')
-    assert.ok(prompt.includes('没什么可说就跳过'), '收束不强制填表——无内容可跳过')
+    assert.ok(prompt.includes('后续建议'), '收束必须包含后续建议段落')
     assert.ok(!prompt.includes('自我设限'), '"NEVER narrate session limits"条已于 2026-07-19 应用户要求整条移除')
   })
 
@@ -203,7 +203,7 @@ describe('buildSystemPrompt', () => {
     const prompt = buildSystemPrompt({ tools: [] })
     assert.ok(prompt.includes('涉及文件'), '收束应有 commit + 文件信息')
     assert.ok(prompt.includes('效果预期'), '收束应提示可写效果预期但不必强制')
-    assert.ok(prompt.includes('没什么可说就跳过'), '收束不强制填表')
+    assert.ok(prompt.includes('后续建议'), '收束必须包含后续建议段落')
   })
 
   it('includes only a short manifest entry for sensitive knowledge domains', () => {

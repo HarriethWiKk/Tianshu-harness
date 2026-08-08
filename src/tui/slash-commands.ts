@@ -62,6 +62,7 @@ import type { BootstrapContext } from '../bootstrap.js'
 import type { Config } from '../config/schema.js'
 import { isProFeatureEnabled } from '../config/pro-license.js'
 import { loadConfig, saveConfig } from '../config/manager.js'
+import { PROVIDER_PRESETS, isProviderPresetKey } from '../config/provider-presets.js'
 import { installPlugin, removePlugin, getInstalledPlugins, isPluginInstalled } from '../plugins/plugin-installer.js'
 import { PLUGIN_PRESETS } from '../plugins/plugin-presets.js'
 import { switchAgentRuntime, switchAgentSession, switchAgentCwd, restorePlanModeFromMeta } from '../bootstrap.js'
@@ -86,6 +87,7 @@ const HELP_TEXT = `Available commands:
 /quit — Exit
 /update — Check and install the latest Rivet release
 /btw <问题> — 侧问：就当前会话问一句，回答显示在浮层，不进对话历史
+/queue <text> — 排队一条消息到下轮（无参预览队列）；busy 时也可攒，回车随下条一并发送
 /compact [status|llm] — Micro-compact context (/compact status for stats)
 /model [name|list] — Show or switch model
 /domain [list|<name>|auto|off] — Show or switch star domain personality
@@ -162,7 +164,7 @@ Ctrl+Esc — 命令面板（模糊搜索全部命令与界面动作）
 
 ⚠ 上下文占用直接影响 token 成本——尽早 /handoff 比触发压缩划算得多。
 
-  · 50% 以上 → 建议 /handoff 写交接文档后开新会话（交接自动注入，比续跑省前缀重建成本）
+  · 70% 以上 → 建议 /handoff 写交接文档后开新会话（交接自动注入，比续跑省前缀重建成本）
   · 70%-78% → 触发自动压缩，压缩本身 token 支出很高（整段历史重写一次）
   · 80% 以上 → 压缩 + 前缀缓存大概率碎裂，每轮 cache miss，成本数倍
   · 版本升级后请勿连接旧会话——提示词结构变化会让缓存整体碎裂
@@ -3247,7 +3249,10 @@ const TUI_SLASH_COMMANDS: readonly TuiSlashCommandDef[] = [
       const level = parts[1]?.toLowerCase() as 'off' | 'low' | 'medium' | 'high' | 'max' | 'auto' | undefined
       const valid: Array<'off' | 'low' | 'medium' | 'high' | 'max' | 'auto'> = ['off', 'low', 'medium', 'high', 'max', 'auto']
       if (!level) {
-        // 无参数 → 打开交互式选择面板（上下选、回车确认）。
+        // 无参数 → 重置面板类型后打开交互式选择面板（上下选、回车确认）。
+        // 不重置的话，先开过 /permission 等面板后 choicePanelKind 残留，
+        // 选择面板会按旧类型渲染（PR #29 移植）。
+        ctx.setChoicePanelKind?.('effort')
         surfacePush?.('choice-panel')
         setIsStreaming(false)
         return true
@@ -3628,6 +3633,39 @@ export async function handleSlashCommand(ctx: SlashHandlerContext): Promise<bool
   return await command.handler(ctx)
 }
 
+/**
+ * /queue <text>：显式排队一条消息到下轮（简单 FIFO lane，不走 steer 的
+ * 优先级/意图分类，也不参与 turn 边界 drain）。busy/idle 都可用——busy 时
+ * 攒着不打断当前 run，idle 时等价「随下条一起发」。lane 唯一出口是下一次
+ * idle 提交的归并（见 app.ts handleInputSubmit 的 steer 收口段）。
+ * 独立导出：单测没有完整 BootstrapContext，需要能单独注册这一条命令。
+ */
+export function registerQueueCommand(app: TuiApp): void {
+  app.registerSlashCommand({
+    name: '/queue',
+    description: 'Queue a message to merge into the next prompt',
+    immediate: true,
+    handler: ({ trimmed }) => {
+      const arg = trimmed.slice('/queue'.length).trim()
+      if (!arg) {
+        // 无参：预览当前 lane（只看不清）。
+        if (app.queueLane.length === 0) {
+          app.commitStatic('⏸ 排队队列为空——/queue <text> 把一条消息攒到下轮，回车随下条一并发送')
+        } else {
+          const preview = app.queueLane
+            .map((t, i) => `${i + 1}. ${t.length > 60 ? `${t.slice(0, 60)}…` : t}`)
+            .join('\n')
+          app.commitStatic(`⏸ 排队队列（${app.queueLane.length} 条）——回车随下条一并发送：\n${preview}`)
+        }
+        return true
+      }
+      app.queueLane.push(arg)
+      app.commitStatic(`⏸ 已排队到下轮（${app.queueLane.length} 条）——回车随下条一并发送`)
+      return true
+    },
+  })
+}
+
 export function registerTuiSlashCommands(app: TuiApp, ctx: BootstrapContext): void {
   const autoSafeRef: MutableRefLike<boolean> = { current: true }
   const verboseRef: MutableRefLike<boolean> = { current: false }
@@ -3808,6 +3846,9 @@ export function registerTuiSlashCommands(app: TuiApp, ctx: BootstrapContext): vo
     },
   })
 
+  // /queue：显式排队 lane（handler 在 registerQueueCommand，独立导出供单测注册）。
+  registerQueueCommand(app)
+
   // 经 SIGINT 走 main.ts 的统一 shutdown（app.dispose → ctx.shutdown →
   // 退出摘要 + resume 指引 → process.exit）。直接调 ctx.shutdown() 不会退出
   // 进程，也绕过退出摘要。
@@ -3874,9 +3915,11 @@ export function registerTuiSlashCommands(app: TuiApp, ctx: BootstrapContext): vo
         app.commitStatic('   ⚠️ 若有其他天枢/rivet 会话在运行，请一并退出——否则 npm 覆盖全局包时仍会命中文件占用而失败。')
         app.commitStatic(`   日志：${schedule.logPath}`)
         setTimeout(() => {
-          ctx.shutdown()
-          app.dispose()
-          process.exit(0)
+          void (async () => {
+            await ctx.shutdown()
+            app.dispose()
+            process.exit(0)
+          })()
         }, 400)
         return true
       }
@@ -3898,9 +3941,11 @@ export function registerTuiSlashCommands(app: TuiApp, ctx: BootstrapContext): vo
 
       app.commitStatic('✅ Update complete. Restarting...')
       setTimeout(() => {
-        ctx.shutdown()
-        app.dispose()
-        restartProcess(ctx.sessionId)
+        void (async () => {
+          await ctx.shutdown()
+          app.dispose()
+          restartProcess(ctx.sessionId)
+        })()
       }, 250)
       return true
     },
@@ -4016,7 +4061,15 @@ export function registerTuiSlashCommands(app: TuiApp, ctx: BootstrapContext): vo
     description: "连接模型服务商（选内置或自定义，填写 API 密钥）",
     immediate: true,
     handler: ({ app }) => {
-      app.startConnect()
+      // 配置读写就在这一层做（同 /config 的先例）——把已配置 provider 列表注入
+      // 向导，让它能提供「为已有服务商添加模型」分支。
+      const cfg = loadConfig()
+      const existing = Object.entries(cfg.provider.providers).map(([name, p]) => ({
+        name,
+        label: isProviderPresetKey(name) ? PROVIDER_PRESETS[name].label : name,
+        modelCount: p.models.length,
+      }))
+      app.startConnect(existing)
       return true
     },
   })

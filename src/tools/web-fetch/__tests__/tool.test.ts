@@ -378,3 +378,176 @@ describe('web_fetch actions（B2）', () => {
     assert.ok(result.content.includes('第 2 步（write）失败'))
   })
 })
+
+describe('web_fetch 批量（urls）与 maxCharacters（Shard A）', () => {
+  it('批量两页全成功：分段头 + 两页内容', async () => {
+    const tool = createWebFetchTool({
+      lookup: publicLookup(),
+      fetch: trackingFetch([], (url) =>
+        url.includes('a.com')
+          ? textResponse(`<main><p>${'A 页内容。'.repeat(30)}</p></main>`, 'text/html')
+          : textResponse(`<main><p>${'B 页内容。'.repeat(30)}</p></main>`, 'text/html')),
+    })
+    const result = await tool.execute({
+      input: { urls: ['https://a.com/1', 'https://b.com/2'] },
+      toolUseId: 'tu_b1',
+      cwd: '/',
+    } as any)
+    assert.equal(result.isError, undefined)
+    assert.ok(result.content.includes('### 1. https://a.com/1'))
+    assert.ok(result.content.includes('### 2. https://b.com/2'))
+    assert.ok(result.content.includes('A 页内容。'))
+    assert.ok(result.content.includes('B 页内容。'))
+    assert.ok(result.content.includes('状态：200'))
+  })
+
+  it('批量时 urls 优先于 url（url 被忽略）', async () => {
+    const tool = createWebFetchTool({
+      lookup: publicLookup(),
+      fetch: trackingFetch([], (url) =>
+        url.includes('a.com')
+          ? textResponse(`<main><p>${'A 内容。'.repeat(30)}</p></main>`, 'text/html')
+          : textResponse(`<main><p>${'不该被抓取的 url 内容。'.repeat(30)}</p></main>`, 'text/html')),
+    })
+    const result = await tool.execute({
+      input: { urls: ['https://a.com/1'], url: 'https://other.com/ignored' },
+      toolUseId: 'tu_b2',
+      cwd: '/',
+    } as any)
+    assert.equal(result.isError, undefined)
+    assert.ok(result.content.includes('### 1. https://a.com/1'))
+    assert.ok(!result.content.includes('other.com'))
+    assert.ok(!result.content.includes('不该被抓取'))
+  })
+
+  it('批量一成一败：成功页照常输出 + 错误行，不整体 isError', async () => {
+    const tool = createWebFetchTool({
+      lookup: publicLookup(),
+      fetch: trackingFetch([], (url) =>
+        url.includes('good.com')
+          ? textResponse(`<main><p>${'好页内容。'.repeat(30)}</p></main>`, 'text/html')
+          : textResponse('not found', 'text/plain', 404)),
+    })
+    const result = await tool.execute({
+      input: { urls: ['https://good.com/a', 'https://bad.com/missing'] },
+      toolUseId: 'tu_b3',
+      cwd: '/',
+    } as any)
+    assert.equal(result.isError, undefined)
+    assert.ok(result.content.includes('### 1. https://good.com/a'))
+    assert.ok(result.content.includes('好页内容。'))
+    assert.ok(!result.content.includes('### 2.'))
+    assert.ok(result.content.includes('错误 https://bad.com/missing：'))
+    assert.ok(result.content.includes('HTTP 404'))
+  })
+
+  it('批量全败：整体 isError，错误逐条列出', async () => {
+    const tool = createWebFetchTool({
+      lookup: publicLookup(),
+      fetch: trackingFetch([], () => textResponse('gone', 'text/plain', 404)),
+    })
+    const result = await tool.execute({
+      input: { urls: ['https://a.com/x', 'https://b.com/y'] },
+      toolUseId: 'tu_b4',
+      cwd: '/',
+    } as any)
+    assert.equal(result.isError, true)
+    assert.ok(result.content.includes('错误 https://a.com/x：'))
+    assert.ok(result.content.includes('错误 https://b.com/y：'))
+  })
+
+  it('maxCharacters 截断生效并在页头标注', async () => {
+    const tool = createWebFetchTool({
+      lookup: publicLookup(),
+      fetch: trackingFetch([], () =>
+        textResponse(`<main><p>${'长内容。'.repeat(200)}</p></main>`, 'text/html')),
+    })
+    const result = await tool.execute({
+      input: { urls: ['https://a.com/long'], maxCharacters: 100 },
+      toolUseId: 'tu_b5',
+      cwd: '/',
+    } as any)
+    assert.equal(result.isError, undefined)
+    assert.ok(result.content.includes('（已按 100 字符截断）'))
+    // 页头与 markdown 之间的首个 \n\n 后即截断内容
+    const md = result.content.slice(result.content.indexOf('\n\n') + 2)
+    assert.ok(md.length > 0, '截断后仍有内容')
+    assert.ok(md.length <= 100, `截断后内容应 ≤100 字符，实际 ${md.length}`)
+  })
+
+  it('maxCharacters 非法值（负数/非有限数）回退不截断', async () => {
+    const tool = createWebFetchTool({
+      lookup: publicLookup(),
+      fetch: trackingFetch([], () =>
+        textResponse(`<main><p>${'完整内容。'.repeat(50)}</p></main>`, 'text/html')),
+    })
+    for (const bad of [-100, NaN, Infinity]) {
+      const result = await tool.execute({
+        input: { urls: ['https://a.com/full'], maxCharacters: bad },
+        toolUseId: 'tu_b6',
+        cwd: '/',
+      } as any)
+      assert.equal(result.isError, undefined)
+      assert.ok(!result.content.includes('已按'), `maxCharacters=${String(bad)} 不应截断`)
+      assert.ok(result.content.includes('完整内容。'.repeat(50)))
+    }
+  })
+
+  it('url 单参数兼容不受影响', async () => {
+    const tool = createWebFetchTool({
+      lookup: publicLookup(),
+      fetch: trackingFetch([], () =>
+        textResponse(`<main><p>${'单页内容。'.repeat(30)}</p></main>`, 'text/html')),
+    })
+    const result = await tool.execute({
+      input: { url: 'https://a.com/single' },
+      toolUseId: 'tu_b7',
+      cwd: '/',
+    } as any)
+    assert.equal(result.isError, undefined)
+    assert.ok(result.content.includes('单页内容。'))
+    assert.ok(result.content.startsWith('URL：https://a.com/single'))
+  })
+
+  it('urls 与 actions 互斥报错', async () => {
+    const tool = createWebFetchTool({
+      lookup: publicLookup(),
+      fetch: trackingFetch([], () => textResponse('x')),
+    })
+    const result = await tool.execute({
+      input: { urls: ['https://a.com/1'], actions: [{ type: 'click', selector: '.a' }] },
+      toolUseId: 'tu_b8',
+      cwd: '/',
+    } as any)
+    assert.equal(result.isError, true)
+    assert.ok(result.content.includes('urls 与 actions 不能同时使用'))
+  })
+
+  it('批量上限：11 个 URL 拒绝且不发任何请求', async () => {
+    const requested: string[] = []
+    const tool = createWebFetchTool({
+      lookup: publicLookup(),
+      fetch: trackingFetch(requested, () => textResponse('x')),
+    })
+    const urls = Array.from({ length: 11 }, (_, i) => `https://a.com/${i}`)
+    const result = await tool.execute({ input: { urls }, toolUseId: 'tu_b9', cwd: '/' } as any)
+    assert.equal(result.isError, true)
+    assert.ok(result.content.includes('一次最多抓取 10 个 URL'))
+    assert.ok(result.content.includes('11'))
+    assert.equal(requested.length, 0, '超限时不应发起任何请求')
+  })
+
+  it('批量上限内：10 个 URL 正常抓取', async () => {
+    const tool = createWebFetchTool({
+      lookup: publicLookup(),
+      fetch: trackingFetch([], () =>
+        textResponse(`<main><p>${'十页内容。'.repeat(30)}</p></main>`, 'text/html')),
+    })
+    const urls = Array.from({ length: 10 }, (_, i) => `https://a.com/${i}`)
+    const result = await tool.execute({ input: { urls }, toolUseId: 'tu_b10', cwd: '/' } as any)
+    assert.equal(result.isError, undefined)
+    assert.ok(result.content.includes('### 1. https://a.com/0'))
+    assert.ok(result.content.includes('### 10. https://a.com/9'))
+    assert.ok(result.content.includes('十页内容。'))
+  })
+})

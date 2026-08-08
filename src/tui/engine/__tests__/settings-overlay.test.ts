@@ -36,11 +36,11 @@ function draft(): SettingsDraft {
       patcherTier: 'cheap',
       escalationCap: 'off',
     },
-    review: { profiles: {}, skipAuto: true, mechanicalFastPath: true },
+    review: { profiles: {}, skipAuto: true, skipAutoSpark: false, mechanicalFastPath: true },
     vision: null,
     visionAutoBridge: false,
     modelVision: {},
-    basics: { toolPreset: 'minimal', approval: 'auto-safe', checkpointEveryTurns: 0, defaultDomain: 'qiming', defaultModel: '' },
+    basics: { toolPreset: 'minimal', runtimeLean: false, approval: 'auto-safe', checkpointEveryTurns: 0, defaultDomain: 'qiming', defaultModel: '' },
     net: { mirrorsEnabled: false, mirrorsPreset: 'default', proxy: '', noProxy: '', searchBackends: 'bing', jinaBaseUrl: 'https://r.jina.ai' },
   }
 }

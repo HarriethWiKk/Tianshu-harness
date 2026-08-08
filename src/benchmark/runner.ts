@@ -11,6 +11,8 @@ export interface BenchmarkRunnerOptions {
   model: string
   storeFile: string
   dryRun: boolean
+  /** 邻居提示 A/B 开关（P2-3）：透传进 run 记录，供 store 内区分对照组。 */
+  hint?: boolean
   executor?: BenchmarkExecutor
 }
 
@@ -34,6 +36,7 @@ export async function runBenchmark(opts: BenchmarkRunnerOptions): Promise<Benchm
     let status: BenchmarkRun['status'] = 'blocked'
     let metrics: BenchmarkMetrics = { turns: 0, toolCalls: 0, retries: 0 }
     let failures: BenchmarkRun['failures'] = []
+    let session: BenchmarkRun['session']
 
     if (!opts.dryRun) {
       try {
@@ -47,6 +50,7 @@ export async function runBenchmark(opts: BenchmarkRunnerOptions): Promise<Benchm
           ...(execution.metrics?.costUsd !== undefined ? { costUsd: execution.metrics.costUsd } : {}),
         }
         failures = execution.failures ?? []
+        session = execution.session
       } catch (error) {
         status = 'failed'
         failures = [{
@@ -67,6 +71,8 @@ export async function runBenchmark(opts: BenchmarkRunnerOptions): Promise<Benchm
       endedAt: new Date().toISOString(),
       metrics,
       failures,
+      ...(opts.hint !== undefined ? { hint: opts.hint } : {}),
+      ...(session ? { session } : {}),
     }
 
     appendBenchmarkRun(opts.storeFile, run)

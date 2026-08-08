@@ -6,12 +6,15 @@ import {
   formatTokenCount,
   formatTurnWorkSummary,
   formatElapsedHuman,
+  formatJobAwaitWait,
+  jobAwaitLimitMs,
   configureSpinnerVerbs,
   setReducedMotion,
   resetSpinnerConfig,
 } from '../format/spinner-status.js'
 import { circleSpinnerFrame } from '../braille-spinner.js'
 import { getTheme } from '../theme.js'
+import type { JobRow } from '../job-registry.js'
 
 const theme = getTheme()
 function stripAnsi(s: string): string {
@@ -119,9 +122,99 @@ describe('formatTurnWorkSummary', () => {
       outputTokens: 890,
     }, theme))
     const useAscii = chalk.level < 3
-    const expectedGlyph = useAscii ? 'Y' : '◆'
+    const expectedGlyph = useAscii ? '*' : '◆'
     assert.ok(line.includes(`${expectedGlyph} 1m 6s`))
     assert.ok(line.includes('12.3k→890'))
+  })
+})
+
+// ── job(await) 等待区如实化 ─────────────────────────────────────────
+// 契约：阻塞在 job(action:'await') 期间如实显示「在等谁 / 已等多久 / 上限多少」，
+// 动词池不轮换（根修「琢磨中 8m11s」式撒谎）。
+
+describe('jobAwaitLimitMs', () => {
+  it('与 job-tool clamp 同口径：缺省 120s、封顶 600s', () => {
+    assert.equal(jobAwaitLimitMs(undefined), 120_000)
+    assert.equal(jobAwaitLimitMs(null), 120_000)
+    assert.equal(jobAwaitLimitMs('abc'), 120_000)
+    assert.equal(jobAwaitLimitMs(30_000), 30_000)
+    assert.equal(jobAwaitLimitMs('45000'), 45_000)
+    assert.equal(jobAwaitLimitMs(9_999_999), 600_000)
+  })
+})
+
+describe('formatJobAwaitWait', () => {
+  const now = 1_000_000
+  const jobRow = (overrides: Partial<JobRow> = {}): JobRow => ({
+    id: 'a1',
+    command: 'npm run dev',
+    status: 'running',
+    startedAt: now - 50_000,
+    lastLine: '',
+    terminal: false,
+    unread: false,
+    ...overrides,
+  })
+
+  it('正常文案：⏳ 等待后台任务 <cmd> · 已等 Xs / 上限 Ys', () => {
+    const view = formatJobAwaitWait({ jobId: 'a1', startMs: now - 5_000 }, jobRow(), now)
+    assert.ok(view.line.includes('等待后台任务 npm run dev'), view.line)
+    assert.ok(view.line.includes('已等 5s'), view.line)
+    assert.ok(view.line.includes('上限 2m 0s'), view.line)
+    assert.equal(view.detail, undefined, '无 lastLine 不出次行')
+  })
+
+  it('有 lastLine 时次行跟随（截断 + 压平空白）', () => {
+    const view = formatJobAwaitWait(
+      { jobId: 'a1', startMs: now - 5_000 },
+      jobRow({ lastLine: 'vite ready\nin 300ms' }),
+      now,
+    )
+    assert.ok(view.detail, '应有次行')
+    assert.ok(view.detail!.includes('vite ready in 300ms'), view.detail)
+    assert.ok(!view.detail!.includes('\n'), '次行不得含换行')
+  })
+
+  it('cmd 超过 40 字符截断', () => {
+    const long = 'x'.repeat(80)
+    const view = formatJobAwaitWait({ jobId: 'a1', startMs: now - 5_000 }, jobRow({ command: long }), now)
+    assert.ok(view.line.includes('…'), '截断应带省略号')
+    assert.ok(!view.line.includes(long), '不得包含完整长命令')
+  })
+
+  it('无 jobRow 时降级为「等待后台任务 <jobId>」不带 cmd', () => {
+    const view = formatJobAwaitWait({ jobId: 'job-9', startMs: now - 12_000 }, undefined, now)
+    assert.ok(view.line.includes('等待后台任务 job-9'), view.line)
+    assert.ok(view.line.includes('已等 12s'), view.line)
+    assert.equal(view.detail, undefined)
+  })
+
+  it('timeout 参数换算进上限（封顶 600s）', () => {
+    const view = formatJobAwaitWait({ jobId: 'a1', timeoutMs: 30_000, startMs: now - 5_000 }, jobRow(), now)
+    assert.ok(view.line.includes('上限 30s'), view.line)
+    const capped = formatJobAwaitWait({ jobId: 'a1', timeoutMs: 9_999_999, startMs: now - 5_000 }, jobRow(), now)
+    assert.ok(capped.line.includes('上限 10m 0s'), capped.line)
+  })
+
+  it('超过上限 → 转「运行已久 — Ctrl+C 可中断」档', () => {
+    const view = formatJobAwaitWait({ jobId: 'a1', timeoutMs: 120_000, startMs: now - 491_000 }, jobRow(), now)
+    assert.ok(view.line.includes('后台任务运行已久'), view.line)
+    assert.ok(view.line.includes('Ctrl+C 可中断'), view.line)
+    assert.ok(view.line.includes('8m 11s'), view.line)
+    assert.ok(!view.line.includes('等待后台任务'), '超上限不再报等待口径')
+  })
+
+  it('动词不轮换：同一命令不同已等时长，静态前缀稳定', () => {
+    const a = formatJobAwaitWait({ jobId: 'a1', startMs: now - 5_000 }, jobRow(), now)
+    const b = formatJobAwaitWait({ jobId: 'a1', startMs: now - 13_000 }, jobRow(), now)
+    const c = formatJobAwaitWait({ jobId: 'a1', startMs: now - 61_000 }, jobRow(), now)
+    const prefix = (v: string) => v.split('·')[0]!
+    assert.equal(prefix(a.line), prefix(b.line))
+    assert.equal(prefix(b.line), prefix(c.line))
+    for (const v of [a, b, c]) {
+      assert.ok(!v.line.includes('琢磨中') && !v.line.includes('思索中') && !v.line.includes('推演中'),
+        `不得冒充思考系动词: ${v.line}`)
+    }
   })
 })
 

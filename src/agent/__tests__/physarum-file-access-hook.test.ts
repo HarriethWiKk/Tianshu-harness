@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createRuntimeHookContext } from '../runtime-hooks.js'
-import { createPhysarumFileAccessHook, canonicalizePhysarumFileTarget } from '../hooks/physarum-file-access-hook.js'
+import { createPhysarumFileAccessHook, canonicalizePhysarumFileTarget, relativizePhysarumFileTarget } from '../hooks/physarum-file-access-hook.js'
 import { PhysarumEngine } from '../../repo/physarum-engine.js'
 
 function makeWorkspace(): string {
@@ -38,6 +38,22 @@ describe('physarum file access hook', () => {
       assert.equal(canonicalizePhysarumFileTarget(cwd, 'src'), null)
       assert.equal(canonicalizePhysarumFileTarget(cwd, 'src/notes.md'), null)
       assert.equal(canonicalizePhysarumFileTarget(cwd, '../outside.ts'), null)
+    } finally {
+      rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+
+  it('relativizes non-existing indexable targets without stat (P2-1 enqueue-side)', () => {
+    const cwd = makeWorkspace()
+    try {
+      // 入队侧不要求文件存在——预测可能指向尚未读取/尚未创建的文件
+      assert.equal(relativizePhysarumFileTarget(cwd, 'src/ghost.ts'), 'src/ghost.ts')
+      assert.equal(relativizePhysarumFileTarget(cwd, join(cwd, 'src', 'ghost.ts')), 'src/ghost.ts')
+      // 同一过滤面：目录（无扩展名）、非索引、逃逸一律拒绝
+      assert.equal(relativizePhysarumFileTarget(cwd, 'src'), null)
+      assert.equal(relativizePhysarumFileTarget(cwd, 'src/notes.md'), null)
+      assert.equal(relativizePhysarumFileTarget(cwd, '../outside.ts'), null)
+      assert.equal(relativizePhysarumFileTarget(cwd, undefined), null)
     } finally {
       rmSync(cwd, { recursive: true, force: true })
     }

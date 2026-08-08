@@ -1,11 +1,14 @@
 import type { Tool, ToolCallParams, ToolResult } from './types.js'
 import type { ToolDefinition } from '../api/types.js'
 import type { MeridianIndexer } from '../repo/meridian-indexer.js'
+import { queryFlow, isUnnamedSymbolId } from '../repo/meridian-indexer.js'
+import { scheduleMeridianBackfill } from '../repo/meridian-backfill.js'
 
 interface RepoGraphInput {
   from_file: string
   max_tokens?: number
-  mode?: 'graph' | 'impact'
+  mode?: 'graph' | 'impact' | 'flow'
+  symbol?: string
 }
 
 const DEFINITION: ToolDefinition = {
@@ -15,12 +18,14 @@ const DEFINITION: ToolDefinition = {
 ### 模式
 - **graph**（默认）：按调用/导入距离排序，返回带导出符号的相关文件排名。
 - **impact**：返回改动该文件的爆炸半径——哪些文件依赖它、需要跑哪些测试。
+- **flow**：从指定符号（symbol 参数）出发沿调用/导入边双向追踪，返回沿途的命名符号（路径最多穿过 1 个未命名桥）。
 
 ### 何时使用
 - 读完文件后，查它依赖什么、什么依赖它
 - 编辑前，评估改动的爆炸半径（用 mode: "impact"）
 - 沿结构连接在陌生代码中导航
 - 编辑后，确认需要跑哪些测试（用 mode: "impact"）
+- 追踪某个函数/类的数据流经过哪些符号（用 mode: "flow" + symbol）
 
 ### 工作原理
 图随你读/写文件增量构建。读过的文件越多，图越完整。`,
@@ -29,7 +34,8 @@ const DEFINITION: ToolDefinition = {
     properties: {
       from_file: { type: 'string', description: '要查关联代码的文件路径（相对项目根）' },
       max_tokens: { type: 'number', default: 2000, description: '响应的 token 预算（控制返回多少文件）' },
-      mode: { type: 'string', enum: ['graph', 'impact'], default: 'graph', description: '查询模式："graph" 查相关文件，"impact" 做爆炸半径分析' },
+      mode: { type: 'string', enum: ['graph', 'impact', 'flow'], default: 'graph', description: '查询模式："graph" 查相关文件，"impact" 做爆炸半径分析，"flow" 从符号出发追踪数据流' },
+      symbol: { type: 'string', description: '流查询的起点符号名（mode: "flow" 必填），须是 from_file 中声明的符号' },
     },
     required: ['from_file'],
   },
@@ -43,12 +49,18 @@ export function createRepoGraphTool(getIndexer: () => MeridianIndexer | null): T
       if (!indexer) {
         return { content: 'Meridian 图尚未初始化。请先读取一些文件以构建索引。', isError: true }
       }
+      // First repo_* use: kick idle full-project backfill (no-op if already scheduled / lean / disabled).
+      scheduleMeridianBackfill(indexer, params.cwd ?? process.cwd(), { reason: 'ondemand' })
 
       const input = params.input as unknown as RepoGraphInput
       const mode = input.mode ?? 'graph'
 
       if (mode === 'impact') {
         return executeImpact(indexer, input.from_file)
+      }
+
+      if (mode === 'flow') {
+        return executeFlow(indexer, input.from_file, input.symbol)
       }
 
       const result = await indexer.query(input.from_file, { maxTokens: input.max_tokens ?? 2000 })
@@ -79,6 +91,47 @@ export function createRepoGraphTool(getIndexer: () => MeridianIndexer | null): T
     isConcurrencySafe() { return true },
     isEnabled() { return true },
   }
+}
+
+/** flow 模式（wave4 T9 工具面）：符号名 → seed id → queryFlow 命名符号 BFS。 */
+function executeFlow(indexer: MeridianIndexer, filePath: string, symbolName: string | undefined): ToolResult {
+  const db = indexer.getDb()
+  const symbols = db.getSymbolsForFile(filePath).filter(s => !isUnnamedSymbolId(s.id))
+  const available = () => {
+    const names = [...new Set(symbols.map(s => s.name))]
+    return names.length > 0 ? names.slice(0, 30).join(', ') : '（无——先读取该文件建立索引）'
+  }
+
+  if (!symbolName) {
+    return { content: `flow 模式需要 symbol 参数。\`${filePath}\` 可用符号：${available()}`, isError: true }
+  }
+
+  // 同名多符号（重载/重声明）取行号最小的那个。
+  const seed = symbols.filter(s => s.name === symbolName).sort((a, b) => a.line - b.line)[0]
+  if (!seed) {
+    return { content: `\`${filePath}\` 中找不到符号 \`${symbolName}\`。可用符号：${available()}`, isError: true }
+  }
+
+  const hits = queryFlow(db, seed.id)
+  if (hits.length === 0) {
+    return { content: `\`${symbolName}\`（${filePath} L${seed.line}）尚无流关联。图可能还需要索引更多文件。` }
+  }
+
+  const lines: string[] = [
+    `## 数据流（起点 \`${symbolName}\` @ ${filePath} L${seed.line}）`,
+    `命中 ${hits.length} 个命名符号；桥 = 路径经过的未命名占位数（0 = 全程命名直达）`,
+    '',
+  ]
+  const shown = hits.slice(0, 40)
+  for (const h of shown) {
+    const bridge = h.bridges > 0 ? `（${h.bridges} 桥）` : ''
+    lines.push(`- ${h.hops} 跳 ${h.name}（${h.kind}） ${h.filePath}:L${h.line}${bridge}`)
+  }
+  if (hits.length > shown.length) {
+    lines.push(`- ...（另有 ${hits.length - shown.length} 个）`)
+  }
+
+  return { content: lines.join('\n') }
 }
 
 function executeImpact(indexer: MeridianIndexer, filePath: string): ToolResult {

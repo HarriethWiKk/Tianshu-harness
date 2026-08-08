@@ -9,6 +9,11 @@
 </p>
 
 <p align="center">
+  <a href="docs/releases/manifesto-v3.0.0.md"><b>✨ 创世纪 · 天枢 3.0 公开声明</b></a> ·
+  <a href="docs/stars/genesis-stele.md">✦ 星域碑文 · 领航星叙事</a>
+</p>
+
+<p align="center">
   🇨🇳 <b>中文</b> · 
   <a href="README.en.md">📖 English</a> · 
   <a href="docs/stars/genesis-stele.md">✦ 星域碑文</a> · 
@@ -160,6 +165,7 @@ rivet --goal "修复所有类型错误" --budget 50   # 无头目标自主模式
 | 提供商 | 认证方式 | 旗舰模型 |
 |--------|----------|----------|
 | DeepSeek | API key | deepseek-v4-pro (1M ctx), deepseek-v4-flash |
+| DeepSeek Spark（Pro 专属） | API key（`DEEPSEEK_SPARK_API_KEY`） | deepseek-v4-flash（轻量推理 + 锚点缓存通道） |
 | Claude | API key（通过 `cc-switch` 代理） | opus-4-7, opus-4-6, sonnet-4-5 |
 | GLM（智谱） | API key | glm-5.2 |
 | Codex (GPT-5.5) | OAuth PKCE（ChatGPT 订阅） | gpt-5.5 |
@@ -361,13 +367,13 @@ DeepSeek 对缓存未命中收取 50× 费用。天枢的提示词引擎围绕�
 
 ### 工具集与 preset
 
-天枢内置 48 个工具，按三档 preset 装配（解析优先级：`RIVET_TOOL_PRESET` 环境变量 > 项目 `.rivet-config.json` 的 `tools.preset` > 用户 `~/.rivet/config.json` > 默认 `minimal`）：
+天枢内置 50 个工具，按 preset 分档装配（解析优先级：`RIVET_TOOL_PRESET` 环境变量 > 项目 `.rivet-config.json` 的 `tools.preset` > 用户 `~/.rivet/config.json` > 默认 `minimal`）：
 
 | Preset | 工具数 | 说明 |
 |--------|--------|------|
 | **minimal**（默认） | 29 | 日常开发全能力——读写/检索/bash/git/测试/委托/web/计划/todo/memory，省 token、保 prefix cache |
 | **frontend** | 30 | minimal + `browser_debug`（UI 渲染验证闭环） |
-| **full** | 48 | 全集，含 `council_convene` / `team_orchestrate` / `attack_case` / `semantic_search` / `repo_graph` / `monitor` / `computer_use` / 办公工具族等进阶能力 |
+| **full** | 50 | 全集，含 `council_convene` / `team_orchestrate` / `attack_case` / `semantic_search` / `repo_graph` / `monitor` / `computer_use` / `capability` / `cli_discover` / 办公工具族等进阶能力 |
 
 ```bash
 RIVET_TOOL_PRESET=full rivet          # 本次会话用 full
@@ -541,6 +547,8 @@ rivet config mcp list                                              # 列出 + �
 |------|--------------|
 | **GlanceBar 状态栏** | 输入框上方单行实时显示：星域 glyph · git 分支 · 模型 · 推理强度 · 缓存命中率 · 上下文占比 · 本轮 cost · 耗时 · turn 计数 · todo 徽章。一屏掌握会话健康度。 |
 | **流式中打断（Steer）** | agent 还在跑时直接打字，回车即可注入。输入按 `now / next / later` 三档优先级排队，在工具结果或回合边界 drain 给 AgentLoop——不必等它说完。`halt` 类意图自动升到 `now`。 |
+| **消息排队（/queue）** | `/queue <text>` 显式排队：agent busy 时攒下整条消息，settle 后自动投递；Esc 中断后排队内容回填输入框不丢失。输入区实时显示后台任务条与 await 等待区。 |
+| **终端内联图片** | kitty / iTerm2 图形协议在终端里直接渲染图片（工具产物、截图验证结果）。默认自动检测协议，`RIVET_IMAGES=0` 关闭、`kitty`/`iterm2` 强制指定。 |
 | **@mention 补全** | 输入 `@file:` / `@folder:` / `@symbol:` 触发路径补全（走 `git ls-files`，支持带空格的 `@file:"a b.ts"` 引用形）。直接粘贴图片自动转 base64 内联（macOS/Linux/Windows 三级降级）。 |
 | **倒带 Rewind** | 双击 `ESC`（间隔 <400ms）打开消息历史，选任一过往用户消息倒带到该点；可选「仅对话 / 仅代码改动 / 两者」三种恢复粒度，代码动作附带精确的文件影响预览。详见 [倒带](#倒带rewind)。 |
 | **命令面板** | `Ctrl+Esc` 打开，模糊搜索所有 slash 命令与 surface 动作（开关侧栏、切主题、进 Cockpit 等），↑/↓ 选中、Enter 执行。 |
@@ -579,6 +587,8 @@ TUI 是 CLI 的默认表面。桌面端（Tauri）与 VS Code/Cursor 插件共�
 - **@file 文件预览**：消息中提及的文件可点击，右侧抽屉展示文件内容（语法高亮 + 行号）
 - **DeepSeek 余额查询**：Insights 面板顶部显示账户余额和欠费状态（调官方 API）
 - **自定义 Provider**：设置 → 连接模型服务商 → + 自定义 Provider，支持任意 OpenAI 兼容端点（Ollama/vLLM/直连 OpenAI），API Key 可选
+- **主题工作室**：多自定义主题库 + 50 步撤销/重做 + 逐 token 编辑 + 壁纸配色引擎（OKLCH 聚类 + 对比度审计），内置「天枢静舱」等主题，支持导入导出
+- **sidecar 内存自适应**：堆上限按机器内存自动分档（8G→2G / 16G→4G / 32G→6G / 64G+→8G，`RIVET_SIDECAR_HEAP_MB` 可覆盖），≤8GB 机器自动启用 lean 资源档
 - **watchdog 自动恢复**：边界停滞时自动续跑，桌面端时间线可见恢复事件（⟳ 自动恢复 / ⏹ 配额耗尽）
 - **多会话并发**：标签栏管理多个会话，独立 cwd + 模型 + 审批模式
 - **功能面板**（左侧栏 `⌘1…9` 切换）：Mission Control（多会话控制台）、Inbox（收件箱）、Automations（定时任务）、Skills / Hooks 管理、Git / GitHub、Changes（改动审查）、Delegation（委派舰队与团队波次 DAG）、Cockpit 驾驶舱
@@ -608,6 +618,62 @@ TUI 是 CLI 的默认表面。桌面端（Tauri）与 VS Code/Cursor 插件共�
 
 > 桌面端还有 Cockpit 驾驶舱、SideChat 旁路提问（⌘;）、Rewind 时间旅行、主题/Glass/壁纸、Mirror 镜像加速等独有特性——详见 [桌面端用户指南](docs/desktop-guide.md)。
 
+### 🎙️ 语音输入（桌面端）
+
+输入框的麦克风按钮支持语音输入，**macOS 与 Windows 通用**。识别由**本地 whisper.cpp 引擎**完成——离线、隐私（录音不上传任何服务器），中英文混杂场景的精度优于系统自带识别。
+
+**首次使用引导**
+
+- 首次点击麦克风会自动下载识别模型（tiny 约 75MB，国内走镜像加速）。下载未完成时点击会提示「语音识别失败（whisper-unavailable）」，稍候重试即可。
+- macOS 首次使用会请求麦克风权限：点击「允许」即可；若误拒，到「系统设置 → 隐私与安全性 → 麦克风」中开启本应用。
+- Windows 若提示权限被拒，在「系统设置 → 隐私 → 麦克风」中允许本应用。
+
+**注意事项**
+
+- 识别全程在本地完成，录音不离开设备。
+- 点击一次开始录音，再点一次结束并识别。
+- 本地引擎不可用时（如模型未下载），macOS 自动回退系统语音识别；Windows 则提示模型未就绪。
+- 追求更高精度可换用 base 模型（约 244MB）：`desktop/scripts/fetch-whisper-runtime.js --with-base` 预下载。
+- 网络受限环境可设 `RIVET_WHISPER_PROXY=http://代理:端口` 加速模型下载。
+
+### ⚡ Lean 资源档（低内存 / 低磁盘）
+
+内存或磁盘吃紧时使用 Lean 档：精简工具集与提示词、关闭 embeddings、收紧会话池（4 会话 / 10 分钟 TTL / 10MB 事件日志）。适合低配机器或长时间多会话运行。
+
+**开启方式**（任选其一）：
+
+- 环境变量：`RIVET_LEAN=1` 全局开启；`RIVET_LEAN_ASPECT=tools,prompt,embeddings,meridian,pool` 按需只开部分子项（`RIVET_LEAN=0` 可显式关闭）
+- TUI：`/config` → Basics → Lean 资源档（开关 + 三个阈值）
+- 桌面端：设置 → 行为 → Lean 资源档
+
+**资源压力提醒**：运行时内存 ≥75% / 磁盘 ≥80% 会在状态行显示警告（仅提醒，不自动改配置）——可人工开 Lean 或开新会话应对。
+
+**阈值默认**：Lean 4 会话 / 600000ms（10 分钟）/ 10MB，正常 16 / 1800000ms（30 分钟）/ 50MB；事件日志磁盘下限 1,000,000 字节。
+
+**最小工具集（taiyi 档）**：`RIVET_TOOL_PRESET=taiyi`（或项目配置 `tools.preset: "taiyi"`）只装配高频核心工具（读写/检索/bash/git/测试/交付/计划等 16 个），去掉编排/浏览器/网络/视觉等重工具——适合评测「只留关键工具是否够用」。`full` 档一键回退全集。
+
+**按域覆盖（runtime.domains）**：`defaultDomain` 钉定某域时，该域的 lean/阈值/工具档位覆盖全局配置（其他域不受影响）：
+
+```jsonc
+{
+  "runtime": {
+    "domains": {
+      "taiyi": {
+        "lean": true,
+        "toolPreset": "taiyi",
+        "maxLoadedSessions": 4,
+        "idleAgentTtlMs": 600000,
+        "maxEventsDiskBytes": 10485760
+      }
+    }
+  }
+}
+```
+
+解析链：`RIVET_LEAN` 环境变量（恒优先）→ 域覆盖 → 全局 runtime。桌面端：设置 → 行为 → Lean 资源档 → 按域覆盖（域列表随新增星域自动扩展）。注意：域覆盖在会话装配期生效（启动钉定域时）；运行中 `/domain` 切换不影响已冻结的工具集与 lean（改工具指纹会重建前缀缓存）。
+
+**无需改文件的一键启动**：`/config` → Basics → 「最小集绑定星域」——选中某域（如 changgeng 或 taiyi），保存即自动写入 `defaultDomain` 钉定该域 + 该域的 lean/taiyi 最小工具档覆盖。此后 `rivet` 裸启动即进入该星域的最小集会话；配合「默认模型」字段（`agent.defaultModel`，`provider:modelId` 格式）即可完全免参数启动。清空绑定则恢复默认域（域覆盖配置保留）。
+
 ## ⌨️ 斜杠命令
 
 **会话与项目**
@@ -622,7 +688,7 @@ TUI 是 CLI 的默认表面。桌面端（Tauri）与 VS Code/Cursor 插件共�
 | `/doctor` | 环境健康检查 + bash 工具用的哪个 shell |
 | `/logs [open [desktop]]` | 本会话日志落点（会话 / 缓存 / 六维 / 桌面 sidecar），含写入门控与回收说明；`open` 在文件管理器中打开 |
 | `/connect` | 连接模型服务商向导（选内置或自定义，填 API 密钥） |
-| `/config` `/settings` `/setup` | 设置面板：子代理路由 / 审查子代理 / 识图模型 / 工具档位·审批·默认星域·默认模型 / 镜像·代理·搜索后端。`Tab` 切栏、`Enter` 编辑、`S` 保存，每项标注即时或下次会话生效 |
+| `/config` `/settings` `/setup` | 设置面板：子代理路由 / 审查开关（`审查 → 关闭提交后自动审查`） / 识图模型 / 工具档位·审批·默认星域·默认模型 / 镜像·代理·搜索后端。`Tab` 切栏、`Enter` 编辑、`S` 保存，每项标注即时或下次会话生效 |
 | `/cd <path>` | 会话中途切换工作目录（保前缀缓存，会话归属迁往新项目） |
 | `/exit` `/quit` | 保存会话并退出 |
 
@@ -652,6 +718,13 @@ TUI 是 CLI 的默认表面。桌面端（Tauri）与 VS Code/Cursor 插件共�
 | `/council <text>` | 召集多模型议事会审查（天权/天府/天璇三席） |
 | `/team <plan.md>` | 团队模式：多 agent 并行执行计划 |
 | `/scout <目标> [--dims 前端,后端,集成]` | 巡天侦察蜂群：并行只读诊断，交付带证据的实测核对清单 + runbook（不写文件；选型口诀——要留计划资产用 /team，只要这一次并行加速用 /scout） |
+
+**审查模式**
+
+每次 `deliver_task` 提交代码时，天枢会自动运行提交后审查。审查分两级：文档/配置等机械变更自动跳过（L1 nudge），核心代码变更触发 L2 接线检查（wiring inspector）。审查结果出现在交付报告中，不会阻止提交（advisory）。
+- **CLI（TUI）**：默认开启。设置面板 → `审查` → `关闭提交后自动审查` 可手动关闭（勾选即跳过审查）。也可用 `RIVET_REVIEW_DISCIPLINE=0` 环境变量全局关闭。
+- **桌面端（desktop）**：标准 DeepSeek 会话默认开启，Spark 会话默认开启且审查子代理用 spark-flash。在 `设置 → Routing → 审查子代理` 中可找到两个独立开关：`SkipAuto`（标准会话）、`SkipAutoSpark`（Spark 会话）。
+- 手动审查：任何时候可用 `/review`（L2 对抗审查）或 `/review max`（L3 五席审查 squad）对当前改动执行深度审查。这是显式请求，不受开关控制。
 
 **子代理与后台任务**
 
@@ -701,7 +774,7 @@ Node.js 22 · TypeScript strict（`noUncheckedIndexedAccess`）· T9 ANSI 渲染
 ```bash
 npx tsc --noEmit                                    # 类型检查
 npm test                                             # 所有测试（13,000+ 用例）
-npm run build                                        # tsup 打包
+npm run build                                        # tsup 打包 + 原生/wasm 载荷落位
 node dist/main.js                                    # 启动 TUI
 node dist/main.js -p "fix the typo"                  # 无界面模式
 ```
@@ -818,6 +891,7 @@ rivet logs open desktop            # 打开 sidecar 日志目录（GUI 起不来
 | 变量 | 作用 |
 |------|------|
 | `DEEPSEEK_API_KEY` | DeepSeek API 密钥 |
+| `DEEPSEEK_SPARK_API_KEY` | DeepSeek Spark（Pro 专属预设）API 密钥 |
 | `RIVET_TOOL_PRESET` | 工具集档位：`minimal`（默认）/ `frontend` / `full` |
 | `RIVET_EMBEDDING_MODEL` / `RIVET_EMBEDDING_BASE_URL` / `RIVET_EMBEDDING_API_KEY` | 语义搜索的嵌入模型路由（默认 `text-embedding-3-small`） |
 | `RIVET_NO_EMBEDDINGS=1` | 关闭嵌入索引 |
@@ -829,6 +903,7 @@ rivet logs open desktop            # 打开 sidecar 日志目录（GUI 起不来
 | 变量 | 作用 |
 |------|------|
 | `RIVET_ASCII_UI=1` | 强制纯 ASCII UI（降级终端） |
+| `RIVET_IMAGES` | 终端内联图片：默认自动检测；`0`/`off` 关闭；`kitty`/`iterm2` 强制协议 |
 | `RIVET_HYPERLINKS=1` | 开启 OSC 8 超链接渲染 |
 | `RIVET_NOTIFY_BELL=1` | 完成时响终端铃 |
 | `RIVET_AMBIGUOUS_WIDTH` | CJK 宽度判定覆盖（终端对齐错乱时用） |

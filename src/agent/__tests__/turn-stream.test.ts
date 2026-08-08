@@ -460,6 +460,43 @@ describe('TurnStreamController', () => {
     assert.equal(JSON.stringify(request), requestBytes, 'TTFT instrumentation must not change request/message bytes')
   })
 
+  it('provider 不回缓存字段时仍记录 TTFT——延迟指标不该被成本字段的存在性挡住', async () => {
+    const times = [1_000, 1_250]
+    const turnCaches: number[] = []
+    const ttfts: number[] = []
+    const client: StreamClient = {
+      stream: mock.fn(async (_request: OaiChatRequest, cb: StreamCallbacks) => {
+        cb.onTextDelta('hello')
+        // 没有 cache_read_input_tokens / cache_creation_input_tokens：
+        // worker 目录一直没有 cache-log，正是被这个条件挡住的。
+        cb.onStopReason('end_turn', { input_tokens: 10, output_tokens: 2 })
+      }),
+    }
+    const controller = new TurnStreamController({
+      client,
+      abortSignal: new AbortController().signal,
+      getStreamedTextLength: () => 0,
+      appendStreamedText: () => {},
+      getLastPrewarmAt: () => 0,
+      setLastPrewarmAt: () => {},
+      maybePrewarm: () => {},
+      addUsage: () => {},
+      recordTurnCache: () => { turnCaches.push(1) },
+      recordTtft: ms => { ttfts.push(ms) },
+      now: () => times.shift() ?? 9_999,
+    })
+
+    await controller.streamTurn({
+      request,
+      turn: 1,
+      lastTurnTextFingerprint: '',
+      callbacks: { onTextDelta: () => {}, onThinkingDelta: () => {}, onToolUse: () => {}, onError: () => {} },
+    })
+
+    assert.deepEqual(ttfts, [250], 'TTFT 必须独立于缓存字段被记录')
+    assert.equal(turnCaches.length, 0, '缓存字段缺席时 recordTurnCache 仍不应触发（缓存诊断语义不变）')
+  })
+
   it('leaves TTFT absent when the provider emits no output signal', async () => {
     const client: StreamClient = {
       stream: mock.fn(async (_request: OaiChatRequest, cb: StreamCallbacks) => {

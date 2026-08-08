@@ -21,14 +21,17 @@
 import type { PostToolRuntimeHook, RuntimeHookContext, RuntimeToolEvent } from '../runtime-hooks.js'
 import type { AdvisoryBus } from '../advisory-bus.js'
 import { renderRouteAnnotation, STALL_ROUTE_TABLE } from '../failure-taxonomy.js'
+import { regressionLoopLimitForWindow } from '../window-thresholds.js'
 
 export interface RegressionBisectDeps {
   advisoryBus: Pick<AdvisoryBus, 'submit'>
   /** 意图锚点（taskContract?.objective ?? initialUserMessage）——回归语义主信源。 */
   getObjective?: () => string | null
+  /** 上下文窗口（token 数）。阈值 5→12（1M）随窗口后移；缺省 = 200K 旧行为。 */
+  getContextWindow?: () => number
 }
 
-/** 连续诊断空转轮数阈值 */
+/** 连续诊断空转轮数阈值（200K 窗口基准；1M 窗口经 regressionLoopLimitForWindow 放大到 12） */
 export const REGRESSION_LOOP_TURN_THRESHOLD = 5
 
 /** 回归语义签名（用户描述 or 模型排查关键词） */
@@ -105,7 +108,9 @@ export function createRegressionBisectHook(
       if (fired) return
       // 本轮进行中也计入（loopTurns 是已完成轮，+1 是当前轮）
       const effectiveLoop = loopTurns + (turnSawDiagnosis && !turnSawWrite ? 1 : 0)
-      if (effectiveLoop < REGRESSION_LOOP_TURN_THRESHOLD) return
+      // 1M 窗口下连续 12 轮纯诊断空转才算异常（200K 基准 5 轮，线性插值）。
+      const windowLimit = regressionLoopLimitForWindow(deps.getContextWindow?.() ?? 200_000)
+      if (effectiveLoop < windowLimit) return
 
       const objective = deps.getObjective?.() ?? ''
       const regressionSemantics = sawRegressionInInputs || REGRESSION_RE.test(objective)

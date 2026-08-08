@@ -1,10 +1,12 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { createDelegateTaskTool, formatUiContent, type DelegateTaskCoordinator } from '../delegate-task.js'
+import { createCoordinatorDelegateAdapter, createDelegateTaskTool, formatUiContent, type DelegateTaskCoordinator } from '../delegate-task.js'
 import type { CoordinatorRun, DelegationRequest } from '../../agent/coordinator.js'
 import { profileRegistry } from '../../agent/profile-registry.js'
 import { MAX_BUDGET_CONTINUATIONS, MAX_HANDS_EXTRA_RUNS } from '../../agent/worker-continuation.js'
 import { starDomainRegistry } from '../../agent/star-domain-registry.js'
+
+const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms))
 
 function makeRun(): CoordinatorRun {
   return {
@@ -26,6 +28,36 @@ function makeRun(): CoordinatorRun {
 }
 
 describe('DELEGATE_TASK_TOOL', () => {
+  it('终态经 mapper.finish 排在合并尾沿之后，延迟 timer 不再补发 running', async () => {
+    const events: Array<{ status: string; eventKind?: string; eventDetail?: string }> = []
+    const coordinator: DelegateTaskCoordinator = {
+      delegate: async request => {
+        request.onActivity?.({
+          workOrderId: 'wo_1',
+          profile: 'code_scout',
+          kind: 'text',
+          detail: 'tail',
+        })
+        return makeRun()
+      },
+    }
+    const tool = createDelegateTaskTool(coordinator)
+
+    await tool.execute({
+      toolUseId: 'tu_mapper_finish',
+      cwd: '/repo',
+      input: { objective: 'flush the activity tail' },
+      onWorkerActivity: (event: any) => events.push(event),
+    } as any)
+
+    assert.deepEqual(events.map(event => [event.status, event.eventKind, event.eventDetail]), [
+      ['running', 'text', 'tail'],
+      ['passed', undefined, undefined],
+    ])
+    await sleep(150)
+    assert.equal(events.length, 2)
+  })
+
   it('validates input and calls the coordinator', async () => {
     const calls: DelegationRequest[] = []
     const coordinator: DelegateTaskCoordinator = {
@@ -55,6 +87,101 @@ describe('DELEGATE_TASK_TOOL', () => {
     assert.equal(result.isError, false)
     assert.ok(result.content.includes('<worker_results>'))
     assert.ok(result.uiContent!.includes('delegate_task · 1/1 通过'))
+  })
+
+  it('异常路径（coordinator 抛错）补发终态——已派发 worker 不得永远卡 running', async () => {
+    // 回归锚点：delegate-task 的 execute 此前无 try-catch，coordinator.delegate
+    // 抛错（abort/内部错误）直接冒泡，onWorkerActivity 收不到终态——
+    // FleetRegistry 里该 worker 永远停在 running、时间一直走（CLI TUI 无
+    // session-manager 的 sweepStaleDelegationNodes 兜底，见 2026-08 调研）。
+    const activities: Array<{ workOrderId?: string; status?: string }> = []
+    const coordinator: DelegateTaskCoordinator = {
+      delegate: async (_request, _signal, onOrderCreated) => {
+        onOrderCreated?.('wo_single_1')
+        throw new Error('simulated coordinator failure')
+      },
+    }
+    const tool = createDelegateTaskTool(coordinator)
+
+    let result: Awaited<ReturnType<typeof tool.execute>> | undefined
+    try {
+      result = await tool.execute({
+        toolUseId: 'tu_single_abort',
+        cwd: '/repo',
+        input: { objective: 'Find the seam.' },
+        onWorkerActivity: (ev: any) => activities.push(ev),
+      } as any)
+    } catch (err) {
+      assert.fail(`execute 必须捕获 coordinator 异常并返回 isError，实际抛出：${(err as Error).message}`)
+    }
+
+    assert.equal(result!.isError, true)
+    const terminal = activities.find(a => a.workOrderId === 'wo_single_1')
+    assert.ok(terminal, '异常路径必须为已派发 worker 补发终态')
+    // 审查门（35f459b8f）LOW-2：必须钉死补发状态 ∈ 终态集合（blocked），
+    // 不能只断言 !== running——否则 blocked 移出 TERMINAL_STATUSES 或改名时
+    // 测试仍绿而停表失效。
+    assert.equal(terminal!.status, 'blocked', '补发的必须是 blocked 终态')
+  })
+
+  it('abort 路径：补发终态后 rethrow AbortError——用户取消不得记成工具失败', async () => {
+    // 复评（35f459b8f）：catch 曾无差别吞掉 abort，转成 isError+runtime_gate——
+    // 管道的 [interrupted] 语义（is_error=false、不计失败记账）被绕过，
+    // 用户 Esc 一次就给 vigor/doom-loop 指纹喂一条假失败。
+    const activities: Array<{ workOrderId?: string; status?: string }> = []
+    const coordinator: DelegateTaskCoordinator = {
+      delegate: async (_request, _signal, onOrderCreated) => {
+        onOrderCreated?.('wo_abort_1')
+        // coordinator 侧 abort 实际抛的是 name='Error' 的 'Delegation aborted: …'
+        throw new Error('Delegation aborted: user cancelled')
+      },
+    }
+    const tool = createDelegateTaskTool(coordinator)
+
+    const controller = new AbortController()
+    controller.abort()
+    await assert.rejects(
+      tool.execute({
+        toolUseId: 'tu_abort_rethrow',
+        cwd: '/repo',
+        input: { objective: 'Find the seam.' },
+        abortSignal: controller.signal,
+        onWorkerActivity: (ev: any) => activities.push(ev),
+      } as any),
+      (err: unknown) => {
+        // 管道只认 name——rethrow 的必须是 AbortError 形态
+        assert.equal((err as Error).name, 'AbortError')
+        return true
+      },
+    )
+    // 终态照发：fleet 里已派发 worker 不许卡 running
+    const terminal = activities.find(a => a.workOrderId === 'wo_abort_1')
+    assert.equal(terminal?.status, 'blocked', 'abort 也要先补发 blocked 终态再 rethrow')
+  })
+
+  it('生产接线适配器：三参全透传 + 未初始化 reject', async () => {
+    // 复评（35f459b8f）：bootstrap 内联适配器丢第三参 onOrderCreated——
+    // 少参函数可赋多参签名，编译期零报警，补发终态在生产成死代码。
+    // 适配器收敛为可测工厂后钉死透传契约。
+    const seen: Array<{ hasSignal: boolean; hasCallback: boolean }> = []
+    const adapter = createCoordinatorDelegateAdapter(() => ({
+      delegate: async (_request, signal, onOrderCreated) => {
+        seen.push({ hasSignal: signal !== undefined, hasCallback: typeof onOrderCreated === 'function' })
+        onOrderCreated?.('wo_wire_1')
+        return makeRun()
+      },
+    }))
+
+    const controller = new AbortController()
+    let created: string | undefined
+    await adapter.delegate({} as DelegationRequest, controller.signal, id => { created = id })
+    assert.deepEqual(seen, [{ hasSignal: true, hasCallback: true }], 'signal 与 onOrderCreated 都必须透传')
+    assert.equal(created, 'wo_wire_1')
+
+    await assert.rejects(
+      createCoordinatorDelegateAdapter(() => null).delegate({} as DelegationRequest),
+      /not initialized/,
+    )
   })
 
   it('passes authority through to the coordinator', async () => {

@@ -1,9 +1,9 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import { createWebSearchTool, WEB_SEARCH_TOOL } from '../tool.js'
-import type { SearchBackend, SearchResult } from '../types.js'
+import type { SearchBackend } from '../types.js'
 
-function backend(name: string, behavior: () => Promise<SearchResult[]>, available = true): SearchBackend {
+function backend(name: string, behavior: SearchBackend['search'], available = true): SearchBackend {
   return { name, isAvailable: () => available, search: behavior }
 }
 
@@ -50,6 +50,56 @@ describe('createWebSearchTool', () => {
     assert.equal(out.isError, true)
     assert.match(out.content, /搜索失败/)
     assert.match(out.content, /ddg: HTTP 503/)
+  })
+
+  it('coerces a numeric-string count to a number', async () => {
+    let receivedCount: number | undefined
+    const tool = createWebSearchTool({
+      backends: [backend('brave', async (_q, count) => {
+        receivedCount = count
+        return Array.from({ length: count }, (_, i) => ({
+          title: `T${i}`,
+          url: `https://x/${i}`,
+          snippet: 'S',
+        }))
+      })],
+    })
+    const out = await tool.execute(params({ query: 'q', count: '3' }))
+    assert.equal(out.isError, undefined)
+    assert.equal(receivedCount, 3)
+    assert.match(out.content, /1\. \[T0\]\(https:\/\/x\/0\)/)
+    assert.match(out.content, /3\. \[T2\]\(https:\/\/x\/2\)/)
+  })
+
+  it('coerces a numeric query to a string', async () => {
+    let receivedQuery: string | undefined
+    const tool = createWebSearchTool({
+      backends: [backend('brave', async (q) => {
+        receivedQuery = q
+        return [{ title: 'T', url: 'https://x', snippet: 'S' }]
+      })],
+    })
+    const out = await tool.execute(params({ query: 123 }))
+    assert.equal(out.isError, undefined)
+    assert.equal(receivedQuery, '123')
+    assert.match(out.content, /「123」的网页搜索结果/)
+  })
+
+  it('falls back to the default count for an invalid count string', async () => {
+    let receivedCount: number | undefined
+    const tool = createWebSearchTool({
+      backends: [backend('brave', async (_q, count) => {
+        receivedCount = count
+        return Array.from({ length: count }, (_, i) => ({
+          title: `T${i}`,
+          url: `https://x/${i}`,
+          snippet: 'S',
+        }))
+      })],
+    })
+    const out = await tool.execute(params({ query: 'q', count: 'abc' }))
+    assert.equal(out.isError, undefined)
+    assert.equal(receivedCount, 10)
   })
 
   it('requires approval and is concurrency-safe', () => {

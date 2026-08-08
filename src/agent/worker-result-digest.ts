@@ -31,6 +31,8 @@ export interface WorkerResultDigestInput {
   changedFilesCount: number
   failureReason?: string
   evidenceStatus?: string
+  /** Worker 自报的研究覆盖规模（sourcesReviewed 透传），存在且 >0 时展示。 */
+  sourcesReviewedCount?: number
 }
 
 /** 结果一句话摘要（detail 头部 + delegate_task uiContent 复用）。
@@ -42,6 +44,7 @@ export function formatWorkerResultDigest(r: WorkerResultDigestInput): string {
   const parts: string[] = [`${glyph} ${summary}`]
   if (r.findingsCount > 0) parts.push(`${r.findingsCount} 条发现`)
   if (r.changedFilesCount > 0) parts.push(`${r.changedFilesCount} 个文件`)
+  if (r.sourcesReviewedCount !== undefined && r.sourcesReviewedCount > 0) parts.push(`${r.sourcesReviewedCount} 个来源`)
   const honesty = digestHonesty(r.failureReason, r.evidenceStatus)
   if (honesty) parts.push(`⚠ ${honesty}`)
   return parts.join(' · ')

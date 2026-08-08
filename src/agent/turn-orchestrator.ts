@@ -27,6 +27,7 @@ import { describeAction } from './evidence-obligation.js'
 import type { AdvisoryEntry } from './advisory-bus.js'
 import { debugLog } from '../utils/debug.js'
 import { hasActionIntent, hasWriteActionIntent, turnUsedOnlyReadTools, DELIVERY_SIGNAL_RE } from './action-intent-detector.js'
+import { b1ReadOnlyLimitForWindow, b2TurnLimitForWindow } from './window-thresholds.js'
 
 // ── Types re-exported for deps interface ──
 
@@ -246,6 +247,14 @@ export interface TurnOrchestratorDeps {
   /** 会话活动模式。diagnostic = 近窗口只读为主 + 零改动（排查/根因分析）。
    *  B2 催收敛文案据此分流为"先核实断言再收束"。缺省 = 恒 build（旧行为）。 */
   getActivityMode?: () => 'diagnostic' | 'build'
+  // === 星域感知（缺陷 2 修复，会话 aa9737bb 审查）===
+  /** 活跃星域 id（如 'tianji'）。B2 对探寻型星域（天机/天璇/破军）降级
+   *  收敛文案——探寻价值被系统承认，不催"输出结论"。缺省 = null。 */
+  getStarDomain?: () => string | null
+  // === 窗口感知阈值（2026-08：1M 窗口下固定轮数提醒太紧）===
+  /** 模型上下文窗口（token 数，如 200_000 / 1_000_000）。B1/B2 提醒阈值
+   *  据此缩放（200K 基准 → 1M 目标线性插值）。缺省 = 200K 旧行为。 */
+  getContextWindow?: () => number
 
   // === Abort signal ===
   // === Abort signal ===
@@ -860,8 +869,11 @@ export class TurnOrchestrator {
           this.deps.state.consecutiveNoToolTurns = 0
           // ── B1 轮内只读调用计数（spec 三轮防御加固）──
           // 在本轮工具结果处理后刷新计数器：全只读则 +1，否则重置。
+          // ?? 0：state 字段无显式初始化点——首轮即全只读时 undefined+1=NaN
+          // 会让 B1 永久失明（NaN >= 阈值恒 false）。真实会话首轮通常非只读
+          // 经 else 分支补 0，测试/首轮只读的会话会踩中。
           if (turnUsedOnlyReadTools(toolUses)) {
-            this.deps.state.consecutiveReadOnlyTurns = this.deps.state.consecutiveReadOnlyTurns + 1
+            this.deps.state.consecutiveReadOnlyTurns = (this.deps.state.consecutiveReadOnlyTurns ?? 0) + 1
           } else {
             this.deps.state.consecutiveReadOnlyTurns = 0
           }
@@ -1014,10 +1026,13 @@ export class TurnOrchestrator {
           }
 
           // ── B1 连续只读螺旋提醒（spec 三轮防御加固）──
-          // 连续 4+ 轮全只读工具且没有写侧承诺 → 模型陷入无声读取螺旋。
+          // 连续 4+ 轮（1M 窗口 9+ 轮，随窗口线性插值）全只读工具且没有写侧
+          // 承诺 → 模型陷入无声读取螺旋。1M 窗口下读 9 轮文件仍是正常调研，
+          // 阈值随窗口后移（会话 b1b4d856 实测固定 4 轮在长任务里频繁误催）。
           // 此时 action-intent gate 不触发（未声明写入），但信息已足够——
           // 注入一次性提醒推动模型行动。
-          if (this.deps.state.consecutiveReadOnlyTurns >= 4) {
+          const b1Limit = b1ReadOnlyLimitForWindow(this.deps.getContextWindow?.() ?? 200_000)
+          if (this.deps.state.consecutiveReadOnlyTurns >= b1Limit) {
             const n = this.deps.state.consecutiveReadOnlyTurns
             this.deps.state.consecutiveReadOnlyTurns = 0 // 一次性，不重复提醒
             const content = `本轮已连续 ${n} 次只读操作（read_file/grep/glob 等），信息可能已足够 — 请基于已有理解开始行动（编辑、测试、或输出结论），不需要继续读取更多文件。`
@@ -1029,6 +1044,12 @@ export class TurnOrchestrator {
                 content,
                 channel: 'system-reminder',
                 immediate: true,
+                // functional 通道：B1 是"连续只读螺旋"守卫，每 run 一次性。
+                // discipline 类受 run 级 1 条 SR 配额约束——长 run 里
+                // probe-discipline/self-verify 等先提交会把它挤到 requeue，
+                // 28 轮/9 轮提醒在 run 结束前无法送达（会话 b1b4d856 实测）。
+                // functional 不限流且 B1 本身一次性，无刷屏风险。
+                srClass: 'functional',
                 expect: {
                   kind: 'tool_appears',
                   tools: ['write_file', 'edit_file', 'hash_edit', 'apply_patch', 'run_tests', 'bash', 'deliver_task'],
@@ -1041,31 +1062,57 @@ export class TurnOrchestrator {
           }
 
           // ── B2 轮内调用上限提醒（spec 三轮防御加固）──
-          // 轮内 API 调用超过 12 次 → 模型发散，注入一次性强提醒。
+          // 轮内 API 调用超过窗口阈值（200K→12，1M→28，中间线性插值）→
+          // 模型发散，注入一次性强提醒。1M 窗口下 12 轮是任务正常形态，固定
+          // 12 轮导致合法长任务被反复催收敛（会话 b1b4d856 实测 6 条 B2）。
           // 不强制截断（避免打断合法大批量编辑），仅收敛建议。
-          if (!turnCallLimitAdvisoryFired && turn >= 12) {
+          const b2TurnLimit = b2TurnLimitForWindow(this.deps.getContextWindow?.() ?? 200_000)
+          if (!turnCallLimitAdvisoryFired && turn >= b2TurnLimit) {
             turnCallLimitAdvisoryFired = true
-            // W3 诊断态分流（incident 20b9714e）：对排查会话催"输出结论"会在
-            // 证据不足时直接诱发脑补——改为要求先核实将写进结论的断言。
-            const diagnostic = this.deps.getActivityMode?.() === 'diagnostic'
-            const content = diagnostic
-              ? '本轮已进行 12+ 次 API 调用。先用工具核实你将要写进结论的关键断言（ls/grep/read 实际文件），核实完再收束；没有工具证据的推断必须标注"未核实"。会话自身状态可用 session_vitals 取证。'
-              : '本轮已进行 12+ 次 API 调用，请收敛当前动作并输出结论，不要继续发散。'
-            if (this.deps.submitAdvisory) {
-              this.deps.submitAdvisory({
-                key: 'turn-call-limit',
-                priority: 0.68,
-                category: 'discipline',
-                content,
-                channel: 'system-reminder',
-                immediate: true,
-                // 诊断态可核销：采纳签名 = 后续轮出现认知型工具调用（去核实）。
-                expect: diagnostic
-                  ? { kind: 'tool_appears', tools: ['read_file', 'grep', 'glob', 'list_dir', 'bash'], withinTurns: 2 }
-                  : undefined,
-              })
+            // 缺陷 2 修复（会话 aa9737bb 审查）：planning 态是合法探寻
+            // （规划/设计/调研），高轮次是任务性质不是发散——催收敛只产生
+            // 妥协（该会话 L572-576 模型自我收束放弃取证）。planning 态
+            // 完全不发收敛提醒。
+            if (this.deps.getPlanModeState() === 'planning') {
+              // 不发——规划/探寻模式的高轮次是任务性质，不是发散
             } else {
-              this.deps.appendSystemReminder(`<system-reminder>${content}</system-reminder>`)
+              // W3 诊断态分流（incident 20b9714e）：对排查会话催"输出结论"会在
+              // 证据不足时直接诱发脑补——改为要求先核实将写进结论的断言。
+              const diagnostic = this.deps.getActivityMode?.() === 'diagnostic'
+              // 缺陷 2 第二层：探寻型星域（天机/天璇/破军）即使被判 build
+              // 也降级为诊断文案——不催"输出结论"，只要求核实断言。
+              const starDomain = this.deps.getStarDomain?.() ?? null
+              const exploringDomain = starDomain !== null && ['tianji', 'tianxuan', 'pojun'].includes(starDomain)
+              const effectiveDiagnostic = diagnostic || exploringDomain
+              const content = effectiveDiagnostic
+                ? `本轮已进行 ${b2TurnLimit}+ 次 API 调用。先用工具核实你将要写进结论的关键断言（ls/grep/read 实际文件），核实完再收束；没有工具证据的推断必须标注"未核实"。会话自身状态可用 session_vitals 取证。`
+                : `本轮已进行 ${b2TurnLimit}+ 次 API 调用，请收敛当前动作并输出结论，不要继续发散。`
+              if (this.deps.submitAdvisory) {
+                this.deps.submitAdvisory({
+                  key: 'turn-call-limit',
+                  priority: 0.68,
+                  category: 'discipline',
+                  content,
+                  channel: 'system-reminder',
+                  immediate: true,
+                  // functional 通道（同 B1）：discipline 类受 run 级 1 条 SR
+                  // 配额约束，长 run 里 turn-budget(0.7)/probe-discipline 等
+                  // 先提交会把 B2 挤到 requeue——1M 窗口 28 轮触发的提醒在
+                  // run 结束前无法送达。B2 每 run 一次性，functional 无刷屏。
+                  srClass: 'functional',
+                  // 诊断态可核销：采纳签名 = 后续轮出现认知型工具调用（去核实）。
+                  // build 态可核销（缺陷 3 修复）：course_changed = 观察窗内出现
+                  // 前置对照窗未见过的工具族×文件面粗签名 → adopted。build 态
+                  // 要求的是「改变方向」，不是「随便调个工具」——course_changed
+                  // 比 tool_appears 更贴合。纳入采纳统计后 efficacy 负反馈环
+                  // （delivered≥3 冷却 / ≥6 静默）能自动降频无效重复注入。
+                  expect: effectiveDiagnostic
+                    ? { kind: 'tool_appears', tools: ['read_file', 'grep', 'glob', 'list_dir', 'bash'], withinTurns: 2 }
+                    : { kind: 'course_changed', withinTurns: 2 },
+                })
+              } else {
+                this.deps.appendSystemReminder(`<system-reminder>${content}</system-reminder>`)
+              }
             }
           }
 
@@ -1361,6 +1408,14 @@ export class TurnOrchestrator {
           voluntary: false,
           detail: 'exhausted without a final turn',
         }, callbacks)
+        // postSession 与 natural-finish / abort 两条路径对齐：此前这里只重置 TUI
+        // 状态机，整个 postSession 阶段被跳过——telemetry-flush、dream、
+        // skill-distill、advisory 核销、flushAdvisoryEfficacy 全部不跑。对每轮
+        // 都用工具直到预算耗尽的 worker（只读 scout 的常态）这就是主路径，
+        // 跨会话效力先验因此长期收不到 worker 侧样本。
+        // 不复用 completeTurn：它内部会再跑一次 runPostTurn，而本轮的 postTurn
+        // 已在循环内执行过。照 abort 路径（下方 catch）的写法直接补 postSession。
+        await this.deps.runPostSession(callbacks)
         callbacks.onTurnComplete(this.deps.getTotalUsage(), this.deps.getTurnCount(), true)
       }
     } catch (err) {

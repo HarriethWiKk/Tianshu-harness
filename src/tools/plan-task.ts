@@ -2,7 +2,7 @@ import type { Tool, ToolCallParams } from './types.js'
 import { decomposeObjective, renderTaskGraphSummary } from '../agent/task-planner.js'
 import { taskGraphToUnifiedPlan, unifiedPlanToTeamTasks, serializeUnifiedPlan, renderUnifiedPlanSummary, validateUnifiedPlan } from '../agent/unified-plan.js'
 import type { DelegationCoordinator } from '../agent/coordinator.js'
-import { executePlan, type PlanExecutorDeps, type PlanExecutorRun } from '../agent/plan-executor.js'
+import { executePlanWaves, type PlanExecutorDeps, type PlanExecutorWavesResult } from '../agent/plan-executor.js'
 import { extractRequiredSkills } from '../agent/skill-gate.js'
 import { storePlan } from '../agent/plan-store.js'
 import { classifyTaskDepth, type TaskContract } from '../context/task-contract.js'
@@ -50,26 +50,84 @@ export function parseChecklistItems(markdown: string): Array<{ text: string; fil
   return items
 }
 
-/** Build a TaskGraph from parsed checklist items — each item becomes a patcher task. */
-function buildTasksFromChecklist(
-  items: Array<{ text: string; files: string[] }>,
+/**
+ * 章节感知解析（用户指令：不再按 checklist 逐项切分，按章节 wave 切是最低限度）。
+ *
+ * 按 H2/H3 标题分组，每个含 ≥1 个 `- [ ]` 项的章节产出一个任务分组。
+ * 章节文件集合 = 章节内所有行（标题+正文+checklist 项）的反引号路径，去重。
+ * 无 H2/H3 章节结构 → 返回空数组，由调用方路由到通用规划（decomposeObjective）
+ * ——不回退逐项 checklist 切分（2026-07-26 用户指令）。
+ */
+export function parseChecklistSections(markdown: string): Array<{
+  heading: string
+  items: Array<{ text: string; files: string[] }>
+  files: string[]
+}> {
+  const sections: Array<{ heading: string; body: string[] }> = []
+  let current: { heading: string; body: string[] } | null = null
+  for (const line of markdown.split('\n')) {
+    const h = line.match(/^(#{2,3})\s+(.+)$/)
+    if (h) {
+      current = { heading: h[2]!.trim(), body: [] }
+      sections.push(current)
+    } else if (current) {
+      current.body.push(line)
+    }
+  }
+
+  const out: Array<{
+    heading: string
+    items: Array<{ text: string; files: string[] }>
+    files: string[]
+  }> = []
+  for (const sec of sections) {
+    // 章节内 checklist 项：复用 parseChecklistItems 的逐行提取逻辑（作用域限定章节 body）
+    const items = parseChecklistItems(sec.body.join('\n'))
+    if (items.length === 0) continue // 无 checklist 的章节（验证命令/反证/后续）不生成任务
+    // 章节文件集合 = 章节内所有行（含标题）的反引号路径。严格口径：
+    // ① 多路径反引号（如验证命令 `npm exec -- tsx --test a.test.ts b.test.ts`）
+    //    按空白/逗号拆开，逐段校验；② 只收 src|docs|specs|test|tests|.rivet|desktop
+    //    前缀的路径——命令文本、非路径反引号不进 scope（scope 直接进 worker 写范围）。
+    const allLines = [sec.heading, ...sec.body]
+    const files = [
+      ...new Set(
+        allLines.flatMap(line =>
+          (line.match(/`([^`]+\.\w+)`/g) ?? [])
+            .map(f => f.replace(/`/g, ''))
+            .flatMap(raw => raw.split(/[,，、;；\s]+/))
+            .map(c => c.replace(/[(),.;:]+$/g, '').trim())
+            .filter(c => /^(src|docs|specs|test|tests|\.rivet|desktop)\//.test(c)),
+        ),
+      ),
+    ]
+    out.push({ heading: sec.heading, items, files })
+  }
+  return out
+}
+
+/** 章节感知建图：每个含 checklist 的章节 → 一个 patcher 任务（正交分片）。
+ *  任务 objective 携带章节标题 + 全部 checklist 项，worker 逐条执行。 */
+function buildTasksFromSections(
+  sections: Array<{
+    heading: string
+    items: Array<{ text: string; files: string[] }>
+    files: string[]
+  }>,
   objective: string,
 ): TaskGraph {
-  const nodes: TaskGraphNode[] = []
-  let seq = 1
-  for (const item of items) {
-    const id = `P${seq++}`
-    nodes.push({
-      id,
-      title: item.text.slice(0, 80),
-      objective: `${item.text}\n\n只执行本 task，不扩展范围，不重写计划。`,
+  const nodes: TaskGraphNode[] = sections.map((sec, i) => {
+    const checklistText = sec.items.map(it => `- [ ] ${it.text}`).join('\n')
+    return {
+      id: `P${i + 1}`,
+      title: sec.heading.slice(0, 80),
+      objective: `${sec.heading}\n\n${checklistText}\n\n只执行本 task，不扩展范围，不重写计划。`,
       profile: 'patcher' as const,
       kind: 'patch_proposal' as const,
-      files: item.files,
+      files: sec.files,
       dependsOn: [],
       riskTier: 'medium' as const,
-    })
-  }
+    }
+  })
   return { mission: objective, nodes, createdAt: Date.now() }
 }
 
@@ -127,7 +185,7 @@ export function createPlanTaskTool(deps: {
       description: `把高层目标分解成 TaskGraph DAG——水平正交分片（horizontal orthogonal shards），可选按波次逐波执行。
 
 适用于需要结构化规划的多步骤工作（重构、功能开发）。每个分片是完整自包含的单元（实现 + 跑 tsc/lint/相关测试到绿），由一个有能力的 flash 端到端负责——不是垂直角色流水线（不拆独立的 lint/type/import/test/verify 步骤）。列出范围文件让规划器按模块切出正交分片以并行执行；同模块文件留在同一分片。
-设 execute: true 通过 team 编排器执行计划（与 team_orchestrate 同一执行路径）。worker 直接写入共享工作区——用 git diff 审查聚合结果。
+设 execute: true 自动完成所有可推进波次——共享多波驱动 executePlanWaves 从 wave 0 逐波推进至计划末波或停止判据（与 team_orchestrate 同一执行路径）。worker 直接写入共享工作区——用 git diff 审查聚合结果。
 
 输出为 UnifiedPlan JSON——传给 team_orchestrate 的 planJson 参数做多波次续跑。`,
       input_schema: {
@@ -167,9 +225,13 @@ export function createPlanTaskTool(deps: {
         try {
           const markdown = await readFile(planPath, 'utf-8')
           requiredSkills = extractRequiredSkills(markdown)
-          const items = parseChecklistItems(markdown)
-          if (items.length > 0) {
-            graph = buildTasksFromChecklist(items, objective)
+          // 章节感知切分（2026-07-26 用户指令：不再按 checklist 逐项切）：
+          // 有 H2/H3 章节 → 每章节一个正交任务；无章节 → 通用规划路径。
+          // 逐项 checklist 切分已移除——碎片化会导致同文件任务串行与
+          // scope.files 缺失（coordinator 派发闸拦截）。
+          const sections = parseChecklistSections(markdown)
+          if (sections.length > 0) {
+            graph = buildTasksFromSections(sections, objective)
           } else {
             graph = decomposeObjective({ objective, files })
           }
@@ -224,12 +286,13 @@ export function createPlanTaskTool(deps: {
         }
       }
 
-      // Step 4: execute via the shared plan executor — the SAME closed loop as
-      // team_orchestrate, minus the review gate. plan_task's post-execution path
-      // is the commit flow, whose post-commit auto review gate already covers the
-      // diff; running a review-squadron here too would double-review. So
-      // reviewGate:false — plan_task still gets dispatch + scope-health +
-      // telemetry + reward/episode closure, just no review-squadron dispatch.
+      // Step 4: execute via the shared multi-wave driver — the SAME closed loop
+      // as team_orchestrate (auto-advancing every advanceable wave), minus the
+      // review gate. plan_task's post-execution path is the commit flow, whose
+      // post-commit auto review gate already covers the diff; running a
+      // review-squadron here too would double-review. So reviewGate:false —
+      // plan_task still gets dispatch + scope-health + telemetry +
+      // reward/episode closure, just no review-squadron dispatch.
       const coordinator = deps.getCoordinator()
       if (!coordinator) {
         return {
@@ -243,13 +306,16 @@ export function createPlanTaskTool(deps: {
         if (params.onOutput) {
           params.onOutput(`\n📋 计划已分解为 ${tasks.length} 个任务，正在派发 worker 执行…\n`)
         }
-        const run: PlanExecutorRun = await executePlan(
+        // executePlanWaves 按 startWave 逐波推进、自动判定停止、聚合每波结果；
+        // 中间波不提前触发末波 review（isLastWave 由真实 wave 序号判定）。
+        const { run }: PlanExecutorWavesResult = await executePlanWaves(
           {
             mode: 'standard',
             objective,
             tasks,
             requiredSkills,
-            fromWave: 0,
+            startWave: 0,
+            autoAdvance: true,
             maxParallel: 3,
             sessionId: params.sessionId,
             parentTurnId: `plan:${params.toolUseId ?? Date.now()}`,

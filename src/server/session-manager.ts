@@ -88,6 +88,7 @@ import type {
   SessionEvent,
   SessionEventType,
   SessionRecord,
+  ResolvedDomainRecord,
   PlanDraft,
 } from './protocol.js'
 import { redactValue, redactText, truncateUtf16Safe } from './redact.js'
@@ -95,7 +96,14 @@ import { redactValue, redactText, truncateUtf16Safe } from './redact.js'
 // The session wire contract (event types, records, statuses) lives in
 // protocol.ts so the desktop can share it type-only. Re-export so existing
 // server-side importers keep working unchanged.
-export type { SessionStatus, SessionEvent, SessionEventType, SessionRecord, PlanDraft } from './protocol.js'
+export type {
+  SessionStatus,
+  SessionEvent,
+  SessionEventType,
+  SessionRecord,
+  ResolvedDomainRecord,
+  PlanDraft,
+} from './protocol.js'
 
 // Compile-time drift guards: the wire copies of ApprovalMode / PlanModeState in
 // protocol.ts must stay identical to the runtime definitions. If either side
@@ -182,6 +190,10 @@ export interface DelegateWorkerInput {
 export interface DelegateActivityUpdate {
   workOrderId: string
   parentToolId?: string
+  /** Runtime execution identity; absent on legacy background updates. */
+  dispatchId?: string
+  attemptId?: string
+  parentAttemptId?: string
   profile?: string
   authority?: string
   /** Why this authority was chosen（worker 命中理由，桌面镜像用）。 */
@@ -219,7 +231,13 @@ export interface DelegateActivityUpdate {
 }
 
 export interface ManagedAgent {
-  run(prompt: string, callbacks: AgentCallbacks, images?: string[]): Promise<void>
+  /**
+   * 包装 `AgentLoop.run`。返回值透传其 outcome——`skipped-already-running`
+   * 表示 re-entry guard 命中、本次没起任何轮次；sidecar 自身不消费它，但不能把
+   * 它在类型上抹成 void，否则调用方失去「这次到底跑没跑」的判据。
+   * 错误预检等本地短路路径仍返回 void。
+   */
+  run(prompt: string, callbacks: AgentCallbacks, images?: string[]): Promise<void | import('../agent/loop.js').AgentRunOutcome>
   abort(): void
   listArtifacts(): Artifact[]
   readArtifact(id: string): Promise<string | null>
@@ -375,7 +393,7 @@ export interface ManagedAgent {
    * worker。与 abort() 严格分离——abort 中止当前 turn 但保留 agent 可继续运行，
    * shutdown 是终结性操作。Optional 以兼容 lightweight test doubles。
    */
-  shutdown?(): void
+  shutdown?(): void | boolean | Promise<void | boolean>
   /**
    * I1: 直接召集议事会评审一个 artifact 中的 council-plan-json 草案。
    * 由桌面 CouncilSurface 调用；实际实现持有 coordinator 与 artifactStore。
@@ -418,6 +436,12 @@ export type AgentFactory = (
    * or fall back to the default when the id no longer resolves.
    */
   modelId?: string,
+  /**
+   * Per-session 工具白名单（蒸馏回放等自动化场景）。有值时 LLM 的工具列表
+   * 收窄到这个集合（经 gateToolDefinitions coreOverride 通路）。缺省 =
+   * 默认全量（行为不变）。工厂实现可忽略（test doubles）。
+   */
+  allowedTools?: string[],
 ) => ManagedAgent | Promise<ManagedAgent>
 
 /**
@@ -479,6 +503,11 @@ export interface CreateSessionInput {
    * 立即拒绝并 fail-closed 中止本次运行（中止原因入事件流 + 走查工件）。
    */
   unattended?: boolean
+  /**
+   * Per-session 工具白名单（蒸馏回放等自动化场景）。有值时 LLM 的工具列表
+   * 收窄到这个集合。缺省 / undefined = 默认全量（行为不变）。
+   */
+  allowedTools?: string[]
   /**
    * P1b（安全）：客户端是否具备计划倒计时自动批准 UI。
    * 仅 desktop/TUI 设置 true；vscode-extension 不设置（默认 false）→ sidecar
@@ -551,6 +580,12 @@ export interface SessionPersistenceAdapter {
    */
   loadRecords?(): SessionRecord[]
   loadEvents?(sessionId: string): SessionEvent[]
+  /**
+   * Return the maximum valid sequence already durable for one session. This
+   * is the allocation high-water mark; `SessionRecord.lastSeq` is only a
+   * snapshot and may lag the append-only event log after an abrupt exit.
+   */
+  loadEventHighWater?(sessionId: string): number
   /**
    * Async event-log read for the reconnect-replay path (optional). Adapters
    * that implement it should do a non-blocking file read and keep JSON parsing
@@ -728,7 +763,34 @@ interface ActiveRunSettlement {
   claimsReleased: boolean
   promise: Promise<void>
   resolve: () => void
+  /** Abort reconciliation state; kept on the exact run token for idempotence. */
+  staleSweep?: {
+    expectedGeneration: number
+    attempts: number
+    scheduled: boolean
+    finishedGeneration?: number
+  }
 }
+
+/** Phase 2 — queue lane 条目状态：queued → steered / retracted / merged。 */
+export type QueueLaneStatus = 'queued' | 'steered' | 'retracted' | 'merged'
+
+/**
+ * Phase 2 — queue lane 条目：busy 期间经 POST /sessions/:id/queue 排队的跟进
+ * 消息。FIFO、无意图分类。终态三选一：下次 prompt 归并（merged）、被
+ * steer { laneId } 升级进 steer buffer 立即注入（steered）、被撤回（retracted）。
+ */
+export interface QueueLaneEntry {
+  id: string
+  text: string
+  status: QueueLaneStatus
+  ts: number
+}
+
+// Coordinator abort salvage currently waits up to five seconds. Reconcile with
+// a small margin, but never keep the process alive or emit a guessed result.
+const ABORT_RECONCILE_RETRY_DELAY_MS = 50
+const ABORT_RECONCILE_MAX_RETRIES = 120
 
 interface InternalSession {
   record: SessionRecord
@@ -769,6 +831,8 @@ interface InternalSession {
   knownArtifacts: Set<string>
   /** T3 — mid-run user guidance, drained into the agent at the next tool boundary. */
   steer: SteerBuffer
+  /** Phase 2 — queue lane：busy 期间排队的跟进消息（下次 prompt 归并 / steer 升级 / 撤回）。 */
+  queueLane: QueueLaneEntry[]
   /**
    * /handoff 登记的归档任务（桌面端 POST /sessions/:id/handoff）：交接 run 收尾时
    * 把项目内 .rivet/HANDOFF.md 拷贝归档到会话目录 <id>.handoff.md——
@@ -956,6 +1020,17 @@ export function extractObjective(input: Record<string, unknown>): string {
 }
 
 /**
+ * N3 组头的 `并行委派 × N` 计数：delegate_batch 从 input.tasks 读批大小，
+ * 其余派发工具（单发/议事/团队/星河）不携带——workerIdentity 只在
+ * taskCount > 0 时渲染 `× N`。Exported for unit tests.
+ */
+export function delegationTaskCount(name: string, input: Record<string, unknown>): number | undefined {
+  if (name !== 'delegate_batch') return undefined
+  const tasks = input.tasks
+  return Array.isArray(tasks) && tasks.length > 0 ? tasks.length : undefined
+}
+
+/**
  * Scan an event log for approvals that were requested but never resolved —
  * i.e. the run was interrupted (sidecar restart) while blocked on them.
  * Used by rehydrate() to close them out honestly instead of leaving a
@@ -1007,6 +1082,27 @@ function extractTodoState(input: Record<string, unknown>): TodoStateItem[] | nul
   return items
 }
 
+/**
+ * 内存环截尾（M1 修复）：保留尾部窗口，但 delegation 事件豁免——stale 对账
+ * （sweepStaleDelegationNodes）与回放依赖它们完整；被截尾的早期 running
+ * 节点对账不可见，回放会永久卡「运行中」。delegation 事件量级小（每 worker
+ * 2-4 条），豁免增长可控。
+ */
+function trimEventRing(events: SessionEvent[], maxEvents: number): SessionEvent[] {
+  if (events.length <= maxEvents) return events
+  const overflow = events.length - maxEvents
+  const kept: SessionEvent[] = []
+  let dropped = 0
+  for (const e of events) {
+    if (dropped < overflow && e.type !== 'delegation') {
+      dropped++
+      continue
+    }
+    kept.push(e)
+  }
+  return kept
+}
+
 export class RuntimeSessionManager {
   private readonly sessions = new Map<string, InternalSession>()
   private readonly createAgent: AgentFactory
@@ -1029,6 +1125,10 @@ export class RuntimeSessionManager {
   private readonly idleAgentTtlMs: number
   /** Goal mode — late-bound per-session goal handles (refs + sessionDir). */
   private readonly resolveGoalHandles?: (sessionId: string) => GoalHandles | undefined
+  /** Registered by serve.ts: drops the per-session stores entry when the
+   *  session is permanently released/deleted (memory bound). Late-bound so
+   *  this module stays free of the heavy serve-agent import. */
+  private storesForgetter: ((sessionId: string) => void) | null = null
   /** PlusMenu (review) — late-bound per-session review-gate ref accessor. */
   private readonly resolveReviewGateRef?: (sessionId: string) => { current: 'auto' | 'off' } | undefined
   /** PlusMenu (review) — config-derived default when no override and no refs. */
@@ -1113,13 +1213,43 @@ export class RuntimeSessionManager {
     this.evictLoadedBeyondCap()
   }
 
+  /** Drop the session's in-memory stores entry (best-effort). */
+  setStoresForgetter(fn: (sessionId: string) => void): void {
+    this.storesForgetter = fn
+  }
+
+  private forgetStores(sessionId: string): void {
+    try { this.storesForgetter?.(sessionId) } catch { /* best-effort */ }
+  }
+
   /** Shut down and drop a session's built agent (timers, coordinator, in-flight
    *  worker handles). The lightweight record/events stay; ensureAgent rebuilds
    *  on demand. Caller guarantees the session is not running. */
   private releaseAgent(s: InternalSession): void {
-    if (!s.agent) return
-    try { s.agent.shutdown?.() } catch { /* best-effort */ }
+    let shutdownResult: void | boolean | Promise<void | boolean> | undefined
+    try { shutdownResult = s.agent?.shutdown?.() } catch { /* best-effort */ }
     s.agent = null
+    // A built agent may own claims even when the session has gone idle.  Wait
+    // for async coordinator cleanup before releasing them; otherwise a worker
+    // that ignored abort could race a new session during idle eviction.
+    if (shutdownResult && typeof (shutdownResult as Promise<void>).then === 'function') {
+      void Promise.resolve(shutdownResult).then(
+        (settled) => { if (settled !== false) this.releaseClaimsIfIdle(s) },
+        () => undefined,
+      )
+    } else if (shutdownResult !== false) {
+      this.releaseClaimsIfIdle(s)
+    }
+    // Stores (goalTrackerRef / reviewGateRef / sessionDir) are rebuilt by the
+    // next buildManagedAgent — drop them now so idle-swept sessions don't pin
+    // full oaiMessages in memory forever.
+    this.forgetStores(s.record.id)
+  }
+
+  /** Release claims only after the session has no active run settlement. */
+  private releaseClaimsIfIdle(s: InternalSession): void {
+    if (s.running || s.activeRunSettlement) return
+    try { this.getRegistry?.()?.releaseAllClaims(s.record.id) } catch { /* best-effort */ }
   }
 
   /**
@@ -1160,7 +1290,8 @@ export class RuntimeSessionManager {
     if (typeof p.loadRecords === 'function' && typeof p.loadEvents === 'function') {
       let records: SessionRecord[]
       try { records = p.loadRecords() } catch { return }
-      for (const rec of records) {
+      for (const rawRecord of records) {
+        const rec = sanitizeSessionDomain(rawRecord)
         const wasRunning = rec.status === 'running'
         const session: InternalSession = {
           record: {
@@ -1180,6 +1311,7 @@ export class RuntimeSessionManager {
           listeners: new Set(),
           knownArtifacts: new Set(),
           steer: new SteerBuffer(),
+          queueLane: [],
           domainState: resolveDomainState(rec.domain ?? 'auto')?.state,
           disabledSkills: new Set(),
           skillLoadErrors: [],
@@ -1194,10 +1326,36 @@ export class RuntimeSessionManager {
           // find approval_required events with no matching approval_resolved,
           // and append 'sidecar-restart' resolutions so the replayed timeline
           // shows WHAT was pending instead of a dangling, unanswerable card.
+          let markerEvents: SessionEvent[] | undefined
           let orphans: Array<{ requestId: string; toolName: string }> = []
           if (rec.pendingApprovals > 0) {
-            try { orphans = findOrphanedApprovals(p.loadEvents!(rec.id)) } catch { /* best-effort */ }
+            try {
+              markerEvents = p.loadEvents!(rec.id)
+              orphans = findOrphanedApprovals(markerEvents)
+            } catch { /* high-water fallback below remains authoritative */ }
           }
+          // `lastSeq` is a record snapshot and can lag events.jsonl while a
+          // long delegation is still running. Allocate recovery markers above
+          // the durable log high-water, otherwise replay cursors can discard
+          // the restart reason as a duplicate or backwards sequence.
+          let durableHighWater: number
+          try {
+            if (markerEvents) {
+              durableHighWater = markerEvents.reduce((max, event) => Math.max(max, event.seq), 0)
+            } else if (p.loadEventHighWater) {
+              durableHighWater = p.loadEventHighWater(rec.id)
+            } else {
+              markerEvents = p.loadEvents!(rec.id)
+              durableHighWater = markerEvents.reduce((max, event) => Math.max(max, event.seq), 0)
+            }
+          } catch {
+            // Do not append sequence-bearing markers from an untrusted stale
+            // snapshot. The in-memory session remains aborted; a later open
+            // can retry recovery after the storage read becomes available.
+            continue
+          }
+          session.seq = Math.max(session.seq, durableHighWater)
+          session.record.lastSeq = session.seq
           // Persist the markers straight to disk WITHOUT keeping the log
           // resident. They re-appear when ensureEvents() reads it on first open.
           const appendMarker = (type: SessionEventType, data: Record<string, unknown>) => {
@@ -1234,7 +1392,11 @@ export class RuntimeSessionManager {
     } catch {
       return
     }
-    for (const ps of restored) {
+    for (const rawPersisted of restored) {
+      const ps = {
+        ...rawPersisted,
+        record: sanitizeSessionDomain(rawPersisted.record),
+      }
       const events = ps.events.slice().sort((a, b) => a.seq - b.seq)
       const maxSeq = events.length ? events[events.length - 1]!.seq : ps.record.lastSeq
       const wasRunning = ps.record.status === 'running'
@@ -1247,7 +1409,7 @@ export class RuntimeSessionManager {
         },
         agent: null,
         // 内存环上限与懒加载路径一致：只保留尾部 maxEvents 进内存。
-        events: events.length > this.maxEvents ? events.slice(events.length - this.maxEvents) : events,
+        events: events.length > this.maxEvents ? trimEventRing(events, this.maxEvents) : events,
         diskFirstSeq: events[0]?.seq,
         eventsLoaded: true,
         seq: maxSeq,
@@ -1260,6 +1422,7 @@ export class RuntimeSessionManager {
           events.filter((e) => e.type === 'artifact').map((e) => String(e.data.id)),
         ),
         steer: new SteerBuffer(),
+        queueLane: [],
         // Restore the live domain selection from the persisted key so a rebuilt
         // agent re-applies it. Skills are in-memory only → start clean.
         domainState: resolveDomainState(ps.record.domain ?? 'auto')?.state,
@@ -1346,7 +1509,7 @@ export class RuntimeSessionManager {
     // 保留尾部进内存——与活跃会话超过环容量后的行为一致（append 已截尾），
     // 客户端 since=0 重放本来就只拿得到环内尾部。磁盘 events.jsonl 不动，
     // 仍是完整历史的 source of truth。
-    session.events = evs.length > this.maxEvents ? evs.slice(evs.length - this.maxEvents) : evs
+    session.events = evs.length > this.maxEvents ? trimEventRing(evs, this.maxEvents) : evs
   }
 
   /** adoptLoadedEvents 的尾部版：截断已在读取侧完成，被截头部的信息由
@@ -1356,7 +1519,8 @@ export class RuntimeSessionManager {
     if (tail.total > 0) session.diskFirstSeq = tail.diskFirstSeq
     const maxSeq = tail.total > 0 ? tail.lastSeq : session.record.lastSeq
     session.seq = Math.max(session.seq, maxSeq)
-    session.events = tail.events
+    // 兜底（M1）：tail 实现返回超限普通事件时再压一次；delegation 两处都豁免。
+    session.events = trimEventRing(tail.events, this.maxEvents)
   }
 
   /**
@@ -1715,6 +1879,8 @@ export class RuntimeSessionManager {
     const i = this.loadedOrder.indexOf(id)
     if (i !== -1) this.loadedOrder.splice(i, 1)
     try { this.persistence?.deleteSession?.(id) } catch { /* best-effort */ }
+    // Permanently destroyed — never rebuilds, so drop stores unconditionally.
+    this.forgetStores(id)
     return true
   }
 
@@ -1753,6 +1919,117 @@ export class RuntimeSessionManager {
     if (settlement.claimsReleased) return
     settlement.claimsReleased = true
     try { this.getRegistry?.()?.releaseAllClaims(id) } catch { /* non-fatal */ }
+  }
+
+  private canReconcileAbortedRun(
+    session: InternalSession,
+    expectedGeneration: number,
+    settlement?: ActiveRunSettlement,
+    requireIdle = false,
+  ): boolean {
+    if (this.sessions.get(session.record.id) !== session) return false
+    if (session.tombstoned || session.record.archived) return false
+    if (session.record.status !== 'aborted') return false
+    if (session.lifecycleGeneration !== expectedGeneration) return false
+    if (settlement && session.activeRunSettlement && session.activeRunSettlement !== settlement) return false
+    if (requireIdle && session.running) return false
+    return true
+  }
+
+  private hasLiveCoordinatorDelegation(session: InternalSession): boolean {
+    const latest = new Map<string, { workerId: string; status: string }>()
+    for (const ev of session.events) {
+      if (ev.type !== 'delegation') continue
+      const workerId = typeof ev.data.workerId === 'string' ? ev.data.workerId : undefined
+      const status = typeof ev.data.status === 'string' ? ev.data.status : undefined
+      if (!workerId || !status) continue
+      const attemptId = typeof ev.data.attemptId === 'string' ? ev.data.attemptId : undefined
+      const dispatchId = typeof ev.data.dispatchId === 'string' ? ev.data.dispatchId : undefined
+      const key = attemptId ?? (dispatchId ? `${dispatchId}:${workerId}` : workerId)
+      latest.set(key, { workerId, status })
+    }
+    for (const { workerId, status } of latest.values()) {
+      if (status !== 'running' || session.backgroundAborts?.has(workerId)) continue
+      try {
+        if (this.isWorkerRunning(session.record.id, workerId)) return true
+      } catch {
+        // Unknown ground truth must not be converted into a fabricated failure.
+        return true
+      }
+    }
+    return false
+  }
+
+  private scheduleAbortStaleDelegationSweep(
+    session: InternalSession,
+    settlement: ActiveRunSettlement,
+    expectedGeneration: number,
+  ): void {
+    const state = settlement.staleSweep ?? (settlement.staleSweep = {
+      expectedGeneration,
+      attempts: 0,
+      scheduled: false,
+    })
+    if (state.expectedGeneration !== expectedGeneration) {
+      state.expectedGeneration = expectedGeneration
+      state.attempts = 0
+      state.finishedGeneration = undefined
+    }
+    if (state.scheduled || state.finishedGeneration === expectedGeneration) return
+    state.scheduled = true
+    void settlement.promise.then(() => {
+      setImmediate(() => this.runAbortStaleDelegationSweep(session, settlement))
+    })
+  }
+
+  private runAbortStaleDelegationSweep(
+    session: InternalSession,
+    settlement: ActiveRunSettlement,
+  ): void {
+    const state = settlement.staleSweep
+    if (!state?.scheduled) return
+    const expectedGeneration = state.expectedGeneration
+    const finish = () => {
+      state.scheduled = false
+      state.finishedGeneration = state.expectedGeneration
+    }
+    const retry = () => {
+      if (state.attempts >= ABORT_RECONCILE_MAX_RETRIES) {
+        // Stop after a bounded window without fabricating a terminal event when
+        // coordinator liveness never becomes authoritative.
+        finish()
+        return
+      }
+      state.attempts++
+      const timer = setTimeout(
+        () => this.runAbortStaleDelegationSweep(session, settlement),
+        ABORT_RECONCILE_RETRY_DELAY_MS,
+      )
+      timer.unref?.()
+    }
+
+    if (!settlement.settled
+      || !this.canReconcileAbortedRun(session, expectedGeneration, settlement, true)) {
+      finish()
+      return
+    }
+    if (this.hasLiveCoordinatorDelegation(session)) {
+      retry()
+      return
+    }
+    try {
+      this.sweepStaleDelegationNodes(session, 'caller_aborted')
+    } catch {
+      retry()
+      return
+    }
+    // Re-check after the sweep so a liveness transition cannot end the chain
+    // between the pre-check and the sweep's own ground-truth read.
+    if (this.hasLiveCoordinatorDelegation(session)) {
+      retry()
+      return
+    }
+    finish()
   }
 
   private cancelPlanDraftTimer(session: InternalSession): void {
@@ -1842,6 +2119,7 @@ export class RuntimeSessionManager {
         // P1b：随 record 持久化，sidecar 重启/rehydrate 后由恢复路径读回——
         // 否则重启后静默失去倒计时自动批准（fail-closed 但前后不一致）。
         ...(input.planAutoApproveUi === true ? { planAutoApproveUi: true } : {}),
+        ...(input.allowedTools !== undefined ? { allowedTools: [...input.allowedTools] } : {}),
       },
       agent: null,
       approvalMode: input.approvalMode,
@@ -1858,6 +2136,7 @@ export class RuntimeSessionManager {
       listeners: new Set(),
       knownArtifacts: new Set(),
       steer: new SteerBuffer(),
+      queueLane: [],
       domainState: sessionDomain && sessionDomain !== 'auto'
         ? resolveDomainState(sessionDomain)?.state
         : undefined,
@@ -1934,8 +2213,13 @@ export class RuntimeSessionManager {
     // see the pre-prompt event log, not this turn's user echo.
     session.running = true
     session.toolResultClosed = false
-    // T3 — drop any guidance left from a previous run so it can't leak forward.
-    session.steer.clear()
+    // Phase 1.1 — 上轮 run 收尾后没赶上工具边界的 steer 残留不再清除（旧语义
+    // 在此 steer.clear() 静默丢弃，UI 回声卡片还在 →「显示已发、模型从未收到」）：
+    // 与 queue lane 里仍 queued 的条目一起按序拼到新 prompt 前面（对齐 TUI
+    // idle 提交语义，app.ts getPendingEntries+clear 归并）。幂等/竞态安全：
+    // 只发生在新 run 发起前（此刻 running 刚置位、同步块内无交错）；run 进行
+    // 期间的 steer 不受影响，仍走 mid-turn 注入（onSteerDrain）。
+    prompt = this.mergeQueuedIntoPrompt(session, prompt)
     session.record.status = 'running'
     session.record.error = undefined
     // R1 — keep the registry heartbeat fresh while this session is active.
@@ -2028,6 +2312,13 @@ export class RuntimeSessionManager {
               session.running = false
             }
             this.releaseRunClaims(id, runSettlement)
+            if (session.record.status === 'aborted') {
+              this.scheduleAbortStaleDelegationSweep(
+                session,
+                runSettlement,
+                session.lifecycleGeneration,
+              )
+            }
             if (!ownsDurability()) {
               if (this.ownsSessionDurability(session) && session.record.archived) {
                 this.unloadSession(session)
@@ -2040,14 +2331,17 @@ export class RuntimeSessionManager {
             this.settleHandoffArchive(session)
             this.append(session, 'done', { status: session.record.status })
             this.persistRecord(session)
-            // 兜底对账：abort 路径上 worker 的终态 delegation 事件会被回调门禁
-            // 吞掉（见 sweepStaleDelegationNodes）。延迟一拍——coordinator 的
-            // abort 结算链是纯 promise，setImmediate 时 orderControllers 必已
-            // 清空，不会把仍在结算的 worker 误判为死亡。
+            // Fast-path reconciliation; abort-specific delayed cleanup is
+            // handled by the settlement-aware retry chain.
             const sweepReason = session.record.status === 'aborted' ? 'caller_aborted' : 'unknown'
             setImmediate(() => {
               if (this.sessions.get(id) !== session) return
-              this.sweepStaleDelegationNodes(session, sweepReason)
+              try {
+                this.sweepStaleDelegationNodes(session, sweepReason)
+              } catch {
+                // Reconciliation is best-effort and must not surface as an
+                // uncaught task after the parent run has already settled.
+              }
             })
             this.maybeWatchdogAutoContinue(session)
             if (session.record.archived) this.unloadSession(session)
@@ -2070,6 +2364,13 @@ export class RuntimeSessionManager {
           session.running = false
         }
         this.releaseRunClaims(id, runSettlement)
+        if (session.record.status === 'aborted') {
+          this.scheduleAbortStaleDelegationSweep(
+            session,
+            runSettlement,
+            session.lifecycleGeneration,
+          )
+        }
         if (ownsDurability()) {
           this.append(session, 'done', { status: session.record.status })
           this.persistRecord(session)
@@ -2272,6 +2573,7 @@ export class RuntimeSessionManager {
       session.record.id,
       session.approvalMode,
       session.record.model,
+      session.record.allowedTools,
     )
     const finish = (agent: ManagedAgent): ManagedAgent => {
       session.agent = agent
@@ -2357,6 +2659,10 @@ export class RuntimeSessionManager {
     try {
       if (session.domainState === null) agent.setSessionDomain?.(null)
       else if (session.domainState !== undefined) agent.setSessionDomain?.(session.domainState)
+      else if (session.record.domain === 'auto' && session.record.resolvedDomain) {
+        const restored = resolveDomainState(session.record.resolvedDomain.key)
+        if (restored?.state) agent.setSessionDomain?.(restored.state)
+      }
     } catch { /* non-fatal */ }
     try {
       if (session.disabledSkills.size > 0) agent.setDisabledSkills?.(new Set(session.disabledSkills))
@@ -2445,13 +2751,15 @@ export class RuntimeSessionManager {
    * PlusMenu — set the session's star domain by selection key (auto | off |
    * <domainId>). Updates the stored selection (applied on lazy build), live-
    * mutates an already-built agent, persists the key, and emits domain_changed.
-   * Returns false when the session is missing or the key is unknown.
+   * Returns false when the session is missing/running or the key is unknown.
    */
   setDomain(id: string, key: string): boolean {
     const session = this.sessions.get(id)
     if (!session) return false
+    if (session.running) return false
     const resolved = resolveDomainState(key)
     if (!resolved) return false
+    delete session.record.resolvedDomain
     session.domainState = resolved.state
     session.record.domain = resolved.key
     try {
@@ -2476,7 +2784,16 @@ export class RuntimeSessionManager {
     if (!session) return undefined
     const current = session.record.model
     const all = this.listModelsFn?.() ?? []
-    return all.map((m) => ({ ...m, current: m.id === current || m.alias === current }))
+    return all.map((m) => {
+      const ref = `${m.provider}:${m.id}`
+      const currentFlag = !!current && (
+        current === ref
+        || current === `${m.provider}:${m.alias}`
+        || current === m.id
+        || current === m.alias
+      )
+      return { ...m, current: currentFlag }
+    })
   }
 
   /**
@@ -3171,23 +3488,116 @@ export class RuntimeSessionManager {
    * the text is buffered and injected at the next tool boundary (onSteerDrain).
    * Only meaningful while running — an idle session has no turn to steer.
    *
+   * Phase 2 — input 也可为 { laneId }：把 queue lane 里仍 queued 的条目升级为
+   * steer（置 steered + 入 steer buffer），立即参与本轮 mid-turn 注入，不再等
+   * 下次 prompt 归并。升级路径 echo queue_status（queue_pending 卡片的状态
+   * 迁移），不再重复 echo steer_queued——queue 卡片已是它的回声。
+   *
    * Returns:
-   *  - 'queued'    guidance accepted into the running session's buffer
-   *  - 'idle'      session exists but is not running (caller should use /prompt)
-   *  - 'not_found' no such session
+   *  - 'queued'         guidance accepted into the running session's buffer
+   *  - 'idle'           session exists but is not running (caller should use /prompt)
+   *  - 'not_found'      no such session
+   *  - 'lane_not_found' laneId 不在该会话的 queue lane 里
+   *  - 'lane_not_queued' 条目存在但已非 queued（steered/retracted/merged）
    */
-  steer(id: string, text: string): 'queued' | 'idle' | 'not_found' {
+  steer(
+    id: string,
+    input: string | { laneId: string },
+  ): 'queued' | 'idle' | 'not_found' | 'lane_not_found' | 'lane_not_queued' {
     const session = this.sessions.get(id)
     if (!session) return 'not_found'
     if (!session.running) return 'idle'
+    let text: string
+    let laneEntry: QueueLaneEntry | undefined
+    if (typeof input === 'string') {
+      text = input
+    } else {
+      laneEntry = session.queueLane.find((e) => e.id === input.laneId)
+      if (!laneEntry) return 'lane_not_found'
+      if (laneEntry.status !== 'queued') return 'lane_not_queued'
+      text = laneEntry.text
+      laneEntry.status = 'steered'
+    }
     // 插话 = 用户参与——取消倒计时自动批准
     this.cancelPlanAutoApprove(session, 'steer')
     session.steer.push(text)
-    // Echo into the event log so the thread reflects the queued guidance and
-    // reconnecting viewers see it (append-only, like the user turn echo).
-    this.append(session, 'steer_queued', { text: redactText(text) })
+    if (laneEntry) {
+      this.append(session, 'queue_status', { laneId: laneEntry.id, status: 'steered' })
+    } else {
+      // Echo into the event log so the thread reflects the queued guidance and
+      // reconnecting viewers see it (append-only, like the user turn echo).
+      this.append(session, 'steer_queued', { text: redactText(text) })
+    }
     this.touch(session)
     return 'queued'
+  }
+
+  /**
+   * Phase 2 — queue lane：busy 期间排队一条跟进消息，等下次 prompt 时归并进
+   * 消息前部（mergeQueuedIntoPrompt），或经 steer { laneId } 升级立即注入、
+   * retractQueued 撤回。与 steer 同门槛（仅 running）；与 steer 的区别是
+   * 不进本轮 mid-turn 注入。
+   */
+  queue(id: string, text: string): { laneId: string } | 'idle' | 'not_found' {
+    const session = this.sessions.get(id)
+    if (!session) return 'not_found'
+    if (!session.running) return 'idle'
+    // 排队跟进同样是用户参与——取消倒计时自动批准（与 steer 对齐）。
+    this.cancelPlanAutoApprove(session, 'queue')
+    const entry: QueueLaneEntry = {
+      id: `q${randomId()}`,
+      text,
+      status: 'queued',
+      ts: this.now(),
+    }
+    session.queueLane.push(entry)
+    this.append(session, 'queue_pending', { laneId: entry.id, text: redactText(text) })
+    this.touch(session)
+    return { laneId: entry.id }
+  }
+
+  /**
+   * Phase 2 — 撤回一条仍 queued 的 queue lane 条目（置 retracted + echo
+   * queue_status）。已 steered/merged/retracted 的条目返回 'lane_not_queued'。
+   */
+  retractQueued(
+    id: string,
+    laneId: string,
+  ): 'retracted' | 'not_found' | 'lane_not_found' | 'lane_not_queued' {
+    const session = this.sessions.get(id)
+    if (!session) return 'not_found'
+    const entry = session.queueLane.find((e) => e.id === laneId)
+    if (!entry) return 'lane_not_found'
+    if (entry.status !== 'queued') return 'lane_not_queued'
+    entry.status = 'retracted'
+    this.append(session, 'queue_status', { laneId: entry.id, status: 'retracted' })
+    this.touch(session)
+    return 'retracted'
+  }
+
+  /**
+   * Phase 1.1/2 — 新 run 发起前的归并：把上轮遗留的 steer 残留（run 收尾后没
+   * 赶上工具边界的排队指导）与 queue lane 中仍 queued 的条目拼到新 prompt
+   * 前面，'\n\n' 分隔。仅 steer 残留时直接拼接（原始文本，不套 [User guidance]
+   * 头——对齐 TUI app.ts idle 提交语义）；有 lane 条目时 lane 部分单独成节、
+   * 带小节头。lane 条目全部置 merged 并逐条 echo queue_status——UI 回声卡片
+   * 据此闭环，不再「显示已发、模型从未收到」。buffer/lane 均空时原样返回
+   * （不动 prompt、不写事件）。
+   */
+  private mergeQueuedIntoPrompt(session: InternalSession, prompt: string): string {
+    const steerEntries = session.steer.getPendingEntries()
+    const laneQueued = session.queueLane.filter((e) => e.status === 'queued')
+    if (steerEntries.length === 0 && laneQueued.length === 0) return prompt
+    session.steer.clear()
+    const sections: string[] = steerEntries.map((e) => e.text)
+    if (laneQueued.length > 0) {
+      sections.push(`${QUEUE_LANE_MERGE_HEADER}\n${laneQueued.map((e) => e.text).join('\n\n')}`)
+      for (const entry of laneQueued) {
+        entry.status = 'merged'
+        this.append(session, 'queue_status', { laneId: entry.id, status: 'merged' })
+      }
+    }
+    return `${sections.join('\n\n')}\n\n${prompt}`
   }
 
   /** 注册 session 的 coordinator 引用（main.ts 在 agent 构建后调用）。 */
@@ -3254,25 +3664,43 @@ export class RuntimeSessionManager {
    */
   private sweepStaleDelegationNodes(session: InternalSession, failureReason: string): void {
     if (session.running) return
-    const latest = new Map<string, string>()
+    const latest = new Map<string, {
+      workerId: string
+      status: string
+      attemptId?: string
+      dispatchId?: string
+      parentAttemptId?: string
+    }>()
     const firstTs = new Map<string, number>()
     for (const ev of session.events) {
       if (ev.type !== 'delegation') continue
       const workerId = typeof ev.data.workerId === 'string' ? ev.data.workerId : undefined
       const status = typeof ev.data.status === 'string' ? ev.data.status : undefined
       if (!workerId || !status) continue
-      if (!firstTs.has(workerId)) firstTs.set(workerId, ev.ts)
-      latest.set(workerId, status)
+      const attemptId = typeof ev.data.attemptId === 'string' ? ev.data.attemptId : undefined
+      const dispatchId = typeof ev.data.dispatchId === 'string' ? ev.data.dispatchId : undefined
+      const parentAttemptId = typeof ev.data.parentAttemptId === 'string' ? ev.data.parentAttemptId : undefined
+      const key = attemptId ?? (dispatchId ? `${dispatchId}:${workerId}` : workerId)
+      if (!firstTs.has(key)) firstTs.set(key, ev.ts)
+      latest.set(key, { workerId, status, attemptId, dispatchId, parentAttemptId })
     }
-    for (const [workerId, status] of latest) {
+    for (const [key, current] of latest) {
+      const { workerId, status, attemptId, dispatchId, parentAttemptId } = current
       if (status !== 'running') continue
       if (session.backgroundAborts?.has(workerId)) continue
       if (this.isWorkerRunning(session.record.id, workerId)) continue
       // 让补发的终态事件带上真实的存活时长（否则 elapsedMs 会从 0 起算）。
       const startedMap = session.delegationStartedAt ?? (session.delegationStartedAt = new Map())
-      const ts = firstTs.get(workerId)
-      if (ts !== undefined && !startedMap.has(workerId)) startedMap.set(workerId, ts)
-      this.emitDelegationActivity(session, { workOrderId: workerId, status: 'failed', failureReason })
+      const ts = firstTs.get(key)
+      if (ts !== undefined && !startedMap.has(key)) startedMap.set(key, ts)
+      this.emitDelegationActivity(session, {
+        workOrderId: workerId,
+        attemptId,
+        dispatchId,
+        parentAttemptId,
+        status: 'failed',
+        failureReason,
+      })
     }
   }
 
@@ -3491,6 +3919,7 @@ export class RuntimeSessionManager {
     const s = this.sessions.get(id)
     if (!s) return false
     const wasRunning = s.running
+    const settlement = s.activeRunSettlement
     // Is there actually anything to stop? Must be sampled before the timers
     // below are cleared. rehydrate() loads EVERY persisted session into memory,
     // so abortAll() (sidecar shutdown + the global POST /abort) walks all of
@@ -3512,6 +3941,7 @@ export class RuntimeSessionManager {
       this.cancelPlanDraftTimer(s)
       s.planDraftLastEmit = undefined
     }
+    const expectedGeneration = s.lifecycleGeneration
     // 窄窗口竞态修复：watchdog stall 后 finally → setImmediate 续跑之间，用户
     // abort 对已停会话是空操作。设此标记让 setImmediate 守卫放弃续跑。
     s.watchdogRecoveryCancelled = true
@@ -3523,15 +3953,23 @@ export class RuntimeSessionManager {
     }
     // abort = 用户参与——取消倒计时自动批准
     this.cancelPlanAutoApprove(s, 'aborted')
+    if (settlement) {
+      this.scheduleAbortStaleDelegationSweep(s, settlement, expectedGeneration)
+    }
     s.agent?.abort()
     this.rejectAllPending(s, 'aborted')
     // 兜底对账：abort 升代后 run finally 失去 durability 早退，worker 终态
     // 事件又恰被回调门禁吞掉（见 sweepStaleDelegationNodes）——在此补发。
-    // 延迟一拍：run finally（microtask）先把 session.running 落为 false，
-    // coordinator 的结算链（纯 promise）也已清空 orderControllers。
+    // Keep the one-tick fast path; delayed coordinator cleanup is handled by
+    // the exact-settlement retry chain above.
     setImmediate(() => {
-      if (this.sessions.get(id) !== s) return
-      this.sweepStaleDelegationNodes(s, 'caller_aborted')
+      if (!this.canReconcileAbortedRun(s, expectedGeneration, settlement)) return
+      try {
+        this.sweepStaleDelegationNodes(s, 'caller_aborted')
+      } catch {
+        // The settlement-aware chain owns retries; an observational sweep must
+        // never turn an injected liveness-reader failure into an uncaught task.
+      }
     })
     // Idle sessions keep their timestamps and their log stays clean. The
     // in-memory suppression flag above still applies — a stall recovery waiting
@@ -3556,13 +3994,25 @@ export class RuntimeSessionManager {
    * abortAll() 分离：abortAll 仅中止当前 turn，shutdownAll 是终结性操作。
    * best-effort：任一 session shutdown 抛错不影响其他。
    */
-  shutdownAll(): void {
+  shutdownAll(): Promise<void> {
     if (this.idleSweepTimer) {
       clearInterval(this.idleSweepTimer)
       this.idleSweepTimer = undefined
     }
+    const pending: Promise<void>[] = []
     for (const s of this.sessions.values()) {
-      try { s.agent?.shutdown?.() } catch { /* best-effort */ }
+      let shutdownResult: void | boolean | Promise<void | boolean> | undefined
+      try {
+        shutdownResult = s.agent?.shutdown?.()
+      } catch { /* best-effort */ }
+      const releaseIdleClaims = (settled?: void | boolean) => {
+        if (settled !== false) this.releaseClaimsIfIdle(s)
+      }
+      if (shutdownResult && typeof (shutdownResult as Promise<void>).then === 'function') {
+        pending.push(Promise.resolve(shutdownResult).then(releaseIdleClaims, () => undefined))
+      } else if (shutdownResult !== false) {
+        releaseIdleClaims()
+      }
       try { s.jobs?.killAll() } catch { /* best-effort */ }
       // Drain any coalescing delta window so the tail is never lost on exit.
       try { this.flushDeltaBuf(s) } catch { /* best-effort */ }
@@ -3570,6 +4020,7 @@ export class RuntimeSessionManager {
     }
     // Flush any buffered events to disk before exit.
     this.persistence?.flushSync?.()
+    return pending.length > 0 ? Promise.all(pending).then(() => undefined) : Promise.resolve()
   }
 
   /**
@@ -4265,6 +4716,9 @@ export class RuntimeSessionManager {
     a: {
       workOrderId: string
       parentToolId?: string
+      dispatchId?: string
+      attemptId?: string
+      parentAttemptId?: string
       /** 嵌套委派的父 worker order id（顶层委派缺省）。 */
       parentWorkerId?: string
       profile?: string
@@ -4294,14 +4748,18 @@ export class RuntimeSessionManager {
     },
   ): void {
     const startedMap = session.delegationStartedAt ?? (session.delegationStartedAt = new Map())
-    let started = startedMap.get(a.workOrderId)
+    const attemptKey = a.attemptId ?? (a.dispatchId ? `${a.dispatchId}:${a.workOrderId}` : a.workOrderId)
+    let started = startedMap.get(attemptKey)
     if (started === undefined) {
       started = this.now()
-      startedMap.set(a.workOrderId, started)
+      startedMap.set(attemptKey, started)
     }
     this.append(session, 'delegation', {
       workerId: a.workOrderId,
       parentId: a.parentToolId,
+      dispatchId: a.dispatchId,
+      attemptId: a.attemptId,
+      parentAttemptId: a.parentAttemptId,
       // 嵌套委派的真实父 worker（parentId 是工具调用 id，只够挂到工具卡下；
       // 层级树渲染要靠这个字段）。
       parentWorkerId: a.parentWorkerId,
@@ -4334,6 +4792,7 @@ export class RuntimeSessionManager {
       verificationBrief: a.verificationBrief,
       evidenceStatus: a.evidenceStatus,
     })
+    if (a.status !== 'running') startedMap.delete(attemptKey)
   }
 
   private buildCallbacks(session: InternalSession): AgentCallbacks {
@@ -4345,6 +4804,27 @@ export class RuntimeSessionManager {
     // 可能是别会话的更新计划，审批卡因此发错/丢失（2026-07-25 修复）。
     const planSubmitToolIds = new Map<string, { slug: string; title: string }>()
     return {
+      onDomainResolved: (resolved) => {
+        if (!isActive()) return
+        const knownDomain = starDomainRegistry.get(resolved.key)
+        const eventPayload: ResolvedDomainRecord = {
+          key: redactText(resolved.key),
+          name: truncateUtf16Safe(redactText(resolved.name), 160),
+          matchedKeywords: resolved.matchedKeywords
+            .slice(0, 3)
+            .map((keyword) => truncateUtf16Safe(redactText(keyword), 80)),
+          reason: resolved.reason,
+        }
+        if (session.record.domain === 'auto' && knownDomain) {
+          session.record.resolvedDomain = {
+            ...eventPayload,
+            key: knownDomain.id,
+            name: eventPayload.name || knownDomain.name,
+          }
+        }
+        this.append(session, 'domain_resolved', { ...eventPayload })
+        this.persistRecord(session)
+      },
       onTextDelta: (text) => {
         if (!isActive()) return
         this.flushToolResultBuf(session)
@@ -4378,6 +4858,8 @@ export class RuntimeSessionManager {
         if (DELEGATION_TOOLS.has(name)) {
           this.append(session, 'delegation', {
             workerId: toolId,
+            toolName: name,
+            taskCount: delegationTaskCount(name, input),
             objective: extractObjective(input),
             profile: typeof input.profile === 'string' ? input.profile : undefined,
             status: 'running',
@@ -4521,7 +5003,19 @@ export class RuntimeSessionManager {
       // T3 — drain mid-run user guidance at the tool boundary (the agent appends
       // it to the last tool_result; see tool-execution.ts). The buffer is fed by
       // POST /sessions/:id/steer while the session is running.
-      onSteerDrain: () => isActive() ? session.steer.drain() : null,
+      // Phase 1.3 — 送达可观测：drain 出非空内容时写 steer_delivered（count 为
+      // 本次 drain 条数），UI 据此把回声卡片标记为「模型已收」。drain 返回值
+      // 不带条数——先按 pending 计数（无 maxPriority 的 drain 必清空全部
+      // pending，计数即本次条数）。仍仅在 isActive() 时 drain，语义不变。
+      onSteerDrain: () => {
+        if (!isActive()) return null
+        const count = session.steer.getPendingEntries().length
+        const drained = session.steer.drain()
+        if (drained !== null && count > 0) {
+          this.append(session, 'steer_delivered', { count })
+        }
+        return drained
+      },
       // C3 — 自治档检查点：cruise 暂停（paused=true，桌面渲染确认卡片）；
       // unleashed 无此回调（无刹车无播报）。digest 为进度摘要。
       onAutonomyCheckpoint: (info) => {
@@ -5057,7 +5551,7 @@ export class RuntimeSessionManager {
     const stored: SessionEvent = { seq: ++session.seq, ts: this.now(), type, data: persistData }
     session.events.push(stored)
     if (session.events.length > this.maxEvents) {
-      session.events.splice(0, session.events.length - this.maxEvents)
+      session.events = trimEventRing(session.events, this.maxEvents)
     }
     session.record.lastSeq = session.seq
     session.record.updatedAt = stored.ts
@@ -5126,11 +5620,75 @@ function randomId(): string {
   )
 }
 
+/** Phase 2 — queue lane 条目归并进新 prompt 时 lane 部分的小节头。 */
+const QUEUE_LANE_MERGE_HEADER = '[排队跟进 — 上轮运行期间排队，请一并处理]'
+
 /** Parse a `data:image/<mime>;base64,<payload>` URL. Returns null if malformed. */
 function parseImageDataUrl(url: string): { mime: string; base64: string } | null {
   const m = /^data:(image\/[a-z0-9.+-]+);base64,(.+)$/i.exec(url)
   if (!m) return null
   return { mime: m[1]!.toLowerCase(), base64: m[2]! }
+}
+
+/**
+ * Normalize persisted domain selection and optional Auto-resolution metadata.
+ * Unknown/deleted selections fail open to Auto; malformed or stale resolutions
+ * are removed so the next run can route normally.
+ */
+function sanitizeSessionDomain(record: SessionRecord): SessionRecord {
+  const raw = record as Omit<SessionRecord, 'domain' | 'resolvedDomain'> & {
+    domain?: unknown
+    resolvedDomain?: unknown
+  }
+  const rawDomain = typeof raw.domain === 'string' ? raw.domain : 'auto'
+  const selection = resolveDomainState(rawDomain)
+  const normalizedDomain = selection?.key ?? 'auto'
+  const { domain: _domain, resolvedDomain: _resolvedDomain, ...rest } = record
+  const base: SessionRecord = { ...rest, domain: normalizedDomain }
+
+  // Resolution metadata is meaningful only for a canonical persisted Auto
+  // selection. Unknown/deleted domains and legacy aliases fail open and must
+  // reroute instead of inheriting a stale resolution.
+  if (raw.domain !== 'auto' || normalizedDomain !== 'auto') return base
+  const resolvedDomain = sanitizeResolvedDomainRecord(raw.resolvedDomain)
+  return resolvedDomain ? { ...base, resolvedDomain } : base
+}
+
+function sanitizeResolvedDomainRecord(value: unknown): ResolvedDomainRecord | undefined {
+  if (typeof value === 'string') {
+    const definition = starDomainRegistry.get(value)
+    if (!definition) return undefined
+    return {
+      key: definition.id,
+      name: truncateUtf16Safe(definition.name, 160),
+      matchedKeywords: [],
+      reason: 'fallback',
+    }
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const candidate = value as Record<string, unknown>
+  if (
+    typeof candidate.key !== 'string'
+    || candidate.key.length === 0
+    || candidate.key.length > 128
+  ) return undefined
+  const definition = starDomainRegistry.get(candidate.key)
+  if (!definition) return undefined
+  const name = typeof candidate.name === 'string' && candidate.name.trim()
+    ? truncateUtf16Safe(redactText(candidate.name), 160)
+    : truncateUtf16Safe(definition.name, 160)
+  const matchedKeywords = Array.isArray(candidate.matchedKeywords)
+    ? candidate.matchedKeywords
+        .filter((keyword): keyword is string => typeof keyword === 'string')
+        .slice(0, 3)
+        .map((keyword) => truncateUtf16Safe(redactText(keyword), 80))
+    : []
+  return {
+    key: definition.id,
+    name,
+    matchedKeywords,
+    reason: candidate.reason === 'keyword' ? 'keyword' : 'fallback',
+  }
 }
 
 /**

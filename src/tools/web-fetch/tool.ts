@@ -5,7 +5,7 @@ import { MIN_SUBSTANTIAL_LENGTH } from './extract.js'
 import { fetchViaPlaywright, type RenderFetchResult } from './render-fetch.js'
 import { parseRenderActions, type RenderAction } from './render-actions.js'
 import { formatCacheAge } from './fetch-cache.js'
-import { fetchMarkdown, type FetchCoreDeps } from './fetch-core.js'
+import { fetchMarkdown, type FetchCoreDeps, type FetchMarkdownOutcome } from './fetch-core.js'
 
 export interface FetchDeps extends FetchCoreDeps {}
 export interface WebFetchOptions extends HttpFetchOptions {
@@ -42,6 +42,7 @@ function formatRenderedOutput(rawUrl: string, rendered: RenderFetchResult): stri
 }
 
 const defaultDeps: FetchDeps = {}
+const MAX_URLS = 10
 
 export function createWebFetchTool(deps: FetchDeps = defaultDeps, opts: WebFetchOptions = {}): Tool {
   const extractMainContentEnabled = opts.extractMainContent ?? true
@@ -75,6 +76,15 @@ export function createWebFetchTool(deps: FetchDeps = defaultDeps, opts: WebFetch
             type: 'string',
             description: '要抓取的 URL',
           },
+          urls: {
+            type: 'array',
+            description: '一次抓取多个 URL（与 url 二选一；批量时优先于 url）。逐页输出，部分失败不整体失败。',
+            items: { type: 'string' },
+          },
+          maxCharacters: {
+            type: 'number',
+            description: '每页 markdown 按字符数截断（省略则不截断——保持现有行为）。',
+          },
           actions: {
             type: 'array',
             description: '渲染后按序执行的交互动作（≤50 步，wait 总时长 ≤60s）。仅 Playwright 渲染可用时生效。',
@@ -94,12 +104,18 @@ export function createWebFetchTool(deps: FetchDeps = defaultDeps, opts: WebFetch
             },
           },
         },
-        required: ['url'],
+        required: [],
       },
     },
 
     async execute(params: ToolCallParams) {
       const rawUrl = params.input.url as string
+      const rawUrls = params.input.urls as string[] | undefined
+
+      // urls 与 actions 互斥：批量抓取走共享降级链，不支持渲染动作序列
+      if (rawUrls !== undefined && params.input.actions !== undefined) {
+        return { content: 'urls 与 actions 不能同时使用：actions 仅单页渲染路径支持，批量抓取不渲染。', isError: true }
+      }
 
       // actions 校验（≤50 步、wait 总长 ≤60s）——任何一步非法整体拒绝，不启动渲染
       let actions: RenderAction[] | undefined
@@ -109,6 +125,56 @@ export function createWebFetchTool(deps: FetchDeps = defaultDeps, opts: WebFetch
           return { content: `actions 校验失败：${parsed.error}`, isError: true }
         }
         actions = parsed.actions
+      }
+
+      // maxCharacters 校验：非有限数/负数 → 忽略（fallback 不截断，保持现有行为）
+      const rawMax = params.input.maxCharacters
+      const truncateTo = typeof rawMax === 'number' && Number.isFinite(rawMax) && rawMax >= 0 ? rawMax : undefined
+
+      // 批量分支：urls 存在时忽略 url，逐页独立走共享内核（缓存→直连→渲染→Jina）
+      if (rawUrls !== undefined) {
+        if (!Array.isArray(rawUrls)) {
+          return { content: 'urls 必须为 URL 字符串数组。', isError: true }
+        }
+        if (rawUrls.length > MAX_URLS) {
+          return { content: `一次最多抓取 ${MAX_URLS} 个 URL（收到 ${rawUrls.length} 个）`, isError: true }
+        }
+        const sections: string[] = []
+        const errors: string[] = []
+        for (let i = 0; i < rawUrls.length; i++) {
+          const u = rawUrls[i]!
+          if (typeof u !== 'string') {
+            errors.push(`错误 ${String(u)}：无效 URL`)
+            continue
+          }
+          let outcome: FetchMarkdownOutcome
+          try {
+            outcome = await fetchMarkdown(u, deps, { ...opts, cwd: params.cwd })
+          } catch (err) {
+            errors.push(`错误 ${u}：${err instanceof Error ? err.message : String(err)}`)
+            continue
+          }
+          if (!outcome.ok) {
+            errors.push(`错误 ${u}：${outcome.error}`)
+            continue
+          }
+          let markdown = outcome.markdown
+          let truncateNote = ''
+          if (truncateTo !== undefined && markdown.length > truncateTo) {
+            markdown = markdown.slice(0, truncateTo)
+            truncateNote = `（已按 ${truncateTo} 字符截断）`
+          }
+          const header = outcome.fromCache
+            ? `状态：${outcome.status}（缓存，${formatCacheAge(outcome.fetchedAt!)}前抓取${outcome.via}）\n内容长度：${markdown.length}${truncateNote}`
+            : `状态：${outcome.status}\n内容长度：${outcome.rawBytes}${outcome.via}${truncateNote}`
+          sections.push(`### ${i + 1}. ${u}\n${header}\n\n${markdown}`)
+        }
+        const body = sections.join('\n\n')
+        const errorBlock = errors.length > 0 ? `\n\n${errors.join('\n')}` : ''
+        if (sections.length === 0) {
+          return { content: errors.join('\n'), isError: true }
+        }
+        return { content: body + errorBlock }
       }
 
       // 动作序列只能跑在渲染路径——跳过直连/turndown 层，直达渲染；禁读禁写缓存
@@ -143,10 +209,16 @@ export function createWebFetchTool(deps: FetchDeps = defaultDeps, opts: WebFetch
           ...(outcome.errorKind ? { errorKind: outcome.errorKind } : {}),
         }
       }
+      let markdown = outcome.markdown
+      let truncateNote = ''
+      if (truncateTo !== undefined && markdown.length > truncateTo) {
+        markdown = markdown.slice(0, truncateTo)
+        truncateNote = `（已按 ${truncateTo} 字符截断）`
+      }
       const header = outcome.fromCache
-        ? `URL：${rawUrl}\n状态：${outcome.status}（缓存，${formatCacheAge(outcome.fetchedAt!)}前抓取${outcome.via}）\n内容长度：${outcome.markdown.length}`
-        : `URL：${rawUrl}\n状态：${outcome.status}\n内容长度：${outcome.rawBytes}${outcome.via}`
-      return { content: `${header}\n\n${outcome.markdown}` }
+        ? `URL：${rawUrl}\n状态：${outcome.status}（缓存，${formatCacheAge(outcome.fetchedAt!)}前抓取${outcome.via}）\n内容长度：${markdown.length}${truncateNote}`
+        : `URL：${rawUrl}\n状态：${outcome.status}\n内容长度：${outcome.rawBytes}${outcome.via}${truncateNote}`
+      return { content: `${header}\n\n${markdown}` }
     },
 
     requiresApproval: () => true,

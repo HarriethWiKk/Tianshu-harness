@@ -130,6 +130,7 @@ with `RIVET_NO_UPDATE_CHECK=1`.
 | Provider | Auth | Notable Models |
 |----------|------|----------------|
 | DeepSeek | API key | deepseek-v4-pro (1M ctx), deepseek-v4-flash |
+| DeepSeek Spark (Pro only) | API key (`DEEPSEEK_SPARK_API_KEY`) | deepseek-v4-flash (lightweight reasoning + anchored cache channel) |
 | Claude | API key (via `cc-switch` proxy) | opus-4-7, opus-4-6, sonnet-4-5 |
 | GLM (Zhipu) | API key | glm-5.2 |
 | Codex (GPT-5.5) | OAuth PKCE (ChatGPT subscription) | gpt-5.5 |
@@ -338,13 +339,13 @@ Delegate sub-tasks to independent headless worker sessions:
 
 ### Toolset & presets
 
-Tianshu ships 48 built-in tools, assembled in three preset tiers (resolution priority: `RIVET_TOOL_PRESET` env > project `.rivet-config.json` `tools.preset` > user `~/.rivet/config.json` > default `minimal`):
+Tianshu ships 50 built-in tools, assembled in preset tiers (resolution priority: `RIVET_TOOL_PRESET` env > project `.rivet-config.json` `tools.preset` > user `~/.rivet/config.json` > default `minimal`):
 
 | Preset | Tools | Description |
 |--------|-------|-------------|
 | **minimal** (default) | 29 | Full daily-dev capability — read/write/search/bash/git/tests/delegation/web/plan/todo/memory; saves tokens, preserves prefix cache |
 | **frontend** | 30 | minimal + `browser_debug` (UI rendering verification loop) |
-| **full** | 48 | Everything — `council_convene` / `team_orchestrate` / `attack_case` / `semantic_search` / `repo_graph` / `monitor` / `computer_use` / office tools, etc. |
+| **full** | 50 | Everything — `council_convene` / `team_orchestrate` / `attack_case` / `semantic_search` / `repo_graph` / `monitor` / `computer_use` / `capability` / `cli_discover` / office tools, etc. |
 
 ```bash
 RIVET_TOOL_PRESET=full rivet          # use full for this session
@@ -518,6 +519,8 @@ Tianshu's command-line interface runs on a purpose-built **T9 rendering engine**
 |------------|-------------------|
 | **GlanceBar status line** | A single line above the input box shows, in real time: star-domain glyph · git branch · model · reasoning effort · cache hit rate · context usage · this-turn cost · elapsed · turn count · todo badge. Session health at a glance. |
 | **Mid-stream interrupt (Steer)** | Type while the agent is still running and press Enter to inject. Inputs queue at `now / next / later` priority and drain to the AgentLoop at tool-result or turn boundaries — no need to wait for it to finish. `halt`-style intents auto-promote to `now`. |
+| **Message queue (/queue)** | `/queue <text>` explicitly queues a whole message while the agent is busy; queued items are delivered on settle, and an Esc interrupt refills them into the input box instead of dropping them. A live background-task bar and await area sit above the input. |
+| **Inline terminal images** | Renders images right in the terminal via the kitty / iTerm2 graphics protocols (tool artifacts, screenshot verifications). Auto-detects the protocol; `RIVET_IMAGES=0` disables, `kitty`/`iterm2` forces one. |
 | **@mention completion** | Type `@file:` / `@folder:` / `@symbol:` to trigger path completion (via `git ls-files`; supports the quoted form `@file:"a b.ts"` for paths with spaces). Pasting an image auto-converts to inline base64 (3-tier fallback across macOS/Linux/Windows). |
 | **Rewind** | Double-tap `ESC` (within 400ms) to open message history; pick any past user message to rewind to, with three restore granularities (conversation only / code only / both) and a precise file-impact preview for code actions. See [Rewind](#rewind). |
 | **Command palette** | `Ctrl+Esc` opens a fuzzy-searchable list of all slash commands and surface actions (toggle side panel, switch theme, enter Cockpit, etc.) — ↑/↓ to select, Enter to run. |
@@ -556,6 +559,8 @@ The desktop app builds a visual interaction layer on top of the TUI's full capab
 - **@file preview** — files mentioned in messages are clickable; a right-side drawer shows the content with syntax highlighting and line numbers.
 - **DeepSeek balance query** — the Insights panel shows the account balance and arrears status at the top (via the official API).
 - **Custom Provider** — Settings → Connect model service → + Custom Provider, supporting any OpenAI-compatible endpoint (Ollama/vLLM/direct OpenAI); API key optional.
+- **Theme Studio** — multiple custom theme libraries, 50-step undo/redo, per-token editing, and a wallpaper color engine (OKLCH clustering + contrast audit); ships the "Tianshu Quiet Cabin" dark theme; import/export supported.
+- **Adaptive sidecar memory** — heap cap auto-tiers by machine RAM (8G→2G / 16G→4G / 32G→6G / 64G+→8G; override via `RIVET_SIDECAR_HEAP_MB`); machines with ≤8GB auto-enable the lean resource tier.
 - **Watchdog auto-recovery** — auto-continues on boundary stalls; the desktop timeline shows recovery events (⟳ auto-recover / ⏹ quota exhausted).
 - **Multi-session concurrency** — a tab bar manages multiple sessions, each with its own cwd + model + approval mode.
 - **Feature panels** (left rail `⌘1…9` to switch): Mission Control (multi-session console), Inbox, Automations (scheduled tasks), Skills / Hooks management, Git / GitHub, Changes (diff review), Delegation (fleet tree & team-wave DAG), Cockpit.
@@ -584,6 +589,24 @@ The desktop app builds a visual interaction layer on top of the TUI's full capab
 | `Esc Esc` | Rewind (desktop time-travel) |
 
 > The desktop app also has Cockpit, SideChat (⌘;), Rewind time-travel, themes/Glass/wallpaper, Mirror acceleration, and other exclusive features — see the [Desktop User Guide](docs/desktop-guide.md).
+
+### 🎙️ Voice Input (Desktop)
+
+The composer's microphone button supports voice input on **both macOS and Windows**. Recognition runs on a **local whisper.cpp engine** — offline and private (audio never leaves your device), with better accuracy than built-in system speech recognition for mixed Chinese/English speech.
+
+**First-run guide**
+
+- The first click auto-downloads the recognition model (tiny ~75MB, mirror-accelerated for CN networks). If you click before the download finishes, you'll see "Speech recognition failed (whisper-unavailable)" — just retry shortly after.
+- macOS requests microphone permission on first use: click **Allow**. If denied by mistake, enable the app under **System Settings → Privacy & Security → Microphone**.
+- On Windows, if permission is denied, allow the app under **System Settings → Privacy → Microphone**.
+
+**Notes**
+
+- Recognition is fully local; recordings never leave the device.
+- Click once to start recording, click again to stop and transcribe.
+- When the local engine is unavailable (e.g. model not downloaded), macOS falls back to the system speech recognizer; Windows shows a model-not-ready hint instead.
+- For higher accuracy, switch to the base model (~244MB): pre-download with `desktop/scripts/fetch-whisper-runtime.js --with-base`.
+- On restricted networks, set `RIVET_WHISPER_PROXY=http://proxy:port` to accelerate model downloads.
 
 ## Slash Commands
 
@@ -676,7 +699,7 @@ Node.js 22 · TypeScript strict (`noUncheckedIndexedAccess`) · T9 ANSI renderin
 ```bash
 npx tsc --noEmit                                    # typecheck
 npm test                                             # all tests (13,000+ cases)
-npm run build                                        # tsup bundle
+npm run build                                        # tsup bundle + staged native/wasm payload
 node dist/main.js                                    # launch TUI
 node dist/main.js -p "fix the typo"                  # headless mode
 ```
@@ -748,6 +771,7 @@ run in parallel without interference.
 | Variable | Effect |
 |----------|--------|
 | `DEEPSEEK_API_KEY` | DeepSeek API key |
+| `DEEPSEEK_SPARK_API_KEY` | DeepSeek Spark (Pro-only preset) API key |
 | `RIVET_TOOL_PRESET` | Toolset tier: `minimal` (default) / `frontend` / `full` |
 | `RIVET_EMBEDDING_MODEL` / `RIVET_EMBEDDING_BASE_URL` / `RIVET_EMBEDDING_API_KEY` | Embedding-model routing for semantic search (default `text-embedding-3-small`) |
 | `RIVET_NO_EMBEDDINGS=1` | Disable the embedding index |
@@ -759,6 +783,7 @@ run in parallel without interference.
 | Variable | Effect |
 |----------|--------|
 | `RIVET_ASCII_UI=1` | Force pure-ASCII UI (degraded terminals) |
+| `RIVET_IMAGES` | Inline terminal images: auto-detect by default; `0`/`off` disables; `kitty`/`iterm2` forces a protocol |
 | `RIVET_HYPERLINKS=1` | Enable OSC 8 hyperlink rendering |
 | `RIVET_NOTIFY_BELL=1` | Ring the terminal bell on completion |
 | `RIVET_AMBIGUOUS_WIDTH` | Override CJK width judgment (for misaligned terminals) |

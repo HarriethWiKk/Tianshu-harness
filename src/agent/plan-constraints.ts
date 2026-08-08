@@ -23,11 +23,12 @@
  */
 
 import { existsSync, readFileSync, statSync } from 'node:fs'
+import { join } from 'node:path'
 import { validatePathSafe } from '../tools/path-validate.js'
 import { listPlansSync } from '../plan/plan-store.js'
 import { MAX_TASK_CONSTRAINT_CHARS } from './work-order.js'
 
-export type PlanConstraintKind = 'anti-goal' | 'assumption'
+export type PlanConstraintKind = 'anti-goal' | 'constraint' | 'assumption'
 
 export interface PlanConstraint {
   kind: PlanConstraintKind
@@ -47,8 +48,18 @@ const HEADING_RE = /^(反目标|非目标|不做的事|待验证假设|anti-?goa
  *  （到下一个加粗标签行或任意标题终止）。「约束」标签只在加粗形态出现——标题名单无它。 */
 const BOLD_RE = /^\*\*(反目标|非目标|不做的事|待验证假设|约束)[：:]*\*\*\s*[：:]?\s*(.*)$/
 
-/** 列表条目：`- item` / `* item` / `- [ ] item` / `1. item`（与 regression-inventory.ts 同源）。 */
-const LIST_ITEM_RE = /^\s*(?:[-*]\s*(?:\[[ xX]\]\s*)?|\d+\.\s+)(.+)$/
+/** 列表条目：`- item` / `* item` / `- [ ] item` / `1. item`。
+ *  与 regression-inventory.ts 同源，但**项目符号后强制要求空白**（markdown 本就如此）：
+ *  松散的 `[-*]\s*` 会把 `---` 分割线吃成条目 `--`，把 `**技术栈：** …` 的第一个 `*`
+ *  当成项目符号、吐出残缺的 `*技术栈：** …`。两者都会逐字进 worker 提示词。 */
+const LIST_ITEM_RE = /^\s*(?:[-*]\s+(?:\[[ xX]\]\s*)?|\d+\.\s+)(.+)$/
+
+/** 分割线：`---` / `***` / `- - -`。是章节边界，不是列表条目。 */
+const THEMATIC_BREAK_RE = /^([-*_])(?:\s*\1){2,}$/
+
+/** 任意加粗开头的行。未命中 BOLD_RE 的（`**技术栈：**` 之类）不是约束，但同样是
+ *  加粗列表的终止边界——否则它后面的列表会继续算在上一个加粗标签名下。 */
+const BOLD_LINE_RE = /^\*\*/
 
 /** objective 里的 .md 路径 token。排除尖括号/引号/反引号包裹（`<abs/path.md>` 取内层）。 */
 const MD_TOKEN_RE = /([^\s<>"'`]+\.md)/g
@@ -63,7 +74,11 @@ function kindForWord(word: string): PlanConstraintKind {
 }
 
 function kindForBoldWord(word: string): PlanConstraintKind {
-  return word === '待验证假设' ? 'assumption' : 'anti-goal'
+  if (word === '待验证假设') return 'assumption'
+  // `**约束**` 是实现约束（「通过 RIVET_X=0 可关闭」），不是反目标。混进 anti-goal
+  // 会给 worker 打上「计划反目标」的禁令前缀，把要做的事说成不要做的事。
+  if (word === '约束') return 'constraint'
+  return 'anti-goal'
 }
 
 /**
@@ -99,6 +114,11 @@ export function extractPlanConstraints(markdown: string): PlanConstraint[] {
       }
       continue
     }
+    // 分割线是章节边界，不是列表条目——同时终止加粗列表。
+    if (THEMATIC_BREAK_RE.test(line)) {
+      bold = null
+      continue
+    }
     // 加粗标签：同行有内容即一条；无内容进入列表收集（下一个加粗标签或任意标题终止）。
     const boldMatch = line.match(BOLD_RE)
     if (boldMatch) {
@@ -106,6 +126,11 @@ export function extractPlanConstraints(markdown: string): PlanConstraint[] {
       const rest = boldMatch[2]!.trim()
       bold = rest ? null : { kind, section: boldMatch[1]! }
       if (rest) push(kind, rest, boldMatch[1]!)
+      continue
+    }
+    // 未命中标签名的加粗行同样终止加粗列表，且绝不当成列表条目。
+    if (BOLD_LINE_RE.test(line)) {
+      bold = null
       continue
     }
     const listMatch = line.match(LIST_ITEM_RE)
@@ -118,9 +143,14 @@ export function extractPlanConstraints(markdown: string): PlanConstraint[] {
   return items
 }
 
+/** 计划级约束渲染前缀的公共前缀——消费侧用它嗅探 request.constraints 是否已含
+ *  计划级条目，避免兜底注入冲突。改 PREFIX_BY_KIND 时此常量须同步更新。 */
+export const PLAN_CONSTRAINT_PREFIX = '[计划'
+
 const PREFIX_BY_KIND: Record<PlanConstraintKind, string> = {
-  'anti-goal': '[计划反目标] ',
-  assumption: '[计划待验证假设·执行期先验证] ',
+  'anti-goal': `${PLAN_CONSTRAINT_PREFIX}反目标] `,
+  constraint: `${PLAN_CONSTRAINT_PREFIX}约束] `,
+  assumption: `${PLAN_CONSTRAINT_PREFIX}待验证假设·执行期先验证] `,
 }
 
 /** 句末标点（截断落点）。 */
@@ -140,11 +170,11 @@ function truncateWithPointer(text: string, section: string, planRef: string | un
   return text.slice(0, cut) + pointer
 }
 
-/** 渲染约束行：先 anti-goal 后 assumption（禁令比待验证项硬），稳定排序保持组内
- *  原文顺序。每条保证 前缀+正文 ≤ MAX_TASK_CONSTRAINT_CHARS（超长带指针截断）。
- *  去重与总数封顶交给下游 withTaskConstraints，渲染器不重复实现。 */
+/** 渲染约束行：anti-goal → constraint → assumption（禁令最硬，待验证项最软），稳定
+ *  排序保持组内原文顺序。每条保证 前缀+正文 ≤ MAX_TASK_CONSTRAINT_CHARS（超长带指针
+ *  截断）。去重与总数封顶交给下游 withTaskConstraints，渲染器不重复实现。 */
 export function renderPlanConstraints(items: readonly PlanConstraint[], planRef?: string): string[] {
-  const rank: Record<PlanConstraintKind, number> = { 'anti-goal': 0, assumption: 1 }
+  const rank: Record<PlanConstraintKind, number> = { 'anti-goal': 0, constraint: 1, assumption: 2 }
   const sorted = [...items].sort((a, b) => rank[a.kind] - rank[b.kind])
   return sorted.map(item => {
     const prefix = PREFIX_BY_KIND[item.kind]
@@ -220,16 +250,85 @@ export function resolvePlanConstraints(cwd: string, src: PlanConstraintSource): 
   }
 }
 
+/** `.rivet/plans` 相对项目根目录的路径——与 plan-store.ts 的 PLANS_DIR 同源。 */
+const PLANS_DIR = '.rivet/plans'
+
+/** findApprovedPlanConstraints 缓存条目。 */
+interface ApprovedPlanCacheEntry {
+  /** 缓存值：undefined = 「无 approved 计划」也是可缓存答案。 */
+  value: string[] | undefined
+  /** 写入时刻（epoch ms），TTL 失效判据。 */
+  at: number
+  /** 缓存时的 .rivet/plans 目录 mtimeMs；目录不存在时为 -1。 */
+  dirMtimeMs: number
+}
+
+/**
+ * 按 cwd 的模块级缓存（delegateBatch 循环体每个工单调一次，starflow 一次完整
+ * 流程十几到二十几个工单；192 份计划 / 2.2MB 实测 listPlansSync 117ms）。
+ *
+ * 双重失效：目录 mtime（新增/删除计划文件立即失效，成本 0.012ms）+ TTL
+ * （approvePlan 原地改写文件内容不更新父目录 mtime，靠 TTL 兜住——本特性
+ * advisory，几秒陈旧无害，工单风暴在毫秒级窗口内）。目录不存在也缓存
+ * 「无计划」答案（dirMtimeMs=-1），别每次重试。
+ */
+const approvedPlanCache = new Map<string, ApprovedPlanCacheEntry>()
+const APPROVED_PLAN_CACHE_TTL_MS = 5000
+
+/** 测试用：清空 findApprovedPlanConstraints 缓存（模块级状态必须可复位）。 */
+export function resetApprovedPlanCache(): void {
+  approvedPlanCache.clear()
+}
+
 /** 从最近的 APPROVED 计划提取计划约束（executed/rejected 不算——已交付或已弃）。
  *  零接线回退：无显式源时用它。任何异常返回 undefined（advisory，绝不阻断派发）。 */
 export function findApprovedPlanConstraints(cwd: string): string[] | undefined {
   try {
+    let dirMtimeMs = -1
+    try {
+      dirMtimeMs = statSync(join(cwd, PLANS_DIR)).mtimeMs
+    } catch {
+      // 目录不存在：mtime 记 -1，「无计划」同样进缓存，避免每次重试。
+    }
+    const now = Date.now()
+    const cached = approvedPlanCache.get(cwd)
+    if (cached && now - cached.at < APPROVED_PLAN_CACHE_TTL_MS && cached.dirMtimeMs === dirMtimeMs) {
+      return cached.value
+    }
     const approved = listPlansSync(cwd).filter(p => p.status === 'approved')
-    if (approved.length === 0) return undefined
-    // listPlansSync 已按 createdAt 降序 — 取最新的 approved。
-    const rendered = renderPlanConstraints(extractPlanConstraints(approved[0]!.content))
-    return rendered.length > 0 ? rendered : undefined
+    const value = approved.length === 0
+      ? undefined
+      // listPlansSync 已按 createdAt 降序 — 取最新的 approved。
+      : (() => {
+          const rendered = renderPlanConstraints(extractPlanConstraints(approved[0]!.content))
+          return rendered.length > 0 ? rendered : undefined
+        })()
+    approvedPlanCache.set(cwd, { value, at: now, dirMtimeMs })
+    return value
   } catch {
     return undefined
   }
+}
+
+/**
+ * 从 UnifiedPlan 契约提取计划约束（starflow / team 的 planJson 来源，D8 计划级
+ * 通道）：nonGoals → anti-goal；obligations 中 deferred_decision /
+ * high_risk_mitigation → constraint（advisory_gate 跳过——它带 gate 命令走
+ * verification 通道）。参数用结构化类型，不 import unified-plan.ts（避免反向依赖）。
+ */
+export function constraintsFromUnifiedPlan(src: {
+  nonGoals?: string[]
+  obligations?: { kind: string; text: string }[]
+}): string[] {
+  const items: PlanConstraint[] = []
+  for (const raw of src.nonGoals ?? []) {
+    const text = raw.trim()
+    if (text) items.push({ kind: 'anti-goal', text, section: 'nonGoals' })
+  }
+  for (const ob of src.obligations ?? []) {
+    if (ob.kind === 'advisory_gate') continue
+    const text = ob.text.trim()
+    if (text) items.push({ kind: 'constraint', text, section: `obligations.${ob.kind}` })
+  }
+  return renderPlanConstraints(items)
 }

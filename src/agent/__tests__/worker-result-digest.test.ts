@@ -37,4 +37,20 @@ describe('formatWorkerResultDigest', () => {
     const d = formatWorkerResultDigest({ status: 'passed', summary: 'x', findingsCount: 0, changedFilesCount: 0, evidenceStatus: 'verified' })
     assert.doesNotMatch(d, /⚠/)
   })
+
+  it('sourcesReviewedCount 存在且 >0 时在文件数之后追加「N 个来源」', () => {
+    const d = formatWorkerResultDigest({ status: 'passed', summary: '调研完成', findingsCount: 2, changedFilesCount: 1, sourcesReviewedCount: 12 })
+    assert.match(d, /12 个来源/)
+    // 顺序：文件数在前，来源数在后
+    const idxFiles = d.indexOf('1 个文件')
+    const idxSources = d.indexOf('12 个来源')
+    assert.ok(idxFiles >= 0 && idxSources > idxFiles, '来源段应排在文件段之后')
+  })
+
+  it('sourcesReviewedCount 缺失或为 0 时不显示来源段', () => {
+    const d0 = formatWorkerResultDigest({ status: 'passed', summary: 'x', findingsCount: 0, changedFilesCount: 0, sourcesReviewedCount: 0 })
+    assert.doesNotMatch(d0, /个来源/)
+    const dU = formatWorkerResultDigest({ status: 'passed', summary: 'x', findingsCount: 0, changedFilesCount: 0 })
+    assert.doesNotMatch(dU, /个来源/)
+  })
 })
