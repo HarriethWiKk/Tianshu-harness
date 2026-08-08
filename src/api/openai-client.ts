@@ -199,6 +199,22 @@ export const SLOW_THINKING_PROVIDERS = new Set(['glm', 'mimo', 'deepseek', 'code
  * rather than fill disk.
  */
 const TOOL_STREAM_LOG_MAX_LINES = 2000
+
+/**
+ * Best-effort redaction for tool-argument previews before they reach stderr
+ * debug logs (CWE-532): blank out string values of sensitive-looking JSON keys
+ * (password/token/secret/api_key/...). Works on truncated fragments too — an
+ * unterminated trailing string value is masked as well. Not a guarantee: args
+ * that embed secrets in free-form strings can still slip through; the always-on
+ * disk log therefore carries no argument content at all.
+ */
+export function redactSensitiveArgs(fragment: string): string {
+  return fragment
+    .replace(
+      /("(?:[^"\\]*(?:password|passwd|secret|token|api[_-]?key|apikey|authorization|credential|private[_-]?key|access[_-]?key)[^"\\]*)"\s*:\s*")((?:[^"\\]|\\.)*)("?)/gi,
+      '$1[REDACTED]$3',
+    )
+}
 // Thinking-stall timeout 现由 config.thinkingStallTimeoutMs 控制（默认禁用，见
 // resetIdleTimer 与 OpenAIClientConfig 注释）。旧的模块级常量已移除——它恒等于
 // SLOW_READ_TIMEOUT_MS（实为禁用），且配套错误文案硬编码"90s"与实际值不符。
@@ -972,7 +988,7 @@ export class OpenAIClient implements StreamClient {
           this.logToolStreamEvent({
             phase: 'reattach-by-id', openBuffers: this.toolCallBuffer.size,
             id: tc.id, name: buf.function.name,
-            argsLen: tc.function?.arguments?.length, argsPreview: tc.function?.arguments?.slice(0, 80),
+            argsLen: tc.function?.arguments?.length,
           })
           return idx
         }
@@ -985,7 +1001,7 @@ export class OpenAIClient implements StreamClient {
       const idx = this.toolCallBuffer.keys().next().value!
       this.logToolStreamEvent({
         phase: 'reattach-sole', openBuffers: 1,
-        argsLen: tc.function?.arguments?.length, argsPreview: tc.function?.arguments?.slice(0, 80),
+        argsLen: tc.function?.arguments?.length,
       })
       return idx
     }
@@ -998,7 +1014,7 @@ export class OpenAIClient implements StreamClient {
     // is visible without RIVET_DEBUG.
     this.logToolStreamEvent({
       phase: 'drop-ambiguous', openBuffers: this.toolCallBuffer.size,
-      argsLen: tc.function?.arguments?.length, argsPreview: tc.function?.arguments?.slice(0, 80),
+      argsLen: tc.function?.arguments?.length,
     })
     return null
   }
@@ -1165,7 +1181,7 @@ export class OpenAIClient implements StreamClient {
         this.logToolStreamEvent({
           phase: 'final-flush-empty', openBuffers: this.toolCallBuffer.size,
           id: buf.id, name: buf.function.name,
-          argsLen: buf.function.arguments.length, argsPreview: buf.function.arguments.slice(0, 120),
+          argsLen: buf.function.arguments.length,
         })
         callbacks.onContentBlock?.({ type: 'tool_use', id: buf.id, name: buf.function.name, input: {}, argsTruncated: true })
         this.toolCallBuffer.delete(idx)
@@ -1211,7 +1227,7 @@ export class OpenAIClient implements StreamClient {
     if (process.env.RIVET_DEBUG_TOOL_STREAM !== '1') return
     debugLog(
       `[tool-stream] phase=${phase} idx=${idx} id=${buf.id ?? '?'} name=${buf.function.name ?? '?'}` +
-      ` argsLen=${buf.function.arguments.length} args=${JSON.stringify(buf.function.arguments.slice(0, 200))}`,
+      ` argsLen=${buf.function.arguments.length} args=${JSON.stringify(redactSensitiveArgs(buf.function.arguments.slice(0, 200)))}`,
     )
   }
 
@@ -1221,6 +1237,11 @@ export class OpenAIClient implements StreamClient {
    * cross-tool argument-pollution class of bug leaves a trace without anyone
    * having to enable RIVET_DEBUG up front. Best-effort: any IO failure disables
    * further logging for this client (sets path to null), never throws.
+   *
+   * Security: events carry argsLen only, NEVER raw argument content — tool
+   * arguments can embed secrets (passwords/tokens passed to Bash etc.) and an
+   * always-on disk log must not capture them (CWE-532). Content previews exist
+   * only in the RIVET_DEBUG_TOOL_STREAM stderr path, redacted.
    *
    * Capped at TOOL_STREAM_LOG_MAX_LINES per process — once hit, logging stops to
    * bound disk on long sessions. The cap is generous: these events are rare
@@ -1233,7 +1254,6 @@ export class OpenAIClient implements StreamClient {
     id?: string
     name?: string
     argsLen?: number
-    argsPreview?: string
   }): void {
     if (this.toolStreamLogPath === null) return
     if (this.toolStreamLogLines >= TOOL_STREAM_LOG_MAX_LINES) return
@@ -1276,7 +1296,7 @@ export class OpenAIClient implements StreamClient {
   ): void {
     const msg =
       `[tool-arg-parse-failure] id=${buf.id ?? '?'} name=${buf.function.name ?? '?'}` +
-      ` argsLen=${buf.function.arguments.length} args=${JSON.stringify(buf.function.arguments.slice(0, 300))}`
+      ` argsLen=${buf.function.arguments.length} args=${JSON.stringify(redactSensitiveArgs(buf.function.arguments.slice(0, 300)))}`
     debugLog(msg)
   }
 
