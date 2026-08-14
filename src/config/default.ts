@@ -98,6 +98,7 @@ export const DEFAULT_CONFIG: Config = {
   },
   agent: {
     approval: 'suggest',
+    unsandboxed: false,
     maxTurns: 200,
     mode: 'code',
     autoReasoning: true,
@@ -205,11 +206,6 @@ export const DEFAULT_CONFIG: Config = {
       subscriptionCeiling: 0.6,
     },
   },
-  cache: {
-    enabled: true,
-    minSystemTokens: 256,
-    showHitRate: true,
-  },
   search: {
     // bing first: cn.bing.com is China-reachable with no API key and returns
     // direct URLs. duckduckgo is the offshore fallback. Users on either side
@@ -313,4 +309,5 @@ export const DEFAULT_CONFIG: Config = {
     },
   },
   plugins: { enabled: {} },
+  hooks: {},
 }

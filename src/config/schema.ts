@@ -86,6 +86,12 @@ export const providerSchema = z.object({
    * 即便小上下文也迟迟不出首 token 时，才需要显式抬高这个 base。
    */
   firstByteTimeoutMs: z.number().int().positive().optional(),
+  /**
+   * 显式声明慢思考端点（更长首字节/read 窗口：180s/300s；thinking 重试上限 2）。
+   * 三态：undefined = 按名称/baseUrl 启发式（isSlowThinkingProvider）；
+   * true/false 都压过启发式。自建 DeepSeek/GLM 中转（自定义 provider 名）建议显式 true。
+   */
+  slowThinking: z.boolean().optional(),
   unsupported: z.array(z.string()).default([]),
   /**
    * Provider usage calibration factor for `prompt_tokens` (0–1).
@@ -243,6 +249,9 @@ export type CouncilConfig = z.infer<typeof councilConfigSchema>
 
 export const agentSchema = z.object({
   approval: z.enum(['auto-accept', 'auto-safe', 'suggest', 'manual', 'dangerously-skip-permissions']).default('auto-safe'),
+  /** 关写沙箱——完全权限档（approval 仍为 dangerously-skip-permissions 但
+   *  写边界不做限制）。默认 false；桌面端选「完全权限」时写入 true。 */
+  unsandboxed: z.boolean().default(false),
   // 长任务远端兜底。runaway 由 wedged-loop/convergence/watchdog/context-pressure
   // 先行拦截，此值对标 Claude Code/Codex 的"无硬上限"取宽松 4 倍余量（50→200，
   // 会话 5158719d 证明 50 轮迫使用户在正常长任务中反复手动「继续」）。
@@ -454,12 +463,6 @@ export const compactSchema = z.object({
     /** Ceiling ratio that fires T9 for subscription providers even with no phase transition. */
     subscriptionCeiling: z.number().min(0).max(1).default(0.6),
   }).default({}),
-})
-
-export const cacheSchema = z.object({
-  enabled: z.boolean().default(true),
-  minSystemTokens: z.number().int().positive().default(256),
-  showHitRate: z.boolean().default(true),
 })
 
 export const searchSchema = z.object({
@@ -804,7 +807,6 @@ export const configSchema = z.object({
   }),
   agent: agentSchema.default({}),
   compact: compactSchema.default({}),
-  cache: cacheSchema.default({}),
   search: searchSchema,
   fetch: fetchSchema,
   network: networkSchema,
@@ -830,6 +832,17 @@ export const configSchema = z.object({
    */
   runtime: runtimeSchema,
   pro: proSchema,
+  /** Runtime hook 装配配置（CVM 五阶段管线，src/agent/runtime-hooks.ts）。
+   *  disabled 会话级禁用的 hook id（管线 manifest 中的 id）。装配时传入管线
+   *  disabledHookIds；交互模式下配置变更可热更（config-watcher），热更只影响
+   *  运行时行为、不动工具指纹；工具装配仍受缓存约束保持启动快照。
+   *  env RIVET_HOOKS_DISABLED（逗号分隔）优先。timeoutMs/slowMs 为启动快照
+   *  （热更范围仅 disabled，诚实标注）。 */
+  hooks: z.object({
+    disabled: z.array(z.string()).optional(),
+    timeoutMs: z.number().int().positive().optional(),
+    slowMs: z.number().int().positive().optional(),
+  }).default({}),
   plugins: z.object({
     enabled: z.record(z.boolean()).default({}),
   }).default({}),
@@ -839,7 +852,6 @@ export type Config = {
   provider: { default: string; providers: Record<string, ProviderConfig> }
   agent: AgentConfig
   compact: CompactConfig
-  cache: CacheConfig
   search: SearchConfig
   fetch: FetchConfig
   network: NetworkConfig
@@ -857,6 +869,7 @@ export type Config = {
   runtime: RuntimeConfig
   pro: ProConfig
   plugins: { enabled: Record<string, boolean> }
+  hooks: { disabled?: string[]; timeoutMs?: number; slowMs?: number }
 }
 
 export type ProviderConfig = z.infer<typeof providerSchema>
@@ -868,7 +881,6 @@ export type EditorPlatform = EditorConfig['platform']
 export type EditorEol = EditorConfig['eol']
 export type AgentConfig = z.infer<typeof agentSchema>
 export type CompactConfig = z.infer<typeof compactSchema>
-export type CacheConfig = z.infer<typeof cacheSchema>
 export type SearchConfig = z.infer<typeof searchSchema>
 export type WorkersConfig = z.infer<typeof workersSchema>
 export type SkillsConfig = z.infer<typeof skillsSchema>

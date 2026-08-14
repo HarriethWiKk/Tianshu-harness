@@ -124,6 +124,7 @@ export function createProviderClient(
     thinking: provider.thinking as 'enabled' | 'disabled' | undefined,
     thinkingStallTimeoutMs: provider.thinkingStallTimeoutMs ?? SLOW_THINKING_STALL_DEFAULT_MS[provider.name],
     firstByteTimeoutMs: provider.firstByteTimeoutMs,
+    slowThinking: provider.slowThinking,
     thinkingFormat: capabilities.thinkingFormat,
     effortFormat: capabilities.effortFormat,
     reasoningEffort: params.reasoningEffort,
