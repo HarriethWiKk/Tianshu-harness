@@ -8,7 +8,7 @@ import { mkdir, writeFile, rename, unlink } from 'node:fs/promises'
  * then rename (which is atomic on POSIX and APFS). If the process crashes
  * mid-write, the original file is untouched.
  */
-export function writeFileAtomicSync(filePath: string, data: string): void {
+export function writeFileAtomicSync(filePath: string, data: string | Buffer): void {
   const dir = dirname(filePath)
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
 
@@ -17,7 +17,8 @@ export function writeFileAtomicSync(filePath: string, data: string): void {
   try {
     // 0o600: files written here are user-private (config with API keys,
     // sessions) — align with token-store.ts; rename preserves the mode.
-    writeFileSync(tmpPath, data, { encoding: 'utf-8', mode: 0o600 })
+    // Buffer payloads (compressed transcripts) skip the utf-8 encoding.
+    writeFileSync(tmpPath, data, data instanceof Buffer ? { mode: 0o600 } : { encoding: 'utf-8', mode: 0o600 })
     renameSync(tmpPath, filePath)
   } catch (err) {
     try { unlinkSync(tmpPath) } catch { /* ignore cleanup failure */ }
@@ -29,13 +30,13 @@ export function writeFileAtomicSync(filePath: string, data: string): void {
  * Async version of writeFileAtomicSync — avoids blocking the event loop
  * during large session rewrites (compaction/reset).
  */
-export async function writeFileAtomicAsync(filePath: string, data: string): Promise<void> {
+export async function writeFileAtomicAsync(filePath: string, data: string | Buffer): Promise<void> {
   const dir = dirname(filePath)
   if (!existsSync(dir)) await mkdir(dir, { recursive: true })
   const suffix = randomUUID().slice(0, 8)
   const tmpPath = filePath + '.' + suffix + '.tmp'
   try {
-    await writeFile(tmpPath, data, { encoding: 'utf-8', mode: 0o600 })
+    await writeFile(tmpPath, data, data instanceof Buffer ? { mode: 0o600 } : { encoding: 'utf-8', mode: 0o600 })
     await rename(tmpPath, filePath)
   } catch (err) {
     try { await unlink(tmpPath) } catch { /* ignore cleanup failure */ }

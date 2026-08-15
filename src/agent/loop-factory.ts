@@ -1185,7 +1185,7 @@ export function createTurnOrchestrator(self: AgentLoop): TurnOrchestrator {
     recordProviderOutcome: (ok) => { self.recordProviderOutcome(ok) },
 
     // === Sub-controllers ===
-    streamTurn: (params) => self.turnStream!.streamTurn(params),
+    streamTurn: (params) => (self.persist ? self.persist.flushSessionBuffer().catch(() => {}).then(() => self.turnStream!.streamTurn(params)) : self.turnStream!.streamTurn(params)),
     executeBatch: (params) => self.toolExecution.executeBatch(params),
     completeTurn: (params) => self.turnCompletion.complete(params),
     appendTurnResult: (turn) => { self.planTraceCoordinator.appendTurnResult(turn) },

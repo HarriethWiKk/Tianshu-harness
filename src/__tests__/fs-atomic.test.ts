@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, rmSync, existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { writeFileAtomicAsync } from '../fs-atomic.js'
+import { writeFileAtomicAsync, writeFileAtomicSync } from '../fs-atomic.js'
 
 describe('writeFileAtomicAsync (S13)', () => {
   let dir: string
@@ -26,5 +26,23 @@ describe('writeFileAtomicAsync (S13)', () => {
     const fp = join(dir, 'nested', 'deep', 'f.json')
     await writeFileAtomicAsync(fp, '{}')
     assert.equal(readFileSync(fp, 'utf-8'), '{}')
+  })
+
+  it('writes binary Buffer payloads without utf-8 corruption (sync)', () => {
+    const fp = join(dir, 'session.jsonl')
+    const payload = Buffer.from([0x00, 0xff, 0x28, 0xb5, 0x2f, 0xfd, 0x01, 0x02])
+    writeFileAtomicSync(fp, payload)
+    const readBack = readFileSync(fp)
+    assert.ok(readBack.equals(payload), 'buffer bytes must roundtrip unchanged')
+    assert.equal(readdirSync(dir).filter(f => f.endsWith('.tmp')).length, 0)
+  })
+
+  it('writes binary Buffer payloads without utf-8 corruption (async)', async () => {
+    const fp = join(dir, 'session.jsonl')
+    const payload = Buffer.from([0x00, 0xff, 0x28, 0xb5, 0x2f, 0xfd, 0x01, 0x02])
+    await writeFileAtomicAsync(fp, payload)
+    const readBack = readFileSync(fp)
+    assert.ok(readBack.equals(payload), 'buffer bytes must roundtrip unchanged')
+    assert.equal(readdirSync(dir).filter(f => f.endsWith('.tmp')).length, 0)
   })
 })

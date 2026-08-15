@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os'
 import { MAX_SESSION_MESSAGE_JSON_CHARS, SessionPersist, evictOldSessionsInternal, getSessionDir, projectSlug, serializeSessionMessage, formatExitSummary, shouldAutoWriteHandoff } from '../session-persist.js'
 import type { OaiMessage } from '../../api/oai-types.js'
 import { appendChecksum } from '../checksum.js'
+import { decodeTranscriptText, encodeBatch } from '../session-transcript-codec.js'
 
 describe('SessionPersist', () => {
   let tempDir: string
@@ -228,6 +229,8 @@ describe('SessionPersist — resolveSessionId / formatSessionList / listMainSess
     await p.appendOaiWithChecksum({ role: 'user', content: title })
     p.initMetadata({ model: 'deepseek-v4' })
     p.updateMetadata({ title })
+    // updateMetadata 合入批节奏（内存缓存），列表走磁盘读——flush 落盘。
+    await p.flushSessionBuffer()
     SessionPersist.invalidateListCache()
   }
 
@@ -566,9 +569,9 @@ describe('checksum integration', () => {
     // 写入有效消息
     await persist.appendWithChecksum(message)
     
-    // 写入无效校验和
+    // 写入无效校验和（帧内坏行——转录已是 zstd 帧流，坏行以帧为单位注入）
     const { appendFileSync } = await import('node:fs')
-    appendFileSync(persist.getFilePath(), '{"invalid": true}|0000000000000000\n')
+    appendFileSync(persist.getFilePath(), encodeBatch('{"invalid": true}|0000000000000000\n'))
     
     const loaded = persist.loadWithChecksum()
 
@@ -590,8 +593,10 @@ describe('checksum integration', () => {
     assert.equal(loaded[1]!.content, 'after switch')
 
     // 但事件确实落盘且通过 checksum（裸读文件能看到 model_switch 行）
+    // write-behind 批队列：裸读前必须显式 flush 让批落盘。
+    await persist.flushSessionBuffer()
     const { readFileSync } = await import('node:fs')
-    const raw = readFileSync(persist.getFilePath(), 'utf-8')
+    const raw = decodeTranscriptText(readFileSync(persist.getFilePath()))
     assert.match(raw, /"type":"model_switch"/)
     assert.match(raw, /"to":"deepseek-v4-pro"/)
     assert.match(raw, /"from":"claude-opus-4-8"/)
@@ -607,7 +612,7 @@ describe('checksum integration', () => {
     persist.compactOai(persist.loadOai())
 
     const { readFileSync } = await import('node:fs')
-    const raw = readFileSync(persist.getFilePath(), 'utf-8')
+    const raw = decodeTranscriptText(readFileSync(persist.getFilePath()))
     assert.match(raw, /"type":"model_switch"/, 'model_switch audit line must survive compactOai')
     assert.match(raw, /"to":"glm-5\.2"/)
     // replay 语义不变：audit 行仍被跳过
@@ -616,7 +621,7 @@ describe('checksum integration', () => {
 
     // 再次重写也不丢、不重复膨胀（每次重写恰好保留一份）
     persist.compactOai(persist.loadOai())
-    const raw2 = readFileSync(persist.getFilePath(), 'utf-8')
+    const raw2 = decodeTranscriptText(readFileSync(persist.getFilePath()))
     assert.equal(raw2.split('\n').filter(l => l.includes('"type":"model_switch"')).length, 1)
   })
 
@@ -628,7 +633,7 @@ describe('checksum integration', () => {
     await persist.compactOaiAsync(persist.loadOai())
 
     const { readFileSync } = await import('node:fs')
-    const raw = readFileSync(persist.getFilePath(), 'utf-8')
+    const raw = decodeTranscriptText(readFileSync(persist.getFilePath()))
     assert.match(raw, /"type":"model_switch"/, 'model_switch audit line must survive compactOaiAsync')
     assert.equal(persist.loadOai().length, 1)
   })

@@ -2206,7 +2206,7 @@ const TUI_SLASH_COMMANDS: readonly TuiSlashCommandDef[] = [
     name: '/fork',
     description: 'Fork current session (optionally from a message line)',
     immediate: true,
-    handler(ctx) {
+    async handler(ctx) {
       const { parts, pushStatic, setIsStreaming } = ctx
       const cmd = parts[0]!.toLowerCase()
       // /fork [name]       — fork current session, auto-switch to the copy
@@ -2237,7 +2237,7 @@ const TUI_SLASH_COMMANDS: readonly TuiSlashCommandDef[] = [
         setIsStreaming(false)
         return true
       }
-
+      await ctx.persist.flushSessionBuffer().catch(() => {})
       // Validate upToLine against actual message count
       if (upToLine !== undefined) {
         const total = countMessageLines(sourceJsonl)

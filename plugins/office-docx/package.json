@@ -1,0 +1,23 @@
+{
+  "name": "office-docx",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Native .docx read/write (docx generation + mammoth text extraction) — synced with @huiliyi37/dsh-office 0.1.5",
+  "tianshu": {
+    "name": "office-docx",
+    "version": "1.0.0",
+    "description": "Native .docx Word document generation (headings/tables/lists/code) + text extraction for context reading",
+    "entry": "index.js",
+    "tools": [
+      { "name": "docx_create", "description": "Generate a .docx Word document from content blocks (heading/h2/h3/paragraph/table/code/list)" },
+      { "name": "docx_read", "description": "Extract plain text from a .docx file for context reading" }
+    ],
+    "permissions": { "fs": true },
+    "skills": ["skills"]
+  },
+  "dependencies": {
+    "docx": "^9.7.0",
+    "mammoth": "^1.12.0"
+  }
+}

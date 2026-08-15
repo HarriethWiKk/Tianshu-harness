@@ -73,6 +73,7 @@ import { resolveAutoApproveMs, shouldArm } from './tui/plan-auto-approve.js'
 import type { PlanPickerEntry } from './tui/format/overlay.js'
 import { skillRegistry } from './skills/skill-loader.js'
 import { starDomainRegistry } from './agent/star-domain-registry.js'
+import { resolveInitialDomainName, resolveInitialModelName } from './tui/initial-status.js'
 import { buildDomainPickerEntries, DOMAIN_SWITCH_CACHE_WARNING } from './agent/domain-picker-entries.js'
 import { SessionPersist, formatExitSummary } from './agent/session-persist.js'
 import { parseSessionCliArgs } from './agent/session-recovery.js'
@@ -770,8 +771,12 @@ async function main() {
   }
 
   // ── Build TuiApp ─────────────────────────────────────────────
-  const currentModel = ctx.provider.models[0]
-  const modelName = currentModel?.alias ?? currentModel?.id ?? 'unknown'
+  // 初始模型名以运行时实际模型为准（tui/initial-status.ts），避免默认模型重启后显示不一致。
+  const { modelName, currentModel } = resolveInitialModelName({
+    models: ctx.provider.models,
+    runtimeModelId: ctx.agent.config.promptEngine.getModel(),
+    defaultModelRef: ctx.config.agent.defaultModel,
+  })
 
   // git branch（启动时读取一次，GlanceBar 显示）
   let gitBranch: string | undefined
@@ -860,7 +865,11 @@ async function main() {
   ctx!.agent.onAskUserQuestionRequested = (info) => {
     setImmediate(() => tuiApp.openAskUserQuestionPanel(info))
   }
-  const initialDomain = ctx!.agent.getSessionDomain()?.name
+  const initialDomain = resolveInitialDomainName({
+    agentDomainName: ctx!.agent.getSessionDomain()?.name,
+    defaultDomain: ctx!.config.agent.defaultDomain,
+    resolve: (id) => starDomainRegistry.get(id),
+  })
   if (initialDomain) {
     tuiApp.setSessionStarDomain(initialDomain)
   }

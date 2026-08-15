@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { extractPlanPath, parseChecklistItems, parseChecklistSections, createPlanTaskTool } from '../plan-task.js'
@@ -188,9 +188,13 @@ describe('timeoutMs', () => {
 // ── Integration: parse real plan file ──
 
 describe('integration: parse real plan file', () => {
-  it('parses tianshu-omp plan checklist into items with file paths', async () => {
+  it('parses tianshu-omp plan checklist into items with file paths', async (t) => {
     const { readFile } = await import('node:fs/promises')
-    const content = await readFile('.rivet/knowledge/tianshu-omp-convergence-precision-backport.md', 'utf-8')
+    const { existsSync } = await import('node:fs')
+    const fixture = '.rivet/knowledge/tianshu-omp-convergence-precision-backport.md'
+    // fixture 在公开仓同步树缺失（.rivet/knowledge/ 整目录忽略）——不是回归。
+    if (!existsSync(fixture)) return t.skip(`${fixture} not in this tree`)
+    const content = await readFile(fixture, 'utf-8')
     const items = parseChecklistItems(content)
     // The updated plan has ~12+ checklist items
     assert.ok(items.length >= 8, `expected at least 8 checklist items, got ${items.length}`)
@@ -238,6 +242,7 @@ describe('createPlanTaskTool execute:true multi-wave driver', () => {
   // 写一份 2-item checklist 计划文件到 .rivet/plans/（plan_task 快速路径读取，
   // 路径相对 CWD=仓库根）。唯一文件名避免并发会话/重复运行冲突，测试结束清理。
   function writeWavePlan(): string {
+    mkdirSync('.rivet/plans', { recursive: true })
     const name = `.rivet/plans/waves-${process.pid}-${Date.now()}.md`
     writeFileSync(name, PLAN_MD, 'utf-8')
     return name
@@ -334,6 +339,7 @@ describe('createPlanTaskTool execute:true multi-wave driver', () => {
 
 describe('integration: sectioned plan via plan_task', () => {
   it('章节计划 execute:false → 任务数 = 章节数（不再逐项切碎片）', async () => {
+    mkdirSync('.rivet/plans', { recursive: true })
     const name = `.rivet/plans/sections-${process.pid}-${Date.now()}.md`
     writeFileSync(name, [
       '### Shard A',

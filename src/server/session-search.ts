@@ -3,6 +3,7 @@ import { join } from 'node:path'
 import { performance } from 'node:perf_hooks'
 import { sessionsDir } from '../config/paths.js'
 import { verifyAndExtract } from '../agent/checksum.js'
+import { decodeTranscriptText } from '../agent/session-transcript-codec.js'
 
 const SEARCH_CONCURRENCY = 4
 const SEARCH_PER_SESSION_MAX = 3
@@ -35,8 +36,8 @@ export type SessionSearchResult = {
 export type SessionSearchOptions = {
   readFile?: (
     path: string,
-    options: { encoding: BufferEncoding; signal?: AbortSignal },
-  ) => Promise<string>
+    options: { signal?: AbortSignal },
+  ) => Promise<Buffer>
   filePathFor?: (session: SessionSearchRecord) => string
   yieldControl?: () => Promise<void>
   onMetrics?: (metrics: SessionSearchMetrics) => void
@@ -62,7 +63,8 @@ async function searchTranscript(
   if (signal?.aborted) return []
   let raw: string
   try {
-    raw = await read(filePathFor(session), { encoding: 'utf-8', signal })
+    const buf = await read(filePathFor(session), { signal })
+    raw = decodeTranscriptText(buf)
   } catch {
     return []
   }

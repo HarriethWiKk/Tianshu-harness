@@ -1,6 +1,7 @@
 import { copyFileSync, readFileSync, writeFileSync, existsSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
+import { decodeTranscriptText } from './session-transcript-codec.js'
 
 export interface ForkOptions {
   sourceJsonlPath: string
@@ -38,7 +39,7 @@ export function forkSession(options: ForkOptions): ForkResult {
   if (options.upToLine === undefined) {
     copyFileSync(options.sourceJsonlPath, newJsonlPath)
   } else {
-    const lines = readFileSync(options.sourceJsonlPath, 'utf-8').trim().split('\n')
+    const lines = decodeTranscriptText(readFileSync(options.sourceJsonlPath)).trim().split('\n')
     writeFileSync(newJsonlPath, lines.slice(0, options.upToLine).join('\n') + '\n')
   }
 
@@ -62,11 +63,12 @@ export function forkSession(options: ForkOptions): ForkResult {
 
 /**
  * Count non-empty lines in a JSONL file. Used to determine the current
- * message count for `fork at <N>` validation.
+ * message count for `fork at <N>` validation. Handles zstd-frame transcripts
+ * and legacy plain text via the transcript codec.
  */
 export function countMessageLines(jsonlPath: string): number {
   if (!existsSync(jsonlPath)) return 0
-  const content = readFileSync(jsonlPath, 'utf-8')
+  const content = decodeTranscriptText(readFileSync(jsonlPath))
   return content.trim().split('\n').filter(l => l.length > 0).length
 }
 

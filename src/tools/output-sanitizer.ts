@@ -33,9 +33,32 @@ export interface SanitizeResult {
   filterName?: string
 }
 
-const NPM_INSTALL_RE = /\bnpm\s+(install|i|ci|add|update)\b/
-const TSC_RE = /\btsc\b/
-const NODE_TEST_RE = /\b(node|tsx)\b[^|;&]*--test\b|\bnpm\s+(run\s+)?test\b/
+const NPM_INSTALL_RE = /^(?:npm|pnpm|yarn|bun)\s+(?:install|i|ci|add|update)\b/
+const TSC_RE = /^(?:npx\s+|npm\s+(?:exec\s+)?|pnpm\s+|yarn\s+|bun\s+)?tsc\b/
+const NODE_TEST_RE = /^(?:node|tsx)\b[^]*--test\b|^(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?test\b/
+
+/**
+ * 把命令行切成执行段并取每段的命令首部。
+ *
+ * 分类正则必须锚定段首：`gh pr create --body "...tsc clean..."` 这类命令
+ * 的参数里可能含任意关键词，`\btsc\b` 这类无锚匹配会把它误分类成 tsc
+ * 命令——tsc 分支在无 error 行时把输出整体替换成 fallback，PR URL 这类
+ * 关键交付信息被吞（回归：2026-08 gh pr create 输出丢失）。
+ * @param cmd - bash 工具收到的完整命令行。
+ * @returns 每段剥掉 cd / 环境变量前缀、管道尾后的命令首部（可为空段）。
+ */
+function commandSegments(cmd: string): string[] {
+  const segments: string[] = []
+  for (const raw of cmd.split(/\s*(?:&&|\|\||;)\s*/)) {
+    let segment = raw.trim()
+    // 剥环境变量赋值前缀（FOO=bar cmd）与 cd 前缀（`cd x && cmd` 分段后独立成段）
+    segment = segment.replace(/^(?:\w+=\S+\s+)+/, '').replace(/^cd\s+\S+/, '')
+    // 只保留管道第一段（`cmd | tail` 的分类看 cmd）
+    segment = segment.split(/\s*\|\s*/)[0]!.trim()
+    if (segment.length > 0) segments.push(segment)
+  }
+  return segments
+}
 
 /** npm 噪声行:日志级别前缀、spinner 残留、进度条、reify 内部计时 */
 const NPM_NOISE_LINE_RE = /^(npm\s+(timing|http|sill|verb|notice)\b|[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏\s]*$|\[[#=.\s]*\]|reify:)/
@@ -357,29 +380,30 @@ export function sanitizeToolOutput(
   const cmd = command(input)
   const clean = stripAnsi(content)
   const lines = clean.split('\n')
+  const segments = commandSegments(cmd)
 
-  if (TSC_RE.test(cmd)) {
+  if (segments.some(s => TSC_RE.test(s))) {
     // 只留 error TS 行与统计尾行;无错误时保底一行
     const kept = lines.filter(l => /error TS\d+/.test(l) || /Found \d+ errors?/.test(l))
     return withMarker(kept.join('\n'), content, 'tsc：未报告错误', 'tsc')
   }
 
-  if (NODE_TEST_RE.test(cmd)) {
+  if (segments.some(s => NODE_TEST_RE.test(s))) {
     // 失败诊断(✖ 行、assertion diff、stack)全保留;只裁逐条通过行。
     // 全绿时逐条 ✔ 是最大的噪声源(数百行),统计块(ℹ tests/pass/fail)保留。
     const kept = lines.filter(l => !TEST_PASS_LINE_RE.test(l))
     return withMarker(kept.join('\n'), content, 'tests：全部通过（细节已裁剪）', 'node-test')
   }
 
-  if (NPM_INSTALL_RE.test(cmd)) {
+  if (segments.some(s => NPM_INSTALL_RE.test(s))) {
     // 去日志级别/spinner/进度噪声,保留摘要(added N packages)、警告与错误
     const kept = lines.filter(l => !NPM_NOISE_LINE_RE.test(l))
     return withMarker(kept.join('\n'), content, 'npm：已完成（输出已裁剪）', 'npm')
   }
 
-  // ── LineFilter 注册表分发 ──
+  // ── LineFilter 注册表分发（同样只对命令段首匹配）──
   for (const [name, filter] of Object.entries(LINE_FILTERS)) {
-    if (filter.matchCommand.test(cmd)) {
+    if (segments.some(s => filter.matchCommand.test(s))) {
       return applyLineFilter(name, filter, content)
     }
   }

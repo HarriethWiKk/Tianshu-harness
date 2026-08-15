@@ -54,6 +54,33 @@ describe('sanitizeToolOutput 缺口 B', () => {
     assert.match(r.content, /tsc：未报告错误/)
   })
 
+  it('参数里含 "tsc" 的非 tsc 命令不被误分类（gh pr create 回归）', () => {
+    // 回归：gh pr create --body 含 "tsc clean" 曾触发 TSC 分支，PR URL 被整体
+    // 替换成 fallback，关键交付信息丢失。分类必须锚定命令段首。
+    const url = 'https://github.com/ayuanwong/deepseek-harness-ux/pull/2'
+    const body = Array.from({ length: 40 }, (_, i) => `verified: package tsc clean, subagent-claude-code.spec.ts 24 passed ${i}`).join('\n')
+    const content = `${url}\n${body}`
+    const r = sanitizeToolOutput('bash', { command: 'gh pr create --repo a/b --body "package tsc clean"' }, content)
+    assert.equal(r.trimmedBytes, 0, 'must not classify a gh command as tsc')
+    assert.ok(r.content.includes(url), 'PR url must survive')
+  })
+
+  it('参数里含 "npm test" 的非 test 命令不被误分类', () => {
+    const url = 'https://github.com/a/b/pull/3'
+    const body = pad('note: "npm test" was mentioned in the summary text', 40)
+    const content = `${url}\n${body}`
+    const r = sanitizeToolOutput('bash', { command: 'gh pr comment 3 --body "npm test passed"' }, content)
+    assert.equal(r.trimmedBytes, 0)
+    assert.ok(r.content.includes(url))
+  })
+
+  it('cd 前缀 + 管道的真实 tsc 命令仍被分类（行为保持）', () => {
+    const content = pad('Files: 312, cached module resolution in 1.2s', 40)
+    const r = sanitizeToolOutput('bash', { command: 'cd /tmp/x && npx tsc -b tsconfig.json 2>&1 | tail -5' }, content)
+    assert.ok(r.trimmedBytes > 0)
+    assert.match(r.content, /tsc：未报告错误/)
+  })
+
   it('node --test: 裁逐条 ✔ 通过行,保留 ✖ 失败与 ℹ 统计', () => {
     const passes = pad('✔ some passing subtest case name that is long enough', 60)
     const content = [

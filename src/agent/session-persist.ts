@@ -1,5 +1,4 @@
-import { appendFile, open } from 'fs/promises'
-import { appendFileSync, existsSync, mkdirSync, readFileSync, unlinkSync, rmSync, readdirSync, statSync } from 'fs'
+import { existsSync, mkdirSync, readFileSync, unlinkSync, rmSync, readdirSync, statSync } from 'fs'
 import { writeFileAtomicSync, writeFileAtomicAsync } from '../fs-atomic.js'
 import { isAbsolute, join, relative, resolve } from 'path'
 import { sessionsDir } from '../config/paths.js'
@@ -59,6 +58,9 @@ import { ContextClaimStore } from '../context/claim-store.js'
 import type { ContextClaim } from '../context/claims.js'
 import { assertValidSessionId } from '../validation.js'
 import { appendChecksum, verifyLines } from './checksum.js'
+import { decodeTranscriptText, encodeBatch } from './session-transcript-codec.js'
+import { SessionBatchWriter } from './session-batch-writer.js'
+import { SessionMetadataStore } from './session-metadata.js'
 
 /** Re-export for backward compatibility — tests still import projectSlug from here. */
 export { projectSlug } from '../config/paths.js'
@@ -146,6 +148,10 @@ export class SessionPersist {
   private frozenPath: string
   private sessionId: string
   private cwd: string
+  /** Write-behind batch writer (zstd frames + 200ms batching + torn recovery). */
+  private batchWriter: SessionBatchWriter
+  /** Metadata store (in-memory cache + batch-flush cadence). */
+  private metaStore: SessionMetadataStore
 
   /** Public getter for testing file-path-dependent integrations. */
   getFilePath(): string {
@@ -160,6 +166,8 @@ export class SessionPersist {
     this.filePath = join(getSessionDir(cwd), `${sessionId}.jsonl`)
     this.metadataPath = join(getSessionDir(cwd), `${sessionId}.meta.json`)
     this.frozenPath = join(getSessionDir(cwd), `${sessionId}.frozen.json`)
+    this.batchWriter = new SessionBatchWriter(this.filePath, () => this.getBackupDir())
+    this.metaStore = new SessionMetadataStore(this.metadataPath)
   }
 
   getBackupDir(): string {
@@ -168,10 +176,28 @@ export class SessionPersist {
     return dir
   }
 
-  /** Append a single message to the session file */
+  /** Append a single message to the session file (checksummed batch path). */
   async append(message: Message): Promise<void> {
     const line = serializeSessionMessage(message) + '\n'
-    await appendFile(this.filePath, line)
+    this.batchWriter.enqueueLine(line)
+  }
+
+  /** Flush barrier: drain the write-behind batch into a zstd frame on disk. */
+  async flushSessionBuffer(): Promise<void> {
+    await this.batchWriter.flush()
+    // Metadata rides the same batch cadence: one atomic write per batch
+    // instead of one read-modify-write per message append.
+    this.metaStore.flush()
+  }
+
+  /** Read the transcript file as JSONL text (zstd frames or legacy passthrough). */
+  private readTranscriptText(): string {
+    const onDisk = existsSync(this.filePath)
+      ? decodeTranscriptText(readFileSync(this.filePath))
+      : ''
+    // In-process readers must also see lines still queued in the write-behind
+    // batch — append() followed by loadOai()/fork without a flush is valid.
+    return this.batchWriter.mergePending(onDisk)
   }
 
   /** Load all messages from the session file (with checksum validation) */
@@ -179,39 +205,11 @@ export class SessionPersist {
     return this.loadWithChecksum()
   }
 
-  /** Append an OpenAI-native message with checksum. */
+  /** Append an OpenAI-native message with checksum (queued into the batch). */
   async appendOaiWithChecksum(message: OaiMessage): Promise<void> {
     const json = serializeOaiSessionMessage(message)
     const line = appendChecksum(json) + '\n'
-    await appendFile(this.filePath, line)
-    await this.fdatasyncQuiet()
-  }
-
-  /**
-   * Force appended data to disk so the abort drain waits for durable bytes,
-   * not just a completed appendFile. Async on purpose: the sync variant
-   * (fdatasyncSync) blocked the event loop once per message append — ordering
-   * is already guaranteed by the session-persist-listener writeChain awaiting
-   * this method before the next append starts.
-   *
-   * Trade-off: writing to page cache (async) rather than fsyncing to disk
-   * means a power loss / kernel crash within the ~30s dirty-page writeback
-   * window may lose trailing lines (including just-written tool results).
-   * SIGKILL / OOM / process crash are safe — the OS eventually flushes
-   * page-cache. On next start, loadOai's repairOrphanToolCalls strips any
-   * orphan tool_use entries introduced by the gap. Acceptable: the window is
-   * narrow, the failure mode is self-healing, and the event-loop benefit
-   * (no per-message ~1ms sync stall) is substantial at scale.
-   */
-  private async fdatasyncQuiet(): Promise<void> {
-    try {
-      const fh = await open(this.filePath, 'a')
-      try {
-        await fh.datasync()
-      } finally {
-        await fh.close()
-      }
-    } catch { /* non-critical: in-memory state still authoritative */ }
+    this.batchWriter.enqueueLine(line)
   }
 
   /**
@@ -231,13 +229,12 @@ export class SessionPersist {
       to: event.to,
       provider: event.provider,
     })) + '\n'
-    appendFileSync(this.filePath, line)
+    this.batchWriter.enqueueLine(line)
   }
 
   /** Load messages in OpenAI-native format, migrating legacy rows on read. */
   loadOai(): OaiMessage[] {
-    if (!existsSync(this.filePath)) return []
-    const content = readFileSync(this.filePath, 'utf-8')
+    const content = this.readTranscriptText()
     const lines = content.trim().split('\n').filter(Boolean)
     const { validLines } = verifyLines(lines)
 
@@ -366,7 +363,7 @@ export class SessionPersist {
   private collectAuditLines(): string[] {
     if (!existsSync(this.filePath)) return []
     try {
-      const lines = readFileSync(this.filePath, 'utf-8').trim().split('\n').filter(Boolean)
+      const lines = this.readTranscriptText().trim().split('\n').filter(Boolean)
       const { validLines } = verifyLines(lines)
       const audit: string[] = []
       for (const json of validLines) {
@@ -385,23 +382,26 @@ export class SessionPersist {
 
   /** Compact the session file with the given messages (with checksums) */
   compact(messages: Message[]): void {
+    this.batchWriter.flushSync()
     const audit = this.collectAuditLines()
     const content = [...audit, ...messages.map(m => appendChecksum(serializeSessionMessage(m)))].join('\n') + '\n'
-    writeFileAtomicSync(this.filePath, content)
+    writeFileAtomicSync(this.filePath, encodeBatch(content))
   }
 
   /** Compact the session file with OAI-format messages */
   compactOai(messages: OaiMessage[]): void {
+    this.batchWriter.flushSync()
     const audit = this.collectAuditLines()
     const content = [...audit, ...messages.map(m => appendChecksum(serializeOaiSessionMessage(m)))].join('\n') + '\n'
-    writeFileAtomicSync(this.filePath, content)
+    writeFileAtomicSync(this.filePath, encodeBatch(content))
   }
 
   /** Async atomic compaction — avoids blocking the agent loop on full rewrites (S13). */
   async compactOaiAsync(messages: OaiMessage[]): Promise<void> {
+    await this.flushSessionBuffer()
     const audit = this.collectAuditLines()
     const content = [...audit, ...messages.map(m => appendChecksum(serializeOaiSessionMessage(m)))].join('\n') + '\n'
-    await writeFileAtomicAsync(this.filePath, content)
+    await writeFileAtomicAsync(this.filePath, encodeBatch(content))
   }
 
   /** Delete the session file */
@@ -410,21 +410,19 @@ export class SessionPersist {
   }
 
   /**
-   * 带校验和的 append
+   * 带校验和的 append（入队批处理）
    */
   async appendWithChecksum(message: Message): Promise<void> {
     const json = serializeSessionMessage(message)
     const line = appendChecksum(json) + '\n'
-    await appendFile(this.filePath, line)
-    await this.fdatasyncQuiet()
+    this.batchWriter.enqueueLine(line)
   }
 
   /**
    * 带校验和的 load（向后兼容）
    */
   loadWithChecksum(): Message[] {
-    if (!existsSync(this.filePath)) return []
-    const content = readFileSync(this.filePath, 'utf-8')
+    const content = this.readTranscriptText()
     const lines = content.trim().split('\n').filter(Boolean)
     
     const { validLines, invalidCount } = verifyLines(lines)
@@ -465,31 +463,14 @@ export class SessionPersist {
   }
 
   writeMetadata(metadata: SessionMetadata): void {
-    writeFileAtomicSync(this.metadataPath, JSON.stringify(metadata, null, 2) + '\n')
+    this.metaStore.write(metadata)
     SessionPersist.invalidateListCache()
   }
 
   /** Upsert specific metadata fields without overwriting others */
   updateMetadata(patch: Partial<SessionMetadata>): void {
-    const existing = this.loadMetadata()
-    const merged: SessionMetadata = {
-      compactEvents: existing?.compactEvents ?? [],
-      ...existing,
-      ...patch,
-      // These must win over ...existing/...patch — place them last:
-      // - sessionId is authoritative from `this`
-      // - createdAt is set once at creation and preserved thereafter
-      // - updatedAt always advances to now (the whole point of the field;
-      //   spreading ...existing after it would freeze it at creation time)
-      sessionId: this.sessionId,
-      createdAt: existing?.createdAt ?? Date.now(),
-      updatedAt: Date.now(),
-      // Preserve nested objects by merging, not replacing
-      tokenUsage: existing?.tokenUsage || patch.tokenUsage
-        ? { prompt: 0, completion: 0, total: 0, ...existing?.tokenUsage, ...patch.tokenUsage }
-        : undefined,
-    }
-    this.writeMetadata(merged)
+    this.metaStore.update(patch, this.sessionId)
+    SessionPersist.invalidateListCache()
   }
 
   /** Initialize metadata for a new session if not already present */
@@ -509,12 +490,7 @@ export class SessionPersist {
   }
 
   loadMetadata(): SessionMetadata | undefined {
-    if (!existsSync(this.metadataPath)) return undefined
-    try {
-      return JSON.parse(readFileSync(this.metadataPath, 'utf-8')) as SessionMetadata
-    } catch {
-      return undefined
-    }
+    return this.metaStore.load()
   }
 
   /**

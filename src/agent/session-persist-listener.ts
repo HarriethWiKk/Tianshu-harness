@@ -74,5 +74,10 @@ export function attachSessionPersistListener(deps: {
         })
     }
   })
-  return { drain: () => writeChain }
+  return { drain: async () => {
+    await writeChain
+    // P1 write-behind: drain must also flush the pending batch so /cd
+    // migration, shutdown, and abort paths leave no unwritten tail.
+    await persist.flushSessionBuffer()
+  } }
 }

@@ -223,17 +223,26 @@ function drawTable(doc, block, applyBody) {
 
 // ── pdf_read ────────────────────────────────────────────────────
 
-async function extractPdfText(filePath) {
+async function extractPdfPages(filePath) {
   const pdfParse = (await import('pdf-parse')).default
   const buffer = readFileSync(filePath)
   // pdf-parse's bundled pdf.js flakes with 'bad XRef entry' on the first
   // parse(s) after an idle period — retry with a short backoff.
+  const pages = []
   let lastErr
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      const data = await pdfParse(buffer)
-      return data.text
+      await pdfParse(buffer, {
+        pagerender: async (pageData) => {
+          const t = await pageData.getTextContent()
+          const text = t.items.map(i => i.str).join(' ').trim()
+          pages.push({ page: pages.length + 1, text })
+          return text
+        },
+      })
+      return pages
     } catch (err) {
+      pages.length = 0
       lastErr = err
       if (attempt < 2) await new Promise(r => setTimeout(r, 75 * (attempt + 1)))
     }
@@ -288,11 +297,13 @@ export const tools = [
   {
     definition: {
       name: 'pdf_read',
-      description: 'Extract text content from a PDF file for reading into context.',
+      description: 'Extract text from a PDF file for reading into context. Each page is emitted under a "--- Page N ---" marker. Use start_page/end_page to read a specific range; large documents are truncated at 8000 characters with a continuation hint.',
       input_schema: {
         type: 'object',
         properties: {
           file_path: { type: 'string', description: 'Path to the .pdf file to read' },
+          start_page: { type: 'number', description: 'First page to read (1-based, default 1)' },
+          end_page: { type: 'number', description: 'Last page to read (1-based, default last page)' },
         },
         required: ['file_path'],
       },
@@ -303,14 +314,35 @@ export const tools = [
       if (!existsSync(fp)) return { content: `Error: file not found: ${fp}`, isError: true }
 
       try {
-        const text = await extractPdfText(fp)
-        if (!text || text.trim().length === 0) {
+        const pages = await extractPdfPages(fp)
+        if (pages.length === 0) {
           return { content: 'PDF appears to contain no extractable text (scanned image?).' }
         }
-        const truncated = text.length > 8000
-          ? text.slice(0, 8000) + `\n\n... (truncated, ${text.length - 8000} more chars. Use read_file to inspect the full text.)`
-          : text
-        return { content: truncated }
+        const start = Math.max(1, params.start_page ?? 1)
+        const end = Math.min(pages.length, params.end_page ?? pages.length)
+        if (start > end) {
+          return { content: `Error: invalid page range: start_page ${start} > end_page ${end} (total ${pages.length} pages)`, isError: true }
+        }
+
+        const blocks = []
+        let chars = 0
+        for (let i = start - 1; i < end; i++) {
+          const p = pages[i]
+          if (!p) continue
+          const block = p.text.length > 0
+            ? `--- Page ${p.page} ---\n${p.text}`
+            : `--- Page ${p.page} ---\n(empty)`
+          if (chars + block.length > 8000 && blocks.length > 0) break
+          blocks.push(block)
+          chars += block.length + 1
+        }
+
+        const shownEnd = start + blocks.length - 1
+        const hints = []
+        if (shownEnd < end) hints.push(`Showing pages ${start}-${shownEnd} of ${pages.length}. Continue with start_page: ${shownEnd + 1}.`)
+        else if (end < pages.length) hints.push(`Showing pages ${start}-${end} of ${pages.length}. Continue with start_page: ${end + 1}.`)
+        if (hints.length > 0) blocks.push(hints.join('\n'))
+        return { content: blocks.join('\n\n'), rawPath: fp }
       } catch (err) {
         return { content: `PDF read failed: ${err.message}`, isError: true }
       }
