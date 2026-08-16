@@ -1,19 +1,19 @@
 {
-  "version": "3.1.1",
-  "notes": "v3.1.0 更新内容：\n\n【桌面端】\n- Win10 适配：窗口阴影、WebView2 检测、会话区滚动条修复、截图稳定性提升\n- 设置页新增「完全权限」档（跳过审批 + 关闭写沙箱）\n- 滚动体验：滚轮回底不再被抢占，16 个滚动事故场景修复\n- 启动与首轮响应优化（编译缓存 / 看门狗降噪 / 首屏骨架）\n- 8GB 内存机器默认全功能，不再自动降级\n- 语音识别：系统识别恢复主链路\n- 性能设置保存修复、会话流小窗闪烁修复、模型视觉标记可发现性\n- ripgrep 自带分发：grep 工具不再依赖系统 PATH\n\n【CLI / Agent】\n- 目标锚系统：长任务目标固化，跨端回显，不再随上下文漂移\n- 提交后自动审查默认开启（可配置关闭）\n- action-intent 误报守卫、交付信号解析修复\n- 工具链：edit_file 指针带路径、hash_edit 截断阈值提升\n\n【其他】\n- computer-use 截图与窗口恢复稳定性提升",
-  "pub_date": "2026-08-10T05:12:28.493Z",
+  "version": "3.3.0",
+  "notes": "v3.3.0 更新内容：\n\n【桌面端】\n- 会话滚动稳定性四连修：Windows 125%/150% 缩放下会话区上下滚动、来回闪、触底难分层根修（plan 模式重钉风暴 13→3、折叠单帧塌缩 16→3、24 步滚轮触底卡死修复）\n- 太一域 taiyi 工具档：钉定太一即默认装配 16 件最小集工具，零配置；设置页新增「最小集绑定星域」卡；TUI/桌面档位菜单补 taiyi 选项\n- B2 收敛轨迹门：轮数高但轨迹收敛时不催（bar=0.4 对齐 L2 分档线）\n\n【已知问题】\n- macOS 本版不提供 DMG（自动更新走 .app.tar.gz 不受影响）；首次打开如提示「已损坏」请执行：xattr -cr /Applications/Tianshu.app\n- 国内自助支付渠道尚未配置：激活码请用管理台手工发放",
+  "pub_date": "2026-08-15T22:05:58.313Z",
   "platforms": {
+    "windows-x86_64": {
+      "url": "https://github.com/huiliyi37/Tianshu-Tui/releases/download/v3.3.0/Tianshu_3.3.0_x64-setup.exe",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaDZmcFdBUytLR2Yrc29RTlBIWkM0ejhDMTFCNExsQ0d4Si9GUFZ1dDBUTXlSd3V3RnpKZnRHTXdtVFovSDNRU1VoQ1FJb21DWG82QTdzcWVvM3dNbzVDUmxqK2tSYXd3PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg2NzgyMDM3CWZpbGU6VGlhbnNodV8zLjMuMF94NjQtc2V0dXAuZXhlCldrTkdKSGtUVkl0ZmZCRkVlMy9NU0t6eU1BSUZPU1hIY01GZzZDaGUyTmtxSXVCMFNGTU1lQVlTWEJOSmpzWmFOVEFYZUlVM0M0c2JxUmV2eGxBWUJ3PT0K"
+    },
     "darwin-aarch64": {
-      "url": "https://github.com/huiliyi37/Tianshu-Tui/releases/download/v3.1.1/Tianshu_3.1.1_aarch64.app.tar.gz",
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaDZmcFdBUytLR1JQWjhnbDRINGsvV3ZTd01LcDgwQ0wxajVxT0U4eG1iVXdlOUFPdEtNQjVtRHVNQ3lBazBPQldJMy9Tc3c4MXhLNm1zWjB1TGRXSUNuVmhKckNRV2c0PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg2MzM2OTk0CWZpbGU6VGlhbnNodS5hcHAudGFyLmd6Ck5sdWdRZUFxS0Q3dUZFdUVaS0xUeVpvNnN5YU1uZm5xOFB1RndQZ3dnVTBhcjhmTEpiTXJRN3k4a2dYTERoVHBGMENEUjFiVTdVVFRYY2tnWTZFMkRnPT0K"
+      "url": "https://github.com/huiliyi37/Tianshu-Tui/releases/download/v3.3.0/Tianshu_3.3.0_aarch64.app.tar.gz",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaDZmcFdBUytLR2VZWndLclNLM1dJdjZPMlRVWEJIZ2xZMUcxSThwV0NqT2tSa1c4NkVUa1JXem5TNExhVnM2QWxNQys0SHJBUFYydkVxUm9aNnVhenY4SFRSNUFnUEEwPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg2ODMxMTE0CWZpbGU6VGlhbnNodS5hcHAudGFyLmd6CjJSdzMwN2h5RnFla1hUNEVhcWlrUUtKNTdmaEVJejUrY0JkODBFSzBIWnRkTUxvWGI5ZTk0Z2o3azBVbVlwK2Q5Nzd1S3pyWnN4WlNpaUZ5aEM1N0RBPT0K"
     },
     "darwin-x86_64": {
-      "url": "https://github.com/huiliyi37/Tianshu-Tui/releases/download/v3.1.1/Tianshu_3.1.1_x64.app.tar.gz",
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaDZmcFdBUytLR1hvTzd6R21CQ3VIV1RiVG5KdVhqMTYzUEFDdWdpQlVncjBLNkFqSGpVeE16MUtUazB4b2U1QUg4blQ4aDRXMVYxSFFkS0srWnhrMk04dCsxWVZLeEFNPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg2MzM4NzQ1CWZpbGU6VGlhbnNodS5hcHAudGFyLmd6CkxKcHlZWmFucGUzYXVUZlpUK3dmdWRIVjJoS29vd2tPUXZseVVac1JzWU82RGJzSDJjeGxOSkpkMmIvSUE0T1ZrZW8wNHlRWURWR1RrR1orWk8yM0JnPT0K"
-    },
-    "windows-x86_64": {
-      "url": "https://github.com/huiliyi37/Tianshu-Tui/releases/download/v3.1.1/Tianshu_3.1.1_x64-setup.exe",
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaDZmcFdBUytLR1VUbGg5K0JNeitTYVNERHpwbjNuWHB0YXVjdG40R2J2dVVXVS9mTythNHhVNDlRZ1ptOFVhTm1sMHY1NjFxeWt5QWllcEdxNnJza1pBa3dsaTYxTHdFPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg2MzI2NzYyCWZpbGU6VGlhbnNodV8zLjEuMV94NjQtc2V0dXAuZXhlCjVocGtiNlcwN1JyY1B5K3d1b0JrVEhmWGZQZTBONmk2Y2tXTXdlYmRmOGs4VDdyUm03Q1l0eFpiUUF6UjNicTJ5eG9sT2VjUlF4ajFHSHhic0ZBSUJ3PT0K"
+      "url": "https://github.com/huiliyi37/Tianshu-Tui/releases/download/v3.3.0/Tianshu_3.3.0_x64.app.tar.gz",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaDZmcFdBUytLR1V0NE9DK3MraG5KM1JtQmI0ZFJVaHlkcVRHWG1sNlVoK0U5aEl2RkJHWGQ1dnlZNDJHVzE1U09Dbk5jRkVZdkMzaUZrcm45a0g0REJuQnBiTmtJbFFFPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg2ODMxNTQyCWZpbGU6VGlhbnNodS5hcHAudGFyLmd6CkhnT05oc2NxU0dwUmNGRzBFZXRaVXJkSjh3SkdJWndWWnR1Z2NyY1JGZjl4ZWZYbHVhUVFpYlYzai81d3hhNTVJaFJYMFJaWkNRT1p4ajVPUXlOVER3PT0K"
     }
   }
 }
