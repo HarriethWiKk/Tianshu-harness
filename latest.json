@@ -1,7 +1,7 @@
 {
   "version": "3.4.0",
   "notes": "v3.4.0 更新内容：\n\n【桌面端】\n- 底部微滚动：会话在最底部时单格上滚不再被钉底逻辑立即拉回（400ms 冷却窗内保留阅读意图）\n- 通知残影修复（Win11）：弹窗开合后右上角「子代理受阻」半截通知残影不再出现\n\n【CLI / TUI】\n- AI 输出中排队的消息不再被自动注入：run 结束后回填输入框，由你按 Enter 确认发送\n- 命令面板换绑 Ctrl+P（Ctrl+Esc 在 Windows 被开始菜单抢占，三条送达路径全断）\n- Ctrl+C 退出确认窗口支持 Esc/编辑/粘贴取消，修复幽灵输入与带输入误退出\n- 任务清单跨 run 不再复活显示陈旧终态（「任务 5/5 不更新」根修）\n- slash 命令提示分层：输入 / 只展示 ~20 条核心命令，继续输入即过滤全部；/undo、/resume 补进提示列表\n- 输入框贴底：滚动到底时输入框位于屏幕最下方\n- 存储治理：遥测/索引/备份文件无界增长收口（meridian DB 保留窗口 + WAL checkpoint + backups 保留策略）\n\n【已知问题】\n- macOS 本版不提供 DMG（自动更新走 .app.tar.gz 不受影响）；首次打开如提示「已损坏」请执行：xattr -cr /Applications/Tianshu.app\n- 国内自助支付渠道尚未配置：激活码请用管理台手工发放\n- Win11 通知残影修复为绘制层根因分析，随本版上线后如仍复现请重开 issue",
-  "pub_date": "2026-08-17T05:10:00.000Z",
+  "pub_date": "2026-08-17T01:27:00.081Z",
   "platforms": {
     "darwin-aarch64": {
       "url": "https://github.com/huiliyi37/Tianshu-Tui/releases/download/v3.4.0/Tianshu_3.4.0_aarch64.app.tar.gz",
@@ -10,6 +10,10 @@
     "darwin-x86_64": {
       "url": "https://github.com/huiliyi37/Tianshu-Tui/releases/download/v3.4.0/Tianshu_3.4.0_x64.app.tar.gz",
       "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaDZmcFdBUytLR1JURFpINXlON1Zkc2tjVFJyT1hjM2lxcm9qcllvWTRwa2dEakRHSjRkYlNFVDUvd1F3Y3IyYkVGVXVzYWVkNVFNd01pakhVR2xhd2hqcmtaazFkN0FBPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg2OTEzNzczCWZpbGU6VGlhbnNodS5hcHAudGFyLmd6ClVmb1BEMS9DVHVSYjl0dGc1UTYxbEExMWNSKzBmZUZnSE16YnlOeEFteEt0MXI4Z2pHa3YrbjVMNjZZNzZ6QzRLOUVTZG4yeUZIdENlYUo1MjMySENnPT0K"
+    },
+    "windows-x86_64": {
+      "url": "https://github.com/huiliyi37/Tianshu-Tui/releases/download/v3.4.0/Tianshu_3.4.0_x64-setup.exe",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRaDZmcFdBUytLR2ZnMHU3SVgrMkt2THZVN1JoaituV0FzZWtJa1FiTTNPanBON01IcmVrYkNIYlM2R0dBdFpVemgzYldOQzN2eFd3OEJzRllRMitUSDRZYTN4ZE5ycHdZPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg2OTMwMDE4CWZpbGU6VGlhbnNodV8zLjQuMF94NjQtc2V0dXAuZXhlCkNDY3Z0UzlHb3ZCSjBSZStkS2pzRjJ3OStyVldiSFYyeEc0QStPZUxDclZrOFNwL3kwWENvbldzeGIreHZzUkZXcVhHb2UyK3dMMkRSMld3WTEwMUFRPT0K"
     }
   }
 }
