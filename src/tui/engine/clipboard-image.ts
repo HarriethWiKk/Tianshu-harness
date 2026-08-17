@@ -32,6 +32,9 @@ export interface ClipboardImage {
 
 export interface ClipboardReader {
   readImage(): Promise<ClipboardImage | null>
+  /** 可选：文本读取也走注入（测试密封化——否则文本路径会调真实 pbpaste，
+   *  剪贴板有内容时 RED 用例被环境扰动）。 */
+  readText?(): Promise<string | null>
 }
 
 export interface ShellClipboardOpts {
@@ -75,6 +78,14 @@ export async function readImageFromClipboard(): Promise<ClipboardImage | null> {
  * Used as fallback when Ctrl+V finds no image in clipboard.
  */
 export async function readTextFromClipboard(): Promise<string | null> {
+  // Test injection path（与 readImageFromClipboard 同款）
+  if (_reader?.readText) {
+    try {
+      return await _reader.readText()
+    } catch {
+      return null
+    }
+  }
   const pf = process.platform
   try {
     if (pf === 'darwin') {

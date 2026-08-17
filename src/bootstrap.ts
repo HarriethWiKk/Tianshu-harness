@@ -973,7 +973,7 @@ export function createAgentRuntime(deps: {
           const ovMaxTokens = isWrite
             ? Math.min(16384, ovSpec?.maxTokens ?? ovContextWindow)
             : Math.min(16384, ovSpec?.maxTokens ?? ovContextWindow)
-          const ovCapabilities = resolveCapabilities(ovProvider.name, ovProvider.capabilities)
+          const ovCapabilities = resolveCapabilities(ovProvider.name, ovProvider.capabilities, ovSpec?.capabilities)
           debugLog(`[worker-model] modelOverride active: profile=${_order.profile} authority=${_order.authority} → ${ovProvider.name}/${ovModel} isWrite=${isWrite}`)
           return {
             order: _order,
@@ -1033,7 +1033,7 @@ export function createAgentRuntime(deps: {
           ? Math.min(16384, overrideSpec?.maxTokens ?? overrideContextWindow)
           : Math.min(16384, overrideSpec?.maxTokens ?? overrideContextWindow)
         debugLog(`[worker-model] review-override active: profile=${_order.profile} model=${overrideResolved.modelId} isWrite=${isWrite}`)
-        const overrideCapabilities = resolveCapabilities(overrideResolved.providerName, overrideResolved.providerConfig.capabilities)
+        const overrideCapabilities = resolveCapabilities(overrideResolved.providerName, overrideResolved.providerConfig.capabilities, overrideSpec?.capabilities)
         return {
           order: _order,
           providerName: overrideResolved.providerName,
@@ -1125,7 +1125,7 @@ export function createAgentRuntime(deps: {
 
     debugLog(`[worker-model] runtimeFactory: kind=${_order.kind} profile=${_order.profile} model=${workerModel} provider=${workerProvider.name} contextWindow=${workerContextWindow}`)
 
-    const workerCapabilities = resolveCapabilities(workerProvider.name, workerProvider.capabilities)
+    const workerCapabilities = resolveCapabilities(workerProvider.name, workerProvider.capabilities, workerModelSpec?.capabilities)
     return {
       order: _order,
       providerName: workerProvider.name,
@@ -1543,8 +1543,9 @@ export interface ResolvedModelTarget {
   alias?: string
   contextWindow?: number
 }
-export function resolveProviderForModel(ctx: Pick<BootstrapContext, 'config' | 'provider' | 'apiKey' | 'auth'>, modelId: string): ResolvedModelTarget | { error: string } | null {
+export function resolveProviderForModel(ctx: Pick<BootstrapContext, 'config' | 'provider' | 'apiKey' | 'auth'>, modelId: string, targetProvider?: string): ResolvedModelTarget | { error: string } | null {
   for (const [provName, prov] of Object.entries(ctx.config.provider.providers)) {
+    if (targetProvider && provName !== targetProvider) continue
     const found = prov.models.find(m => m.id === modelId || m.alias === modelId)
     if (!found) continue
     let provider = ctx.provider
@@ -1581,11 +1582,11 @@ export function resolveProviderForModel(ctx: Pick<BootstrapContext, 'config' | '
  *
  * session / persist / toolRegistry / refs / fileHistory 等全部复用，前缀缓存与历史不受影响。
  */
-export function switchAgentRuntime(ctx: BootstrapContext, modelId: string): SwitchModelResult {
+export function switchAgentRuntime(ctx: BootstrapContext, modelId: string, targetProvider?: string): SwitchModelResult {
   // 切换前记录当前模型 id，供 JSONL 审计事件的 from 字段。
   let fromModel: string | undefined
   try { fromModel = ctx.agent.config.promptEngine.getModel() } catch { /* idle/未初始化 */ }
-  const resolved = resolveProviderForModel(ctx, modelId)
+  const resolved = resolveProviderForModel(ctx, modelId, targetProvider)
   if (!resolved) return { ok: false, error: `Model "${modelId}" not found in any provider.` }
   if ('error' in resolved) return { ok: false, error: resolved.error }
   const { provider, apiKey, auth, providerName: provName } = resolved

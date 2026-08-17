@@ -27,7 +27,7 @@ import { describeAction } from './evidence-obligation.js'
 import type { AdvisoryEntry } from './advisory-bus.js'
 import { debugLog } from '../utils/debug.js'
 import { hasActionIntent, hasWriteActionIntent, turnUsedOnlyReadTools, DELIVERY_SIGNAL_RE } from './action-intent-detector.js'
-import { b1ReadOnlyLimitForWindow, b2TurnLimitForWindow } from './window-thresholds.js'
+import { b1ReadOnlyLimitForWindow, b2TurnLimitForWindow, isB2ConvergingRecently } from './window-thresholds.js'
 
 // ── Types re-exported for deps interface ──
 
@@ -255,6 +255,11 @@ export interface TurnOrchestratorDeps {
   /** 模型上下文窗口（token 数，如 200_000 / 1_000_000）。B1/B2 提醒阈值
    *  据此缩放（200K 基准 → 1M 目标线性插值）。缺省 = 200K 旧行为。 */
   getContextWindow?: () => number
+  // === B2 收敛轨迹门（会话 506a5e86 优化：轮数高但轨迹收敛时不催）===
+  /** 最近收敛 score 轨迹（loop.convergenceScoreHistory，最新在后）。
+   *  B2 据此判断轮数高是任务性质还是发散——轨迹收敛（最近均值 >= 0.4）
+   *  时静默且不消耗本 run 配额（后续转坏仍可触发）。缺省 = 无轨迹 → 照发（旧行为）。 */
+  getConvergenceScoreHistory?: () => readonly number[]
 
   // === Abort signal ===
   // === Abort signal ===
@@ -1079,7 +1084,11 @@ export class TurnOrchestrator {
           // 12 轮导致合法长任务被反复催收敛（会话 b1b4d856 实测 6 条 B2）。
           // 不强制截断（避免打断合法大批量编辑），仅收敛建议。
           const b2TurnLimit = b2TurnLimitForWindow(this.deps.getContextWindow?.() ?? 200_000)
-          if (!turnCallLimitAdvisoryFired && turn >= b2TurnLimit) {
+          // 收敛轨迹门（会话 506a5e86 优化）：轮数高但最近收敛 score 轨迹良好
+          // （持续编辑/验证的合法长任务）→ 静默且不置位 fired——后续轮次轨迹
+          // 转坏（原地打转/停滞）仍可触发。冷启动/无轨迹 → 照发（旧行为）。
+          const b2Converging = isB2ConvergingRecently(this.deps.getConvergenceScoreHistory?.() ?? [])
+          if (!turnCallLimitAdvisoryFired && turn >= b2TurnLimit && !b2Converging) {
             turnCallLimitAdvisoryFired = true
             // 缺陷 2 修复（会话 aa9737bb 审查）：planning 态是合法探寻
             // （规划/设计/调研），高轮次是任务性质不是发散——催收敛只产生

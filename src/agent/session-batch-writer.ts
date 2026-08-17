@@ -11,7 +11,7 @@
 import { appendFileSync, copyFileSync, existsSync, readFileSync } from 'node:fs'
 import { appendFile, open } from 'node:fs/promises'
 import { join } from 'node:path'
-import { decodeTranscriptText, encodeBatch, isZstdFrameStream } from './session-transcript-codec.js'
+import { encodeBatch, isZstdFrameStream } from './session-transcript-codec.js'
 import { writeFileAtomicSync } from '../fs-atomic.js'
 
 export class SessionBatchWriter {

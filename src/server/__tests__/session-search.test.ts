@@ -25,7 +25,7 @@ test('search reads at most four transcripts concurrently', async () => {
       maximum = Math.max(maximum, active)
       await new Promise((resolve) => setTimeout(resolve, 2))
       active--
-      return row(`a needle in ${path}`)
+      return Buffer.from(row(`a needle in ${path}`))
     },
   })
 
@@ -40,10 +40,10 @@ test('search preserves session and transcript order when reads finish out of ord
     readFile: async (path) => {
       const index = Number(path.split('-')[1])
       await new Promise((resolve) => setTimeout(resolve, delays[index]))
-      return [
+      return Buffer.from([
         row(`first needle ${index}`, 'assistant'),
         row(`second needle ${index}`),
-      ].join('')
+      ].join(''))
     },
   })
 
@@ -66,7 +66,7 @@ test('search pool starts new work as soon as a worker becomes available', async 
     readFile: async (path) => {
       started.push(path)
       if (path === 'session-0') await slow
-      return row(`needle ${path}`)
+      return Buffer.from(row(`needle ${path}`))
     },
   })
 
@@ -80,7 +80,7 @@ test('search pool starts new work as soon as a worker becomes available', async 
 test('search caps each session at three hits and all sessions at fifty', async () => {
   const result = await searchSessionTranscripts(records(20), 'needle', {
     filePathFor: (session) => session.id,
-    readFile: async () => Array.from({ length: 5 }, (_, index) => row(`needle ${index}`)).join(''),
+    readFile: async () => Buffer.from(Array.from({ length: 5 }, (_, index) => row(`needle ${index}`)).join('')),
   })
 
   assert.equal(result.results.length, 50)
@@ -94,8 +94,8 @@ test('search skips missing files and malformed rows while normalizing snippets',
     filePathFor: (session) => session.id,
     readFile: async (path) => {
       if (path === 'session-0') throw new Error('ENOENT')
-      if (path === 'session-1') return 'not json\n{"role":"tool","content":"needle"}\n'
-      return row(`${'x'.repeat(70)} \n needle\twith   spaces ${'y'.repeat(70)}`, 'assistant')
+      if (path === 'session-1') return Buffer.from('not json\n{"role":"tool","content":"needle"}\n')
+      return Buffer.from(row(`${'x'.repeat(70)} \n needle\twith   spaces ${'y'.repeat(70)}`, 'assistant'))
     },
   })
 
@@ -110,7 +110,7 @@ test('search yields to the event loop between ordered batches', async () => {
   let yielded = 0
   const result = await searchSessionTranscripts(records(9), 'absent', {
     filePathFor: (session) => session.id,
-    readFile: async () => row('no match'),
+    readFile: async () => Buffer.from(row('no match')),
     yieldControl: async () => {
       yielded++
       await yieldImmediate()
@@ -127,13 +127,13 @@ test('aborting an obsolete scan stops scheduling and releases active reads promp
   const started: string[] = []
   const cancellableRead = (request: string) => async (
     path: string,
-    options: { signal?: AbortSignal } | BufferEncoding,
-  ): Promise<string> => {
-    const signal = typeof options === 'string' ? undefined : options.signal
+    options: { signal?: AbortSignal },
+  ): Promise<Buffer> => {
+    const signal = options.signal
     started.push(`${request}:${path}`)
     active++
     maximumAggregate = Math.max(maximumAggregate, active)
-    return new Promise<string>((resolve, reject) => {
+    return new Promise<Buffer>((resolve, reject) => {
       const finish = () => {
         active--
         signal?.removeEventListener('abort', onAbort)
@@ -144,7 +144,7 @@ test('aborting an obsolete scan stops scheduling and releases active reads promp
       }
       signal?.addEventListener('abort', onAbort, { once: true })
       if (signal?.aborted) onAbort()
-      if (!signal) setTimeout(() => { finish(); resolve(row('needle')) }, 2)
+      if (!signal) setTimeout(() => { finish(); resolve(Buffer.from(row('needle'))) }, 2)
     })
   }
 
@@ -177,7 +177,7 @@ test('search reports duration and scanned-file metrics for a 100-session fixture
   let observed: { durationMs: number; scannedFiles: number } | undefined
   const result = await searchSessionTranscripts(records(100), 'absent', {
     filePathFor: (session) => session.id,
-    readFile: async () => row('haystack'),
+    readFile: async () => Buffer.from(row('haystack')),
     onMetrics: (metrics) => { observed = metrics },
   })
 

@@ -9,7 +9,7 @@
  * 集成测试：构造真实 AgentLoop + mock client 连续输出工具调用，
  * 驱动 turn >= 12 触发 B2，检查注入的 system-reminder 内容。
  */
-import { describe, it, mock } from 'node:test'
+import { describe, it, after, mock } from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -20,10 +20,20 @@ import { PromptEngine } from '../../prompt/engine.js'
 import { ToolRegistry } from '../../tools/registry.js'
 import { BASH_TOOL } from '../../tools/bash.js'
 import { READ_FILE_TOOL } from '../../tools/read-file.js'
+import { WRITE_FILE_TOOL } from '../../tools/write-file.js'
+import { cpuPool } from '../../workers/cpu-pool.js'
 import type { StreamCallbacks, StreamClient } from '../../api/stream-client.js'
 import type { ContentBlock } from '../../api/types.js'
 
 const TEST_CWD = mkdtempSync(join(tmpdir(), 'b2-mode-test-'))
+
+// 真实执行写类工具会触发 edit-diff → cpuPool 懒加载 worker，其 MessagePort
+// 保持 ref 阻止 node:test 进程退出（Worker.unref() 不覆盖 MessagePort）。
+// 文件跑完后 dispose：terminate worker + 永久标记 dead，后续用例走 inline
+// fallback（cpu-pool 设计如此）。缺这行，本文件含写工具用例时会挂起至超时。
+after(() => {
+  cpuPool.dispose()
+})
 
 function makeToolUseBlock(id: string, command: string): ContentBlock {
   return {
@@ -45,6 +55,15 @@ function makeReadFileBlock(id: string, filePath: string): ContentBlock {
 
 function makeTextBlock(text: string): ContentBlock {
   return { type: 'text', text } as ContentBlock
+}
+
+function makeWriteFileBlock(id: string, filePath: string): ContentBlock {
+  return {
+    type: 'tool_use',
+    id,
+    name: 'write_file',
+    input: { file_path: filePath, content: 'probe\n' },
+  } as ContentBlock
 }
 
 /** Mock client: 前 N 次调用输出只读 bash 工具调用，之后 clean 结束。 */
@@ -87,6 +106,11 @@ function makeCallbacks() {
     onAbort: () => {},
     onApprovalRequired: async () => false,
   }
+}
+
+/** write_file 需要审批——批准所有写操作，让工具真实执行成功。 */
+function makeApprovingCallbacks() {
+  return { ...makeCallbacks(), onApprovalRequired: async () => true }
 }
 
 /** 从会话消息中提取 system-reminder 内容列表 */
@@ -305,5 +329,95 @@ describe('B2 turn-call-limit planMode/star-domain awareness (defect 2)', () => {
     assert.equal(convergence.length, 1, '200K 窗口 12 轮仍触发收敛提醒')
     assert.ok(convergence[0]!.includes('请收敛当前动作并输出结论'),
       '200K 窗口保持原强收敛文案（回归锚点）')
+  })
+
+  it('轨迹转坏后触发：先收敛后空转，收敛提醒在转坏后发出恰一次', async () => {
+    const session = new SessionContext()
+    const registry = new ToolRegistry()
+    registry.register(BASH_TOOL)
+    registry.register(READ_FILE_TOOL)
+
+    // 预填 20 个高分（历史上限）→ 初始轨迹收敛。30 次 echo 空转由真实
+    // loop 每轮 push 低分（execute 相位 editRatio=0 → score 低），20 轮后
+    // 高分被 shift 挤光 → 轨迹转坏 → turn >= 28 时触发恰一次。
+    let callCount = 0
+    const client = {
+      stream: mock.fn(async (_req: unknown, cb: StreamCallbacks, _sig?: AbortSignal) => {
+        callCount++
+        const usage = { input_tokens: 100, output_tokens: 50, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
+        if (callCount <= 30) {
+          cb.onTextDelta('Idle...')
+          cb.onContentBlock(makeToolUseBlock(`call_${callCount}`, 'echo idle-step'))
+          cb.onStopReason('tool_use', usage)
+        } else {
+          cb.onTextDelta('Done.')
+          cb.onContentBlock(makeTextBlock('Done.'))
+          cb.onStopReason('end_turn', usage)
+        }
+      }),
+    } as unknown as StreamClient
+
+    const agent = new AgentLoop({
+      client,
+      promptEngine: makeEngine(),
+      toolRegistry: registry,
+      maxTurns: 60,
+      contextWindow: 1_000_000,
+      defaultDomain: 'tianliang',
+      compact: { enabled: false, autoThreshold: 800_000, autoFloor: 500_000, model: 'flash' },
+    } as any, session, TEST_CWD)
+
+    agent.convergenceScoreHistory.push(...Array.from({ length: 20 }, () => 0.9))
+
+    await agent.run('build then idle', makeCallbacks())
+
+    const reminders = remindersIn(session)
+    const convergence = reminders.filter(r => r.includes('28+ 次 API 调用'))
+    assert.equal(convergence.length, 1,
+      'RED: 轨迹转坏（持续空转）后应触发收敛提醒，且每 run 恰一次')
+  })
+
+  it('轨迹收敛（持续写不同文件）时静默：turn >= 28 不发收敛提醒（会话 506a5e86 优化）', async () => {
+    const session = new SessionContext()
+    const registry = new ToolRegistry()
+    registry.register(BASH_TOOL)
+    registry.register(READ_FILE_TOOL)
+    registry.register(WRITE_FILE_TOOL)
+
+    // 30 次成功 write_file（每次不同文件，novelty 不塌）→ editRatio 高、
+    // 收敛 score 高 → 轮数高是任务性质不是发散，B2 应静默。
+    let callCount = 0
+    const client = {
+      stream: mock.fn(async (_req: unknown, cb: StreamCallbacks, _sig?: AbortSignal) => {
+        callCount++
+        const usage = { input_tokens: 100, output_tokens: 50, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
+        if (callCount <= 30) {
+          cb.onTextDelta('Writing module...')
+          cb.onContentBlock(makeWriteFileBlock(`call_${callCount}`, join(TEST_CWD, `mod-${callCount}.ts`)))
+          cb.onStopReason('tool_use', usage)
+        } else {
+          cb.onTextDelta('Done.')
+          cb.onContentBlock(makeTextBlock('Done.'))
+          cb.onStopReason('end_turn', usage)
+        }
+      }),
+    } as unknown as StreamClient
+
+    const agent = new AgentLoop({
+      client,
+      promptEngine: makeEngine(),
+      toolRegistry: registry,
+      maxTurns: 60,
+      contextWindow: 1_000_000,
+      defaultDomain: 'tianliang',
+      compact: { enabled: false, autoThreshold: 800_000, autoFloor: 500_000, model: 'flash' },
+    } as any, session, TEST_CWD)
+
+    await agent.run('build the modules', makeApprovingCallbacks())
+
+    const reminders = remindersIn(session)
+    const convergence = reminders.filter(r => r.includes('28+ 次 API 调用'))
+    assert.equal(convergence.length, 0,
+      'RED: 轨迹收敛（持续成功写入）时不得催收敛——轮数高是任务性质，不是发散')
   })
 })

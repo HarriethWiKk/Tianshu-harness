@@ -112,7 +112,11 @@ import { boxCharsFor, boxInnerWidth } from '../box-chars.js'
 import { appendHistoryAsync, nextHistoryAfterSubmit } from '../history.js'
 import { renderPager, renderStarmap, renderCommandPalette, renderChronicle, renderTasks, renderDomainPicker, renderDomainGenesisCard, genesisCardMaxScroll, renderModelPicker, renderThemePicker, renderChoicePanel, renderPlanPicker, renderConnect, renderInitFlow } from '../format/overlay.js'
 import type { PagerData, StarmapData, PaletteData, ChronicleData, TasksData, TasksGroup, TasksWorkerRow, DomainPickerData, ModelPickerData, ThemePickerData, ChoicePanelData, PlanPickerData, ChoiceEntry, ConnectOverlayData, InitOverlayData } from '../format/overlay.js'
-import { ConnectFlow, type ConnectCommit, type ConnectProviderRef, type ConnectStepResult } from '../connect-flow.js'
+import { ConnectFlow, DIY_PENDING_KEY_REF, type ConnectCommit, type ConnectProviderRef, type ConnectStepResult } from '../connect-flow.js'
+import { VisionOnboardingFlow, type VisionCandidate, type VisionOnboardingRequest, type VisionOnboardingResult } from '../vision-onboarding-flow.js'
+import { readConnectDraft, saveConnectDraft, clearConnectDraft } from '../connect-draft.js'
+import { readSecret, writeSecret, deleteSecret } from '../../config/secrets-store.js'
+import { probeProvider } from '../../api/provider-probe.js'
 import { InitFlow, probeInitFlowInput, type InitCommit, type InitStepResult } from '../init-flow.js'
 import { renderSettings } from '../format/settings.js'
 import type { SettingsFlow, SettingsSaveRequest, SettingsSaveResult, SettingsView } from '../settings-flow.js'
@@ -243,6 +247,13 @@ function buildCommandPrefixPredicate(commands: ReadonlyArray<{ name: string }>):
   return (name: string) => prefixes.has(name.toLowerCase())
 }
 
+/** 草稿密钥的 secrets.json 引用名：preset 流程用草稿专用名（draft-<presetKey>），
+ *  DIY 流程用占位名 diy-pending。绝不返回正式 provider 名——Esc 取消/草稿恢复
+ *  路径不得覆盖在用凭证（PR#38 审查阻断 5）。 */
+function draftSecretRef(presetKey?: string): string {
+  return presetKey ? `draft-${presetKey}` : DIY_PENDING_KEY_REF
+}
+
 // 线框字符集与框体宽度公式已下沉到 src/tui/box-chars.ts —— 首屏欢迎框要与
 // 输入框逐列等宽，公式必须只有一份。此处再导出保持既有引用路径不变。
 export { boxCharsFor }
@@ -363,6 +374,11 @@ export type TuiMetricsProvider = () => TuiMetrics | null
  */
 export { TOOL_ACCUMULATOR_MAX_BYTES, capToolAccumulator } from './tool-accumulator.js'
 
+// ── /connect 输入光标闪烁参数 ──────────────────────────────────
+// 静止常亮；移动/增删激活后按 500ms 间隔持续闪烁，直到换步/关闭复位。
+const CONNECT_BLINK_PERIOD_MS = 500
+const CONNECT_BLINK_TICK_MS = 250
+
 // ── TuiApp ─────────────────────────────────────────────────────
 
 export class TuiApp {
@@ -403,6 +419,21 @@ export class TuiApp {
   private connectFlow?: ConnectFlow
   private connectInput = ''
   private connectError?: string
+  /** 输入光标在缓冲中的位置（支持 ←→ 移动与中间插入/删除）。 */
+  private connectCursor = 0
+  /** form 步当前选中字段下标。 */
+  private connectFormFieldIndex = 0
+  /** 渲染方回填的硬件光标落点（每帧更新，供 overlay engine 定位终端光标）。 */
+  private connectCaret: { row: number; col: number } | null = null
+  /** 最近一次移动/增删的时间戳（0 = 未激活）——激活后光标按 500ms 间隔闪烁。 */
+  private connectEditActiveAt = 0
+  /** 闪烁驱动定时器（仅闪烁期间存活）。 */
+  private connectBlinkTimer: ReturnType<typeof setInterval> | null = null
+  /** /vision 独立识图桥向导：只发 discover/onboard 请求，不复用通用 provider onboarding。 */
+  private visionOnboardingFlow?: VisionOnboardingFlow
+  private visionInput = ''
+  private visionError?: string
+  private visionExec?: (request: VisionOnboardingRequest) => Promise<{ candidates?: VisionCandidate[] }>
   /** /init 交互式初始化向导：无头状态机 + 当前步校验错误。 */
   private initFlow?: InitFlow
   private initError?: string
@@ -452,6 +483,9 @@ export class TuiApp {
    * 把排队内容拉回输入框交还用户（Claude Code 风格，见 notifyRunSettled）。
    */
   private abortSteerBackfill = false
+  /** 守护中断（watchdog/convergence）pending 标志：settle 时消费，用于区分
+   *  「run 自然结束」与「守护中断自动续跑」——后者不回填排队队列。 */
+  private guardianAbortPending = false
   /**
    * 查询 agent 是否仍有未 settle 的 run（main.ts 注入 → `ctx.agent.isRunning()`）。
    *
@@ -569,8 +603,8 @@ export class TuiApp {
    * 退出 plan 时原样恢复；`/yes` 等在 planning 期间改审批时同步更新此 stash。
    */
   approvalModeBeforePlan: string | null = null
-  /** choice-panel 当前模式：'effort' (推理强度) / 'permission' (权限选择) / 'permission-yolo-confirm' (YOLO 二次确认) / 'plan-approval' (计划审批) / 'ask-user-question' (问题选项选择) */
-  choicePanelKind: 'effort' | 'permission' | 'permission-yolo-confirm' | 'plan-approval' | 'ask-user-question' = 'effort'
+  /** choice-panel 当前模式：'effort' (推理强度) / 'permission' (权限选择) / 'permission-yolo-confirm' (YOLO 二次确认) / 'plan-approval' (计划审批) / 'ask-user-question' (问题选项选择) / 'disconnect' (断开服务商选择) / 'disconnect-confirm' (断开二次确认) / 'disconnect-retarget' (默认 provider 改设新默认) */
+  choicePanelKind: 'effort' | 'permission' | 'permission-yolo-confirm' | 'plan-approval' | 'ask-user-question' | 'disconnect' | 'disconnect-confirm' | 'disconnect-retarget' = 'effort'
   /** 当前待审批计划信息（plan-approval 面板使用）。 */
   pendingPlanApproval: PlanSubmittedInfo | undefined = undefined
   /** 待审批计划正文预览摘要（开面板时一次性提取；随面板关闭/重开更新）。 */
@@ -699,6 +733,12 @@ export class TuiApp {
   private sidePanelLeaderTimer: ReturnType<typeof setTimeout> | null = null
   /** todo 徽章高亮熄灭定时器（活动期外 ticker 停转，靠它在 1s 后重绘恢复正常色） */
   private todoFlashTimer: ReturnType<typeof setTimeout> | null = null
+  /** 本 run 是否写入过 todo（用户提交重置，updateTodos 检测到清单签名变化置位）。
+   *  用于跨 run 陈旧显示 gate：新 run 未写 todo 前，上一轮**全部完成**的清单
+   *  不再占用任务面板与 GlanceBar 徽章（观感即「◇ 任务 (5/5) 不更新」——旧值
+   *  复活挂在新 run 头上，直到 AI 首次 todo write）。部分完成清单不受影响
+   *  （AI 大概率续写）；守护中断的自动续跑视为同一任务的延续，不重置。 */
+  private todosWrittenThisRun = false
   /** 监控型 overlay（激活期间随数据/tick 实时重绘，而非打开瞬间的快照） */
   private static readonly LIVE_OVERLAY_IDS: ReadonlySet<string> = new Set(['tasks', 'cockpit', 'jobs'])
   /** live overlay 上次重绘时间戳（节流 ≥400ms） */
@@ -877,10 +917,23 @@ export class TuiApp {
       if (this.overlay.activeId() === 'connect' && this.connectFlow) {
         const view = this.connectFlow.view()
         if (view.kind === 'input') {
-          this.connectInput += text
+          const before = this.connectInput.slice(0, this.connectCursor)
+          const after = this.connectInput.slice(this.connectCursor)
+          this.connectInput = before + text + after
+          this.connectCursor += text.length
+          this.connectEditActiveAt = Date.now()
           this.connectError = undefined
           this.overlay.rerender()
         }
+        return
+      }
+      if (this.overlay.activeId() === 'vision-onboarding' && this.visionOnboardingFlow?.view().kind === 'input') {
+        const before = this.visionInput.slice(0, this.connectCursor)
+        const after = this.visionInput.slice(this.connectCursor)
+        this.visionInput = before + text + after
+        this.connectCursor += text.length
+        this.visionError = undefined
+        this.overlay.rerender()
         return
       }
       // Settings panel editing a text field → paste into its buffer (proxy URL,
@@ -892,6 +945,12 @@ export class TuiApp {
       }
       // Other overlays active → don't paste into main input
       if (this.overlay.isActive()) return
+      // 确认窗口内粘贴 = 继续对话：取消 pending-exit 再插入文本
+      // （与打字路径的取消同一状态位，见 handleKey 的 Normal input processing）。
+      if (this.inputController.ctrlCPendingSince > 0) {
+        this.inputController.ctrlCPendingSince = 0
+        this.renderLive()
+      }
 
       // 右键粘贴/终端菜单粘贴走 bracketed paste 文本通道，不触发 ctrl_v 按键，
       // 因此不会调 handleCtrlV → readImageFromClipboard。若剪贴板当前是图片，
@@ -1034,8 +1093,9 @@ export class TuiApp {
         if (this.isAgentActive()) {
           // Agent active (含首 token 前/纯工具窗口): abort current agent run
           this.handleAbort()
-        } else if (this.inputController.ctrlCPendingSince > 0) {
-          // Second Ctrl+C within window → exit
+        } else if (this.inputController.ctrlCPendingSince > 0 && !this.inputLine.value.trim()) {
+          // Second Ctrl+C within window → exit（有输入时不退出——窗口内
+          // 打过字说明用户在继续对话，退化为清空输入，见下方分支）
           this.inputController.ctrlCPendingSince = 0
           this.dispose()
           if (this.onExitCallback) {
@@ -1044,8 +1104,10 @@ export class TuiApp {
             process.exit(0)
           }
         } else if (this.inputLine.value.trim()) {
-          // Idle with input: clear input line, don't exit
+          // Idle with input: clear input line, don't exit（同时取消可能
+          // 残留的确认窗口——清空输入后提示行没有理由继续显示）
           this.inputLine.setValue('')
+          this.inputController.ctrlCPendingSince = 0
           this.renderLive()
         } else {
           // Idle with empty input: first Ctrl+C → show hint, start 2s window
@@ -1055,13 +1117,38 @@ export class TuiApp {
         }
         return
       }
+      if (key.name === 'ctrl_p') {
+        // Ctrl+P → 命令面板开关。原 Ctrl+Esc 三条送达路径全断：Windows 宿主
+        // 被「开始菜单」抢占（事件到不了终端）、传统转义序列下与单独 Esc 同码
+        // （0x1B）、kitty 增强键盘的 \x1B[27;5u 未被解析器映射。Ctrl+P（0x10）
+        // 在所有终端可靠送达。翻历史入口不受影响：单行 ↑/↓、Ctrl+N、Ctrl+R。
+        if (this.overlay.isActive() && this.overlay.activeId() === 'command-palette') {
+          this.deactivateOverlay()
+        } else {
+          this.activateOverlay('command-palette')
+        }
+        return
+      }
       if (key.name === 'escape' && key.ctrl) {
-        // Ctrl+Esc → 激活命令面板
+        // Ctrl+Esc → 激活命令面板（见上方 Ctrl+P 注释：此路径当前解析器
+        // 不可达，保留给未来增强键盘协议映射，主键位为 Ctrl+P）
         this.overlayController.resetNav()
         this.overlay.activate('command-palette')
         return
       }
       if (key.name === 'escape') {
+        // Ctrl+C pending-exit 确认窗口内：Esc = 取消退出、恢复输入框。优先于
+        // vim 切换 / 双击 rewind / overlay 关闭——屏幕处于退出提示态（输入框
+        // 被隐藏），用户此刻按 Esc 的意图是「回到对话」。overlay 激活时的 Esc
+        // 已在上方 handleOverlayKey 消费（先关 overlay），不会走到这里。
+        if (this.inputController.ctrlCPendingSince > 0) {
+          this.inputController.ctrlCPendingSince = 0
+          // 取消用的 Esc 不计入双击 rewind 计时，避免「取消后立刻双击 Esc」
+          // 误开 rewind overlay。
+          this.inputController.lastEscAt = 0
+          this.renderLive()
+          return
+        }
         // Vim 模式下：overlay/agent 激活时 ESC 关闭 overlay 或中断 agent，
         // 空闲时 ESC 落入输入框的 vim normal/insert 切换（保持原行为）。
         if (this.inputLine.vimEnabled) {
@@ -1216,6 +1303,12 @@ export class TuiApp {
         return
       }
       // ── Normal input processing ─────────────────────────────
+      // 确认窗口内的任何编辑键 = 用户继续对话：取消 pending-exit，恢复输入框。
+      // 否则字符进 value 但输入框仍被隐藏（幽灵输入），Enter 还会提交不可见内容。
+      if (this.inputController.ctrlCPendingSince > 0) {
+        this.inputController.ctrlCPendingSince = 0
+        this.renderLive()
+      }
       const event = this.inputLine.handleKey(key.name, key.char, key.ctrl, key.meta, key.shift)
       // 选区剪切/复制的 OSC52 drain（终端支持时写系统剪贴板，不支持者无害忽略）
       const clip = this.inputLine.takeClipboardOut()
@@ -1297,7 +1390,11 @@ export class TuiApp {
       },
       onIntentNote: (intent) => this.handleIntentNote(intent),
       onAutonomyCheckpoint: (info) => this.handleAutonomyCheckpoint(info),
-      onSteerDrain: () => this.steerBuffer.drain(),
+      // 工具边界只注入紧急意图（halt=now / redirect=next）：普通消息（later：
+      // guidance/question/augment/ack）留在队列等 run 结束后回填输入框、由用户
+      // 再次 Enter 确认发送——与「⏳ 已排队」文案一致（此前无过滤 drain 会把
+      // 排队中的普通消息自动注入给 AI，界面显示排队、实际已发出，是撒谎）。
+      onSteerDrain: () => this.steerBuffer.drain('next'),
       onDelegationActivity: (activity) => this.handleDelegationActivity(activity),
     }
 
@@ -1499,6 +1596,7 @@ export class TuiApp {
       this.streamRenderer.reset()
       this.streamRenderController.assistantHeaderDone = false
       this.agentBusy = true
+      this.todosWrittenThisRun = false
     }
     // Reset turn timer for the new turn
     this.state.turnStartMs = Date.now()
@@ -1599,12 +1697,23 @@ export class TuiApp {
     this.abortSettling = false
     const backfill = this.abortSteerBackfill
     this.abortSteerBackfill = false
+    const guardian = this.guardianAbortPending
+    this.guardianAbortPending = false
     const pending = this.pendingSubmitAfterAbort
     if (!pending) {
-      // 无补发消息的 settle：用户主动 ESC 的收尾才回填（守护中断自动续跑，
-      // 排队指引留在队列等 drain）。有补发消息时新 run 即将发起，队列随它
-      // 在工具边界 drain，不动。
-      if (backfill) this.backfillSteerToInput()
+      // 无补发消息的 settle：
+      //  - 用户主动 ESC 的收尾回填（Claude Code 风格）；
+      //  - run 自然结束（isFinal 已复位 busy）同样回填——AI 输出期间排队的普通
+      //    消息不再在工具边界自动注入（onSteerDrain 只 drain 紧急意图），run
+      //    结束即交还用户确认（再次 Enter 发送），与 ESC 路径同语义；
+      //  - 守护中断（watchdog/convergence）自动续跑：guardian 时不回填，队列
+      //    保留等续跑 run 结束后的 settle 再回填，或下次提交归并。
+      // 有补发消息时新 run 即将发起，队列随它在工具边界 drain，不动。
+      if (backfill) {
+        this.backfillSteerToInput()
+      } else if (!guardian && !this.agentBusy) {
+        this.backfillSteerToInput()
+      }
       return
     }
     this.pendingSubmitAfterAbort = null
@@ -1613,6 +1722,7 @@ export class TuiApp {
     this.streamRenderer.reset()
     this.streamRenderController.assistantHeaderDone = false
     this.agentBusy = true
+    this.todosWrittenThisRun = false
     this.state.turnStartMs = Date.now()
     this.streamRenderController.lastActivityMs = Date.now()
     this.onSubmitCallback?.(pending.text, pending.images)
@@ -1774,6 +1884,7 @@ export class TuiApp {
       case 'history-search':
       case 'chronicle':
       case 'connect':
+      case 'vision-onboarding':
       case 'init':
       case 'settings':
       case 'jobs':
@@ -1891,12 +2002,31 @@ export class TuiApp {
   }
 
   /** 打开 /connect 服务商配置向导（选内置服务商或自定义，填写密钥）。 */
-  startConnect(existing?: ConnectProviderRef[]): void {
-    this.connectFlow = new ConnectFlow(existing)
-    this.connectInput = ''
+  startConnect(existing?: ConnectProviderRef[], currentDefault?: string): void {
+    const draft = readConnectDraft()
+    // 草稿只存 secrets.json 引用——恢复时物化密钥交给 flow；引用失效（secrets
+    // 被清）时传 undefined，normalizeDraft 的降级链会滑回密钥输入步。
+    const restoredKey = draft?.collected.keyRef ? readSecret(draft.collected.keyRef) : undefined
+    const flow = new ConnectFlow(existing, draft, restoredKey, currentDefault)
+    // 结构合法但语义不可恢复的草稿（preset 已删等）——顺手清掉，免得反复弹提示。
+    if (flow.draftRejected) clearConnectDraft()
+    this.connectFlow = flow
+    this.setConnectInput('', true)
     this.connectError = undefined
     this.input.setMode('input')
     this.activateOverlay('connect')
+  }
+
+  /** Open the dedicated image-recognition bridge wizard. */
+  startVisionOnboarding(execute: (request: VisionOnboardingRequest) => Promise<{ candidates?: VisionCandidate[] }>): void {
+    this.visionOnboardingFlow = new VisionOnboardingFlow()
+    this.visionExec = execute
+    this.visionInput = ''
+    this.connectCursor = 0
+    this.visionError = undefined
+    this.overlayController.nav().connectIndex = 0
+    this.input.setMode('input')
+    this.activateOverlay('vision-onboarding')
   }
 
   /**
@@ -2112,6 +2242,120 @@ export class TuiApp {
       input: this.connectInput,
       error: this.connectError,
       selectedIndex: this.overlayController.nav().connectIndex,
+      cursorPos: this.connectCursor,
+      cursorVisible: this.connectCursorVisibleNow(),
+      formFieldIndex: this.connectFormFieldIndex,
+    }
+  }
+
+  /** Dedicated vision overlay data; rendering intentionally reuses only the generic wizard surface. */
+  getVisionOnboardingOverlayData(): ConnectOverlayData {
+    const view = this.visionOnboardingFlow?.view() ?? { kind: 'choice' as const, title: '', options: [] }
+    return {
+      view: view as unknown as ConnectOverlayData['view'],
+      input: this.visionInput,
+      error: this.visionError,
+      selectedIndex: this.overlayController.nav().connectIndex,
+      cursorPos: this.connectCursor,
+    }
+  }
+
+  private advanceVisionOnboarding(result: VisionOnboardingResult): void {
+    const flow = this.visionOnboardingFlow
+    if (!flow) return
+    if (result.kind === 'error') {
+      this.visionError = result.message
+      this.overlay.rerender()
+      return
+    }
+    if (result.kind === 'next') {
+      this.visionInput = ''
+      this.connectCursor = 0
+      this.visionError = undefined
+      this.overlayController.nav().connectIndex = 0
+      this.overlay.rerender()
+      return
+    }
+    if (result.kind === 'done') {
+      this.visionOnboardingFlow = undefined
+      this.visionExec = undefined
+      this.commitStatic(result.summary)
+      this.deactivateOverlay()
+      return
+    }
+    const execute = this.visionExec
+    if (!execute) {
+      this.advanceVisionOnboarding(flow.requestFailed('识图桥服务端请求未接线'))
+      return
+    }
+    this.visionInput = ''
+    this.visionError = undefined
+    this.overlay.rerender()
+    void execute(result.request).then(response => {
+      if (this.visionOnboardingFlow !== flow) return
+      if (result.request.kind === 'discover') this.advanceVisionOnboarding(flow.applyDiscovery(response.candidates ?? []))
+      else this.advanceVisionOnboarding(flow.applyOnboardSuccess())
+    }).catch(error => {
+      if (this.visionOnboardingFlow === flow) this.advanceVisionOnboarding(flow.requestFailed(error instanceof Error ? error.message : String(error)))
+    })
+  }
+
+  /** 搜索过滤缩短选项列表后，光标索引可能越界——收敛回有效范围。 */
+  private clampConnectIndex(): void {
+    const count = this.connectFlow?.view().options?.length ?? 0
+    const nav = this.overlayController.nav()
+    nav.connectIndex = count > 0 ? Math.min(nav.connectIndex, count - 1) : 0
+  }
+
+  /** 赋值输入缓冲并把光标停到末尾；resetBlink 时清空闪烁激活态（预填等静止场景）。 */
+  private setConnectInput(value: string, resetBlink: boolean): void {
+    this.connectInput = value
+    this.connectCursor = value.length
+    if (resetBlink) {
+      this.connectEditActiveAt = 0
+      this.stopConnectBlink()
+    }
+  }
+
+  /** 搜索框闪烁联动：非空 → 激活闪烁（打字刷新相位）；清空 → 停止闪烁、
+   *  光标常亮停在占位符前方。下一步推进会经 setConnectInput 整体复位。 */
+  private syncConnectFilterBlink(): void {
+    const filter = this.connectFlow?.view().filter ?? ''
+    if (filter.length > 0) this.markConnectEditActivity()
+    else {
+      this.connectEditActiveAt = 0
+      this.stopConnectBlink()
+    }
+  }
+
+  /** 移动/增删发生时调用：记录激活时间，启动闪烁定时器（已在跑则复用）。 */
+  private markConnectEditActivity(): void {
+    this.connectEditActiveAt = Date.now()
+    if (!this.connectBlinkTimer) {
+      this.connectBlinkTimer = setInterval(() => this.tickConnectBlink(), CONNECT_BLINK_TICK_MS)
+      this.connectBlinkTimer.unref?.() // 不拦进程退出（测试场景无清理也不悬挂）
+    }
+  }
+
+  /** 光标此刻是否可见：静止常亮；激活后按 500ms 间隔持续翻转，直到复位。 */
+  private connectCursorVisibleNow(): boolean {
+    if (this.connectEditActiveAt === 0) return true
+    const elapsed = Date.now() - this.connectEditActiveAt
+    return Math.floor(elapsed / CONNECT_BLINK_PERIOD_MS) % 2 === 0
+  }
+
+  private tickConnectBlink(): void {
+    if (this.overlay.activeId() !== 'connect') {
+      this.stopConnectBlink()
+      return
+    }
+    this.overlay.rerender()
+  }
+
+  private stopConnectBlink(): void {
+    if (this.connectBlinkTimer) {
+      clearInterval(this.connectBlinkTimer)
+      this.connectBlinkTimer = null
     }
   }
 
@@ -2122,10 +2366,42 @@ export class TuiApp {
       this.overlay.rerender()
       return
     }
+    if (result.kind === 'probe') {
+      // probe-first：flow 进入 busy 态，异步探测完成后把 report 回灌。
+      // 探测期间用户 Esc 会清掉 connectFlow —— 回调先核对实例再回灌。
+      const flow = this.connectFlow
+      this.setConnectInput('', true)
+      this.connectError = undefined
+      this.overlay.rerender()
+      void probeProvider({ baseUrl: result.baseUrl, apiKey: result.apiKey, protocol: result.protocol, probeModel: result.probeModel, providerName: result.providerName })
+        .then(report => {
+          if (this.connectFlow === flow && flow) this.advanceConnect(flow.applyProbe(report))
+        })
+        .catch(e => {
+          if (this.connectFlow === flow && flow) {
+            this.advanceConnect(flow.probeFailed(e instanceof Error ? e.message : String(e)))
+          }
+        })
+      return
+    }
     if (result.kind === 'next') {
-      this.connectInput = ''
+      // 草稿恢复会在这里一次性预填输入缓冲（restoredInput 读后即清）；
+      // 否则把步骤的 defaultValue 预填进缓冲区——预填地址等应是可直接编辑的
+      // 实体，而不是灰底占位符（placeholder 只提示、不随编辑变化）。
+      const restored = this.connectFlow?.takeRestoredInput()
+      const nextView = this.connectFlow?.view()
+      this.setConnectInput(
+        restored && restored.length > 0
+          ? restored
+          : (nextView?.kind === 'input' ? nextView.defaultValue ?? '' : ''),
+        true,
+      )
       this.connectError = undefined
       this.overlayController.nav().connectIndex = 0
+      this.connectFormFieldIndex = 0
+      // form 步：光标落首个可编辑字段末尾（setConnectInput 刚把光标归零）。
+      const firstField = nextView?.kind === 'form' ? (nextView.fields ?? [])[0] : undefined
+      if (firstField && firstField.kind === 'text') this.connectCursor = firstField.value.length
       this.overlay.rerender()
       return
     }
@@ -2134,7 +2410,16 @@ export class TuiApp {
     // it after leaves a ghost frame (see overlay-deactivate-regression).
     const exec = this.overlayController.getConnectExec()
     this.connectFlow = undefined
-    exec?.(result.commit, result.summary)
+    // exec 失败（如 registerProvider 撞名）时草稿必须保留，否则恢复场景下
+    // 用户全部输入作废——返回值 undefined 视为成功（兼容旧签名）。
+    const ok = exec?.(result.commit, result.summary) ?? true
+    if (ok) {
+      clearConnectDraft()
+      // 暂存密钥已由 registerProvider 以最终 provider 名重写——清掉占位条目
+      // （DIY 用 diy-pending；preset 流程用 draft-<presetKey> 草稿专用名）。
+      deleteSecret(DIY_PENDING_KEY_REF)
+      if (result.commit.mode === 'preset') deleteSecret(draftSecretRef(result.commit.setup.providerName))
+    }
     this.deactivateOverlay()
   }
 
@@ -2183,10 +2468,38 @@ export class TuiApp {
   }
 
   private cancelConnect(): void {
+    const flow = this.connectFlow
+    let savedDraft = false
+    if (flow && !flow.draftPromptPending()) {
+      // Esc 在恢复提示上 → 文件原样保留；密钥已保存后有进展 → 落盘（含未回车文本）；
+      // 密钥保存前 Esc 纯取消不落草稿；选过「重新开始」且无新进展 → 清掉旧草稿。
+      const secretInfo = flow.draftSecretInfo()
+      // 密钥步上未回车的文本可能是半截明文 key——绝不落盘。
+      const draft = flow.toDraft(secretInfo.onKeyStep ? undefined : this.connectInput)
+      if (draft) {
+        // 草稿磁盘永不落明文：密钥先进 secrets.json（0600），草稿只留引用。
+        if (secretInfo.apiKey) {
+          // PR#38 审查阻断 5：草稿引用一律用草稿专用名（draft-<presetKey>），
+          // 绝不写正式 provider 名——Esc 取消不得覆盖在用凭证。
+          const ref = draftSecretRef(secretInfo.presetKey)
+          try {
+            writeSecret(ref, secretInfo.apiKey)
+            draft.collected.keyRef = ref
+          } catch { /* secrets 写失败 → 草稿保留其余进度，恢复时降级回密钥步 */ }
+        }
+        saveConnectDraft(draft)
+        savedDraft = true
+      } else if (flow.wasDraftDiscarded()) {
+        clearConnectDraft()
+        deleteSecret(draftSecretRef(secretInfo.presetKey))
+      }
+    }
     this.connectFlow = undefined
     // Buffer the notice into scrollback before exiting the overlay, so the
     // deactivate repaint paints a single clean frame (no ghost of the overlay).
-    this.commitStatic('已取消服务商配置。')
+    this.commitStatic(savedDraft
+      ? '已取消服务商配置。进度已存为草稿（密钥单独存于 secrets.json），下次 /connect 可恢复。'
+      : '已取消服务商配置。')
     this.deactivateOverlay()
   }
 
@@ -2441,34 +2754,236 @@ export class TuiApp {
     const c = key.char.toLowerCase()
     const isSearch = id === 'command-palette' || id === 'history-search'
 
+    // Dedicated vision bridge wizard. It has no provider probe or config write path:
+    // injected executor calls the same discovery/onboarding service boundary as Desktop.
+    if (id === 'vision-onboarding' && this.visionOnboardingFlow) {
+      const flow = this.visionOnboardingFlow
+      const view = flow.view()
+      if (key.name === 'escape') {
+        this.visionOnboardingFlow = undefined
+        this.visionExec = undefined
+        this.deactivateOverlay()
+        return true
+      }
+      if (view.kind === 'busy') return true
+      if (view.kind === 'choice') {
+        const options = view.options ?? []
+        const nav = this.overlayController.nav()
+        if (key.name === 'down') { if (options.length) { nav.connectIndex = (nav.connectIndex + 1) % options.length; this.overlay.rerender() }; return true }
+        if (key.name === 'up') { if (options.length) { nav.connectIndex = (nav.connectIndex - 1 + options.length) % options.length; this.overlay.rerender() }; return true }
+        if (key.name === 'return') {
+          const option = options[nav.connectIndex]
+          if (option) this.advanceVisionOnboarding(flow.choose(option.id))
+          return true
+        }
+        return true
+      }
+      if (key.name === 'return') { this.advanceVisionOnboarding(flow.submit(this.visionInput)); return true }
+      if (key.name === 'left') { this.connectCursor = Math.max(0, this.connectCursor - 1); this.overlay.rerender(); return true }
+      if (key.name === 'right') { this.connectCursor = Math.min(this.visionInput.length, this.connectCursor + 1); this.overlay.rerender(); return true }
+      if (key.name === 'backspace' || key.name === 'ctrl_h') {
+        if (this.connectCursor > 0) {
+          this.visionInput = this.visionInput.slice(0, this.connectCursor - 1) + this.visionInput.slice(this.connectCursor)
+          this.connectCursor--
+        }
+        this.visionError = undefined
+        this.overlay.rerender()
+        return true
+      }
+      if (key.ctrl && c === 'u') { this.visionInput = ''; this.connectCursor = 0; this.visionError = undefined; this.overlay.rerender(); return true }
+      if (this.isPrintableKey(key)) {
+        this.visionInput = this.visionInput.slice(0, this.connectCursor) + key.char + this.visionInput.slice(this.connectCursor)
+        this.connectCursor += key.char.length
+        this.visionError = undefined
+        this.overlay.rerender()
+      }
+      return true
+    }
+
     // Connect wizard — a stateful choice/input overlay. Handled first so typed
     // characters (incl. 'q') feed the input buffer instead of closing the overlay.
     if (id === 'connect' && this.connectFlow) {
       const view = this.connectFlow.view()
-      if (key.name === 'escape') { this.cancelConnect(); return true }
-      if (view.kind === 'choice') {
+      if (key.name === 'escape') {
+        // form 步 Esc = 返回模型选择重挑（对应旧「返回模型选择」选项）；
+        // 其余步骤维持全局语义：取消向导（落草稿）。
+        if (view.kind === 'form') this.advanceConnect(this.connectFlow.backFromAdvanced())
+        else this.cancelConnect()
+        return true
+      }
+      if (view.kind === 'busy') {
+        // 探测进行中——除 Esc（上面已处理）外吞掉所有按键。
+        return true
+      }
+      if (view.kind === 'form') {
+        const fields = view.fields ?? []
+        if (fields.length === 0) return true
+        const idx = Math.min(this.connectFormFieldIndex, fields.length - 1)
+        const field = fields[idx]!
+        const selectField = (i: number): void => {
+          this.connectFormFieldIndex = i
+          const f = fields[i]!
+          this.connectCursor = f.kind === 'text' ? f.value.length : 0
+          // 换字段 = 静止起点：光标常亮，下次编辑再激活闪烁。
+          this.connectEditActiveAt = 0
+          this.stopConnectBlink()
+          this.overlay.rerender()
+        }
+        if (key.name === 'down') { selectField((idx + 1) % fields.length); return true }
+        if (key.name === 'up') { selectField((idx - 1 + fields.length) % fields.length); return true }
+        if (field.kind === 'toggle') {
+          if (key.name === 'left' || key.name === 'right' || key.char === ' ') {
+            this.connectFlow.toggleAdvancedField(field.id)
+            this.connectError = undefined
+            this.overlay.rerender()
+          }
+          return true
+        }
+        // text 字段——与输入步同套光标编辑语义，缓冲真源在 flow 草稿。
+        if (key.name === 'return') { this.advanceConnect(this.connectFlow.submitAdvancedForm()); return true }
+        if (key.name === 'left') {
+          this.connectCursor = Math.max(0, this.connectCursor - 1)
+          this.markConnectEditActivity()
+          this.overlay.rerender()
+          return true
+        }
+        if (key.name === 'right') {
+          this.connectCursor = Math.min(field.value.length, this.connectCursor + 1)
+          this.markConnectEditActivity()
+          this.overlay.rerender()
+          return true
+        }
+        if (key.name === 'backspace' || key.name === 'ctrl_h') {
+          if (this.connectCursor > 0) {
+            const v = field.value
+            this.connectFlow.editAdvancedField(field.id, v.slice(0, this.connectCursor - 1) + v.slice(this.connectCursor))
+            this.connectCursor--
+          }
+          this.connectError = undefined
+          this.markConnectEditActivity()
+          this.overlay.rerender()
+          return true
+        }
+        if (key.ctrl && c === 'u') {
+          this.connectFlow.editAdvancedField(field.id, '')
+          this.connectCursor = 0
+          this.connectError = undefined
+          this.markConnectEditActivity()
+          this.overlay.rerender()
+          return true
+        }
+        if (this.isPrintableKey(key)) {
+          const v = field.value
+          this.connectFlow.editAdvancedField(field.id, v.slice(0, this.connectCursor) + key.char + v.slice(this.connectCursor))
+          this.connectCursor += key.char.length
+          this.connectError = undefined
+          this.markConnectEditActivity()
+          this.overlay.rerender()
+          return true
+        }
+        return true
+      }
+      if (view.kind === 'choice' || view.kind === 'multi-choice') {
         const options = view.options ?? []
         const count = options.length
         const nav = this.overlayController.nav()
         if (key.name === 'down') { if (count > 0) { nav.connectIndex = (nav.connectIndex + 1) % count; this.overlay.rerender() } return true }
         if (key.name === 'up') { if (count > 0) { nav.connectIndex = (nav.connectIndex - 1 + count) % count; this.overlay.rerender() } return true }
-        if (key.name === 'return') {
+        if (view.kind === 'multi-choice' && key.char === ' ') {
+          // 勾选不推进步骤——原地重绘，光标保持不动（走 advanceConnect 会被
+          // next 分支重置 connectIndex，光标会跳回第一项）。
           const opt = options[nav.connectIndex]
-          if (opt) this.advanceConnect(this.connectFlow.submitChoice(opt.id))
+          if (opt) {
+            const res = this.connectFlow.toggle(opt.id)
+            this.connectError = res.kind === 'error' ? res.message : undefined
+            this.overlay.rerender()
+          }
+          return true
+        }
+        if (view.kind === 'multi-choice' && key.name === 'ctrl_a') {
+          const res = this.connectFlow.toggleAllModels()
+          this.connectError = res.kind === 'error' ? res.message : undefined
+          this.overlay.rerender()
+          return true
+        }
+        // Type-to-search：多选步的可打印字符进过滤器（不再是吞掉）。
+        if (view.kind === 'multi-choice' && (key.name === 'backspace' || key.name === 'ctrl_h')) {
+          this.connectFlow.backspaceModelFilter()
+          this.syncConnectFilterBlink()
+          this.clampConnectIndex()
+          this.overlay.rerender()
+          return true
+        }
+        if (view.kind === 'multi-choice' && key.ctrl && c === 'u') {
+          this.connectFlow.clearModelFilter()
+          this.syncConnectFilterBlink()
+          this.clampConnectIndex()
+          this.overlay.rerender()
+          return true
+        }
+        if (view.kind === 'multi-choice' && this.isPrintableKey(key)) {
+          this.connectFlow.typeModelFilter(key.char)
+          this.syncConnectFilterBlink()
+          this.clampConnectIndex()
+          this.overlay.rerender()
+          return true
+        }
+        if (key.name === 'return') {
+          if (view.kind === 'multi-choice') {
+            this.advanceConnect(this.connectFlow.confirm())
+          } else {
+            const opt = options[nav.connectIndex]
+            if (opt) this.advanceConnect(this.connectFlow.submitChoice(opt.id))
+          }
           return true
         }
         return true
       }
       // input step
       if (key.name === 'return') { this.advanceConnect(this.connectFlow.submitInput(this.connectInput)); return true }
+      if (key.name === 'left') {
+        this.connectCursor = Math.max(0, this.connectCursor - 1)
+        this.markConnectEditActivity()
+        this.overlay.rerender()
+        return true
+      }
+      if (key.name === 'right') {
+        this.connectCursor = Math.min(this.connectInput.length, this.connectCursor + 1)
+        this.markConnectEditActivity()
+        this.overlay.rerender()
+        return true
+      }
       // Backspace has two encodings: \x7f → 'backspace', \x08 → 'ctrl_h'.
       // Matching both (mirroring InputLine.handleKey) keeps delete working on
       // terminals/SSH sessions whose backspace emits BS (\x08) — otherwise the
       // key is swallowed by the trailing `return true` and the user can type
       // but not erase.
-      if (key.name === 'backspace' || key.name === 'ctrl_h') { this.connectInput = this.connectInput.slice(0, -1); this.connectError = undefined; this.overlay.rerender(); return true }
-      if (key.ctrl && c === 'u') { this.connectInput = ''; this.connectError = undefined; this.overlay.rerender(); return true }
-      if (this.isPrintableKey(key)) { this.connectInput += key.char; this.connectError = undefined; this.overlay.rerender(); return true }
+      if (key.name === 'backspace' || key.name === 'ctrl_h') {
+        if (this.connectCursor > 0) {
+          this.connectInput = this.connectInput.slice(0, this.connectCursor - 1) + this.connectInput.slice(this.connectCursor)
+          this.connectCursor--
+        }
+        this.connectError = undefined
+        this.markConnectEditActivity()
+        this.overlay.rerender()
+        return true
+      }
+      if (key.ctrl && c === 'u') {
+        this.connectInput = ''
+        this.connectCursor = 0
+        this.connectError = undefined
+        this.markConnectEditActivity()
+        this.overlay.rerender()
+        return true
+      }
+      if (this.isPrintableKey(key)) {
+        this.connectInput = this.connectInput.slice(0, this.connectCursor) + key.char + this.connectInput.slice(this.connectCursor)
+        this.connectCursor += key.char.length
+        this.connectError = undefined
+        this.markConnectEditActivity()
+        this.overlay.rerender()
+        return true
+      }
       return true
     }
 
@@ -3074,7 +3589,7 @@ export class TuiApp {
       }
       if (key.name === 'return') {
         const entry = count > 0 ? this.overlayController.getData()?.modelPickerData?.().entries[cur] : undefined
-        if (entry && this.overlayController.getModelPickerExec()) this.overlayController.getModelPickerExec()?.(entry.id)
+        if (entry && this.overlayController.getModelPickerExec()) this.overlayController.getModelPickerExec()?.(entry.provider, entry.id)
         this.deactivateOverlay()
         return true
       }
@@ -3497,6 +4012,7 @@ export class TuiApp {
       this.streamRenderer.reset()
       this.streamRenderController.assistantHeaderDone = false
       this.agentBusy = true
+      this.todosWrittenThisRun = false
       this.state.turnStartMs = Date.now()
       this.streamRenderController.lastActivityMs = Date.now()
       this.onSubmitCallback?.(text, images)
@@ -4133,6 +4649,11 @@ export class TuiApp {
     const prevDone = prev.reduce((n, x) => n + (x.status === 'completed' ? 1 : 0), 0)
     const nextDone = items.reduce((n, x) => n + (x.status === 'completed' ? 1 : 0), 0)
     this.state.todos = items
+    // 本 run 写入检测（清单身份签名变化 = 新写入）：签名覆盖 id/status/内容，
+    // 与 provider 轮询的同值拉取（ticker 每 120ms 拉一次）区分——只有 AI 真正
+    // 写了新清单才算「本 run 有 todo」，见 todosWrittenThisRun 注释。
+    const sig = (xs: readonly TodoItem[]): string => xs.map(x => `${x.id}:${x.status}:${x.content}`).join('|')
+    if (sig(items) !== sig(prev)) this.todosWrittenThisRun = true
     if (!isReducedMotion() && (nextDone > prevDone || items.length !== prev.length)) {
       this.state.todoFlashUntil = Date.now() + 1000
       if (this.todoFlashTimer) clearTimeout(this.todoFlashTimer)
@@ -4987,6 +5508,11 @@ export class TuiApp {
     // 自动续跑，排队指引应留在队列里等 drain，不该被拉回输入框。
     this.abortSteerBackfill =
       this.abortSettling && !reason?.startsWith('watchdog') && !reason?.startsWith('convergence')
+    // 守护中断标志：notifyRunSettled 消费——自然结束（isFinal）的回填逻辑
+    // 不得误伤守护中断（自动续跑时把排队消息拉回输入框会打断续跑流程）。
+    // ?? false：reason 可选（undefined）时 startsWith 短路出 undefined。
+    this.guardianAbortPending =
+      (this.abortSettling && (reason?.startsWith('watchdog') || reason?.startsWith('convergence'))) ?? false
     this.state.isStreaming = false
     this.state.isThinking = false
     this.setPhase('idle')
@@ -5369,6 +5895,9 @@ export class TuiApp {
       const t = this.state.todos
       const total = t.length
       if (total === 0) return undefined
+      // 跨 run 陈旧 gate（同 shouldShowTaskPanel）：全完成 + 本 run 未写 →
+      // 徽章不显示，避免旧 5/5 复活挂在新 run 头上冒充当前进度。
+      if (!this.todosWrittenThisRun && t.every(x => x.status === 'completed')) return undefined
       return {
         total,
         done: t.filter(x => x.status === 'completed').length,
@@ -5666,7 +6195,7 @@ export class TuiApp {
     // 3b. 常驻任务面板（todo 列表）——空列表不渲染；run 空闲且全部完成时隐藏
     //    （shouldShowTaskPanel；todoExpanded 展开态强制显示以回看 completed）。
     //    宽屏时已由 side panel 承载。
-    if (!showSidePanel && this.state.todos.length > 0 && (this.state.todoExpanded || shouldShowTaskPanel(this.state.todos, this.state.phase))) {
+    if (!showSidePanel && this.state.todos.length > 0 && (this.state.todoExpanded || shouldShowTaskPanel(this.state.todos, this.state.phase, !this.todosWrittenThisRun))) {
       const taskLines = formatTaskList(this.state.todos, this.theme, {
         width: cols,
         maxRows: this.state.todoExpanded ? 15 : 6,
@@ -5698,7 +6227,9 @@ export class TuiApp {
     }
 
     // 5. Input line / Ctrl+C hint（多行输入：每行单独 push）
-    if (this.inputController.ctrlCPendingSince > 0) {
+    // 渲染防御：输入框有内容时永远显示输入框——提示行只在空输入时取代它，
+    // 兜住一切未取消 pending 的漏网路径（粘贴竞态等），杜绝幽灵输入。
+    if (this.inputController.ctrlCPendingSince > 0 && !this.inputLine.value) {
       lines.push({ text: '(Ctrl+C again to exit)' })
     } else {
       const inputVal = this.inputLine.value
@@ -5874,23 +6405,8 @@ export class TuiApp {
         })
       }
 
-      lines.push({ text: topBorder })
-      if (vimNormalMode) {
-        lines.push({
-          text: this.renderInputRow(`${vimModeLabel}${colorizeInputLine(withPastePills(withGhost(withFenceTint(inputLines[0] ?? '', 0), 0)))}`, innerWidth, leftBar, rightBar),
-          ...(inputDisplay.caret.line === 0 ? { caretCol: caretColFor(0) } : {}),
-        })
-        for (let i = 1; i < inputLines.length; i++) {
-          pushInputRow(inputLines[i]!, i)
-        }
-      } else {
-        for (let i = 0; i < inputLines.length; i++) {
-          pushInputRow(inputLines[i]!, i)
-        }
-      }
-      lines.push({ text: botBorder })
-
-      // 5a. 图片附件摘要（输入框正下方、权限模式行上方）
+      // ── 辅助行（状态/metrics/提示）全部在输入框上方 ──────────────
+      // 5a. 图片附件摘要（输入框上方、状态行上方）
       const imageCount = this.inputLine.images.length
       if (imageCount > 0) {
         const imageLabel = `📎 ${imageCount} image${imageCount > 1 ? 's' : ''}`
@@ -5898,7 +6414,7 @@ export class TuiApp {
       }
 
       // 5b. 状态行：左 metrics（模型/effort/cache/ctx/耗时）+ 右权限模式（右对齐）——
-      //     顶框不再承载指标，收敛到输入框正下方这一行（权限行仍是单一事实来源）。
+      //     顶框不再承载指标，收敛到输入框上方这一行（权限行仍是单一事实来源）。
       //     slash 提示打开时权限让位；整行放不下时权限独占下一行。
       const permLine = formatPermissionModeLine({ approvalMode: this._approvalMode, planMode: planModeActive, askMode: askModeActive }, this.theme)
       const permTrim = permLine.trimStart()
@@ -5949,6 +6465,23 @@ export class TuiApp {
         }
         lines.push({ text: this.clampLine(color('tab to cycle', this.theme.dim)) })
       }
+
+      // 输入框：chrome 段最后一行（滚动到底时贴屏幕底部，Claude Code 风格）。
+      lines.push({ text: topBorder })
+      if (vimNormalMode) {
+        lines.push({
+          text: this.renderInputRow(`${vimModeLabel}${colorizeInputLine(withPastePills(withGhost(withFenceTint(inputLines[0] ?? '', 0), 0)))}`, innerWidth, leftBar, rightBar),
+          ...(inputDisplay.caret.line === 0 ? { caretCol: caretColFor(0) } : {}),
+        })
+        for (let i = 1; i < inputLines.length; i++) {
+          pushInputRow(inputLines[i]!, i)
+        }
+      } else {
+        for (let i = 0; i < inputLines.length; i++) {
+          pushInputRow(inputLines[i]!, i)
+        }
+      }
+      lines.push({ text: botBorder })
     }
 
     if (this.screenReader) {
@@ -6001,6 +6534,7 @@ export class TuiApp {
         columns: sidePanelWidth,
         todos: this.state.todos,
         phase: this.state.phase,
+        todosStale: !this.todosWrittenThisRun,
         todoExpanded: this.state.todoExpanded,
         workers: this.fleetFrame(cols, false).activeWorkers,
         teamModel: this.liveTeamModel ? this.teamModelWithLiveStatus(this.liveTeamModel) : null,
@@ -6274,6 +6808,7 @@ export class TuiApp {
       this.streamRenderer.reset()
       this.streamRenderController.assistantHeaderDone = false
       this.agentBusy = true
+      this.todosWrittenThisRun = false
       this.state.turnStartMs = Date.now()
       this.streamRenderController.lastActivityMs = Date.now()
       this.onSubmitCallback?.(input)
@@ -6307,7 +6842,7 @@ export class TuiApp {
     themePickerData?: () => ThemePickerData
     choicePanelData?: () => ChoicePanelData
     planPickerData?: () => PlanPickerData
-  }, paletteExec?: (index: number) => void, rewindExec?: (messageIndex: number, mode: RewindMode) => void, chronicleExec?: (id: string) => void, domainPickerExec?: (key: string) => void, modelPickerExec?: (key: string) => void, domainPickerSaveDefaultExec?: (key: string) => void, modelPickerSaveDefaultExec?: (provider: string, modelId: string) => void, themePickerExec?: (key: string) => void, themePickerSaveDefaultExec?: (key: string) => void, choicePanelExec?: (id: string) => void, connectExec?: (commit: ConnectCommit, summary: string) => void, planPickerExec?: (slug: string) => void, initExec?: (commit: InitCommit, summary: string) => void): void {
+  }, paletteExec?: (index: number) => void, rewindExec?: (messageIndex: number, mode: RewindMode) => void, chronicleExec?: (id: string) => void, domainPickerExec?: (key: string) => void, modelPickerExec?: (provider: string, modelId: string) => void, domainPickerSaveDefaultExec?: (key: string) => void, modelPickerSaveDefaultExec?: (provider: string, modelId: string) => void, themePickerExec?: (key: string) => void, themePickerSaveDefaultExec?: (key: string) => void, choicePanelExec?: (id: string) => void, connectExec?: (commit: ConnectCommit, summary: string) => boolean | void, planPickerExec?: (slug: string) => void, initExec?: (commit: InitCommit, summary: string) => void): void {
     this.overlayController.setData(overlayData)
     this.overlayController.setPaletteExec(paletteExec)
     this.overlayController.setRewindExec(rewindExec)
@@ -6322,6 +6857,20 @@ export class TuiApp {
     this.overlayController.setConnectExec(connectExec)
     this.overlayController.setPlanPickerExec(planPickerExec)
     this.overlayController.setInitExec(initExec)
+    // Dedicated vision bridge wizard. It shares only generic wizard rendering;
+    // state, endpoint discovery, and persistence are distinct from /connect.
+    this.overlay.register('vision-onboarding', {
+      render: (_w, _h) => {
+        // 与 connect overlay 同款 caret 接线：renderConnect 回填 data.caret，
+        // caret() 供引擎定位（此前只 render 不接 caret——输入步无可见光标）。
+        const data = this.getVisionOnboardingOverlayData()
+        const lines = renderConnect(data, this.columns, this.rows, this.theme)
+        this.connectCaret = data.caret ?? null
+        return lines
+      },
+      caret: () => this.connectCaret,
+    })
+
     // Pager — page / mode / search / message 由 overlayNav 注入（覆盖 provider 的静态值）
     this.overlay.register('pager', {
       render: (_w, _h) => {
@@ -6510,8 +7059,15 @@ export class TuiApp {
     })
 
     // Connect Wizard — /connect 服务商配置向导；数据来自 app 持有的 ConnectFlow。
+    // render 时渲染方把硬件光标落点回填进 data.caret，caret() 供引擎定位。
     this.overlay.register('connect', {
-      render: (_w, _h) => renderConnect(this.getConnectOverlayData(), this.columns, this.rows, this.theme),
+      render: (_w, _h) => {
+        const data = this.getConnectOverlayData()
+        const lines = renderConnect(data, this.columns, this.rows, this.theme)
+        this.connectCaret = data.caret ?? null
+        return lines
+      },
+      caret: () => this.connectCaret,
     })
 
     // Init Wizard — /init 交互式项目初始化；数据来自 app 持有的 InitFlow。

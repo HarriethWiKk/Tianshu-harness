@@ -1,11 +1,26 @@
 import type { ModelConfig, ProviderConfig } from './schema.js'
 
-export type ProviderPresetKey = 'deepseek' | 'glm' | 'mimo' | 'mimo-api' | 'minimax' | 'codex' | 'siliconflow' | 'longcat' | 'ccswitch' | 'zhipu-vision'
+export type ProviderPresetKey = 'deepseek' | 'glm' | 'kimi' | 'mimo' | 'mimo-api' | 'minimax' | 'codex' | 'openai' | 'siliconflow' | 'longcat' | 'ccswitch' | 'zhipu-vision' | 'dashscope' | 'volc' | 'openrouter' | 'relay' | 'ollama'
+
+/** 一种计费模式对应一个官方 Base URL（如百炼的按量计费 / token plan）。 */
+export interface ProviderBillingMode {
+  id: string
+  label: string
+  description?: string
+  /** 可含 {WorkspaceId} 等占位符——端点确认步要求用户替换后才能探测。 */
+  baseUrl: string
+}
 
 export interface ProviderPreset {
   key: ProviderPresetKey
   label: string
   description: string
+  /** 免密钥端点（如本地 Ollama）——向导跳过 key 步直接探测。 */
+  keyless?: boolean
+  /** 中转/聚合平台（模型多且杂）——向导模型多选默认全不选，提供搜索/全选。 */
+  aggregator?: boolean
+  /** 多于一种计费模式时，向导在选类型后插入「计费模式」选择步。 */
+  billingModes?: ProviderBillingMode[]
   provider: ProviderConfig
   defaultModelId: string
 }
@@ -101,6 +116,50 @@ export const PROVIDER_PRESETS: Record<ProviderPresetKey, ProviderPreset> = {
         },
       ],
       unsupported: ['stream_options'],
+    },
+  },
+  kimi: {
+    key: 'kimi',
+    label: 'Moonshot Kimi',
+    description: '月之暗面：K3 旗舰推理 + K2.7 代码档',
+    defaultModelId: 'kimi-k3',
+    provider: {
+      name: 'kimi',
+      apiKeyEnv: 'MOONSHOT_API_KEY',
+      baseUrl: 'https://api.moonshot.cn/v1',
+      protocol: 'openai',
+      capabilities: {
+        cacheControl: false,
+        stripParams: [],
+        toolJsonBug: false,
+        prefixCache: 'none',
+        prefixCompletion: false,
+      },
+      thinking: 'enabled',
+      maxTokens: 32_768,
+      models: [
+        {
+          id: 'kimi-k3',
+          description: 'K3 旗舰：2.8T MoE，1M 上下文',
+          alias: 'k3',
+          contextWindow: 1_000_000,
+          maxTokens: 32_768,
+          reasoningEffort: 'high',
+          tier: 'strong',
+          pricing: { input: 4, output: 16, cacheRead: 0.4, cacheWrite: 4 },
+        },
+        {
+          id: 'kimi-k2.7-code',
+          description: 'K2.7 代码档：面向编程任务',
+          alias: 'k27-code',
+          contextWindow: 262_144,
+          maxTokens: 32_768,
+          reasoningEffort: 'high',
+          tier: 'strong',
+          pricing: { input: 0.6, output: 2.5, cacheRead: 0.1, cacheWrite: 0.6 },
+        },
+      ],
+      unsupported: [],
     },
   },
   mimo: {
@@ -225,6 +284,7 @@ export const PROVIDER_PRESETS: Record<ProviderPresetKey, ProviderPreset> = {
     key: 'siliconflow',
     label: '硅基流动 (SiliconFlow)',
     description: '聚合站：多模型可选，含 DeepSeek/GLM/Kimi/Qwen',
+    aggregator: true,
     defaultModelId: 'deepseek-ai/DeepSeek-V4-Pro',
     provider: {
       name: 'siliconflow',
@@ -232,17 +292,11 @@ export const PROVIDER_PRESETS: Record<ProviderPresetKey, ProviderPreset> = {
       baseUrl: 'https://api.siliconflow.cn/v1',
       protocol: 'openai',
       capabilities: {
-        cacheControl: false,
-        stripParams: [],
-        // 默认模型是 SiliconFlow 代理的 DeepSeek —— 沿用其"工具 JSON 混进正文"的
-        // 模型固有 bug 处理;换到聚合站里的其他模型时该开关无害(仅在检测到正文
-        // 内 tool JSON 时才生效)。
+        // WELL_KNOWN_DEFAULTS['siliconflow'] provides canonical cacheControl / stripParams
+        // / prefixCache / prefixCompletion. Default model is a DeepSeek proxy → keep
+        // the DeepSeek "tool JSON leaks into content" bug marker here; other fields
+        // fall through to WELL_KNOWN.
         toolJsonBug: true,
-        // SiliconFlow 对 DeepSeek-V4 / GLM-5.2 计"Cached Input"价 → 存在服务端隐式
-        // 前缀缓存,按 deepseek-native 记账以保住前缀缓存优化;但前缀补全(beta 续写
-        // 端点)是 deepseek.com 专属,聚合网关没有 → 关。
-        prefixCache: 'deepseek-native',
-        prefixCompletion: false,
       },
       thinking: 'enabled',
       maxTokens: 384_000,
@@ -300,11 +354,72 @@ export const PROVIDER_PRESETS: Record<ProviderPresetKey, ProviderPreset> = {
       unsupported: [],
     },
   },
+  // openai 必须排在 codex 之前：别名表按 preset 顺序合并重复 canonical
+  // （gpt-5.6-sol 两处都有），保留首个条目的元数据——官方 API 定价优先于
+  // codex 的订阅折算价。
+  openai: {
+    key: 'openai',
+    label: 'OpenAI',
+    description: 'OpenAI 官方 API：GPT-5.6 系列（Sol 旗舰 / Terra 均衡 / Luna 轻量）',
+    defaultModelId: 'gpt-5.6-sol',
+    provider: {
+      name: 'openai',
+      apiKeyEnv: 'OPENAI_API_KEY',
+      baseUrl: 'https://api.openai.com/v1',
+      protocol: 'openai',
+      capabilities: {
+        cacheControl: false,
+        stripParams: [],
+        toolJsonBug: false,
+        // OpenAI prompt caching 是服务端自动的，无需客户端标记。
+        prefixCache: 'none',
+        prefixCompletion: false,
+      },
+      thinking: 'enabled',
+      maxTokens: 128_000,
+      models: [
+        {
+          id: 'gpt-5.6-sol',
+          description: '旗舰：1.05M 上下文，视觉支持',
+          alias: 'sol',
+          contextWindow: 1_050_000,
+          maxTokens: 128_000,
+          reasoningEffort: 'max',
+          tier: 'strong',
+          supportsVision: true,
+          pricing: { input: 5, output: 30, cacheRead: 2.5, cacheWrite: 5 },
+        },
+        {
+          id: 'gpt-5.6-terra',
+          description: '均衡档：日常任务性价比之选',
+          alias: 'terra',
+          contextWindow: 400_000,
+          maxTokens: 128_000,
+          reasoningEffort: 'high',
+          tier: 'strong',
+          supportsVision: true,
+          pricing: { input: 2.5, output: 15, cacheRead: 1.25, cacheWrite: 2.5 },
+        },
+        {
+          id: 'gpt-5.6-luna',
+          description: '轻量档：低成本快速任务',
+          alias: 'luna',
+          contextWindow: 400_000,
+          maxTokens: 128_000,
+          reasoningEffort: 'medium',
+          tier: 'cheap',
+          supportsVision: true,
+          pricing: { input: 1, output: 6, cacheRead: 0.5, cacheWrite: 1 },
+        },
+      ],
+      unsupported: [],
+    },
+  },
   codex: {
     key: 'codex',
     label: 'Codex',
     description: 'OpenAI Codex：OAuth 登录，旗舰推理',
-    defaultModelId: 'gpt-5.5',
+    defaultModelId: 'gpt-5.6-sol',
     provider: {
       name: 'codex',
       baseUrl: 'https://chatgpt.com/backend-api/codex',
@@ -321,10 +436,10 @@ export const PROVIDER_PRESETS: Record<ProviderPresetKey, ProviderPreset> = {
       maxTokens: 128000,
       models: [
         {
-          id: 'gpt-5.5',
-          description: 'OpenAI 旗舰，视觉支持',
+          id: 'gpt-5.6-sol',
+          description: 'OpenAI 旗舰（Sol），视觉支持',
           alias: 'codex',
-          contextWindow: 1_000_000,
+          contextWindow: 1_050_000,
           maxTokens: 128000,
           reasoningEffort: 'max',
           tier: 'strong',
@@ -374,6 +489,7 @@ export const PROVIDER_PRESETS: Record<ProviderPresetKey, ProviderPreset> = {
     key: 'ccswitch',
     label: 'CC Switch',
     description: 'cc-switch 本地代理：Claude/GPT/DeepSeek 等',
+    aggregator: true,
     defaultModelId: 'claude-opus-4-8',
     provider: {
       name: 'ccswitch',
@@ -488,6 +604,234 @@ export const PROVIDER_PRESETS: Record<ProviderPresetKey, ProviderPreset> = {
         },
       ],
       unsupported: ['stream_options'],
+    },
+  },
+  // 阿里 DashScope（通义千问 Qwen 官方 OpenAI 兼容端点）。
+  // 模型能力分裂：Qwen3-max 支持 thinking block，Qwen-plus/turbo 不支持 ——
+  // 由用户在 models[].capabilities 里按 model 覆盖（WELL_KNOWN_DEFAULTS 给出
+  // 默认 thinkingBlockType='enabled'，对不支持 thinking 的 model 显式设 'none'）。
+  dashscope: {
+    key: 'dashscope',
+    label: '阿里云百炼 (DashScope)',
+    description: '阿里 DashScope：Qwen 系列官方端点，OpenAI 兼容协议',
+    defaultModelId: 'qwen3.8-max',
+    billingModes: [
+      {
+        id: 'payg',
+        label: '按量计费',
+        description: '需替换 {WorkspaceId} 为你的业务空间 ID（百炼控制台可查）',
+        baseUrl: 'https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/compatible-mode/v1',
+      },
+      {
+        id: 'token-plan',
+        label: 'token plan',
+        description: '订阅制 token 套餐专用端点',
+        baseUrl: 'https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1',
+      },
+    ],
+    provider: {
+      name: 'dashscope',
+      apiKeyEnv: 'DASHSCOPE_API_KEY',
+      baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+      protocol: 'openai',
+      capabilities: {},
+      thinking: 'enabled',
+      maxTokens: 32_768,
+      models: [
+        {
+          id: 'qwen3.8-max',
+          description: 'Qwen3.8 旗舰（1M 上下文，支持 thinking）',
+          alias: 'qs-max',
+          contextWindow: 1_000_000,
+          maxTokens: 131_072,
+          reasoningEffort: 'high',
+          tier: 'strong',
+          pricing: { input: 12, output: 36, cacheRead: 1.5, cacheWrite: 15 },
+          capabilities: { thinkingBlock: 'enabled', effortFormat: 'reasoning_effort' },
+        },
+        {
+          id: 'qwen3.7-max',
+          description: 'Qwen3.7 旗舰（1M 上下文，支持 thinking）',
+          alias: 'qs37-max',
+          contextWindow: 1_000_000,
+          maxTokens: 131_072,
+          reasoningEffort: 'high',
+          tier: 'strong',
+          capabilities: { thinkingBlock: 'enabled', effortFormat: 'reasoning_effort' },
+        },
+        {
+          id: 'qwen3.7-plus',
+          description: 'Qwen3.7 均衡档（1M 上下文，支持 thinking）',
+          alias: 'qs37-plus',
+          contextWindow: 1_000_000,
+          maxTokens: 131_072,
+          reasoningEffort: 'medium',
+          tier: 'balanced',
+          capabilities: { thinkingBlock: 'enabled', effortFormat: 'reasoning_effort' },
+        },
+        {
+          id: 'qwen3.7-flash',
+          description: 'Qwen3.7 快速档（1M 上下文，低成本）',
+          alias: 'qs37-flash',
+          contextWindow: 1_000_000,
+          maxTokens: 131_072,
+          reasoningEffort: 'medium',
+          tier: 'cheap',
+          capabilities: { thinkingBlock: 'enabled', effortFormat: 'reasoning_effort' },
+        },
+      ],
+      unsupported: [],
+    },
+  },
+  // OpenRouter — 国际聚合，含 OpenAI/Claude/Anthropic/开源模型。
+  // thinking block 透传不稳定（多数模型只支持 reasoning_effort 透传），
+  // 故 WELL_KNOWN_DEFAULTS 设 thinkingBlockType='none'、effortFormat='reasoning_effort'。
+  openrouter: {
+    key: 'openrouter',
+    label: 'OpenRouter',
+    description: 'OpenRouter 聚合：OpenAI / Claude / Gemini / 开源模型',
+    aggregator: true,
+    defaultModelId: 'anthropic/claude-sonnet-4.5',
+    provider: {
+      name: 'openrouter',
+      apiKeyEnv: 'OPENROUTER_API_KEY',
+      baseUrl: 'https://openrouter.ai/api/v1',
+      protocol: 'openai',
+      capabilities: {},
+      thinking: 'enabled',
+      maxTokens: 32_768,
+      models: [
+        {
+          id: 'anthropic/claude-sonnet-4.5',
+          description: 'Claude Sonnet 4.5（聚合）',
+          alias: 'or-sonnet',
+          contextWindow: 200_000,
+          maxTokens: 32_768,
+          reasoningEffort: 'high',
+          tier: 'strong',
+        },
+        {
+          id: 'openai/gpt-5',
+          description: 'GPT-5（聚合）',
+          alias: 'or-gpt5',
+          contextWindow: 200_000,
+          maxTokens: 32_768,
+          reasoningEffort: 'high',
+          tier: 'strong',
+        },
+      ],
+      unsupported: [],
+    },
+  },
+  // one-api / new-api 自建中转通用模板。
+  // 不预设具体模型 —— baseUrl 从环境变量取，用户按需填模型列表。
+  // WELL_KNOWN_DEFAULTS['relay'] 提供 thinking 能力默认值（block=none + effort=reasoning_effort），
+  // 与 ccswitch 同模板，但默认 config 不激活，让用户手动启用以避免体验重复。
+  relay: {
+    key: 'relay',
+    label: '自建中转 (one-api / new-api)',
+    description: '通用 OpenAI 兼容中转模板（one-api / new-api 等），baseUrl 走 RELAY_BASE_URL 环境变量',
+    aggregator: true,
+    defaultModelId: 'gpt-5',
+    provider: {
+      name: 'relay',
+      apiKeyEnv: 'RELAY_API_KEY',
+      baseUrl: process.env.RELAY_BASE_URL ?? 'http://127.0.0.1:3000/v1',
+      protocol: 'openai',
+      capabilities: {},
+      thinking: 'enabled',
+      maxTokens: 32_768,
+      models: [
+        {
+          id: 'gpt-5',
+          description: '示例模型（按需替换）',
+          alias: 'relay-gpt5',
+          contextWindow: 200_000,
+          maxTokens: 32_768,
+          reasoningEffort: 'high',
+          tier: 'strong',
+        },
+      ],
+      unsupported: [],
+    },
+  },
+  volc: {
+    key: 'volc',
+    label: '火山方舟 (豆包)',
+    description: '火山引擎方舟：豆包 Doubao 系列，OpenAI 兼容端点',
+    defaultModelId: 'doubao-seed-2.0-pro',
+    provider: {
+      name: 'volc',
+      apiKeyEnv: 'VOLC_API_KEY',
+      baseUrl: 'https://ark.cn-beijing.volces.com/api/v3',
+      protocol: 'openai',
+      capabilities: {
+        cacheControl: false,
+        stripParams: [],
+        toolJsonBug: false,
+        prefixCache: 'none',
+        prefixCompletion: false,
+      },
+      thinking: 'enabled',
+      maxTokens: 32_768,
+      // 方舟模型以控制台接入点为准——探测（/v3/models）能拉到真实列表，
+      // 下表仅兜底推荐，型号随方舟发布更新。
+      models: [
+        {
+          id: 'doubao-seed-2.0-pro',
+          description: '豆包旗舰（以方舟控制台接入点为准）',
+          alias: 'doubao-pro',
+          contextWindow: 262_144,
+          maxTokens: 32_768,
+          reasoningEffort: 'high',
+          tier: 'strong',
+        },
+        {
+          id: 'doubao-seed-2.0-flash',
+          description: '豆包快速档：低延迟轻量任务',
+          alias: 'doubao-flash',
+          contextWindow: 131_072,
+          maxTokens: 16_384,
+          reasoningEffort: 'medium',
+          tier: 'cheap',
+        },
+      ],
+      unsupported: [],
+    },
+  },
+  // 本地 Ollama —— 免密钥，向导跳过 key 步直接探测。
+  // 模型表只是兜底示例：探测能拉到用户实际 pull 的模型列表。
+  ollama: {
+    key: 'ollama',
+    label: '本地 Ollama',
+    description: '本地部署（默认 11434 端口），无需 API Key',
+    keyless: true,
+    defaultModelId: 'qwen3',
+    provider: {
+      name: 'ollama',
+      baseUrl: 'http://127.0.0.1:11434/v1',
+      protocol: 'openai',
+      capabilities: {
+        cacheControl: false,
+        stripParams: [],
+        toolJsonBug: false,
+        prefixCache: 'none',
+        prefixCompletion: false,
+      },
+      thinking: 'enabled',
+      maxTokens: 32_768,
+      models: [
+        {
+          id: 'qwen3',
+          description: '示例模型（按你实际 pull 的模型替换）',
+          alias: 'ollama-qwen3',
+          contextWindow: 32_768,
+          maxTokens: 8_192,
+          reasoningEffort: 'medium',
+          tier: 'cheap',
+        },
+      ],
+      unsupported: [],
     },
   },
 }

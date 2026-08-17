@@ -6,7 +6,7 @@
  */
 
 import { readUnacknowledged, recordRecovery, type RecoveryEntry } from './recovery-journal.js'
-import { existsSync, readFileSync, mkdirSync, copyFileSync } from 'node:fs'
+import { existsSync, readFileSync, mkdirSync, copyFileSync, readdirSync, rmSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 
 /** Lightweight record of a file mutation with a backup for undo. */
@@ -53,6 +53,33 @@ function backupKey(cwd: string, filePath: string): string {
   return join(cwd, filePath)
 }
 
+/** Cap on `.rivet/backups/` timestamp directories kept on disk. */
+const MAX_BACKUP_DIRS = 100
+
+/**
+ * Evict oldest timestamp-named backup dirs beyond the cap. The dirs are
+ * `Date.now()`-named (see trackFileChange), so name order = age order; only
+ * fully-numeric names are eligible, foreign dirs are never touched. Best-effort
+ * — eviction failures degrade silently (backup cleanup is non-critical).
+ */
+export function evictOldBackups(cwd: string, maxDirs = MAX_BACKUP_DIRS): void {
+  try {
+    const backupsDir = join(cwd, '.rivet', 'backups')
+    if (!existsSync(backupsDir)) return
+    const dirs = readdirSync(backupsDir, { withFileTypes: true })
+      .filter(e => e.isDirectory() && /^\d+$/.test(e.name))
+      .map(e => e.name)
+      .sort()
+    const excess = dirs.length - maxDirs
+    if (excess <= 0) return
+    for (const name of dirs.slice(0, excess)) {
+      rmSync(join(backupsDir, name), { recursive: true, force: true })
+    }
+  } catch {
+    // Non-critical — degrade silently
+  }
+}
+
 /**
  * Restore a file to its most recent backup recorded by trackFileChange.
  * Returns true if a backup existed and was restored; false otherwise.
@@ -90,6 +117,9 @@ export function trackFileChange(cwd: string, record: Omit<FileChangeRecord, 'bac
     backupPath = join(backupDir, record.filePath)
     copyFileSync(absPath, backupPath)
     latestBackups.set(backupKey(cwd, record.filePath), backupPath)
+    // Unbounded .rivet/backups growth (observed 6,396 dirs / 238MB) — cap it
+    // on the write path where the dir count is already being touched.
+    evictOldBackups(cwd)
   }
 
   return { ...record, backupPath, ts }

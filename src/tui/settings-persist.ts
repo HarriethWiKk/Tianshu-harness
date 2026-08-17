@@ -88,7 +88,7 @@ export function loadSettingsDraft(): SettingsDraft {
         maxLoadedSessions: leanCfg.maxLoadedSessions ?? leanDefaults.maxLoadedSessions,
         idleAgentTtlMs: leanCfg.idleAgentTtlMs ?? leanDefaults.idleAgentTtlMs,
         maxEventsDiskBytes: leanCfg.maxEventsDiskBytes ?? leanDefaults.maxEventsDiskBytes,
-        // 绑定星域：defaultDomain 钉定 + 该域 lean 覆盖同时成立时显示绑定状态
+        // 绑定星域：defaultDomain 钉定 + 该域 taiyi 工具档覆盖成立时显示绑定状态
         domainBind: inferDomainBind(),
         approval: cfg.agent.approval,
         checkpointEveryTurns: getCheckpointConfig().checkpointEveryTurns,
@@ -130,15 +130,17 @@ function parseBackends(raw: string): string[] {
   return raw.split(',').map(s => s.trim()).filter(s => s.length > 0)
 }
 
-/** 推断「最小集绑定星域」：defaultDomain 钉定某域且该域配置了完整绑定
- * （lean + taiyi 工具档）时视为绑定（面板显示）；否则空（不绑定）。
- * 审查 F2：仅 lean 不算绑定——绑定语义是 lean+taiyi 组合。 */
+/** 推断「最小集绑定星域」：defaultDomain 钉定某域且该域显式配置了 taiyi
+ *  工具档时视为绑定（面板显示）；否则空（不绑定）。
+ *  2026-08-15：绑定不再含 lean（资源减配）。taiyi 域经 star-domain-data
+ *  内置档兜底——手写 defaultDomain=taiyi 而无域覆盖时行为等价但不显示绑定，
+ *  以面板显式绑定为准。 */
 function inferDomainBind(): string {
   const leanCfg = getRuntimeLeanConfig()
   const domain = getDefaultDomainConfig().defaultDomain
   if (!domain || domain === 'auto') return ''
   const slice = leanCfg.domains?.[domain]
-  return slice?.lean === true && slice.toolPreset === 'taiyi' ? domain : ''
+  return slice?.toolPreset === 'taiyi' ? domain : ''
 }
 
 /**
@@ -245,15 +247,16 @@ export function saveSettings(
         attempt(block, () => setDefaultDomainConfig({ defaultDomain: draft.basics.defaultDomain }))
         break
       case 'domainBind': {
-        // 最小集绑定：选中域 → 钉定 defaultDomain + 写该域 lean/taiyi 覆盖
-        //（域覆盖的 lean 即让该域会话 lean 生效，无需动全局 runtime.lean——
-        // 全局 lean 会波及所有域且清空绑定不还原，审查 F1）；清空 → 恢复
-        // 默认域 qiming（域覆盖保留，用户可另行调整）。
+        // 最小集绑定：选中域 → 钉定 defaultDomain + 写该域 taiyi 工具档覆盖。
+        // 不写 lean（2026-08-15 产品决策：lean 是资源减配，会关掉核心能力——
+        // 用户要的是工具精简集，不是减配）；全局 runtime.lean 更不写（波及
+        // 所有域且清空绑定不还原，审查 F1）；清空 → 恢复默认域 qiming
+        // （域覆盖保留，用户可另行调整）。
         const bind = draft.basics.domainBind ?? ''
         if (bind) {
           attempt(block, () => setDefaultDomainConfig({ defaultDomain: bind }))
           attempt(block, () => setRuntimeLeanConfig({
-            domains: { [bind]: { lean: true, toolPreset: 'taiyi' } },
+            domains: { [bind]: { toolPreset: 'taiyi' } },
           }))
         } else {
           attempt(block, () => setDefaultDomainConfig({ defaultDomain: 'qiming' }))

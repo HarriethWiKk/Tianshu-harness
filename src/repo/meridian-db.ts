@@ -141,7 +141,26 @@ CREATE TABLE IF NOT EXISTS cli_entries (
   source_file TEXT NOT NULL,
   PRIMARY KEY(flag, source_file)
 );
+
+CREATE TABLE IF NOT EXISTS meridian_meta (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_access_time ON access_log(accessed_at);
+CREATE INDEX IF NOT EXISTS idx_sm_created ON sensorimotor_log(created_at);
+CREATE INDEX IF NOT EXISTS idx_p3_updated ON p3_state(updated_at);
 `;
+
+/**
+ * Minimum interval between retention cleanups (ms). Cleanup runs at most once
+ * per 24h per process — the DELETE cost is bounded and amortized.
+ */
+const CLEANUP_MIN_INTERVAL_MS = 24 * 3600 * 1000
+/** Append-only p3_state event rows retention window (days). */
+const P3_EVENT_RETENTION_DAYS = 30
+/** access_log / sensorimotor_log retention window (days). */
+const LOG_RETENTION_DAYS = 90
 
 /**
  * Escape GLOB wildcards so a literal file path can be used with SQLite GLOB.
@@ -173,6 +192,11 @@ export class MeridianDb {
         this.conn.pragma('busy_timeout = 3000')
         this.conn.exec(SCHEMA)
         migrateToV1(this.conn)
+        // WAL cap: without journal_size_limit the -wal file grows unbounded
+        // (observed 376MB); autocheckpoint alone never truncates it.
+        this.conn.pragma('journal_size_limit = 67108864')
+        migrateToV2(this.conn)
+        this.cleanupExpiredRows()
       } catch (err) {
         // Packaged sidecar with a broken native bundle: fail loud, never degrade.
         if ((err as { code?: string })?.code === 'ESQLITE_BUNDLE_BROKEN') throw err
@@ -641,6 +665,24 @@ export class MeridianDb {
 
   // ─── T2-02: Bandit state persistence ──────────────────────────────────
 
+  /**
+   * Periodic retention cleanup (anti-regression): runs at most once per 24h,
+   * tracked in meridian_meta. Idempotent; failures degrade silently — telemetry
+   * cleanup never blocks any path.
+   */
+  private cleanupExpiredRows(): void {
+    if (!this._available) return
+    try {
+      const row = this.db.prepare(`SELECT value FROM meridian_meta WHERE key = 'last_cleanup_at'`).get() as { value: string } | undefined
+      const last = row ? Number(row.value) : 0
+      if (Number.isFinite(last) && Date.now() - last < CLEANUP_MIN_INTERVAL_MS) return
+      purgeExpiredRows(this.db)
+      this.db.prepare(`INSERT OR REPLACE INTO meridian_meta (key, value) VALUES ('last_cleanup_at', ?)`).run(String(Date.now()))
+    } catch {
+      // Non-critical — degrade silently
+    }
+  }
+
   saveBanditState(kind: string, json: string): void {
     if (!this._available) return
     try {
@@ -673,12 +715,15 @@ export class MeridianDb {
     if (!this._available) return []
     try {
       const safeLimit = Math.max(1, Math.min(1000, Math.floor(limit)))
+      // LIKE with a leading-literal pattern can use the PRIMARY KEY(kind, version)
+      // prefix scan; substr(kind,1,length(?)) = ? cannot (T2-02 audit: full-table
+      // scan on 195k rows). Internal kinds never contain LIKE wildcards.
       return this.db.prepare(`
         SELECT kind, json, updated_at as updatedAt FROM p3_state
-        WHERE substr(kind, 1, length(?)) = ?
+        WHERE kind LIKE ?
         ORDER BY updated_at DESC
         LIMIT ${safeLimit}
-      `).all(prefix, prefix) as Array<{ kind: string; json: string; updatedAt: string }>
+      `).all(`${prefix}%`) as Array<{ kind: string; json: string; updatedAt: string }>
     } catch {
       return []
     }
@@ -741,7 +786,13 @@ export class MeridianDb {
   }
 
   close(): void {
-    if (this.conn) { this.conn.close(); this.conn = null }
+    if (this.conn) {
+      // Truncate the WAL so the file shrinks back to ~0 on close instead of
+      // leaving a multi-hundred-MB -wal behind (observed 376MB). Best-effort —
+      // TRUNCATE fails harmlessly under concurrent readers.
+      try { this.conn.pragma('wal_checkpoint(TRUNCATE)') } catch { /* best-effort */ }
+      this.conn.close(); this.conn = null
+    }
   }
 }
 
@@ -761,7 +812,7 @@ function createNullDb(): any {
 }
 
 /** Current Meridian data schema version (mirrored to PRAGMA user_version). */
-const MERIDIAN_SCHEMA_VERSION = 1
+const MERIDIAN_SCHEMA_VERSION = 2
 
 /**
  * One-shot migration to schema v1: purge historical dirty rows — absolute-path
@@ -792,5 +843,42 @@ function migrateToV1(db: any): void {
   } catch {
     // Migration must never block DB open — index still functions on dirty data.
   }
+}
+
+/**
+ * One-shot migration to schema v2: purge expired telemetry rows — append-only
+ * p3_state event kinds (unique-per-write kind strings stamp sessionId+timestamp,
+ * so the UPSERT never hits and the table grows without bound), access_log and
+ * sensorimotor_log. State kinds (fixed keys: bandit:*, p3:*, teamPlanCache:*)
+ * are whitelisted and preserved. The user_version guard runs this exactly once;
+ * cleanupExpiredRows then keeps the window enforced afterwards.
+ */
+function migrateToV2(db: any): void {
+  try {
+    if (((db.pragma('user_version', { simple: true }) as number) ?? 0) >= MERIDIAN_SCHEMA_VERSION) return
+    const tx = db.transaction(() => {
+      purgeExpiredRows(db)
+      db.pragma('user_version = ' + MERIDIAN_SCHEMA_VERSION)
+    })
+    tx()
+    // One-time cost after the purge: reclaim file holes. Best-effort — a busy
+    // DB (concurrent session) or permissions must never block open.
+    try {
+      db.pragma('wal_checkpoint(TRUNCATE)')
+      db.exec('VACUUM')
+    } catch { /* best-effort */ }
+  } catch {
+    // Migration must never block DB open — index still functions on dirty data.
+  }
+}
+
+/** Delete telemetry rows past their retention window. Idempotent. */
+function purgeExpiredRows(db: any): void {
+  // Append-only p3_state event rows; state kinds are a fixed-key whitelist.
+  db.prepare(`DELETE FROM p3_state
+    WHERE updated_at < datetime('now', ?)
+      AND kind NOT LIKE 'bandit:%' AND kind NOT LIKE 'p3:%' AND kind NOT LIKE 'teamPlanCache:%'`).run(`-${P3_EVENT_RETENTION_DAYS} days`)
+  db.prepare(`DELETE FROM access_log WHERE accessed_at < datetime('now', ?)`).run(`-${LOG_RETENTION_DAYS} days`)
+  db.prepare(`DELETE FROM sensorimotor_log WHERE created_at < datetime('now', ?)`).run(`-${LOG_RETENTION_DAYS} days`)
 }
 

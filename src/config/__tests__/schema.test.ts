@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { agentSchema, configSchema, modelConfigSchema, workersSchema } from '../schema.js'
+import { agentSchema, configSchema, modelConfigSchema, providerSchema, workersSchema, inferModelContextWindow, DEFAULT_MODEL_CONTEXT_WINDOW, DEFAULT_MODEL_MAX_TOKENS } from '../schema.js'
 import { DEFAULT_CONFIG } from '../default.js'
 
 describe('model supportsVision', () => {
@@ -26,6 +26,106 @@ describe('model supportsVision', () => {
     assert.equal(glm?.supportsVision, true)
     const deepseek = parsed.provider.providers.deepseek?.models.find(m => m.id === 'deepseek-v4-pro')
     assert.equal(deepseek?.supportsVision, undefined, 'text-only models stay undeclared')
+  })
+})
+
+describe('model capabilities override (per-model thinking split)', () => {
+  const base = { id: 'm', contextWindow: 128_000, maxTokens: 8_192 }
+
+  it('defaults to undefined (no per-model override)', () => {
+    const parsed = modelConfigSchema.parse(base)
+    assert.equal(parsed.capabilities, undefined)
+  })
+
+  it('parses a thinkingBlock override (Qwen-style split)', () => {
+    const parsed = modelConfigSchema.parse({
+      ...base,
+      capabilities: { thinkingBlock: 'enabled', effortFormat: 'reasoning_effort' },
+    })
+    assert.equal(parsed.capabilities?.thinkingBlock, 'enabled')
+    assert.equal(parsed.capabilities?.effortFormat, 'reasoning_effort')
+  })
+
+  it('parses a "thinking off" override for cheaper model in same provider', () => {
+    const parsed = modelConfigSchema.parse({
+      ...base,
+      capabilities: { thinkingBlock: 'none', effortFormat: 'none' },
+    })
+    assert.equal(parsed.capabilities?.thinkingBlock, 'none')
+    assert.equal(parsed.capabilities?.effortFormat, 'none')
+  })
+
+  it('rejects invalid thinkingBlock values', () => {
+    assert.throws(() => modelConfigSchema.parse({
+      ...base,
+      capabilities: { thinkingBlock: 'bogus' },
+    }))
+  })
+
+  it('dashscope preset carries per-model thinking split through configSchema', () => {
+    const parsed = configSchema.parse(DEFAULT_CONFIG)
+    const dashscope = parsed.provider.providers.dashscope
+    assert.ok(dashscope, 'dashscope must be in DEFAULT_CONFIG')
+    const qmax = dashscope.models.find(m => m.id === 'qwen3.8-max')
+    assert.equal(qmax?.capabilities?.thinkingBlock, 'enabled')
+    assert.equal(qmax?.capabilities?.effortFormat, 'reasoning_effort')
+    assert.equal(qmax?.contextWindow, 1_000_000)
+  })
+})
+
+describe('model contextWindow/maxTokens materialization', () => {
+  it('infers the context window from size suffixes in the model id', () => {
+    assert.equal(inferModelContextWindow('glm-4.6-air-128k'), 128 * 1024)
+    assert.equal(inferModelContextWindow('qwen-long-1m'), 1024 * 1024)
+    assert.equal(inferModelContextWindow('deepseek-chat-64k-preview'), 64 * 1024)
+  })
+
+  it('does not false-positive on model names that merely contain digits+k/m letters', () => {
+    assert.equal(inferModelContextWindow('kimi-k2'), undefined)
+    assert.equal(inferModelContextWindow('minimax-m3'), undefined)
+    assert.equal(inferModelContextWindow('gpt-5.5'), undefined)
+    assert.equal(inferModelContextWindow('claude-opus-4-7'), undefined)
+  })
+
+  it('falls back to conservative defaults when the id carries no size hint', () => {
+    const parsed = modelConfigSchema.parse({ id: 'some-unknown-model' })
+    assert.equal(parsed.contextWindow, DEFAULT_MODEL_CONTEXT_WINDOW)
+    assert.equal(parsed.maxTokens, DEFAULT_MODEL_MAX_TOKENS)
+  })
+
+  it('prefers an explicit contextWindow over id inference', () => {
+    const parsed = modelConfigSchema.parse({ id: 'm-128k', contextWindow: 200_000 })
+    assert.equal(parsed.contextWindow, 200_000)
+  })
+
+  it('clamps default maxTokens to the context window', () => {
+    const parsed = modelConfigSchema.parse({ id: 'tiny-4k', maxTokens: 100_000 })
+    assert.equal(parsed.contextWindow, 4 * 1024)
+    assert.equal(parsed.maxTokens, 4 * 1024)
+  })
+})
+
+describe('provider protocol normalization', () => {
+  const minimal = { baseUrl: 'https://api.example.com', models: [{ id: 'm' }] }
+
+  it('defaults protocol to openai', () => {
+    const parsed = providerSchema.parse({ ...minimal, name: 'my-provider' })
+    assert.equal(parsed.protocol, 'openai')
+  })
+
+  it('normalizes a provider named anthropic to protocol anthropic', () => {
+    const parsed = providerSchema.parse({ ...minimal, name: 'anthropic' })
+    assert.equal(parsed.protocol, 'anthropic')
+  })
+
+  it('preserves an explicit protocol override on a provider named anthropic', () => {
+    const parsed = providerSchema.parse({ ...minimal, name: 'anthropic', protocol: 'openai' })
+    assert.equal(parsed.protocol, 'openai')
+  })
+
+  it('allows an empty model list (probe-filled providers)', () => {
+    const parsed = providerSchema.parse({ name: 'probe-me', baseUrl: 'https://api.example.com' })
+    assert.deepEqual(parsed.models, [])
   })
 })
 
@@ -123,7 +223,7 @@ describe('config permissions schema', () => {
     const parsed = configSchema.parse(DEFAULT_CONFIG)
 
     assert.deepEqual(parsed.provider.providers.codex?.auth, { type: 'oauth', provider: 'codex' })
-    assert.equal(parsed.provider.providers.codex?.models[0]?.id, 'gpt-5.5')
+    assert.equal(parsed.provider.providers.codex?.models[0]?.id, 'gpt-5.6-sol')
   })
 
   it('keeps DEFAULT_CONFIG default provider and model specs valid', () => {
@@ -291,5 +391,82 @@ describe('pro schema', () => {
     assert.equal(parsed.pro.licenseKey, 'test-key')
     assert.equal(parsed.pro.features.computerUse, false)
     assert.equal(parsed.pro.features.chatGateway, true)
+  })
+})
+
+describe('providerSchema keyRef and userSaved fields', () => {
+  it('accepts a provider with keyRef instead of apiKey', () => {
+    const input = {
+      name: 'deepseek',
+      keyRef: 'deepseek-apikey',
+      baseUrl: 'https://api.deepseek.com/v1',
+      protocol: 'openai',
+      capabilities: {},
+    }
+    const result = providerSchema.parse(input)
+    assert.equal(result.name, 'deepseek')
+    assert.equal(result.keyRef, 'deepseek-apikey')
+    assert.equal(result.apiKey, undefined)
+    assert.equal(result.userSaved, undefined)
+  })
+
+  it('accepts a provider with userSaved=true', () => {
+    const input = {
+      name: 'my-custom',
+      apiKey: 'sk-test',
+      baseUrl: 'https://example.com/v1',
+      protocol: 'openai',
+      capabilities: {},
+      userSaved: true,
+    }
+    const result = providerSchema.parse(input)
+    assert.equal(result.userSaved, true)
+  })
+
+  it('defaults userSaved to undefined when omitted', () => {
+    const input = {
+      name: 'deepseek',
+      apiKey: 'sk-test',
+      baseUrl: 'https://api.deepseek.com/v1',
+      capabilities: {},
+    }
+    const result = providerSchema.parse(input)
+    assert.equal(result.userSaved, undefined)
+  })
+
+  it('prefers keyRef over apiKey when both are present', () => {
+    const input = {
+      name: 'deepseek',
+      apiKey: 'sk-inline',
+      keyRef: 'deepseek-apikey',
+      baseUrl: 'https://api.deepseek.com/v1',
+      protocol: 'openai',
+      capabilities: {},
+    }
+    const result = providerSchema.parse(input)
+    // Both fields parse; keyRef is the preferred channel per comments, but schema accepts both
+    assert.equal(result.apiKey, 'sk-inline')
+    assert.equal(result.keyRef, 'deepseek-apikey')
+  })
+
+  it('rejects keyRef with non-string type', () => {
+    const input = {
+      name: 'deepseek',
+      keyRef: 123 as any,
+      baseUrl: 'https://api.deepseek.com/v1',
+      capabilities: {},
+    }
+    assert.throws(() => providerSchema.parse(input))
+  })
+
+  it('rejects invalid baseUrl with keyRef', () => {
+    const input = {
+      name: 'deepseek',
+      keyRef: 'deepseek-apikey',
+      baseUrl: 'not-a-url',
+      protocol: 'openai',
+      capabilities: {},
+    }
+    assert.throws(() => providerSchema.parse(input))
   })
 })

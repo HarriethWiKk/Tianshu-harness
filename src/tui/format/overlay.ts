@@ -623,6 +623,40 @@ function wrapToWidth(text: string, width: number, maxLines: number): string[] {
 }
 
 /**
+ * 列表视口滚动窗口（无状态）：保证 selectedIndex 所在项可见。
+ * 策略：以光标为锚交替向下/向上扩展窗口，光标大致停在视口纵向中部——
+ * 长列表上下滚动都逐项平滑推进，不会贴边或整屏跳动。
+ */
+function scrollWindow(heights: number[], selectedIndex: number, budget: number): { start: number; end: number } {
+  const n = heights.length
+  if (n === 0 || budget <= 0) return { start: 0, end: 0 }
+  const total = heights.reduce((a, b) => a + b, 0)
+  if (total <= budget) return { start: 0, end: n }
+  const sel = Math.min(Math.max(selectedIndex, 0), n - 1)
+  let used = Math.min(heights[sel]!, budget)
+  let start = sel
+  let end = sel + 1
+  let up = true
+  while (used < budget && (start > 0 || end < n)) {
+    const upFits = start > 0 && used + heights[start - 1]! <= budget
+    const downFits = end < n && used + heights[end]! <= budget
+    if (!upFits && !downFits) break
+    if (upFits && (up || !downFits)) { start--; used += heights[start]! }
+    else { used += heights[end]!; end++ }
+    up = !up
+  }
+  return { start, end }
+}
+
+/** scrollWindow + 为上下截断指示行预留行预算（两趟收敛即可）。 */
+function scrollWindowWithIndicators(heights: number[], selectedIndex: number, budget: number): { start: number; end: number } {
+  let win = scrollWindow(heights, selectedIndex, budget)
+  const indicators = (win.start > 0 ? 1 : 0) + (win.end < heights.length ? 1 : 0)
+  if (indicators > 0) win = scrollWindow(heights, selectedIndex, Math.max(1, budget - indicators))
+  return win
+}
+
+/**
  * 渲染 Domain Picker overlay（CC 风星域选择器）。
  *
  * 列表（cursor + current 标记 + name + dim meta）→ 分隔线 → 选中项 essence 预览。
@@ -941,6 +975,9 @@ export function renderModelPicker(data: ModelPickerData, width: number, height: 
 
   const sel = data.selectedIndex
   const visible = data.entries.slice(0, listRows)
+  if (data.entries.length === 0) {
+    lines.push(padLine(color('  尚无已保存的 provider——运行 /connect 接入后模型会出现在这里', theme.muted), width, theme))
+  }
   for (let i = 0; i < visible.length; i++) {
     const e = visible[i]!
     const selected = i === sel
@@ -1119,11 +1156,17 @@ export function renderChoicePanel(data: ChoicePanelData, width: number, height: 
     return lines
   }
 
-  // Each choice takes 1-2 lines (label + optional description). Calculate
-  // how many fit, with wrapping for long descriptions.
+  // Each choice takes 1-2 lines (label + optional description). A scroll
+  // window keeps the cursor visible in short terminals instead of silently
+  // truncating choices beyond the viewport.
+  const choiceHeights = data.choices.map(c => 1 + (c.description ? wrapToWidth(c.description, innerWidth, 2).length : 0))
+  const win = scrollWindowWithIndicators(choiceHeights, data.selectedIndex, contentRows)
   let rowsUsed = 0
-  for (let i = 0; i < data.choices.length; i++) {
-    if (rowsUsed >= contentRows) break
+  if (win.start > 0) {
+    lines.push(padLine(`   ${color(`↑ 以上还有 ${win.start} 项`, theme.muted)}`, width, theme))
+    rowsUsed++
+  }
+  for (let i = win.start; i < win.end && rowsUsed < contentRows; i++) {
     const c = data.choices[i]!
     const selected = i === data.selectedIndex
 
@@ -1145,6 +1188,10 @@ export function renderChoicePanel(data: ChoicePanelData, width: number, height: 
         rowsUsed++
       }
     }
+  }
+  if (win.end < data.choices.length && rowsUsed < contentRows) {
+    lines.push(padLine(`   ${color(`↓ 以下还有 ${data.choices.length - win.end} 项`, theme.muted)}`, width, theme))
+    rowsUsed++
   }
 
   // Pad remaining rows
@@ -1219,9 +1266,14 @@ export function renderPlanPicker(data: PlanPickerData, width: number, height: nu
     return lines
   }
 
+  const entryHeights = data.entries.map(e => 2) // label line + meta line when selected; conservative uniform height
+  const win = scrollWindowWithIndicators(entryHeights, data.selectedIndex, contentRows)
   let rowsUsed = 0
-  for (let i = 0; i < data.entries.length; i++) {
-    if (rowsUsed >= contentRows) break
+  if (win.start > 0) {
+    lines.push(padLine(`   ${color(`↑ 以上还有 ${win.start} 项`, theme.muted)}`, width, theme))
+    rowsUsed++
+  }
+  for (let i = win.start; i < win.end && rowsUsed < contentRows; i++) {
     const e = data.entries[i]!
     const selected = i === data.selectedIndex
     const icon = planStatusGlyph(e.status, theme)
@@ -1240,6 +1292,10 @@ export function renderPlanPicker(data: PlanPickerData, width: number, height: nu
         rowsUsed++
       }
     }
+  }
+  if (win.end < data.entries.length && rowsUsed < contentRows) {
+    lines.push(padLine(`   ${color(`↓ 以下还有 ${data.entries.length - win.end} 项`, theme.muted)}`, width, theme))
+    rowsUsed++
   }
 
   while (rowsUsed < contentRows) {
@@ -1265,6 +1321,17 @@ export interface ConnectOverlayData {
   error?: string
   /** Selected option index for choice-kind steps. */
   selectedIndex: number
+  /** 输入光标在缓冲中的位置（默认贴末尾）。 */
+  cursorPos?: number
+  /** 光标本帧是否可见（闪烁期由 app 逐帧计算；默认可见）。 */
+  cursorVisible?: boolean
+  /** form 步当前选中字段下标。 */
+  formFieldIndex?: number
+  /**
+   * 渲染方回填：本帧硬件光标落点（1-based 行/列）。null = 无光标。
+   * 光标是终端原生 caret——落在字符格边界上、零占位、不挤压文本。
+   */
+  caret?: { row: number; col: number } | null
 }
 
 function maskSecret(value: string): string {
@@ -1273,6 +1340,7 @@ function maskSecret(value: string): string {
 
 export function renderConnect(data: ConnectOverlayData, width: number, height: number, theme: RivetTheme): string[] {
   const { view } = data
+  data.caret = null
   const lines: string[] = []
   lines.push(formatBorder(width, theme, 'subtle'))
   const titleBar = view.stepLabel ? `${view.title}   ${view.stepLabel}` : view.title
@@ -1292,17 +1360,57 @@ export function renderConnect(data: ConnectOverlayData, width: number, height: n
     if (rowsUsed < contentRows) push('')
   }
 
-  if (view.kind === 'choice') {
-    const options = view.options ?? []
-    for (let i = 0; i < options.length; i++) {
+  if (view.filter !== undefined && rowsUsed < contentRows) {
+    // 多选步即时搜索行：查询文本 + 计数。占位文字仅空查询时显示（非实体）；
+    // caret 是硬件光标——空时停在占位符前方（句首），非空贴在查询末尾。
+    const hasQuery = view.filter.length > 0
+    const text = hasQuery ? color(view.filter, theme.secondary) : color('输入关键字过滤模型…', theme.dim)
+    const counter = color(` ${view.options?.length ?? 0}/${view.optionTotal ?? 0}`, theme.muted)
+    if (data.cursorVisible !== false) {
+      // 行首 │ 边框 1 列 + ' > ' 前缀 3 列 → 文本第 5 列起；col 为 1-based。
+      data.caret = { row: lines.length + 1, col: 5 + (hasQuery ? stringWidth(view.filter) : 0) }
+    }
+    push(` ${color('>', theme.primary, { bold: true })} ${text}${counter}`)
+    if (rowsUsed < contentRows) push('')
+  }
+
+  if (view.report && view.report.length > 0) {
+    for (const line of view.report) {
       if (rowsUsed >= contentRows) break
+      const toneColor = line.tone === 'ok'
+        ? theme.success
+        : line.tone === 'fail'
+          ? theme.error ?? theme.primary
+          : line.tone === 'head'
+            ? theme.secondary
+            : theme.muted
+      const opts = line.tone === 'head' ? { bold: true } : undefined
+      for (const d of wrapToWidth(line.text, innerWidth, 2)) {
+        if (rowsUsed >= contentRows) break
+        push(` ${color(d, toneColor, opts)}`)
+      }
+    }
+    if (rowsUsed < contentRows) push('')
+  }
+
+  if (view.kind === 'choice' || view.kind === 'multi-choice') {
+    const options = view.options ?? []
+    // Scroll window keeps the cursor visible in short terminals (e.g. the
+    // 19-item provider list) instead of silently truncating beyond viewport.
+    const optionHeights = options.map(o => 1 + (o.description ? wrapToWidth(o.description, innerWidth, 2).length : 0))
+    const win = scrollWindowWithIndicators(optionHeights, data.selectedIndex, contentRows - rowsUsed)
+    if (win.start > 0) push(`   ${color(`↑ 以上还有 ${win.start} 项`, theme.muted)}`)
+    for (let i = win.start; i < win.end && rowsUsed < contentRows; i++) {
       const opt = options[i]!
       const selected = i === data.selectedIndex
       const cursor = selected ? color(CURSOR, theme.primary, { bold: true }) : ' '
       const star = opt.recommended ? color('★', theme.warning ?? theme.primary, { bold: true }) : ' '
+      const box = view.kind === 'multi-choice'
+        ? `${opt.checked ? color('☑', theme.success) : color('☐', theme.muted)} `
+        : ''
       const labelColor = selected ? theme.primary : theme.secondary
       const label = selected ? color(opt.label, labelColor, { bold: true }) : color(opt.label, labelColor)
-      push(` ${cursor} ${star} ${label}`)
+      push(` ${cursor} ${star} ${box}${label}`)
       if (opt.description && rowsUsed < contentRows) {
         for (const d of wrapToWidth(opt.description, innerWidth, 2)) {
           if (rowsUsed >= contentRows) break
@@ -1310,11 +1418,49 @@ export function renderConnect(data: ConnectOverlayData, width: number, height: n
         }
       }
     }
+    if (win.end < options.length && rowsUsed < contentRows) {
+      push(`   ${color(`↓ 以下还有 ${options.length - win.end} 项`, theme.muted)}`)
+    }
+  } else if (view.kind === 'busy') {
+    push(` ${color('⠋ 请稍候…', theme.primary, { bold: true })}`)
+  } else if (view.kind === 'form') {
+    // 单步表单：字段竖排，选中行带硬件 caret（text 字段）或高亮值（toggle）。
+    const fields = view.fields ?? []
+    const active = Math.min(Math.max(data.formFieldIndex ?? 0, 0), Math.max(0, fields.length - 1))
+    for (let i = 0; i < fields.length && rowsUsed < contentRows; i++) {
+      const f = fields[i]!
+      const selected = i === active
+      const cursor = selected ? color(CURSOR, theme.primary, { bold: true }) : ' '
+      const labelStr = color(`${f.label}：`, selected ? theme.primary : theme.muted, selected ? { bold: true } : undefined)
+      let valueStr: string
+      if (f.kind === 'toggle') {
+        valueStr = color(f.value, selected ? theme.primary : theme.muted)
+      } else {
+        valueStr = color(f.value, selected ? theme.secondary : theme.muted)
+        if (selected && data.cursorVisible !== false) {
+          const caretPos = Math.min(Math.max(data.cursorPos ?? f.value.length, 0), f.value.length)
+          // caret col = 行首 │ 边框 1 列 + 纯文本前缀宽 + 值前缀宽 + 1（1-based）。
+          const prefixWidth = stringWidth(` ${CURSOR} ${f.label}：`)
+          data.caret = { row: lines.length + 1, col: prefixWidth + stringWidth(f.value.slice(0, caretPos)) + 2 }
+        }
+      }
+      const hint = selected && f.hint ? color(`  ${f.hint}`, theme.dim) : ''
+      push(` ${cursor} ${labelStr}${valueStr}${hint}`)
+    }
   } else {
     const shown = view.masked ? maskSecret(data.input) : data.input
-    const cursor = color('▏', theme.primary, { bold: true })
-    const body = shown.length > 0 ? color(shown, theme.secondary) : color(view.placeholder ?? '', theme.dim)
-    push(` ${color('>', theme.primary, { bold: true })} ${body}${cursor}`)
+    // 掩码步按码点展示，先把 UTF-16 位置换算成码点。
+    const utf16Pos = Math.min(Math.max(data.cursorPos ?? data.input.length, 0), data.input.length)
+    const pos = view.masked ? [...data.input.slice(0, utf16Pos)].length : utf16Pos
+    // 光标是硬件 caret（格子边界、零占位），不在行内画任何字形；
+    // 占位符仅空输入时显示，非实体。
+    const body = shown.length > 0
+      ? color(shown, theme.secondary)
+      : color(view.placeholder ?? '', theme.dim)
+    if (data.cursorVisible !== false) {
+      data.caret = { row: lines.length + 1, col: 5 + stringWidth(shown.slice(0, pos)) }
+    }
+    push(` ${color('>', theme.primary, { bold: true })} ${body}`)
   }
 
   if (data.error && rowsUsed < contentRows) {
@@ -1329,7 +1475,13 @@ export function renderConnect(data: ConnectOverlayData, width: number, height: n
 
   const footer = view.kind === 'choice'
     ? compactHints([['↑↓', '选择'], ['Enter', '确认'], ['Esc', '取消']])
-    : compactHints([['Enter', '提交'], ['Esc', '取消']])
+    : view.kind === 'multi-choice'
+      ? compactHints([['↑↓', '移动'], ['空格', '勾选'], ['输入', '搜索'], ['Ctrl+A', '全选'], ['Enter', '确认'], ['Esc', '取消']])
+      : view.kind === 'busy'
+        ? compactHints([['Esc', '取消']])
+        : view.kind === 'form'
+          ? compactHints([['↑↓', '选字段'], ['←→', '移光标'], ['空格', '切换'], ['Enter', '确认'], ['Esc', '返回']])
+          : compactHints([['←→', '移动'], ['Enter', '提交'], ['Esc', '取消']])
   lines.push(formatFooter(footer, width, theme, 'subtle'))
   lines.push(formatBottomBorder(width, theme, 'subtle'))
   return lines
@@ -1378,8 +1530,10 @@ export function renderInitFlow(data: InitOverlayData, width: number, height: num
 
   if (view.kind === 'multi-choice') {
     const options = view.options ?? []
-    for (let i = 0; i < options.length; i++) {
-      if (rowsUsed >= contentRows) break
+    const optionHeights = options.map(o => 1 + (o.description ? wrapToWidth(o.description, innerWidth, 2).length : 0))
+    const win = scrollWindowWithIndicators(optionHeights, data.selectedIndex, contentRows - rowsUsed)
+    if (win.start > 0) push(`   ${color(`↑ 以上还有 ${win.start} 项`, theme.muted)}`)
+    for (let i = win.start; i < win.end && rowsUsed < contentRows; i++) {
       const opt = options[i]!
       const selected = i === data.selectedIndex
       const cursor = selected ? color(CURSOR, theme.primary, { bold: true }) : ' '
@@ -1394,6 +1548,9 @@ export function renderInitFlow(data: InitOverlayData, width: number, height: num
           push(`     ${color(d, theme.muted)}`)
         }
       }
+    }
+    if (win.end < options.length && rowsUsed < contentRows) {
+      push(`   ${color(`↓ 以下还有 ${options.length - win.end} 项`, theme.muted)}`)
     }
   } else {
     // confirm step: the file list about to be written.

@@ -32,3 +32,22 @@ export const b1ReadOnlyLimitForWindow = (contextWindow: number): number =>
 /** 回归空转断路器：200K→5，1M→12（与 B2 同比例）。 */
 export const regressionLoopLimitForWindow = (contextWindow: number): number =>
   scaledThreshold(contextWindow, 5, 12)
+
+/**
+ * B2 收敛轨迹门（会话 506a5e86 优化）：最近 window 个收敛 score 均值 >= bar
+ * → 轨迹收敛 → B2 静默。score 来自 convergence-detector.evaluateConvergence
+ * （[0,1]，越高越收敛）。bar=0.4 对齐 detector 的 L2 分档线（<=0.4 = L2）：
+ * B2 静默区与 detector 的 L2+ 提醒严格不重叠，防双提醒叠罗汉（0.4-0.6 的
+ * L1 区间 detector 仍会发轻度提醒，B2 不追加）。
+ * 冷启动：样本 < minSamples 时返回 false（保守照发，旧行为）。
+ */
+export function isB2ConvergingRecently(
+  scoreHistory: readonly number[],
+  minSamples = 2,
+  window = 3,
+  bar = 0.4,
+): boolean {
+  if (scoreHistory.length < minSamples) return false
+  const recent = scoreHistory.slice(-window)
+  return recent.reduce((a, b) => a + b, 0) / recent.length >= bar
+}

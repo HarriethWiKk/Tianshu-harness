@@ -67,8 +67,8 @@ export interface BasicsDraft {
   maxLoadedSessions?: number
   idleAgentTtlMs?: number
   maxEventsDiskBytes?: number
-  /** 最小集绑定星域：选中即 defaultDomain 钉定该域 + domains[域] lean/taiyi。
-   *  空串 = 不绑定（defaultDomain 回 qiming）。 */
+  /** 最小集绑定星域：选中即 defaultDomain 钉定该域 + domains[域] taiyi 工具档
+   *  （不含 lean 资源减配）。空串 = 不绑定（defaultDomain 回 qiming）。 */
   domainBind?: string
   approval: string
   checkpointEveryTurns: number
@@ -148,9 +148,10 @@ export const APPROVAL_OPTIONS: readonly SettingsOption[] = [
 ]
 
 export const TOOL_PRESET_OPTIONS: readonly SettingsOption[] = [
-  { id: 'minimal', label: 'minimal — 27 个工具（省 token）' },
-  { id: 'frontend', label: 'frontend — 28 个，含 browser_debug（默认）' },
-  { id: 'full', label: 'full — 47 个全集，含 computer_use / 办公工具' },
+  { id: 'minimal', label: 'minimal — 29 个工具（省 token）' },
+  { id: 'frontend', label: 'frontend — 30 个，含 browser_debug（默认）' },
+  { id: 'full', label: 'full — 50 个全集，含 computer_use / 办公工具' },
+  { id: 'taiyi', label: 'taiyi — 16 个最小集（评测档；太一域钉定默认此档）' },
 ]
 
 export const MIRROR_PRESET_OPTIONS: readonly SettingsOption[] = [
@@ -633,7 +634,7 @@ function basicsCategory(): SettingsCategory {
       label: '工具档位',
       block: 'toolPreset',
       effect: 'next-session',
-      hint: '控制装配的工具数量：frontend 默认（28，含 browser_debug）；full 全集但占更多 system prompt',
+      hint: '装配工具集：minimal 29 日常全能力；frontend 30（默认）+ browser_debug；full 50 全集（编排/semantic/computer_use/办公族，system prompt 更贵）；taiyi 16 最小评测档——太一域钉定自动落此档。某域专属档位用「最小集绑定星域」或 runtime.domains 按域覆盖',
       options: TOOL_PRESET_OPTIONS,
       get: d => d.basics.toolPreset,
       set: (d, value) => withBasics(d, { toolPreset: value }),
@@ -714,11 +715,11 @@ function basicsCategory(): SettingsCategory {
     },
     {
       id: 'agent.domainBind',
-      label: '最小集绑定星域（lean 一键启动）',
+      label: '最小集绑定星域',
       kind: 'enum',
       block: 'domainBind',
       effect: 'next-session',
-      hint: '选中某域：defaultDomain 钉定该域 + 写入 lean 与 taiyi 最小工具档——rivet 启动即该域的最小集会话，无需启动参数。清空 = 恢复默认域',
+      hint: '选中某域：defaultDomain 钉定该域 + taiyi 16 件最小工具档——rivet 启动即该域的最小集会话，无需启动参数（不含 lean 资源减配）。清空 = 恢复默认域',
       display: d => d.basics.domainBind || '（不绑定）',
       options: (_d, env) => [
         { id: '', label: '（不绑定）' },

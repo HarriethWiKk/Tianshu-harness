@@ -43,8 +43,10 @@ export const MAX_LINES_BASELINE: ReadonlyArray<readonly [string, number]> = [
   ['src/agent/deliver-task.ts', 1613],
   ['src/tui/format/overlay.ts', 1492],
   ['src/api/openai-client.ts', 1492],
-  ['src/agent/turn-orchestrator.ts', 1462],
-  ['src/agent/loop-factory.ts', 1470],
+  // 1462→1471：B2 收敛轨迹门（会话 506a5e86 优化，deps getter + AND 门判定，+9 行）。
+  ['src/agent/turn-orchestrator.ts', 1471],
+  // 1470→1473：注入 B2 收敛轨迹 getter（getConvergenceScoreHistory，+3 行）。
+  ['src/agent/loop-factory.ts', 1473],
   ['src/agent/advisory-bus.ts', 1273],
   ['src/agent/convergence-detector.ts', 1260],
   ['src/tui/engine/input-line.ts', 1236],
@@ -74,6 +76,8 @@ export const MAX_LINES_BASELINE: ReadonlyArray<readonly [string, number]> = [
   ['src/pro/computer-use/windows-uia-com.ts', 888],
   ['src/config/schema.ts', 891],
   ['src/agent/session-persist.ts', 874],
+  // 797→884：schema v2 遥测保留机制（migrateToV2/cleanupExpiredRows/WAL checkpoint/LIKE 前缀索引，2026-08-17 存储膨胀修复）。
+  ['src/repo/meridian-db.ts', 884],
   ['src/tui/settings-model.ts', 865],
 ]
 

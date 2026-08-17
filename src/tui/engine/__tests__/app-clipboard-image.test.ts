@@ -76,7 +76,7 @@ test('RED #2: Ctrl+V onAnyKey → handleCtrlV → inputLine.addImage (end-to-end
 test('RED #3: Ctrl+V with no image in clipboard → text fallback', async () => {
   const { app, stdin } = makeApp()
   app.start()
-  setClipboardReader({ async readImage() { return null } })
+  setClipboardReader({ async readImage() { return null }, async readText() { return null } })
   ;(app as any).lastInputFocusAt = Date.now() - 2_000
 
   stdin.dataHandler!('\x16')

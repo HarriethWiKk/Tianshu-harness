@@ -225,7 +225,46 @@ describe('resolveToolPreset precedence', () => {
     }))
     __resetToolPresetForTest()
     assert.equal(resolveToolPreset(dir, 'changgeng'), 'taiyi')
-    assert.equal(resolveToolPreset(dir, 'taiyi'), 'frontend', '未配置的域不受影响')
+    assert.equal(resolveToolPreset(dir, 'pojun'), 'frontend', '未配置的域不受影响')
+  })
+
+  it('域内置默认：defaultDomain=taiyi 无任何配置落到 taiyi 档', () => {
+    // 隔离真实用户配置（本机 ~/.rivet/config.json 有 tools.preset，会先于域内置生效）
+    const home = mkdtempSync(join(tmpdir(), 'tool-preset-home-'))
+    const prevHome = process.env.RIVET_HOME
+    process.env.RIVET_HOME = home
+    try {
+      __resetToolPresetForTest()
+      assert.equal(resolveToolPreset(dir, 'taiyi'), 'taiyi')
+      // 无内置档的域不受波及
+      assert.equal(resolveToolPreset(dir, 'qiming'), 'frontend')
+      assert.equal(resolveToolPreset(dir), 'frontend')
+    } finally {
+      if (prevHome === undefined) delete process.env.RIVET_HOME
+      else process.env.RIVET_HOME = prevHome
+      rmSync(home, { recursive: true, force: true })
+      __resetToolPresetForTest()
+    }
+  })
+
+  it('域内置默认：RIVET_TOOL_PRESET env 覆盖 taiyi 域内置档', () => {
+    process.env.RIVET_TOOL_PRESET = 'full'
+    __resetToolPresetForTest()
+    assert.equal(resolveToolPreset(dir, 'taiyi'), 'full')
+  })
+
+  it('域内置默认：项目 tools.preset 覆盖 taiyi 域内置档', () => {
+    writeFileSync(join(dir, '.rivet-config.json'), JSON.stringify({ tools: { preset: 'minimal' } }))
+    __resetToolPresetForTest()
+    assert.equal(resolveToolPreset(dir, 'taiyi'), 'minimal')
+  })
+
+  it('域内置默认：runtime.domains.taiyi.toolPreset 配置覆盖 taiyi 域内置档', () => {
+    writeFileSync(join(dir, '.rivet-config.json'), JSON.stringify({
+      runtime: { domains: { taiyi: { toolPreset: 'full' } } },
+    }))
+    __resetToolPresetForTest()
+    assert.equal(resolveToolPreset(dir, 'taiyi'), 'full')
   })
 })
 

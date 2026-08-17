@@ -701,7 +701,12 @@ export function buildWindowsSelfUpdateScript(opts: {
     `if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }`,
     `function Write-Log { param([string]$m) Add-Content -Path $log -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $m" -ErrorAction SilentlyContinue }`,
     `Write-Log 'update start; waiting for parent process ${opts.pid}'`,
-    `try { Wait-Process -Id ${opts.pid} -Timeout 120 } catch { Write-Log "wait process failed: $($_.Exception.Message)"; exit 1 }`,
+    // Wait-Process 在 PID 已不存在时抛异常（"Cannot find a process with..."），
+    // 此前 catch 里 exit 1 导致 npm install 永远不执行——真实 /update 场景下
+    // rivet 进程在 spawn 后 400ms 就 process.exit 了，update.ps1 冷启动慢，
+    // 等它跑起来时 PID 早已不存在。PID 不存在 = 父进程已退出 = 可以开始装，
+    // 不应 exit；只有超时（进程还在但 120s 没退出）才是真异常。
+    `try { Wait-Process -Id ${opts.pid} -Timeout 120 } catch { Write-Log "parent process ${opts.pid} already exited; proceeding" }`,
     `Start-Sleep -Milliseconds 800`,
     `Write-Log "running npm install -g ${opts.packageName}@${opts.channel}"`,
     `$out = & ${npm} install -g ${opts.packageName}@${opts.channel} 2>&1`,
@@ -747,9 +752,20 @@ export function spawnWindowsSelfUpdate(root: string, channel: string, relaunch =
     logPath,
   })
   try {
+    // 把更新脚本写到一个 .ps1 文件，用 PowerShell 原生的 Start-Process 启动它。
+    // 此前用 spawn(detached:true)+powershell -Command 启动，但 Node 的 detached
+    // 在 Windows 上不可靠——父进程退出时分离的 PowerShell 子进程常常被连带终止
+    // （update.log 从未生成就是铁证）。Start-Process 是 Windows 原生的分离启动，
+    // 创建独立进程，父进程退出不影响它。.ps1 文件也避免了 -Command 内联的超长 +
+    // 转义问题。
+    const scriptPath = join(rivetHome(), 'update.ps1')
+    writeFileAtomicSync(scriptPath, script)
+    // 用一个极短的 PowerShell 调用 Start-Process 启动 update.ps1（隐藏窗口）。
+    // Start-Process 本身就是分离的——这个调用立即返回，update.ps1 独立运行。
+    const launcher = `Start-Process -FilePath '${powerShell}' -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','${scriptPath}' -WindowStyle Hidden`
     const child = spawn(
       powerShell,
-      ['-NoProfile', '-NonInteractive', '-Command', script],
+      ['-NoProfile', '-NonInteractive', '-Command', launcher],
       { detached: true, stdio: 'ignore', windowsHide: true },
     )
     child.unref()

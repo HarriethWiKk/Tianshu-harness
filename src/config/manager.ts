@@ -3,19 +3,65 @@ import { writeFileAtomicSync } from '../fs-atomic.js'
 import { resolve, join } from 'path'
 import { z } from 'zod'
 import { resolveProfileName, resolveProfileOverlay, resolveHookDisabledEnv } from './profile.js'
-import { configSchema, providerSchema, reviewConfigSchema, workersSchema, councilConfigSchema, editorSchema, mirrorsSchema, prDefaultsSchema, envSchema, uiSchema, permissionsSchema, networkSchema, fetchSchema, searchSchema, type Config, type ProviderConfig, type ModelConfig, type ReviewConfig, type WorkersConfig, type CouncilConfig, type EditorConfig, type MirrorsConfig, type PrDefaultsConfig, type UiConfig } from './schema.js'
+import { configSchema, providerBaseSchema, reviewConfigSchema, workersSchema, councilConfigSchema, editorSchema, mirrorsSchema, prDefaultsSchema, envSchema, uiSchema, permissionsSchema, networkSchema, fetchSchema, searchSchema, modelConfigSchema, type Config, type ProviderConfig, type ModelConfig, type ProviderCapabilitiesConfig, type ProviderAdvancedConfig, type ReviewConfig, type WorkersConfig, type CouncilConfig, type EditorConfig, type MirrorsConfig, type PrDefaultsConfig, type UiConfig } from './schema.js'
 import { DEFAULT_CONFIG } from './default.js'
 import { userConfigPath } from './paths.js'
 import { findPresetModel, isProviderPresetKey, type ProviderPresetKey } from './provider-presets.js'
 import { cloneResolvedPreset, resolvePreset } from '../api/pro-registry.js'
 import { backfillPresetModelFields } from './preset-model-backfill.js'
+import { writeSecret, readSecret, deleteSecret } from './secrets-store.js'
 import { invalidateToolPreset } from '../tools/tool-preset.js'
 import { invalidatePromptBlocks } from '../prompt/block-policy.js'
 import { validateRuntimeLeanSlice, type RuntimeLeanConfigSlice } from './runtime-lean.js'
 import { formatProviderCard, formatSuccess, formatError, formatMcpServerList, type FormatOpts } from './cli-format.js'
+import { formatZodError } from './format-zod-error.js'
 
 const APPROVAL_MODES = ['auto-safe', 'manual', 'auto-accept', 'dangerously-skip-permissions'] as const
 type ApprovalModeConfig = typeof APPROVAL_MODES[number]
+
+/**
+ * Config load failure (malformed JSON or schema violation). Always thrown —
+ * never silently downgraded to defaults, so a broken config surfaces at
+ * startup instead of distorting behavior (wrong contextWindow, lost keys).
+ */
+export class ConfigLoadError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'ConfigLoadError'
+  }
+}
+
+/** Convert a JSON.parse error position into 1-based line:column. */
+function lineColAt(text: string, position: number): string {
+  let line = 1
+  let col = 1
+  for (let i = 0; i < position && i < text.length; i++) {
+    if (text[i] === '\n') { line++; col = 1 } else col++
+  }
+  return `${line}:${col}`
+}
+
+/**
+ * Read + parse a config layer. Malformed JSON throws a ConfigLoadError with
+ * the file path and line:column (plus a terminal bell for attention) —
+ * falling back to defaults is forbidden.
+ */
+function readConfigJson(path: string): Record<string, unknown> {
+  const text = readFileSync(path, 'utf-8')
+  try {
+    const raw = JSON.parse(text)
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+      throw new ConfigLoadError(`\u0007配置文件 ${path} 顶层必须是 JSON 对象——拒绝回退默认配置，请修正后重试。`)
+    }
+    return raw as Record<string, unknown>
+  } catch (e) {
+    if (e instanceof ConfigLoadError) throw e
+    const detail = e instanceof Error ? e.message : String(e)
+    const posMatch = detail.match(/position (\d+)/)
+    const where = posMatch ? `（第 ${lineColAt(text, Number.parseInt(posMatch[1]!, 10))} 处）` : ''
+    throw new ConfigLoadError(`\u0007配置文件 ${path} JSON 解析失败${where}：${detail}——拒绝回退默认配置，请修正后重试。`)
+  }
+}
 
 export function getUserConfigPath(): string {
   return userConfigPath()
@@ -162,6 +208,92 @@ function migrateV4FlashEffort(raw: Record<string, unknown>): boolean {
 }
 
 /**
+ * One-shot migration: plaintext provider.apiKey values in config.json move
+ * into the 0600 secrets.json store, leaving only a keyRef pointer behind.
+ * Idempotent — providers already on keyRef (or without an inline key) are
+ * untouched. Mutates `raw` in place. Returns true if any value was changed.
+ */
+function migrateInlineApiKeys(raw: Record<string, unknown>): boolean {
+  const provider = raw.provider as Record<string, unknown> | undefined
+  const providers = provider?.providers as Record<string, unknown> | undefined
+  if (!providers) return false
+  let changed = false
+  for (const [name, entry] of Object.entries(providers)) {
+    if (!entry || typeof entry !== 'object') continue
+    const prov = entry as Record<string, unknown>
+    if (typeof prov.apiKey !== 'string' || prov.apiKey.length === 0) continue
+    if (prov.keyRef) continue
+    try {
+      writeSecret(name, prov.apiKey)
+    } catch {
+      continue // secrets write failed — keep the inline key rather than lose it
+    }
+    delete prov.apiKey
+    prov.keyRef = name
+    changed = true
+  }
+  return changed
+}
+
+/** PR#38 审查阻断 3：旧 capabilities 字段 supportsThinking/thinkingFormat 已从
+ *  schema 删除——zod strip 不报错，老用户显式写的配置静默丢失（thinking 行为
+ *  回弹）。加载期映射到新模型（幂等；thinkingBlock 已存在时不动——新字段优先）：
+ *  thinkingFormat 'anthropic' → thinkingBlock 'enabled'；'openai'/'none' → 'none'；
+ *  无 thinkingFormat 时按 supportsThinking 布尔落 'enabled'/'none'。 */
+function migrateLegacyCapabilities(raw: Record<string, unknown>): boolean {
+  const provider = raw.provider as Record<string, unknown> | undefined
+  const providers = provider?.providers as Record<string, unknown> | undefined
+  if (!providers) return false
+  let changed = false
+  for (const entry of Object.values(providers)) {
+    if (!entry || typeof entry !== 'object') continue
+    const caps = (entry as Record<string, unknown>).capabilities as Record<string, unknown> | undefined
+    if (!caps || typeof caps !== 'object') continue
+    const hasLegacy = 'supportsThinking' in caps || 'thinkingFormat' in caps
+    if (!hasLegacy) continue
+    if (caps.thinkingBlock === undefined) {
+      const fmt = caps.thinkingFormat
+      if (fmt === 'anthropic') caps.thinkingBlock = 'enabled'
+      else if (fmt === 'openai' || fmt === 'none') caps.thinkingBlock = 'none'
+      else if (caps.supportsThinking === true) caps.thinkingBlock = 'enabled'
+      else caps.thinkingBlock = 'none'
+    }
+    delete caps.supportsThinking
+    delete caps.thinkingFormat
+    changed = true
+  }
+  return changed
+}
+
+/** PR#38 审查阻断 2：旧 factory 按 `name === 'anthropic' || prefixCacheStrategy
+ *  === 'anthropic-cache-control'` 派发 AnthropicClient，且旧 schema 的 protocol
+ *  枚举只有 'openai'——存量自定义 provider 靠 prefixCache override 走 Anthropic
+ *  协议，新 factory 只看 protocol 会静默改走 OpenAI 客户端（且 cache_control
+ *  断点注进 OpenAI 请求，双重错协议）。加载期把该组合迁移为显式
+ *  protocol: 'anthropic'（幂等）。 */
+function migrateAnthropicProtocol(raw: Record<string, unknown>): boolean {
+  const provider = raw.provider as Record<string, unknown> | undefined
+  const providers = provider?.providers as Record<string, unknown> | undefined
+  if (!providers) return false
+  let changed = false
+  for (const entry of Object.values(providers)) {
+    if (!entry || typeof entry !== 'object') continue
+    const prov = entry as Record<string, unknown>
+    if (prov.protocol === 'anthropic') continue
+    // name === 'anthropic' 的条目由 schema preprocess 在内存注入协议——无需也不应
+    // 落盘（落盘会被 saveConfig 的可逆注入剥离逻辑再删掉，且旧枚举 schema 读取方
+    // （dsh/旧 rivet）会 zod 抛错）。
+    if (prov.name === 'anthropic') continue
+    const caps = prov.capabilities as Record<string, unknown> | undefined
+    if (caps?.prefixCache === 'anthropic-cache-control') {
+      prov.protocol = 'anthropic'
+      changed = true
+    }
+  }
+  return changed
+}
+
+/**
  * Load config with 3-layer resolution: user → project → session overlay.
  *
  * Priority (highest wins):
@@ -186,40 +318,37 @@ export function loadConfig(options?: {
   // Layer 2: user global config
   const configPath = getUserConfigPath()
   if (existsSync(configPath)) {
-    try {
-      const raw = JSON.parse(readFileSync(configPath, 'utf-8'))
-      const cpMigrated = migrateLegacyCheckpointInterval(raw as Record<string, unknown>)
-      const dsChanged = migrateDeepseekMaxTokens(cpMigrated)
-      const flashChanged = migrateV4FlashEffort(cpMigrated)
-      // Write back if any migration modified the raw config so the fix
-      // persists across restarts (one-shot, idempotent).
-      if (cpMigrated !== raw || dsChanged || flashChanged) {
-        try {
-          writeFileAtomicSync(configPath, JSON.stringify(cpMigrated, null, 2) + '\n')
-        } catch {
-          // best-effort — migration still applied in memory
-        }
+    const raw = readConfigJson(configPath)
+    const cpMigrated = migrateLegacyCheckpointInterval(raw)
+    const dsChanged = migrateDeepseekMaxTokens(cpMigrated)
+    const flashChanged = migrateV4FlashEffort(cpMigrated)
+    const keysMoved = migrateInlineApiKeys(cpMigrated)
+    const capsChanged = migrateLegacyCapabilities(cpMigrated)
+    const protoChanged = migrateAnthropicProtocol(cpMigrated)
+    // Write back if any migration modified the raw config so the fix
+    // persists across restarts (one-shot, idempotent).
+    if (cpMigrated !== raw || dsChanged || flashChanged || keysMoved || capsChanged || protoChanged) {
+      try {
+        writeFileAtomicSync(configPath, JSON.stringify(cpMigrated, null, 2) + '\n')
+      } catch {
+        // best-effort — migration still applied in memory
       }
-      base = deepMerge(base, cpMigrated)
-    } catch {
-      // malformed user config — fall through to defaults
     }
+    base = deepMerge(base, cpMigrated)
   }
 
   // Layer 3: project config
   const projectPath = options?.projectConfigPath
     ?? (options?.cwd ? findProjectConfig(options.cwd) : undefined)
   if (projectPath && existsSync(projectPath)) {
-    try {
-      const raw = JSON.parse(readFileSync(projectPath, 'utf-8'))
-      const cpMigrated = migrateLegacyCheckpointInterval(raw as Record<string, unknown>)
-      migrateDeepseekMaxTokens(cpMigrated)
-      migrateV4FlashEffort(cpMigrated)
-      // NOTE: no write-back for project configs — they may be version-controlled.
-      base = deepMerge(base, cpMigrated)
-    } catch {
-      // malformed project config — skip
-    }
+    const raw = readConfigJson(projectPath)
+    const cpMigrated = migrateLegacyCheckpointInterval(raw)
+    migrateDeepseekMaxTokens(cpMigrated)
+    migrateV4FlashEffort(cpMigrated)
+    migrateLegacyCapabilities(cpMigrated)
+    migrateAnthropicProtocol(cpMigrated)
+    // NOTE: no write-back for project configs — they may be version-controlled.
+    base = deepMerge(base, cpMigrated)
   }
 
   // Layer 3.5: profile overlay（RIVET_PROFILE env / --profile flag，见 profile.ts）。
@@ -246,6 +375,25 @@ export function loadConfig(options?: {
         if (entry && typeof entry === 'object' && !(entry as Record<string, unknown>).name) {
           (entry as Record<string, unknown>).name = key
         }
+        // userSaved 打标（PR#38 审查阻断 1 修复）：非内置名的 provider 只能来自
+        // 用户配置层 → 直接打标。内置名条目可能是快照伪影——saveConfig 会把合并
+        // 后的全量 providers（含 15 个未配置预设）落进用户 config.json，名字启发式
+        // 会让老用户的内置名条目永远拿不到标记（/model 切换器清零），而「层里出现
+        // 即打标」又会让快照伪影全员进切换器。判据：凭证或接入点超出默认预设——
+        // keyRef（只有用户写入产生）/ 项目层未迁移的 apiKey / 非默认的 apiKeyEnv
+        // （预设自带 DEEPSEEK_API_KEY 等，同名不算）/ baseUrl 偏离预设。
+        if (entry && typeof entry === 'object') {
+          const e = entry as Record<string, unknown>
+          if (!(key in DEFAULT_CONFIG.provider.providers)) {
+            e.userSaved = true
+          } else {
+            const def = (DEFAULT_CONFIG.provider.providers as Record<string, { baseUrl?: string; apiKeyEnv?: string }>)[key]
+            const hasCredential = Boolean(e.keyRef) || Boolean(e.apiKey)
+              || (typeof e.apiKeyEnv === 'string' && e.apiKeyEnv !== def?.apiKeyEnv)
+            const repointed = typeof e.baseUrl === 'string' && typeof def?.baseUrl === 'string' && e.baseUrl !== def.baseUrl
+            if (hasCredential || repointed) e.userSaved = true
+          }
+        }
       }
     }
   }
@@ -254,7 +402,24 @@ export function loadConfig(options?: {
   // deepMerge replaced the array wholesale above — so preset fields added later
   // (e.g. supportsVision) are missing from every config already on disk. Refill
   // the absent ones here; see preset-model-backfill.ts for the scope limits.
-  return backfillPresetModelFields(configSchema.parse(base))
+  const parsed = configSchema.safeParse(base)
+  if (!parsed.success) {
+    // 绝不回退默认——校验失败说明用户配置里有真实错误，静默降级会让错误
+    // 一直藏着（错误的 contextWindow 直接扭曲压缩行为）。
+    const sources = [configPath, ...(projectPath ? [projectPath] : [])].join(' / ')
+    throw new ConfigLoadError(`${formatZodError(parsed.error, 'rivet')}\n涉及的配置文件：${sources}`)
+  }
+  const config = backfillPresetModelFields(parsed.data)
+  // Materialize keyRef secrets into in-memory apiKey — runtime consumers read
+  // provider.apiKey in ~10 places; disk never sees this value (saveConfig
+  // strips it back out for keyRef providers).
+  for (const provider of Object.values(config.provider.providers)) {
+    if (provider.keyRef && !provider.apiKey) {
+      const secret = readSecret(provider.keyRef)
+      if (secret) provider.apiKey = secret
+    }
+  }
+  return config
 }
 
 /** Load config with backward-compatible signature (no options). */
@@ -263,7 +428,22 @@ export function loadConfigDefault(): Config {
 }
 
 export function saveConfig(config: Config): void {
-  writeFileAtomicSync(getUserConfigPath(), JSON.stringify(config, null, 2) + '\n')
+  // provider.apiKey is a runtime-only materialized value. Persisted provider
+  // credentials must be either keyRef or apiKeyEnv; config.json never receives
+  // plaintext API keys, including legacy objects that have no keyRef yet.
+  const toWrite = structuredClone(config)
+  for (const provider of Object.values(toWrite.provider.providers)) {
+    provider.apiKey = undefined
+    // name === 'anthropic' 的 protocol:'anthropic' 是 providerSchema preprocess 的
+    // 可逆注入值（磁盘无该字段时读取侧自动补齐）——写盘前剥掉，使 config.json
+    // 对旧枚举（'openai'-only）schema 的读取方保持兼容（dsh/旧 rivet 每次
+    // loadConfig 都会 zod 抛错，实证：hook 拦截 bash 通道）。显式写 'openai'
+    // 的条目不受影响；自定义名的 protocol:'anthropic' 是真语义，保留。
+    if (provider.name === 'anthropic' && provider.protocol === 'anthropic') {
+      delete (provider as unknown as { protocol?: string }).protocol
+    }
+  }
+  writeFileAtomicSync(getUserConfigPath(), JSON.stringify(toWrite, null, 2) + '\n')
 }
 
 // --- P2 hook 装配配置面（list-hooks / set-hook-disabled）---
@@ -316,9 +496,24 @@ export function addProvider(name: string, config: ProviderConfig): void {
   saveConfig(cfg)
 }
 
-export function removeProvider(name: string): void {
+export interface RemoveProviderResult {
+  name: string
+  /** 被删除条目携带的模型数（整组删除的规模）。 */
+  modelCount: number
+  /** 条目指向 secrets.json 的引用；keyless/inline/env 条目为 undefined。 */
+  keyRef?: string
+  /** 是否清理了指向被删 provider 的 agent.defaultModel。 */
+  defaultModelCleared: boolean
+  /** 是否已从 secrets.json 删除对应密钥。 */
+  secretDeleted: boolean
+  /** 其他 provider 仍引用同一 keyRef 时列出——密钥因此保留。 */
+  keyRefSharedWith: string[]
+}
+
+export function removeProvider(name: string, options?: { keepSecret?: boolean }): RemoveProviderResult {
   const cfg = loadConfig()
-  if (!cfg.provider.providers[name]) {
+  const entry = cfg.provider.providers[name]
+  if (!entry) {
     throw new Error(
       `Provider "${name}" not found. Available: ${Object.keys(cfg.provider.providers).join(', ')}`,
     )
@@ -331,8 +526,24 @@ export function removeProvider(name: string): void {
   if (cfg.provider.default === name) {
     throw new Error(`Cannot remove default provider "${name}". Set a different default first.`)
   }
+  const keyRef = entry.keyRef
+  const modelCount = entry.models.length
+  const defaultModelCleared = cfg.agent.defaultModel?.startsWith(`${name}:`) ?? false
+  if (defaultModelCleared) delete cfg.agent.defaultModel
   delete cfg.provider.providers[name]
   saveConfig(cfg)
+
+  // 一个 key 对应一个模型组：条目删除即整组删除，密钥随之清除（否则成孤儿）。
+  // 仍被其他 provider 引用的 keyRef 保留——手改配置共享 keyRef 的场景合法存在。
+  let secretDeleted = false
+  const keyRefSharedWith = keyRef
+    ? Object.entries(cfg.provider.providers).filter(([, p]) => p.keyRef === keyRef).map(([n]) => n)
+    : []
+  if (keyRef && !options?.keepSecret && keyRefSharedWith.length === 0 && readSecret(keyRef) !== undefined) {
+    deleteSecret(keyRef)
+    secretDeleted = true
+  }
+  return { name, modelCount, keyRef, defaultModelCleared, secretDeleted, keyRefSharedWith }
 }
 
 export function setDefaultProvider(name: string): void {
@@ -778,10 +989,10 @@ export function setDeliveryConfig(input: { autoCommit?: unknown }): DeliveryConf
   return { autoCommit: cfg.agent.delivery?.autoCommit !== false }
 }
 
-// --- Tool preset (minimal/frontend/full, session-start assembly tier) ---
+// --- Tool preset (minimal/frontend/full/taiyi, session-start assembly tier) ---
 
 export interface ToolPresetConfigSnapshot {
-  preset: 'minimal' | 'frontend' | 'full'
+  preset: 'minimal' | 'frontend' | 'full' | 'taiyi'
 }
 
 const TOOL_PRESETS = new Set(['minimal', 'frontend', 'full', 'taiyi'])
@@ -800,7 +1011,7 @@ export function setToolPresetConfig(input: { preset?: unknown }): ToolPresetConf
   const cfg = loadConfig()
   if (input.preset !== undefined) {
     if (typeof input.preset !== 'string' || !TOOL_PRESETS.has(input.preset)) {
-      throw new Error(`preset must be one of: minimal | frontend | full`)
+      throw new Error(`preset must be one of: minimal | frontend | full | taiyi`)
     }
     cfg.tools.preset = input.preset as ToolPresetConfigSnapshot['preset']
   }
@@ -1107,6 +1318,95 @@ export function setVisionModelConfig(
   return parsed
 }
 
+export interface RegisterVisionModelConfigOptions {
+  providerName: string
+  baseUrl: string
+  apiKey?: string
+  apiKeyEnv?: string
+  modelId: string
+}
+
+/**
+ * Register an image-analysis-only provider and select it as the vision bridge in
+ * one config write. The primary provider/default model are deliberately left
+ * untouched; this entry is consumed only through agent.visionModel.
+ */
+export function registerVisionModelConfig(
+  options: RegisterVisionModelConfigOptions,
+): VisionModelConfigSnapshot {
+  const providerName = z.string().trim().min(1).parse(options.providerName)
+  const modelId = z.string().trim().min(1).parse(options.modelId)
+  const apiKey = options.apiKey?.trim()
+  const apiKeyEnv = options.apiKeyEnv?.trim()
+  if (apiKey && apiKeyEnv) {
+    throw new Error('Vision provider credentials must use either apiKey or apiKeyEnv, not both.')
+  }
+  if (options.apiKey !== undefined && !apiKey) throw new Error('Vision provider apiKey must not be blank.')
+  if (options.apiKeyEnv !== undefined && !apiKeyEnv) throw new Error('Vision provider apiKeyEnv must not be blank.')
+  assertValidUrl(options.baseUrl)
+
+  const model = modelConfigSchema.parse({ id: modelId, maxTokens: 1024, supportsVision: true })
+  const vision = visionModelConfigSchema.parse({ provider: providerName, model: modelId, maxTokens: 1024 })
+  const provider: ProviderConfig = {
+    name: providerName,
+    ...(apiKey ? { keyRef: providerName } : {}),
+    ...(apiKeyEnv ? { apiKeyEnv } : {}),
+    baseUrl: options.baseUrl,
+    protocol: 'openai',
+    capabilities: {},
+    thinking: 'enabled',
+    maxTokens: 1024,
+    allowProFallback: false,
+    models: [model],
+    unsupported: [],
+    userSaved: true,
+  }
+
+  const cfg = loadConfig()
+  const existing = cfg.provider.providers[providerName]
+  if (providerName === cfg.provider.default) {
+    throw new Error(`Vision provider "${providerName}" cannot replace the default provider.`)
+  }
+  if (existing && !isCompatibleVisionProvider(cfg, existing, providerName, options.baseUrl, apiKey, apiKeyEnv)) {
+    throw new Error(`Provider "${providerName}" is not a compatible dedicated vision provider.`)
+  }
+
+  const previousProvider = existing
+  const previousVision = cfg.agent.visionModel
+  cfg.provider.providers[providerName] = provider
+  cfg.agent.visionModel = vision
+  saveConfig(cfg)
+  try {
+    if (apiKey) writeSecret(providerName, apiKey)
+  } catch (error) {
+    if (previousProvider) cfg.provider.providers[providerName] = previousProvider
+    else delete cfg.provider.providers[providerName]
+    if (previousVision) cfg.agent.visionModel = previousVision
+    else delete (cfg.agent as Record<string, unknown>).visionModel
+    try {
+      saveConfig(cfg)
+    } catch {
+      // Preserve the original secret-write error; a failed rollback is actionable from config state.
+    }
+    throw error
+  }
+  return vision
+}
+
+function isCompatibleVisionProvider(
+  cfg: Config,
+  existing: ProviderConfig,
+  providerName: string,
+  baseUrl: string,
+  apiKey: string | undefined,
+  apiKeyEnv: string | undefined,
+): boolean {
+  if (cfg.agent.visionModel?.provider !== providerName || existing.baseUrl !== baseUrl) return false
+  if (apiKeyEnv) return existing.apiKeyEnv === apiKeyEnv
+  if (apiKey) return existing.keyRef === providerName && existing.apiKey === apiKey
+  return !existing.keyRef && !existing.apiKeyEnv
+}
+
 /**
  * 校验 provider 在 provider.providers 里存在、且该 provider 下有指定 model。
  * 与 setDefaultModelConfig 的内联校验同构，抽出复用给 vision 主桥/fallback。
@@ -1242,10 +1542,14 @@ export function setUiConfig(input: { theme?: unknown }): UiConfig {
 }
 
 export function setApiKey(providerName: string, key: string): void {
+  // 先校验 provider 存在再写 secret——顺序反了会对不存在的 provider 留孤儿密钥
+  // （无任何 config 条目引用它，removeProvider 也清不到）。
   const cfg = loadConfig()
   const provider = cfg.provider.providers[providerName]
   if (!provider) throw new Error(`Provider "${providerName}" not found`)
-  provider.apiKey = key
+  writeSecret(providerName, key)
+  provider.keyRef = providerName
+  ;(provider as unknown as { apiKey?: string | null }).apiKey = null
   ;(provider as unknown as { apiKeyEnv?: string | null }).apiKeyEnv = null
   saveConfig(cfg)
 }
@@ -1256,12 +1560,15 @@ export function setApiKeyEnv(providerName: string, envVar: string): void {
   if (!provider) throw new Error(`Provider "${providerName}" not found`)
   provider.apiKeyEnv = envVar
   ;(provider as unknown as { apiKey?: string | null }).apiKey = null
+  ;(provider as unknown as { keyRef?: string | null }).keyRef = null
   saveConfig(cfg)
 }
 
 export function getApiKeyStatus(providerName: string): { source: 'inline' | 'env' | 'none'; ref: string } {
   const provider = getProvider(providerName)
   if (!provider) return { source: 'none', ref: '' }
+  // keyRef-backed secret: loadConfig materializes it into provider.apiKey, so
+  // this branch also reports the masked tail of the secrets-store value.
   if (provider.apiKey) return { source: 'inline', ref: '***' + provider.apiKey.slice(-4) }
   if (provider.apiKeyEnv && process.env[provider.apiKeyEnv]) {
     return { source: 'env', ref: provider.apiKeyEnv }
@@ -1283,8 +1590,12 @@ export interface SetupProviderOptions {
   apiKeyEnv?: string
   baseUrl?: string
   model?: ModelConfig
+  /** 批量模型回填（免密钥 preset 探测路径）——每项走与 model 相同的合并语义。 */
+  models?: Array<Partial<ModelConfig> & { id: string }>
   makeDefault?: boolean
   allowProFallback?: boolean
+  /** Advanced knobs (timeout/retry/temperature/proxy) — undefined = untouched. */
+  advanced?: ProviderAdvancedConfig
 }
 
 function assertValidUrl(value: string): void {
@@ -1352,6 +1663,7 @@ export function upsertProviderModel(providerName: string, model: ModelConfig, op
     const preferred = provider.models.splice(preferredIndex, 1)[0]
     if (preferred) provider.models.unshift(preferred)
   }
+  provider.userSaved = true
   saveConfig(cfg)
 }
 
@@ -1363,8 +1675,42 @@ export function setProviderAllowProFallback(providerName: string, allowProFallba
   saveConfig(cfg)
 }
 
+/**
+ * Write advanced knobs field-by-field. `!== undefined` guards are load-bearing:
+ * `maxRetries: 0` and `temperature: 0` are legal values a truthy check would drop.
+ */
+function applyAdvancedConfig(target: ProviderConfig, advanced?: ProviderAdvancedConfig): void {
+  if (!advanced) return
+  if (advanced.requestTimeoutMs !== undefined) target.requestTimeoutMs = advanced.requestTimeoutMs
+  if (advanced.maxRetries !== undefined) target.maxRetries = advanced.maxRetries
+  if (advanced.temperature !== undefined) target.temperature = advanced.temperature
+  if (advanced.proxy !== undefined) target.proxy = advanced.proxy
+}
+
+/** Persist the config first; a failed secret write must not leave a dangling keyRef. */
+function saveProviderConfigWithSecret(config: Config, previousConfig: Config, keyRef?: string, apiKey?: string): void {
+  saveConfig(config)
+  if (!keyRef || !apiKey) return
+  try {
+    writeSecret(keyRef, apiKey)
+  } catch (error) {
+    try {
+      saveConfig(previousConfig)
+    } catch (rollbackError) {
+      throw new Error(
+        `Failed to save API key and could not restore the previous configuration: ${
+          rollbackError instanceof Error ? rollbackError.message : String(rollbackError)
+        }`,
+        { cause: error },
+      )
+    }
+    throw error
+  }
+}
+
 export function setupProvider(options: SetupProviderOptions): void {
   const cfg = loadConfig()
+  const previousConfig = structuredClone(cfg)
   const presetKey = options.preset ?? (resolvePreset(options.providerName) ? options.providerName : undefined)
   const current = cfg.provider.providers[options.providerName]
   const base = presetKey ? cloneResolvedPreset(presetKey) : current
@@ -1377,12 +1723,14 @@ export function setupProvider(options: SetupProviderOptions): void {
     next.baseUrl = options.baseUrl
   }
   if (options.apiKey) {
-    next.apiKey = options.apiKey
+    next.keyRef = options.providerName
+    ;(next as unknown as { apiKey?: string | null }).apiKey = null
     ;(next as unknown as { apiKeyEnv?: string | null }).apiKeyEnv = null
   }
   if (options.apiKeyEnv) {
     next.apiKeyEnv = options.apiKeyEnv
     ;(next as unknown as { apiKey?: string | null }).apiKey = null
+    ;(next as unknown as { keyRef?: string | null }).keyRef = null
   }
   if (options.model) {
     const model = clampModelTokens(options.model)
@@ -1393,35 +1741,63 @@ export function setupProvider(options: SetupProviderOptions): void {
     if (existing) next.models[existingIndex] = mergeModelUpdate(existing, model)
     else next.models.unshift(model)
   }
+  if (options.models) {
+    for (const raw of options.models) {
+      const model = clampModelTokens(modelConfigSchema.parse(raw))
+      const existingIndex = next.models.findIndex(item => item.id === model.id || (model.alias !== undefined && item.alias === model.alias))
+      const existing = existingIndex >= 0 ? next.models[existingIndex] : undefined
+      if (existing) next.models[existingIndex] = mergeModelUpdate(existing, model)
+      else next.models.push(model)
+    }
+  }
   cfg.provider.providers[options.providerName] = next
+  next.userSaved = true
   if (options.makeDefault) cfg.provider.default = options.providerName
   if (options.allowProFallback !== undefined) {
     next.allowProFallback = options.allowProFallback
   }
-  saveConfig(cfg)
+  applyAdvancedConfig(next, options.advanced)
+  saveProviderConfigWithSecret(cfg, previousConfig, options.apiKey ? options.providerName : undefined, options.apiKey)
 }
 
-export interface SetupCustomProviderOptions {
+export interface RegisterProviderOptions {
   providerName: string
   baseUrl: string
   /** API key — optional for local deployments (Ollama/vLLM) that need no auth. */
   apiKey?: string
-  model: { id: string; alias?: string; contextWindow: number; maxTokens: number; reasoningEffort?: ModelConfig['reasoningEffort']; supportsVision?: boolean }
+  /** Env var name holding the API key. */
+  apiKeyEnv?: string
+  /** Wire protocol of the endpoint. Default 'openai'. */
+  protocol?: 'openai' | 'anthropic'
+  /** Capability overrides; omitted fields fall through to catalog defaults. */
+  capabilities?: ProviderCapabilitiesConfig
+  /** Model list — may be empty (probe-filled later) or multi-model. Each entry
+   *  is normalized through modelConfigSchema (contextWindow inference +
+   *  maxTokens clamping), so partial backfills from the matcher are safe. */
+  models?: Array<Partial<ModelConfig> & { id: string }>
   makeDefault?: boolean
   allowProFallback?: boolean
-  /** 显式声明慢思考端点（更长超时窗口）；undefined = 按名称/baseUrl 启发式。 */
+  /** Advanced knobs (timeout/retry/temperature/proxy) — undefined = untouched. */
+  advanced?: ProviderAdvancedConfig
+  /** Overwrite an existing entry. Without this flag a same-name write throws —
+   *  silent overwrites used to lose baseUrl/key/models. */
+  force?: boolean
+  /** Explicitly mark a slow-thinking endpoint; undefined keeps name/baseUrl heuristics. */
   slowThinking?: boolean
 }
 
 /**
- * Create (or overwrite) a brand-new OpenAI-compatible provider from the minimal
- * inputs the in-TUI /connect DIY wizard collects. Unlike `setupProvider`, this
- * does not require an existing entry or a built-in preset — it materializes a
- * complete `ProviderConfig` with conservative capability defaults (no vendor
- * prefix-cache assumptions, no param stripping) so any OpenAI-wire endpoint
- * works out of the box.
+ * Unified provider write core — the single function that materializes a
+ * ProviderConfig from scratch. Consumed by the CLI (`rivet provider add`),
+ * the desktop HTTP routes, and the in-TUI /connect wizard. Unlike
+ * `setupProvider`, this does not require an existing entry or a built-in
+ * preset; capabilities left undeclared fall through to DEFAULT_CAPABILITIES
+ * in `resolveCapabilities`.
  */
-export function setupCustomProvider(options: SetupCustomProviderOptions): void {
+export function registerProvider(options: RegisterProviderOptions): void {
+  if (options.apiKey && options.apiKeyEnv) {
+    throw new Error('Provider credentials must use either apiKey or apiKeyEnv, not both.')
+  }
   // 自定义 provider 拒绝内置预设名：撞名条目在列表里显示预设 label、删除时曾
   // 被预设名拦截（历史死锁）。想覆盖预设行为请走 setupProvider
   // （POST /config/providers，克隆预设后覆盖字段）。
@@ -1432,49 +1808,37 @@ export function setupCustomProvider(options: SetupCustomProviderOptions): void {
     )
   }
   assertValidUrl(options.baseUrl)
-  // 同名 provider 已存在时禁止静默覆盖——用户应通过 edit 路径修改已有 provider，
-  // 避免意外丢失 baseUrl/key/models 配置。
   const existing = loadConfig().provider.providers[options.providerName]
-  if (existing) {
+  if (existing && !options.force) {
     throw new Error(
       `Provider "${options.providerName}" already exists. ` +
       `Use "rivet config set-url ${options.providerName} <url>" or ` +
-      `"rivet config setup ${options.providerName}" to edit it, or delete it first.`,
+      `"rivet config setup ${options.providerName}" to edit it, or delete it first ` +
+      `(pass --force to overwrite).`,
     )
   }
-  const contextWindow = Math.max(1, Math.floor(options.model.contextWindow))
-  const maxTokens = Math.max(1, Math.min(Math.floor(options.model.maxTokens), contextWindow))
-  const model: ModelConfig = {
-    id: options.model.id,
-    ...(options.model.alias ? { alias: options.model.alias } : {}),
-    contextWindow,
-    maxTokens,
-    ...(options.model.reasoningEffort ? { reasoningEffort: options.model.reasoningEffort } : {}),
-    ...(options.model.supportsVision ? { supportsVision: true } : {}),
-  }
+  const models = (options.models ?? []).map(raw => modelConfigSchema.parse(raw))
   const provider: ProviderConfig = {
     name: options.providerName,
-    ...(options.apiKey ? { apiKey: options.apiKey } : {}),
+    ...(options.apiKey ? { keyRef: options.providerName } : {}),
+    ...(options.apiKeyEnv ? { apiKeyEnv: options.apiKeyEnv } : {}),
     baseUrl: options.baseUrl,
-    protocol: 'openai',
-    capabilities: {
-      cacheControl: false,
-      stripParams: [],
-      toolJsonBug: false,
-      prefixCache: 'none',
-      prefixCompletion: false,
-    },
+    protocol: options.protocol ?? 'openai',
+    capabilities: options.capabilities ?? {},
     thinking: 'enabled',
-    maxTokens,
+    maxTokens: models.reduce((max, m) => Math.max(max, m.maxTokens), 64_000),
     allowProFallback: options.allowProFallback ?? false,
     ...(options.slowThinking !== undefined ? { slowThinking: options.slowThinking } : {}),
-    models: [model],
+    models,
     unsupported: [],
+    userSaved: true,
   }
+  applyAdvancedConfig(provider, options.advanced)
   const cfg = loadConfig()
+  const previousConfig = structuredClone(cfg)
   cfg.provider.providers[options.providerName] = provider
   if (options.makeDefault) cfg.provider.default = options.providerName
-  saveConfig(cfg)
+  saveProviderConfigWithSecret(cfg, previousConfig, options.apiKey ? options.providerName : undefined, options.apiKey)
 }
 
 /**
@@ -1497,7 +1861,7 @@ export function updateProviderTunables(providerName: string, fields: Record<stri
   const provider = cfg.provider.providers[providerName]
   if (!provider) throw new Error(`Provider "${providerName}" not found`)
 
-  const shape = providerSchema.shape as Record<string, z.ZodTypeAny>
+  const shape = providerBaseSchema.shape as Record<string, z.ZodTypeAny>
   for (const [key, value] of Object.entries(fields)) {
     if (!(TUNABLE_FIELD_KEYS as readonly string[]).includes(key)) {
       throw new Error(`Unknown tunable field "${key}". Allowed: ${TUNABLE_FIELD_KEYS.join(', ')}`)
@@ -1529,6 +1893,7 @@ export function addModel(providerName: string, model: ModelConfig): void {
   const provider = cfg.provider.providers[providerName]
   if (!provider) throw new Error(`Provider "${providerName}" not found`)
   provider.models.push(model)
+  provider.userSaved = true
   saveConfig(cfg)
 }
 
@@ -1570,7 +1935,6 @@ export interface ConfigCliIO {
   stdout?: (line: string) => void
   stderr?: (line: string) => void
   exit?: (code: number) => void
-  runWizard?: () => Promise<void>
 }
 
 function cliOut(io: ConfigCliIO, line: string): void {
@@ -1608,6 +1972,8 @@ function printConfigHelp(io: ConfigCliIO): void {
 
 Usage: rivet config <command>
 
+Interactive provider setup: start rivet and use /connect.
+
 Commands:
   show                         Show full config (JSON)
   providers                    List providers with key status
@@ -1631,7 +1997,7 @@ Commands:
   add-model <p> <id> [ctx] [max] [--vision]  Add model to provider (--vision marks it vision-capable)
   set-model-vision <p> <m> <on|off>  Toggle vision support on a stored model
   remove-model <p> <id>        Remove model from provider
-  remove-provider <name>       Remove a custom provider (presets cannot be removed)
+  remove-provider <name>       Remove a provider (default provider cannot be removed)
   mcp                          MCP server management
 
 Examples:
@@ -1653,28 +2019,40 @@ Examples:
   rivet config mcp add-stdio fs npx -y @modelcontextprotocol/server-filesystem /tmp`)
 }
 
+/** Mask every credential in a config snapshot for display (`config show`).
+ *  provider.apiKey may be a secrets-store value materialized by loadConfig. */
+function maskKey(value: string | undefined): string | undefined {
+  if (!value) return value
+  return '***' + value.slice(-4)
+}
+
+export function maskConfigSecrets(config: Config): Config {
+  const masked = structuredClone(config)
+  for (const provider of Object.values(masked.provider.providers)) {
+    provider.apiKey = maskKey(provider.apiKey)
+  }
+  const search = masked.search
+  if (search) {
+    search.bochaApiKey = maskKey(search.bochaApiKey)
+    search.braveApiKey = maskKey(search.braveApiKey)
+    search.tavilyApiKey = maskKey(search.tavilyApiKey)
+  }
+  return masked
+}
+
 export async function runConfigCLI(args: string[], io: ConfigCliIO = {}): Promise<void> {
   const cmd = args[0]
   const useColor = io.isTTY ?? (process.stdout.isTTY ?? false)
   const fmtOpts: FormatOpts = { useColor, width: 80 }
   try {
     if (!cmd) {
-      const isTTY = io.isTTY ?? process.stdin.isTTY
-      if (isTTY) {
-        if (io.runWizard) await io.runWizard()
-        else {
-          const { runProviderConfigWizard } = await import('./provider-wizard.js')
-          await runProviderConfigWizard({ write: line => cliOut(io, line) })
-        }
-        return
-      }
       printConfigHelp(io)
       return
     }
 
     switch (cmd) {
       case 'show':
-        cliOut(io, JSON.stringify(loadConfig(), null, 2))
+        cliOut(io, JSON.stringify(maskConfigSecrets(loadConfig()), null, 2))
         break
 
       case 'providers': {

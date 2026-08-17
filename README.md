@@ -106,7 +106,7 @@ Add-Content $PROFILE ". C:\path\to\rivet.ps1"
 
 ### 4. 配置 API Key（首次必做）
 
-**直接安装的用户无需手动配置**——首次启动会自动进入引导，粘贴 DeepSeek key 即可：桌面端是连接向导，CLI 首启缺 key 时也会自动弹出配置向导。之后随时修改：桌面端 Settings → Provider，CLI 里 `rivet config`。
+**直接安装的用户无需手动配置**——首次运行 `rivet` 会先进入主界面，再自动打开 `/connect`；在那里选择服务商并完成认证。之后随时输入 `/connect` 添加或调整 Provider；桌面端也可在 Settings → Provider 管理配置。
 
 **开发者拉源码启动**（或想在启动前预先配好）才需要手动来：
 
@@ -155,7 +155,7 @@ rivet --goal "修复所有类型错误" --budget 50   # 无头目标自主模式
 | `--skip-welcome` | 跳过欢迎屏 |
 | `--stream-events <path>` | 把本次 run 镜像为 NDJSON `SessionEvent` 写入文件 |
 
-子命令：`rivet config`（交互式配置）、`rivet serve`（启动 sidecar HTTP/SSE）、`rivet sessions`（列会话）、`rivet logs`（日志落点）、`rivet browser status` / `rivet browser install [--no-mirror]`（`browser_debug` 所需 chromium 的体检与一键安装，默认走国内镜像）。
+子命令：`rivet config`（查看配置命令帮助；交互式 Provider 配置使用 TUI `/connect`）、`rivet serve`（启动 sidecar HTTP/SSE）、`rivet sessions`（列会话）、`rivet logs`（日志落点）、`rivet browser status` / `rivet browser install [--no-mirror]`（`browser_debug` 所需 chromium 的体检与一键安装，默认走国内镜像）。
 
 ### 自动更新
 
@@ -178,7 +178,8 @@ rivet --goal "修复所有类型错误" --budget 50   # 无头目标自主模式
 会话内用 `/model <name>` 随时切换提供商。
 
 ```bash
-rivet config                          # 交互式设置（TTY）
+rivet                                 # 启动 TUI；首次缺 key 时自动打开 /connect
+rivet config                          # 查看配置命令帮助
 rivet config setup codex --default    # Codex 走 OAuth（首次浏览器登录）
 rivet config show                     # 查看完整配置
 ```
@@ -208,6 +209,10 @@ rivet config show                     # 查看完整配置
 图片能不能进模型看**主控模型**的能力：声明 `supportsVision` 的直接看图；不支持的，配一个识图桥（`agent.visionModel`）把图先换成文字描述；两者都没有则图片被丢弃——且会明说（TUI 给警告，截图工具的结果文字里写明"该附件已被丢弃，改用 `observe`/`extract`/`eval` 读 DOM"），不让模型凭"我截了图"断言渲染正常。
 
 内置能直接看图的模型：`glm-5.2`（glm / ccswitch）、`MiniMax-M3`（minimax）、`zai-org/GLM-5.2`（siliconflow）、`gpt-5.5`（codex）。**默认的 `deepseek-v4-pro` 不支持**，用 DeepSeek 当主控就需要桥。
+
+需要添加新的视觉 endpoint 时，在 TUI 输入 `/vision`。它会从 endpoint 的 `/models` 获取候选，只允许选择刚发现的模型，并对所选模型发送一次真实图片验证；验证成功后才保存专用视觉 Provider，不会替换默认 Provider 或进入普通模型路由。inline API key 只写入 `secrets.json`，环境变量方式只保存变量名。
+
+如果视觉 Provider 已经配置好，再使用 `/config` 或桌面 Settings → 集成 → 识图模型从已有 `supportsVision` 模型中选择即可。
 
 ```jsonc
 {
@@ -370,13 +375,14 @@ DeepSeek 对缓存未命中收取 50× 费用。天枢的提示词引擎围绕�
 
 ### 工具集与 preset
 
-天枢内置 50 个工具，按 preset 分档装配（解析优先级：`RIVET_TOOL_PRESET` 环境变量 > 项目 `.rivet-config.json` 的 `tools.preset` > 用户 `~/.rivet/config.json` > 默认 `minimal`）：
+天枢内置 50 个工具，按 preset 分档装配（解析优先级：`RIVET_TOOL_PRESET` 环境变量 > 项目 `.rivet-config.json` 的 `tools.preset` > 项目/用户 `runtime.domains.<域>.toolPreset` 按域覆盖 > 星域内置默认档（太一域→taiyi）> 默认 `frontend`）：
 
 | Preset | 工具数 | 说明 |
 |--------|--------|------|
-| **minimal**（默认） | 29 | 日常开发全能力——读写/检索/bash/git/测试/委托/web/计划/todo/memory，省 token、保 prefix cache |
-| **frontend** | 30 | minimal + `browser_debug`（UI 渲染验证闭环） |
+| **minimal** | 29 | 日常开发全能力——读写/检索/bash/git/测试/委托/web/计划/todo/memory，省 token、保 prefix cache |
+| **frontend**（默认） | 30 | minimal + `browser_debug`（UI 渲染验证闭环） |
 | **full** | 50 | 全集，含 `council_convene` / `team_orchestrate` / `attack_case` / `semantic_search` / `repo_graph` / `monitor` / `computer_use` / `capability` / `cli_discover` / 办公工具族等进阶能力 |
+| **taiyi** | 16 | 最小评测档——高频核心 + 交付闭环，去编排/浏览器/网络/视觉等重工具；太一星域钉定时自动落此档（见下文「最小工具集」） |
 
 ```bash
 RIVET_TOOL_PRESET=full rivet          # 本次会话用 full
@@ -554,8 +560,8 @@ rivet config mcp list                                              # 列出 + �
 | **终端内联图片** | kitty / iTerm2 图形协议在终端里直接渲染图片（工具产物、截图验证结果）。默认自动检测协议，`RIVET_IMAGES=0` 关闭、`kitty`/`iterm2` 强制指定。 |
 | **@mention 补全** | 输入 `@file:` / `@folder:` / `@symbol:` 触发路径补全（走 `git ls-files`，支持带空格的 `@file:"a b.ts"` 引用形）。直接粘贴图片自动转 base64 内联（macOS/Linux/Windows 三级降级）。 |
 | **倒带 Rewind** | 双击 `ESC`（间隔 <400ms）打开消息历史，选任一过往用户消息倒带到该点；可选「仅对话 / 仅代码改动 / 两者」三种恢复粒度，代码动作附带精确的文件影响预览。详见 [倒带](#倒带rewind)。 |
-| **命令面板** | `Ctrl+Esc` 打开，模糊搜索所有 slash 命令与 surface 动作（开关侧栏、切主题、进 Cockpit 等），↑/↓ 选中、Enter 执行。 |
-| **Cockpit 驾驶舱** | `Ctrl+Esc` → 选 Cockpit，或 `/cockpit <panel>` 进入。8 面板全屏视图：summary / trace / verify / context / safety / model / mcp / advisory，←/→/Tab 切换聚焦，实时展示 doom-loop 等级、验证交付状态、缓存与投机预读统计、MCP 连接、advisory 提醒等。 |
+| **命令面板** | `Ctrl+P` 打开，模糊搜索所有 slash 命令与 surface 动作（开关侧栏、切主题、进 Cockpit 等），↑/↓ 选中、Enter 执行，再按 `Ctrl+P` 关闭。原 `Ctrl+Esc` 在 Windows 被系统「开始菜单」抢占、在传统转义序列下与 Esc 同码不可区分，已换绑。 |
+| **Cockpit 驾驶舱** | `Ctrl+P` → 选 Cockpit，或 `/cockpit <panel>` 进入。8 面板全屏视图：summary / trace / verify / context / safety / model / mcp / advisory，←/→/Tab 切换聚焦，实时展示 doom-loop 等级、验证交付状态、缓存与投机预读统计、MCP 连接、advisory 提醒等。 |
 | **多智能体面板** | `/tasks` 打开全屏 worker 详情（融合 live 视图 + JSONL 转录，含 Contract/Activity/Result/Transcript 分段与诚实标签）；宽终端（≥100 列）下 `Ctrl+]` 切出右侧抽屉，实时展示舰队树、团队波次 DAG、todo、token 仪表。 |
 | **主题与无障碍** | `/theme [name|list]` 切换色彩主题；`auto` 主题用 OSC 11 探测终端背景色自动适配明暗。truecolor / 256 色 / 16 色三轨自动降级。`/vim` 切换 vim 键绑定；`ui.reducedMotion: true` 把 spinner 与徽章动画静态化（无障碍）。读屏用户用 `--screen-reader`（或 `ui.screenReader: true`）：动态段整体不渲染、周期重绘停转，活动的开始与等待批准改为静态行播报——`reducedMotion` 只冻结字形，救不了每 120ms 被复读一遍。 |
 
@@ -566,7 +572,7 @@ rivet config mcp list                                              # 列出 + �
 | `Enter` | 发送 · `Shift+Enter` 换行 |
 | `Ctrl+C` | 三态：agent 活跃时中断当前 run；有输入时清空输入行；空闲时 2 秒内双击退出 |
 | `Esc` | 关闭覆盖层 / 退出 worker 视图；agent 跑时中断；vim 模式下兼 normal↔insert；双击（<400ms）倒带 |
-| `Ctrl+Esc` | 命令面板 |
+| `Ctrl+P` | 命令面板（Ctrl+Esc 被 Windows「开始菜单」抢占，已换绑） |
 | `Ctrl+]` | 切右侧抽屉（宽终端） |
 | `Ctrl+R` | 历史搜索 overlay（仅空闲时） |
 | `Ctrl+O` | 展开/折叠最近被截断的工具结果 |
@@ -653,7 +659,7 @@ TUI 是 CLI 的默认表面。桌面端（Tauri）与 VS Code/Cursor 插件共�
 
 **阈值默认**：Lean 4 会话 / 600000ms（10 分钟）/ 10MB，正常 16 / 1800000ms（30 分钟）/ 50MB；事件日志磁盘下限 1,000,000 字节。
 
-**最小工具集（taiyi 档）**：`RIVET_TOOL_PRESET=taiyi`（或项目配置 `tools.preset: "taiyi"`）只装配高频核心工具（读写/检索/bash/git/测试/交付/计划等 16 个），去掉编排/浏览器/网络/视觉等重工具——适合评测「只留关键工具是否够用」。`full` 档一键回退全集。
+**最小工具集（taiyi 档）**：`RIVET_TOOL_PRESET=taiyi`（或项目配置 `tools.preset: "taiyi"`）只装配高频核心工具（读写/检索/bash/git/测试/交付/计划等 16 个），去掉编排/浏览器/网络/视觉等重工具——适合评测「只留关键工具是否够用」。`full` 档一键回退全集。**太一星域内置此档**：`defaultDomain` 钉定 `taiyi` 时无需任何配置即自动落 taiyi 档（显式给档恒优先可覆盖）；一键组合见下方「最小集绑定星域」。
 
 **按域覆盖（runtime.domains）**：`defaultDomain` 钉定某域时，该域的 lean/阈值/工具档位覆盖全局配置（其他域不受影响）：
 
@@ -675,9 +681,11 @@ TUI 是 CLI 的默认表面。桌面端（Tauri）与 VS Code/Cursor 插件共�
 
 解析链：`RIVET_LEAN` 环境变量（恒优先）→ 域覆盖 → 全局 runtime。桌面端：设置 → 行为 → Lean 资源档 → 按域覆盖（域列表随新增星域自动扩展）。注意：域覆盖在会话装配期生效（启动钉定域时）；运行中 `/domain` 切换不影响已冻结的工具集与 lean（改工具指纹会重建前缀缓存）。
 
-**无需改文件的一键启动**：`/config` → Basics → 「最小集绑定星域」——选中某域（如 changgeng 或 taiyi），保存即自动写入 `defaultDomain` 钉定该域 + 该域的 lean/taiyi 最小工具档覆盖。此后 `rivet` 裸启动即进入该星域的最小集会话；配合「默认模型」字段（`agent.defaultModel`，`provider:modelId` 格式）即可完全免参数启动。清空绑定则恢复默认域（域覆盖配置保留）。
+**无需改文件的一键启动**：`/config` → Basics → 「最小集绑定星域」——选中某域（如 changgeng 或 taiyi），保存即自动写入 `defaultDomain` 钉定该域 + 该域的 taiyi 最小工具档覆盖（不含 lean 资源减配）。此后 `rivet` 裸启动即进入该星域的最小集会话；配合「默认模型」字段（`agent.defaultModel`，`provider:modelId` 格式）即可完全免参数启动。清空绑定则恢复默认域（域覆盖配置保留）。桌面端同款项：设置 → 系统 → 「最小集绑定星域」。
 
 ## ⌨️ 斜杠命令
+
+> **分层提示**：输入框输入 `/` 默认只展示约 20 条核心命令（高频好用的优先露出）；**继续输入任意字符即过滤全部命令**（含 /team、/council、/skill 等进阶命令），`Ctrl+Esc` 命令面板永远全量模糊搜索。命令总数 65+ 条（外加已安装的 skills），分层只影响「发现性」，不删任何命令。
 
 **会话与项目**
 

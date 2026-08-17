@@ -61,7 +61,8 @@ import type { SlashCommand } from './slash-command-registry.js'
 import type { BootstrapContext } from '../bootstrap.js'
 import type { Config } from '../config/schema.js'
 import { isProFeatureEnabled } from '../config/pro-license.js'
-import { loadConfig, saveConfig } from '../config/manager.js'
+import { loadConfig, saveConfig, registerVisionModelConfig } from '../config/manager.js'
+import { discoverVisionModels, validateVisionModel } from '../api/vision-model-onboarding.js'
 import { PROVIDER_PRESETS, isProviderPresetKey } from '../config/provider-presets.js'
 import { installPlugin, removePlugin, getInstalledPlugins, isPluginInstalled } from '../plugins/plugin-installer.js'
 import { PLUGIN_PRESETS } from '../plugins/plugin-presets.js'
@@ -157,8 +158,8 @@ const HELP_TEXT = `Available commands:
 /rollback [<N>] — Rollback file changes (alias of /undo)
 /write-plan — Write current plan to file
 Ctrl+C — Interrupt current turn (press twice to exit)
-Ctrl+P / Ctrl+N — 翻历史命令（上一条 / 下一条；多行编辑时方向键不翻历史，用这组）
-Ctrl+Esc — 命令面板（模糊搜索全部命令与界面动作）
+↑ / Ctrl+N — 翻历史命令（单行 ↑ 上一条；多行编辑时方向键只做行间导航，用 Ctrl+R 历史搜索）
+Ctrl+P — 命令面板（模糊搜索全部命令与界面动作；Ctrl+Esc 被 Windows「开始菜单」抢占，已换绑）
 
 ▌▌ 上下文与缓存（DeepSeek V4 成本关键）▌▌
 
@@ -191,7 +192,7 @@ export interface SlashHandlerContext {
   maxTokens: number
   availableModels: Array<{ id: string; alias: string }>
   onModelSwitch: (modelId: string) => { ok: boolean; error?: string }
-  allProviders: Record<string, { models: Array<{ id: string; alias: string }> }>
+  allProviders: Record<string, { models: Array<{ id: string; alias: string }>; userSaved?: boolean }>
   currentProvider: string
   currentSessionId: string
   /**
@@ -969,8 +970,10 @@ const TUI_SLASH_COMMANDS: readonly TuiSlashCommandDef[] = [
       const cmd = parts[0]!.toLowerCase()
       const targetModel = parts[1]
       if (!targetModel || targetModel === 'list') {
+        // 只列用户已保存的 provider——内置预设舰队不刷屏。
         const lines: string[] = []
         for (const [provName, prov] of Object.entries(ctx.allProviders)) {
+          if (!prov.userSaved) continue
           const marker = provName === ctx.currentProvider ? ' ← current' : ''
           lines.push(`[${provName}]${marker}`)
           for (const m of prov.models) {
@@ -978,6 +981,7 @@ const TUI_SLASH_COMMANDS: readonly TuiSlashCommandDef[] = [
             lines.push(`  ${m.alias} (${m.id})${isCurrent ? ' ←' : ''}`)
           }
         }
+        if (lines.length === 0) lines.push('(尚无已保存的 provider——运行 /connect 接入后模型会出现在这里)')
         pushStatic(createLogEntry({ type: 'system', content: `Models:\n${lines.join('\n')}\n\nCurrent: ${ctx.model} [${ctx.currentProvider}]\nContext: ${ctx.maxTokens.toLocaleString()} tokens\nCost: ¥${ctx.cost.toFixed(4)}` }))
       } else {
         const result = ctx.onModelSwitch(targetModel)
@@ -3672,9 +3676,9 @@ export function registerTuiSlashCommands(app: TuiApp, ctx: BootstrapContext): vo
   const rollbackTokenRef: MutableRefLike<string | null> = { current: null }
   let cacheHitRate = 0
 
-  const allProviders: Record<string, { models: Array<{ id: string; alias: string }> }> = {}
+  const allProviders: Record<string, { models: Array<{ id: string; alias: string }>; userSaved?: boolean }> = {}
   for (const [name, prov] of Object.entries(ctx.config.provider.providers)) {
-    allProviders[name] = { models: prov.models.map(m => ({ id: m.id, alias: m.alias ?? m.id })) }
+    allProviders[name] = { models: prov.models.map(m => ({ id: m.id, alias: m.alias ?? m.id })), ...(prov.userSaved ? { userSaved: true } : {}) }
   }
 
   function buildHandlerContext(input: string): SlashHandlerContext {
@@ -4071,7 +4075,62 @@ export function registerTuiSlashCommands(app: TuiApp, ctx: BootstrapContext): vo
         label: isProviderPresetKey(name) ? PROVIDER_PRESETS[name].label : name,
         modelCount: p.models.length,
       }))
-      app.startConnect(existing)
+      app.startConnect(existing, cfg.provider.default)
+      return true
+    },
+  })
+
+  register("/vision", {
+    description: "配置识图桥（发现模型、图片验证后保存；不改变主服务商）",
+    immediate: true,
+    handler: ({ app }) => {
+      app.startVisionOnboarding(async request => {
+        const apiKeyEnv = request.body.apiKeyEnv
+        if (apiKeyEnv && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(apiKeyEnv)) {
+          throw new Error('apiKeyEnv must be a valid environment variable name')
+        }
+        const resolvedEnvKey = apiKeyEnv ? process.env[apiKeyEnv]?.trim() : undefined
+        if (apiKeyEnv && !resolvedEnvKey) {
+          throw new Error(`Environment variable "${apiKeyEnv}" is not set or is blank in this process`)
+        }
+        const requestWithResolvedKey = {
+          ...request.body,
+          ...(resolvedEnvKey ? { apiKey: resolvedEnvKey } : {}),
+        }
+        if (request.kind === 'discover') {
+          return await discoverVisionModels(requestWithResolvedKey)
+        }
+        await validateVisionModel({
+          baseUrl: request.body.baseUrl,
+          providerName: request.body.providerName,
+          modelId: request.body.modelId,
+          ...(requestWithResolvedKey.apiKey ? { apiKey: requestWithResolvedKey.apiKey } : {}),
+        })
+        registerVisionModelConfig({
+          providerName: request.body.providerName,
+          baseUrl: request.body.baseUrl,
+          ...(request.body.apiKey && !apiKeyEnv ? { apiKey: request.body.apiKey } : {}),
+          ...(apiKeyEnv ? { apiKeyEnv } : {}),
+          modelId: request.body.modelId,
+        })
+        return {}
+      })
+      return true
+    },
+  })
+
+  register("/disconnect", {
+    description: "断开服务商（整组删除该 key 注册的模型列表并清除密钥）",
+    immediate: true,
+    handler: ({ app }) => {
+      const cfg = loadConfig()
+      const saved = Object.entries(cfg.provider.providers).filter(([, p]) => p.userSaved)
+      if (saved.length === 0) {
+        app.commitStatic('尚无已保存的服务商——先用 /connect 接入。')
+        return true
+      }
+      app.choicePanelKind = 'disconnect'
+      app.activateOverlay('choice-panel')
       return true
     },
   })

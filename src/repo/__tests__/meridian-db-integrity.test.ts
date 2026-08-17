@@ -33,7 +33,7 @@ describe('meridian db data integrity (D6 task 3)', () => {
     })
     const files = db.getAllFiles()
     assert.ok(files.every(f => !ABS_PATH_RE.test(f)), `absolute-path rows leaked: ${JSON.stringify(files)}`)
-    assert.equal(db.schemaVersion(), 1)
+    assert.equal(db.schemaVersion(), 2)
   })
 
   it('all imports edges resolve to an indexed file (no dangling targets)', () => {

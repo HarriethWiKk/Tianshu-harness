@@ -205,8 +205,8 @@ describe('meridian db', () => {
   })
 
   // ─── D6 task 2: schema version + legacy migration ──────────────────
-  it('reports schema version 1 after open', () => {
-    assert.equal(db.schemaVersion(), 1)
+  it('reports schema version 2 after open', () => {
+    assert.equal(db.schemaVersion(), 2)
   })
 
   /** Roll user_version back to 0 so the next open sees a pre-v1 database. */
@@ -246,7 +246,7 @@ describe('meridian db', () => {
     const files = db.getAllFiles()
     assert.ok(!files.some(f => f.startsWith('/')), `absolute-path rows remain: ${JSON.stringify(files)}`)
     assert.ok(files.includes('src/ok.ts'), 'clean relative row must survive migration')
-    assert.equal(db.schemaVersion(), 1)
+    assert.equal(db.schemaVersion(), 2)
     // Dangling imports edge purged; valid imports edge kept
     assert.equal(db.getEdgesTo('src/nonexistent.ts:*:0').length, 0, 'dangling imports edge must be purged')
     assert.equal(db.getEdgesTo('src/ok.ts:*:0').length, 1, 'valid imports edge must survive')
@@ -268,7 +268,7 @@ describe('meridian db', () => {
     db.close()
     db = new MeridianDb(dir)
     assert.ok(!db.getAllFiles().some(f => f.startsWith('/')), 'second migration must be a no-op')
-    assert.equal(db.schemaVersion(), 1)
+    assert.equal(db.schemaVersion(), 2)
   })
 
   it('leaves edges to not-yet-indexed files alone once the db is at v1', () => {

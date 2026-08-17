@@ -14,6 +14,7 @@ import { debugLog } from '../utils/debug.js'
 import { repairInvalidJsonEscapes } from './json-escape-repair.js'
 import { appendFileSync, mkdirSync } from 'node:fs'
 import { dirname, join } from 'node:path'
+import { ProxyAgent } from 'undici'
 
 /**
  * Parse accumulated tool_call arguments into an input object.
@@ -103,8 +104,14 @@ export interface OpenAIClientConfig {
   maxTokens: number
   reasoningEffort?: string
   thinking?: 'enabled' | 'disabled'
-  /** How to format thinking in the request body. 'openai' = use reasoning_effort only, others = use thinking block */
-  thinkingFormat?: 'anthropic' | 'openai' | 'none'
+  /** What type of thinking block to send. 'enabled' = {type:'enabled'}, 'adaptive' = {type:'adaptive'}, 'none' = reasoning_effort only */
+  thinkingBlockType?: 'enabled' | 'adaptive' | 'none'
+  /** Whether the provider separates reasoning into a reasoning_content field */
+  reasoningSplit?: boolean
+  /** Which field carries the thinking budget inside the thinking block */
+  thinkingBudgetField?: 'budget_tokens'
+  /** Per-provider effort ceiling — values above this cap are clamped */
+  effortCap?: Record<string, string>
   /** How effort/thinking intensity is controlled. 'none' = provider doesn't support reasoning_effort */
   effortFormat?: 'reasoning_effort' | 'output_config' | 'none'
   auth?: import('../auth/types.js').AuthProvider
@@ -116,14 +123,16 @@ export interface OpenAIClientConfig {
   providerProfile?: ProviderProfile
   /** Provider name for feature gating (e.g. 'glm' for web_search) */
   providerName?: string
+  /** Env var holding the API key — surfaced in 401/403 error hints. */
+  apiKeyEnv?: string
   /** Session-frozen wire-transform context (spark truncate N 等)。随会话 meta
    *  冻结、resume 读回——wire 字节在 env 漂移/跨端下保持稳定（前缀缓存前提）。 */
   wireContext?: import('./pro-registry.js').WireTransformContext
   /**
    * Preserved-thinking protocol family (DeepSeek native: reasoning_content echoed
-   * back on tool-call turns). Factory derives it from capabilities.prefixCache ===
-   * 'deepseek-native' — covers deepseek/mimo/spark without name hardcoding.
-   * Fallback to the legacy name set when absent (tests construct without it).
+   * back on tool-call turns, Chinese-thinking system suffix). Capability-table
+   * field: the factory passes `capabilities.preservedThinkingProtocol` resolved
+   * from WELL_KNOWN_DEFAULTS / user overrides — no providerName inference here.
    */
   preservedThinkingProtocol?: boolean
   /** Enable DeepSeek Beta prefix completion (skip preamble) */
@@ -167,6 +176,22 @@ export interface OpenAIClientConfig {
    * 0 = discard prompt_tokens; use local estimate instead.
    */
   usageCalibrationFactor?: number
+  /**
+   * Total request timeout (ms) for a single stream attempt — replaces the
+   * 10min（glm 20min）硬顶 base。显式配置即严格：不做按进度续期（续期机制只
+   * 服务于内置默认），到点直接 abort。firstByte/thinkingStall/read 三层计时器
+   * 不受影响，谁先到谁生效。
+   */
+  requestTimeoutMs?: number
+  /** Max retry attempts for retryable API errors. undefined = 保留内置默认
+   *  （thinking 1 次 / slow-thinking 2 次 / 非 thinking 5 次）；0 = 禁用重试。 */
+  maxRetries?: number
+  /** Provider-level sampling temperature default (0–2)。仅当请求未显式指定
+   *  temperature 且 thinking 未启用时注入——推理模式下多数服务端拒绝调温。 */
+  temperature?: number
+  /** Per-provider HTTP proxy（优先于全局 network.proxy）。构造时物化为
+   *  undici ProxyAgent，经 fetchWithTimeout 的 dispatcher 槽位透传。 */
+  proxy?: string
 }
 
 interface ToolCallChunk {
@@ -348,12 +373,15 @@ export class OpenAIClient implements StreamClient {
   private prevWireSignatures: Array<{ sig: string; len: number; role: string }> | null = null
   /** Latest wire divergence (consume-once via consumeWireDivergence). */
   private lastWireDivergence: WireDivergence | null = null
+  /** undici ProxyAgent for config.proxy (undefined = no per-provider proxy). */
+  private readonly proxyDispatcher: ProxyAgent | undefined
 
   constructor(private config: OpenAIClientConfig) {
-    this.systemSuffix = (config.preservedThinkingProtocol ?? (config.providerName === 'mimo' || config.providerName === 'deepseek')) && config.thinking === 'enabled'
+    this.systemSuffix = Boolean(config.preservedThinkingProtocol) && config.thinking === 'enabled'
       ? '\n\n请在内部思考链中使用中文进行推理。不要在回复中输出你的推理过程，只输出最终答案或工具调用。'
       : ''
     this._sanitizedCount = 0
+    this.proxyDispatcher = config.proxy ? new ProxyAgent(config.proxy) : undefined
   }
 
   /** 慢思考端点判定（名称/URL/显式配置三级，见 isSlowThinkingProvider）。 */
@@ -390,12 +418,12 @@ export class OpenAIClient implements StreamClient {
   ): Promise<void> {
     this.lastRequestMessages = request.messages
     // reasoning_content stripping rules:
-    // - DeepSeek (preserved thinking): keep for tool-call turns, strip for pure-text
-    // - GLM (independent reasoning): always strip — no preserved thinking context
+    // - Preserved-thinking protocol (capability-declared, e.g. DeepSeek/MiMo):
+    //   keep for tool-call turns, strip for pure-text
+    // - Independent reasoning (e.g. GLM — no preservedThinkingProtocol): always strip
     // - Thinking disabled: always strip
-    const isGlm = this.config.providerName === 'glm'
-    const isPreservedThinking = this.config.thinking === 'enabled' && !isGlm
-      && (this.config.preservedThinkingProtocol ?? (this.config.providerName === 'deepseek' || this.config.providerName === 'mimo'))
+    const isPreservedThinking = this.config.thinking === 'enabled'
+      && Boolean(this.config.preservedThinkingProtocol)
     const messages = request.messages.map(m => {
       if (m.role !== 'assistant') return m
       const hasToolCalls = Array.isArray((m as any).tool_calls) && (m as any).tool_calls.length > 0
@@ -460,34 +488,32 @@ export class OpenAIClient implements StreamClient {
       body.response_format = { type: 'json_object' }
     }
 
-    if (request.temperature !== undefined) body.temperature = request.temperature
+    if (request.temperature !== undefined) {
+      body.temperature = request.temperature
+    } else if (this.config.temperature !== undefined && this.config.thinking !== 'enabled') {
+      // provider 级采样温度默认值；思考模式下多数推理服务端拒绝调温，不注入。
+      body.temperature = this.config.temperature
+    }
 
-    // MiniMax: reasoning_split separates thinking into reasoning_content field
-    // (DeepSeek-compatible), otherwise thinking is embedded in <think> tags inside content
-    if (this.config.providerName === 'minimax') {
+    // Provider-specific reasoning output separation (e.g. MiniMax sends thinking
+    // in a dedicated reasoning_content field rather than embedded in content).
+    if (this.config.reasoningSplit) {
       body.reasoning_split = true
     }
 
-    // Thinking / reasoning dispatch.
-    // Providers that accept {thinking: {type: 'enabled'}} (DeepSeek, GLM, etc.):
-    // send the thinking block. Pure OpenAI providers use reasoning_effort.
-    const usesThinkingBlock = this.config.thinkingFormat === 'anthropic'
-      || this.config.providerName === 'glm'
-      || this.config.providerName === 'claude'
-      || this.config.providerName === 'mimo'
-      || this.config.providerName === 'minimax'
+    // Thinking / reasoning dispatch — fully capability-driven.
+    // thinkingBlockType determines what type of thinking block to send:
+    //   'enabled'  → {thinking: {type: 'enabled'}}
+    //   'adaptive' → {thinking: {type: 'adaptive'}}
+    //   'none'     → no thinking block; use reasoning_effort param instead
+    const blockType = this.config.thinkingBlockType ?? 'none'
 
     if (this.config.thinking === 'enabled') {
-      if (usesThinkingBlock) {
-        body.thinking = { type: this.config.thinking }
-        if (this.config.providerName === 'minimax') {
-          body.thinking = { type: 'adaptive' }
-        }
-        // GLM: independent reasoning mode (no preserved thinking).
-        // Prior reasoning is NOT echoed — each turn is a fresh reasoning start.
-        // This avoids the cross-API-call context discontinuity that causes GLM
-        // to restart reasoning mid-turn after a stream abort/timeout.
-        if (this.config.providerName === 'claude' && this.config.reasoningEffort) {
+      if (blockType !== 'none') {
+        body.thinking = { type: blockType }
+
+        // Thinking budget (e.g. Claude's budget_tokens).
+        if (this.config.thinkingBudgetField === 'budget_tokens' && this.config.reasoningEffort) {
           const budgetMap: Record<string, number> = {
             max: this.config.maxTokens,
             high: Math.floor(this.config.maxTokens * 0.6),
@@ -498,11 +524,11 @@ export class OpenAIClient implements StreamClient {
           const budget = budgetMap[this.config.reasoningEffort ?? 'high'] ?? Math.floor(this.config.maxTokens * 0.6)
           ;(body.thinking as Record<string, unknown>)['budget_tokens'] = budget
         }
-        // DeepSeek-style: thinking 块与 reasoning_effort **并存**（官方 curl 样例
-        // 同时带 {thinking:{type:enabled}} 和 {reasoning_effort:high/max}）。
-        // 旧实现只发 thinking 块，配置的 reasoningEffort(v4-pro=max) 被静默丢弃，
-        // DeepSeek 退回服务端默认 effort(high)。Claude/GLM/minimax 各有块内 effort
-        // 编码(budget_tokens/clear_thinking/adaptive)，故仅对 reasoning_effort 格式补发。
+
+        // DeepSeek-style: thinking block + reasoning_effort coexist.
+        // Only for providers that accept reasoning_effort alongside the thinking block.
+        // Providers with in-block effort encoding (budget_tokens / adaptive) don't need
+        // a separate reasoning_effort field.
         if (this.config.effortFormat === 'reasoning_effort'
           && this.config.reasoningEffort
           && this.config.reasoningEffort !== 'off') {
@@ -515,15 +541,11 @@ export class OpenAIClient implements StreamClient {
     if (request.reasoning_effort && this.config.effortFormat !== 'none') {
       body.reasoning_effort = request.reasoning_effort
     }
-    // Codex (served via cliproxy) tops out at 'xhigh', not Rivet's canonical
-    // 'max'. Map at the wire so the global ReasoningEffort enum stays unchanged
-    // and other providers keep receiving 'max'.
-    if (this.config.providerName === 'codex' && body.reasoning_effort === 'max') {
-      body.reasoning_effort = 'xhigh'
-    }
-    // Kimi (kimi-for-coding) does not support 'max'; cap at 'high'.
-    if (this.config.providerName === 'kimi' && body.reasoning_effort === 'max') {
-      body.reasoning_effort = 'high'
+
+    // Effort cap: clamp effort values to provider-supported maximums.
+    if (this.config.effortCap && typeof body.reasoning_effort === 'string') {
+      const capped = this.config.effortCap[body.reasoning_effort]
+      if (capped) body.reasoning_effort = capped
     }
 
     // Apply stable system suffix (Chinese thinking instruction) — computed once
@@ -698,12 +720,12 @@ export class OpenAIClient implements StreamClient {
         },
         body: JSON.stringify(effectiveBody),
         signal: lifecycle.signal,
-      }, fetchTimeout)
+      }, fetchTimeout, this.proxyDispatcher)
 
       if (!response.ok) {
         const errorBody = await response.text().catch(() => '')
         const err = Object.assign(
-          new Error(parseOpenAIError(response.status, errorBody, { providerName: this.config.providerName, baseUrl: this.config.baseUrl })),
+          new Error(parseOpenAIError(response.status, errorBody, { providerName: this.config.providerName, baseUrl: this.config.baseUrl, apiKeyEnv: this.config.apiKeyEnv })),
           { status: response.status },
         )
         // Attach parsed retry-after for the error classifier to use
@@ -717,6 +739,21 @@ export class OpenAIClient implements StreamClient {
         throw err
       }
 
+      // Content-type gate: a 200 that is NOT an SSE stream means the endpoint
+      // answered something else entirely — usually a JSON error page (wrong
+      // path / missing /v1 suffix) or an HTML gateway. Fail fast with an
+      // actionable hint instead of feeding HTML to the SSE parser.
+      const contentType = response.headers.get('content-type') ?? ''
+      if (contentType && !contentType.includes('event-stream') && !contentType.includes('octet-stream')) {
+        const snippet = await response.text().catch(() => '')
+        throw Object.assign(
+          new Error(
+            `端点返回 200 但 content-type 是 ${contentType}（不是 SSE 流）——端点可能不支持流式，或路径错误（baseUrl 是否缺 /v1？）。baseUrl=${this.config.baseUrl}。响应片段：${snippet.slice(0, 200)}`,
+          ),
+          { status: 200, nonSse: true },
+        )
+      }
+
       const reader = response.body?.getReader()
       if (!reader) throw new Error('Response body is not readable')
 
@@ -728,9 +765,10 @@ export class OpenAIClient implements StreamClient {
       // 前缀缓存，重试命中近 100% 缓存（实测 deepseek 99.4% hit、~12s 完成），代价极低。
       // 给它们 2 次重试，让「单次服务端 thinking 卡死」甚至「连续两次卡死」都能自愈而
       // 不冒泡成错误。maxTotalDurationMs 仍是总时长兜底，防 runaway。
-      maxTotalRetries: isThinking
+      // An explicit provider maxRetries overrides the built-in thinking budget (0 disables retries).
+      maxTotalRetries: this.config.maxRetries ?? (isThinking
         ? (this.isSlowThinking ? 2 : 1)
-        : undefined,
+        : undefined),
       onRetry: (info) => {
         if (info.classified.category === 'rate_limit') {
           callbacks.onRateLimit?.(info.classified.retryDelayMs)
@@ -787,7 +825,10 @@ export class OpenAIClient implements StreamClient {
     // 续 60s 一档，绝对上限 3×基础（30min）兜底 runaway。
     const timeoutController = new AbortController()
     const isGlm = this.config.providerName === 'glm'
-    const baseStreamMs = isGlm ? 20 * 60_000 : 10 * 60_000
+    // provider 级 requestTimeoutMs：显式配置 = 严格总时限（不做按进度续期——
+    // 续期机制只服务于内置默认，避免用户设了 5min 却被续到 15min）。
+    const explicitRequestTimeoutMs = this.config.requestTimeoutMs
+    const baseStreamMs = explicitRequestTimeoutMs ?? (isGlm ? 20 * 60_000 : 10 * 60_000)
     const streamStartedAt = Date.now()
     let lastDataEventAt = streamStartedAt
     let hardCapExtended = false
@@ -806,7 +847,9 @@ export class OpenAIClient implements StreamClient {
       if (action.extended) hardCapExtended = true
       maxStreamTimer = setTimeout(checkHardCap, action.rearmMs)
     }
-    let maxStreamTimer: ReturnType<typeof setTimeout> = setTimeout(checkHardCap, baseStreamMs)
+    let maxStreamTimer: ReturnType<typeof setTimeout> = explicitRequestTimeoutMs !== undefined
+      ? setTimeout(() => timeoutController.abort(), explicitRequestTimeoutMs)
+      : setTimeout(checkHardCap, baseStreamMs)
 
     // Wire both external and timeout signals to reader.cancel() so that
     // either agent.abort() OR the hard timeout can interrupt blocking read().
@@ -853,17 +896,23 @@ export class OpenAIClient implements StreamClient {
     try {
       resetIdleTimer()
       let streamDone = false
+      // 硬顶 abort 可能发生在 reader.read() 阻塞期间——cancel() 让 read() 以
+      // done=true 返回，若不在此显式抛出会变成"静默正常结束"，严格时限形同虚设。
+      const throwIfHardCapAborted = (): void => {
+        if (!timeoutController.signal.aborted) return
+        const mins = Math.round((Date.now() - streamStartedAt) / 60_000)
+        throw new Error(explicitRequestTimeoutMs !== undefined
+          ? `OpenAI SSE stream request timeout (${Math.round(explicitRequestTimeoutMs / 1000)}s, provider requestTimeoutMs) — total request duration exceeded configured limit`
+          : hardCapExtended
+            ? `OpenAI SSE stream hard timeout (~${mins}min, progress-extended) — stream exceeded maximum duration`
+            : 'OpenAI SSE stream hard timeout (10min) — stream stopped progressing')
+      }
       while (!streamDone) {
         // Check both external signal and internal timeout signal.
         // External signal: agent.abort() / worker budget / Ctrl+C
         // Timeout signal: hard 10min ceiling on stream duration
         if (signal?.aborted) throw new DOMException('Aborted', 'AbortError')
-        if (timeoutController.signal.aborted) {
-          const mins = Math.round((Date.now() - streamStartedAt) / 60_000)
-          throw new Error(hardCapExtended
-            ? `OpenAI SSE stream hard timeout (~${mins}min, progress-extended) — stream exceeded maximum duration`
-            : 'OpenAI SSE stream hard timeout (10min) — stream stopped progressing')
-        }
+        throwIfHardCapAborted()
 
         const { done, value } = await reader.read()
         // Check timeout AFTER read — reader.cancel() from idle timer causes
@@ -875,7 +924,10 @@ export class OpenAIClient implements StreamClient {
             : `OpenAI SSE stream idle timeout (${secs}s)`
           throw new Error(msg)
         }
-        if (done) break
+        if (done) {
+          throwIfHardCapAborted()
+          break
+        }
 
         receivedFirstChunk = true
 
@@ -1453,6 +1505,8 @@ export interface ApiErrorProviderContext {
   /** Provider name for feature gating (e.g. 'deepseek', 'glm') */
   providerName?: string
   baseUrl?: string
+  /** Env var holding the API key — named in 401/403 hints so users know where to look. */
+  apiKeyEnv?: string
 }
 
 /**
@@ -1480,13 +1534,30 @@ function apiErrorHint(code: string, message: string, provider?: ApiErrorProvider
   return '\n提示：当前 provider 账户余额不足，请充值后重试，或用 /model 切换到其他 provider。'
 }
 
+/**
+ * 按 HTTP 状态码追加可操作提示：401/403 指明 key 的环境变量名（用户知道
+ * 去哪检查），404 指向 `rivet provider models`（核对模型 id 是否拼错/已改名）。
+ */
+function statusHint(status: number, provider?: ApiErrorProviderContext): string {
+  if (status === 401 || status === 403) {
+    const envPart = provider?.apiKeyEnv
+      ? `——请检查环境变量 ${provider.apiKeyEnv} 是否已导出且未过期`
+      : '——请检查 API key 是否正确'
+    return `\n提示：鉴权失败（HTTP ${status}）${envPart}，或用 /connect 重新配置。`
+  }
+  if (status === 404) {
+    return '\n提示：404 通常是模型 id 拼错或端点路径不对——运行 `rivet provider models <provider>` 核对端点实际提供的模型 id。'
+  }
+  return ''
+}
+
 export function parseOpenAIError(status: number, body: string, provider?: ApiErrorProviderContext): string {
   try {
     const parsed = JSON.parse(body)
     const code = parsed.error?.code ?? parsed.error?.type ?? `HTTP ${status}`
     const message = parsed.error?.message ?? body
-    return `OpenAI API error (${code}): ${message}${apiErrorHint(String(code), String(message), provider)}`
+    return `OpenAI API error (${code}): ${message}${apiErrorHint(String(code), String(message), provider)}${statusHint(status, provider)}`
   } catch {
-    return `OpenAI API error (HTTP ${status}): ${body}`
+    return `OpenAI API error (HTTP ${status}): ${body}${statusHint(status, provider)}`
   }
 }

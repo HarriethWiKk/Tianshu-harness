@@ -181,7 +181,7 @@ describe('settings persist', () => {
     assert.equal(after.basics.maxEventsDiskBytes, 10 * 1024 * 1024)
   })
 
-  it('最小集绑定星域：写 defaultDomain + lean/taiyi 域覆盖，一键启动', () => {
+  it('最小集绑定星域：写 defaultDomain + taiyi 域覆盖（不含 lean），一键启动', () => {
     const before = loadSettingsDraft()
     const draft: SettingsDraft = { ...before, basics: { ...before.basics, domainBind: 'changgeng' } }
     saveSettings({ draft, blocks: dirtyBlocks(before, draft) })
@@ -189,7 +189,7 @@ describe('settings persist', () => {
     assert.equal(loadConfig().agent.defaultDomain, 'changgeng')
     const runtime = loadConfig().runtime!
     assert.equal(runtime.lean, false, '绑定不得写全局 lean（审查 F1：波及所有域且清空不还原）')
-    assert.equal(runtime.domains?.changgeng?.lean, true)
+    assert.equal(runtime.domains?.changgeng?.lean, undefined, '绑定不写 lean——工具精简集不是资源减配')
     assert.equal(runtime.domains?.changgeng?.toolPreset, 'taiyi')
     // 回读时推断绑定状态
     assert.equal(loadSettingsDraft().basics.domainBind, 'changgeng')
@@ -199,7 +199,7 @@ describe('settings persist', () => {
     const cleared: SettingsDraft = { ...bound, basics: { ...bound.basics, domainBind: '' } }
     saveSettings({ draft: cleared, blocks: dirtyBlocks(bound, cleared) })
     assert.equal(loadConfig().agent.defaultDomain, 'qiming')
-    assert.equal(loadConfig().runtime!.domains?.changgeng?.lean, true, '域覆盖保留')
+    assert.equal(loadConfig().runtime!.domains?.changgeng?.toolPreset, 'taiyi', '域覆盖保留')
   })
 
   it('单个 setter 失败只报自己那块，其他块照写', () => {

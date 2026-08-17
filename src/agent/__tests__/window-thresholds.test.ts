@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { scaledThreshold } from '../window-thresholds.js'
+import { scaledThreshold, isB2ConvergingRecently } from '../window-thresholds.js'
 
 describe('scaledThreshold — 上下文窗口感知的提醒阈值', () => {
   it('200K 及以下返回 200K 基准值（旧行为）', () => {
@@ -30,5 +30,39 @@ describe('scaledThreshold — 上下文窗口感知的提醒阈值', () => {
     // 600K 中点
     assert.equal(scaledThreshold(600_000, 4, 9), 7) // round(6.5)
     assert.equal(scaledThreshold(600_000, 5, 12), 9) // round(8.5)
+  })
+})
+
+describe('isB2ConvergingRecently — B2 收敛轨迹门（会话 506a5e86 优化）', () => {
+  it('冷启动：空轨迹或样本不足 → false（保守照发，旧行为）', () => {
+    assert.equal(isB2ConvergingRecently([]), false)
+    assert.equal(isB2ConvergingRecently([0.9]), false)
+  })
+
+  it('最近样本均值 ≥ 0.4 → true（轨迹收敛，静默）', () => {
+    // [0.9, 0.5] → avg 0.7
+    assert.equal(isB2ConvergingRecently([0.9, 0.5]), true)
+    // [0.5, 0.3] → avg 0.4 恰过线
+    assert.equal(isB2ConvergingRecently([0.5, 0.3]), true)
+    // 持续收敛
+    assert.equal(isB2ConvergingRecently([0.9, 0.8, 0.7]), true)
+  })
+
+  it('均值 < 0.4 → false（轨迹发散，照发）', () => {
+    assert.equal(isB2ConvergingRecently([0.2, 0.3, 0.2]), false)
+  })
+
+  it('只看最近 window=3 个样本：旧高分不掩盖最近转坏', () => {
+    // 前两个 0.9/0.8 是旧高分，最近三个全 0.2 → 照发
+    assert.equal(isB2ConvergingRecently([0.9, 0.8, 0.2, 0.2, 0.2]), false)
+  })
+
+  it('自定义 window/minSamples/bar 参数生效', () => {
+    // window=2：只看最近两个 [0.3, 0.3] → 发散
+    assert.equal(isB2ConvergingRecently([0.9, 0.3, 0.3], 2, 2, 0.4), false)
+    // bar=0.8：[0.5, 0.5, 0.5] avg 0.5 < 0.8 → 照发
+    assert.equal(isB2ConvergingRecently([0.5, 0.5, 0.5], 2, 3, 0.8), false)
+    // minSamples=4：3 样本不足 → 照发
+    assert.equal(isB2ConvergingRecently([0.9, 0.9, 0.9], 4, 3, 0.4), false)
   })
 })

@@ -1217,6 +1217,9 @@ export function createTurnOrchestrator(self: AgentLoop): TurnOrchestrator {
     // 用 id（'tianji'）而非 name（'天机'）——调用方按 id 匹配探寻域列表。
     getStarDomain: () => self.sessionDomain?.id ?? null,
 
+    // === B2 收敛轨迹门（会话 506a5e86 优化）：轨迹收敛时静默收敛提醒 ===
+    getConvergenceScoreHistory: () => [...self.convergenceScoreHistory],
+
     // === Abort signal ===
     getAbortSignal: () => self.abortController?.signal,
 

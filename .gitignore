@@ -56,6 +56,7 @@ desktop/.rivet/
 .cc-switch/
 .rivet/check2.txt
 .rivet/*.txt
+.rivet/tauri-key/
 .rivet/frames.jsonl
 .rivet/tool-stream.jsonl
 .rivet/meridian.db*

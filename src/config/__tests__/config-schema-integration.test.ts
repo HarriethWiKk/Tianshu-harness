@@ -1,12 +1,27 @@
-import { describe, it } from 'node:test'
+import { describe, it, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { join } from 'node:path'
+import { tmpdir } from 'node:os'
 import { userConfigPath } from '../paths.js'
 import { configSchema } from '../schema.js'
 import { loadConfig } from '../manager.js'
 
 describe('Config schema integration', () => {
+  // 真实配置路径在 describe 收集期（env 设置前）捕获——前两个用例的「真实文件
+  // 可解析」意图保留。loadConfig() 必须走隔离路径：它对真实配置有迁移回写
+  // 副作用（2026-08-15 实证：migrateAnthropicProtocol 把 protocol:'anthropic'
+  // 写进真实 config.json，dsh 旧 schema 会话 bash 全挂）。
   const configPath = userConfigPath()
+  let dir = ''
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'config-schema-int-'))
+    process.env.RIVET_CONFIG_PATH = join(dir, 'config.json') // 不存在 → loadConfig 纯默认合并
+  })
+  afterEach(() => {
+    delete process.env.RIVET_CONFIG_PATH
+    rmSync(dir, { recursive: true, force: true })
+  })
 
   it('parses full user config through Zod schema', () => {
     if (!existsSync(configPath)) return // skip if no user config

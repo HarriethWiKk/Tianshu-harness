@@ -70,14 +70,14 @@ export class OverlayController {
   private rewindExec?: (messageIndex: number, mode: RewindMode) => void
   private chronicleExec?: (id: string) => void
   private domainPickerExec?: (key: string) => void
-  private modelPickerExec?: (key: string) => void
+  private modelPickerExec?: (provider: string, modelId: string) => void
   private domainPickerSaveDefaultExec?: (key: string) => void
   private modelPickerSaveDefaultExec?: (provider: string, modelId: string) => void
   private themePickerExec?: (key: string) => void
   private themePickerSaveDefaultExec?: (key: string) => void
   private choicePanelExec?: (id: string) => void
   private planPickerExec?: (slug: string) => void
-  private connectExec?: (commit: ConnectCommit, summary: string) => void
+  private connectExec?: (commit: ConnectCommit, summary: string) => boolean | void
   private initExec?: (commit: InitCommit, summary: string) => void
   private cockpitPanel: Panel = 'summary'
 
@@ -147,8 +147,8 @@ export class OverlayController {
   setChronicleExec(fn: ((id: string) => void) | undefined): void { this.chronicleExec = fn }
   getDomainPickerExec(): ((key: string) => void) | undefined { return this.domainPickerExec }
   setDomainPickerExec(fn: ((key: string) => void) | undefined): void { this.domainPickerExec = fn }
-  getModelPickerExec(): ((key: string) => void) | undefined { return this.modelPickerExec }
-  setModelPickerExec(fn: ((key: string) => void) | undefined): void { this.modelPickerExec = fn }
+  getModelPickerExec(): ((provider: string, modelId: string) => void) | undefined { return this.modelPickerExec }
+  setModelPickerExec(fn: ((provider: string, modelId: string) => void) | undefined): void { this.modelPickerExec = fn }
   getDomainPickerSaveDefaultExec(): ((key: string) => void) | undefined { return this.domainPickerSaveDefaultExec }
   setDomainPickerSaveDefaultExec(fn: ((key: string) => void) | undefined): void { this.domainPickerSaveDefaultExec = fn }
   getModelPickerSaveDefaultExec(): ((provider: string, modelId: string) => void) | undefined { return this.modelPickerSaveDefaultExec }
@@ -161,8 +161,8 @@ export class OverlayController {
   setChoicePanelExec(fn: ((id: string) => void) | undefined): void { this.choicePanelExec = fn }
   getPlanPickerExec(): ((slug: string) => void) | undefined { return this.planPickerExec }
   setPlanPickerExec(fn: ((slug: string) => void) | undefined): void { this.planPickerExec = fn }
-  getConnectExec(): ((commit: ConnectCommit, summary: string) => void) | undefined { return this.connectExec }
-  setConnectExec(fn: ((commit: ConnectCommit, summary: string) => void) | undefined): void { this.connectExec = fn }
+  getConnectExec(): ((commit: ConnectCommit, summary: string) => boolean | void) | undefined { return this.connectExec }
+  setConnectExec(fn: ((commit: ConnectCommit, summary: string) => boolean | void) | undefined): void { this.connectExec = fn }
   getInitExec(): ((commit: InitCommit, summary: string) => void) | undefined { return this.initExec }
   setInitExec(fn: ((commit: InitCommit, summary: string) => void) | undefined): void { this.initExec = fn }
 

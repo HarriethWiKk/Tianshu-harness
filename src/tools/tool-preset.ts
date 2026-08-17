@@ -2,6 +2,8 @@ import { existsSync, readFileSync } from 'node:fs'
 import { findProjectConfig } from '../config/manager.js'
 import { userConfigPath } from '../config/paths.js'
 import { isRuntimeLeanAspect } from '../config/runtime-lean.js'
+// 叶模块（0 import），仅取域内置档位默认，无循环依赖。
+import { STAR_DOMAINS } from '../agent/star-domain-data.js'
 
 /**
  * Tool preset — 会话启动期的工具装配档位（会话内冻结，前缀缓存零影响）。
@@ -11,7 +13,7 @@ import { isRuntimeLeanAspect } from '../config/runtime-lean.js'
  *   交付/plan/web_search/web_fetch。去掉编排（council/team）、browser 系、
  *   attack_case、semantic_search 等重而冷门的工具。
  * - **frontend（默认，30）**：minimal + browser_debug（UI 渲染验证闭环）。
- * - **full（48）**：全集，含 attack_case/council/team/semantic_search/repo_graph/
+ * - **full（50）**：全集，含 attack_case/council/team/semantic_search/repo_graph/
  *   undo/recall_general/record_general_finding/ast_edit/related_tests/
  *   inspect_project/import_resource/leave_mark/browser_debug/monitor。
  * - **taiyi（16 个，评测档）**：太一星域最小工具集——只保留 2026-08-04 会话
@@ -26,11 +28,14 @@ import { isRuntimeLeanAspect } from '../config/runtime-lean.js'
  *   bootstrap 层未门控，实装远多于文档 16；本注释曾写 17 并误含
  *   request_path_access，与 default-registry 实现相反，一并修正）。
  *   用途：评测「只留关键工具是否够用」；显式 RIVET_TOOL_PRESET=taiyi 或
- *   tools.preset=taiyi 触发，不进默认回退链。
+ *   tools.preset=taiyi 触发。另作太一星域内置默认档（star-domain-data
+ *   toolPreset 字段）：defaultDomain 钉定 taiyi 且无任何显式给档时落到本档——
+ *   这是「钉太一即 16 件」的默认体验，显式配置恒优先可覆盖。
  *
  * 解析优先级：`RIVET_TOOL_PRESET` env > 项目 `.rivet-config.json` tools.preset
- * > 用户配置 tools.preset（`userConfigPath()`，认 RIVET_HOME/RIVET_CONFIG_PATH）
- * > lean 默认 `minimal` > 'frontend'。
+ * > 项目 runtime.domains[域].toolPreset > 用户配置 tools.preset（`userConfigPath()`，
+ * 认 RIVET_HOME/RIVET_CONFIG_PATH）> 用户 runtime.domains[域].toolPreset
+ * > 域内置默认档（STAR_DOMAINS[域].toolPreset）> lean 默认 `minimal` > 'frontend'。
  * 变更只在下个会话生效（会话中途改工具指纹 = 前缀全量重建，反经济）。
  */
 
@@ -45,10 +50,11 @@ function parsePreset(raw: unknown): ToolPreset | null {
 const memo = new Map<string, ToolPreset>()
 
 /**
- * 解析工具档位。`domainId`（config.agent.defaultDomain，装配期静态值）非空
- * 且项目/用户配置里存在 `runtime.domains[domainId].toolPreset` 时，域档位
- * 优先于全局 tools.preset——但 RIVET_TOOL_PRESET env 仍最高（显式环境变量
- * 不被域配置覆盖）。运行期 /domain 切换不改档位（装配已过，改指纹=前缀重建）。
+ * 解析工具档位。`domainId`（config.agent.defaultDomain，装配期静态值）非空时，
+ * 域相关档位按两级参与解析（均低于 RIVET_TOOL_PRESET env 与同文件 tools.preset）：
+ * ① 项目/用户配置 `runtime.domains[domainId].toolPreset`（显式域档）；
+ * ② 域定义内置默认（`STAR_DOMAINS[domainId].toolPreset`，如 taiyi 域内置 taiyi 档）。
+ * 完整优先级见文件头注释。运行期 /domain 切换不改档位（装配已过，改指纹=前缀重建）。
  */
 export function resolveToolPreset(cwd: string, domainId?: string): ToolPreset {
   const key = domainId ? `${cwd}\u0000${domainId}` : cwd
@@ -90,6 +96,12 @@ export function resolveToolPreset(cwd: string, domainId?: string): ToolPreset {
         }
       } catch { /* malformed user config — fall through */ }
     }
+  }
+
+  // 域内置默认档（star-domain-data toolPreset 字段）：仅在 env/项目/用户均未
+  // 显式给档时生效。domainId 可能是 'auto' 或自定义域 id——查不到自然落兜底。
+  if (!preset && domainId) {
+    preset = parsePreset((STAR_DOMAINS as Record<string, { toolPreset?: unknown }>)[domainId]?.toolPreset)
   }
 
   const resolved = preset ?? (isRuntimeLeanAspect('tools', undefined, cwd) ? 'minimal' : 'frontend')
