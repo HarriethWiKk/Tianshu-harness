@@ -13,6 +13,15 @@ import { debugLog } from '../utils/debug.js'
 import { CircuitBreakerManager } from './worker-circuit-breaker.js'
 import { InMemoryMailbox, type WorkerMailbox } from './worker-mailbox.js'
 import { profileRegistry } from './profile-registry.js'
+import {
+  WRITE_DEFAULT_MAX_TURNS,
+  historyBudgetEnabled,
+  historyBudgetFloor,
+  mergeBudgetOverride,
+  parseWorkerActualRows,
+  shapeWriteBudgetForProfile,
+} from './budget-shape.js'
+import { hashObjective } from './worker-episode.js'
 import { PLAN_CONSTRAINT_PREFIX } from './plan-constraints.js'
 import {
   createReadOnlyWorkOrder,
@@ -50,7 +59,7 @@ import {
 } from './worker-revision.js'
 import { WorkerLiveness, EXPLORE_STALL_MS, deriveWorkerStallMs } from './worker-liveness.js'
 import { runHandsSession, type HandsSessionConfig, type HandsSessionRun } from './hands-session.js'
-import { buildWorkerEpisode } from './worker-episode.js'
+import { buildWorkerEpisode, persistWorkerActualIndex } from './worker-episode.js'
 import { recordWorkerEpisodeClosure } from './reward-loop.js'
 import { signalFromWorkerEpisode, signalsFromVerifiedResults } from './control-plane-adapters.js'
 import { WorktreeCoordinator } from './worktree-coordinator.js'
@@ -1355,8 +1364,16 @@ export class DelegationCoordinator {
    *  store. Shadow-first: rows only influence FUTURE dispatch ranking via
    *  buildHistoricalModelRewards behind the efeRouting gate — never the
    *  current task. Telemetry failures must never affect delegation. */
-  private recordWorkerEpisode(order: WorkOrder, handsRun: HandsSessionRun, model: string): void {
+  private recordWorkerEpisode(order: WorkOrder, handsRun: HandsSessionRun, model: string, dispatchStartedAt?: number): void {
     try {
+      const actuals = {
+        ...(handsRun.toolUses !== undefined ? { toolUses: handsRun.toolUses } : {}),
+        ...(dispatchStartedAt !== undefined ? { durationMs: Math.max(0, Date.now() - dispatchStartedAt) } : {}),
+        ...(handsRun.usage && ((handsRun.usage.input_tokens ?? 0) > 0 || (handsRun.usage.output_tokens ?? 0) > 0)
+          ? { usage: { input: handsRun.usage.input_tokens ?? 0, output: handsRun.usage.output_tokens ?? 0 } }
+          : {}),
+        budget: { maxTurns: order.budget.maxTurns, timeoutMs: order.budget.timeoutMs },
+      }
       const episode = buildWorkerEpisode({
         order,
         result: handsRun.result,
@@ -1364,8 +1381,18 @@ export class DelegationCoordinator {
         model,
         role: 'hands',
         ...(handsRun.writeGate ? { writeGate: handsRun.writeGate } : {}),
+        actuals,
       })
       recordWorkerEpisodeClosure(this.config.modelTierShadowStore, episode)
+      // 预算回馈索引行：objectiveHash 进 key，同目标重派时前缀查询直达。
+      persistWorkerActualIndex(this.config.modelTierShadowStore, episode.objectiveHash, {
+        toolUses: handsRun.toolUses ?? 0,
+        durationMs: actuals.durationMs ?? 0,
+        ...(actuals.usage ? { usage: actuals.usage } : {}),
+        budget: actuals.budget,
+        exhausted: episode.exhausted === true,
+        status: episode.status,
+      })
       // Wave 3 episode path: control plane consumes writeGate/falseGreen/
       // repairCount facts here (NOT via aggregation — its signature stays).
       this.config.onControlSignal?.(signalFromWorkerEpisode(episode))
@@ -1610,7 +1637,7 @@ export class DelegationCoordinator {
             authority: request.authority,
             riskTier: request.riskTier,
             sessionTurn: request.sessionTurn,
-            budget: request.budget,
+            budget: isWrite ? this.budgetWithHistory(request) : request.budget,
             modelOverride: request.modelOverride,
             tierFloor: request.tierFloor,
           })
@@ -1684,9 +1711,12 @@ export class DelegationCoordinator {
     mergedSignal: AbortSignal,
     currentResult: WorkerResult,
     sessionMessages: readonly OaiMessage[],
+    priorUsage?: Partial<Usage>,
   ): Promise<{ result: WorkerResult; sessionMessages: readonly OaiMessage[] }> {
     let result = currentResult
     let messages = sessionMessages
+    // 扩写轮同样落同一会话文件——回种累计用量，逐轮滚动。
+    let expansionUsage: Partial<Usage> | undefined = priorUsage
 
     for (let attempt = 0; attempt < SUMMARY_CONTINUATION_ATTEMPTS; attempt++) {
       if (result.summary.length >= SUMMARY_MIN_LENGTH) break
@@ -1701,9 +1731,11 @@ export class DelegationCoordinator {
         ...workerConfig,
         order: expansionOrder,
         priorMessages: messages,
+        ...(expansionUsage ? { priorUsage: expansionUsage } : {}),
       }
       try {
         const expansionRun = await this.runWorker(expansionConfig)
+        expansionUsage = mergeUsage(expansionUsage, expansionRun.usage) ?? expansionUsage
         const expandedResult = expansionRun.result
         // Only accept the expansion when it is itself passed AND actually longer.
         // A failed/blocked expansion (e.g. 收尾轮 JSON 解析崩后 salvage 出的长
@@ -1778,6 +1810,8 @@ export class DelegationCoordinator {
         ...workerConfig,
         order: continuationOrder,
         priorMessages: run.sessionMessages,
+        // 回种此前各轮累计用量——续跑轮的 meta 从「只剩本轮」变为「派发终身」
+        priorUsage: run.usage,
         ...(checkpoint ? { checkpoint } : {}),
       }
 
@@ -1858,6 +1892,7 @@ export class DelegationCoordinator {
         ...workerConfig,
         order: revisionOrder,
         priorMessages: current.sessionMessages,
+        priorUsage: current.usage,
       })
     } catch (error) {
       debugLog(`[worker-revision] ${order.id} 复核抛错：${error instanceof Error ? error.message : String(error)}`)
@@ -2100,11 +2135,42 @@ export class DelegationCoordinator {
   /** P1-7: parentSignal / mailbox are explicit parameters (not read from
    *  this.config / this.mailbox) so concurrent waves never inherit another
    *  wave's abort signal or mailbox. */
+  /** 预算发准（2026-08-18）：写工派发前查同 objective 的历史实际用量
+   *  （worker_actual 索引行）——耗尽 / near-miss 样本给预算上地板（3× 帽 +
+   *  绝对帽），让反复续跑的任务一次发准。模型显式 budget 逐字段全胜；
+   *  store 缺席 / 闸门关闭 / 坏数据一律静默降级为原 budget。 */
+  private budgetWithHistory(request: DelegationRequest): DelegationRequest['budget'] {
+    if (!historyBudgetEnabled()) return request.budget
+    const store = this.config.modelTierShadowStore
+    const load = store?.loadBanditStatesByPrefix?.bind(store)
+    if (!load) return request.budget
+    try {
+      const hash = hashObjective(request.objective)
+      const samples = parseWorkerActualRows(load(`worker_actual:${hash}:`, 5), hash)
+      if (samples.length === 0) return request.budget
+      const shaped = shapeWriteBudgetForProfile(request.scope.files, request.profile)
+      const current = {
+        maxTurns: request.budget?.maxTurns ?? shaped?.maxTurns ?? WRITE_DEFAULT_MAX_TURNS,
+        timeoutMs: request.budget?.timeoutMs ?? shaped?.timeoutMs
+          ?? profileRegistry.get(request.profile ?? '')?.defaultTimeoutMs ?? 600_000,
+      }
+      const floor = historyBudgetFloor(samples, current)
+      if (!floor) return request.budget
+      return mergeBudgetOverride(request.budget, floor)
+    } catch {
+      return request.budget
+    }
+  }
+
   private async delegateOrder(
     order: WorkOrder,
     parentSignal: AbortSignal | undefined,
     mailbox: WorkerMailbox,
   ): Promise<CoordinatorRun> {
+    // 预算回馈（2026-08-18）：派发墙钟从入口起算——episode 落盘早于
+    // WorkerResult.durationMs 盖章（runDelegationWithGlobalGate 的 .then），
+    // 实际用量须在 episode 构建时自算。
+    const dispatchStartedAt = Date.now()
     const identity: DelegationIdentity = {
       // dispatchId 用 parentTurnId 作兼容派发域。attemptId 是本次派发的执行
       // 身份：per-dispatch 而非 per-attempt——delegateOrder 内的同模型重试 /
@@ -2341,6 +2407,13 @@ export class DelegationCoordinator {
 
     let run: DelegateRunState | undefined
 
+    // usage-ledger 对齐（2026-08-18）：同一派发（同 order.id + nonce → 同一 worker
+    // 会话文件）跨轮累计的净增用量。每轮 runWorker 前经 priorUsage 回种进新
+    // SessionContext（meta 单调递增、与 cache-log 对账一致），轮后并入本账。
+    // 各轮返回的是差值，mergeUsage 累加即派发真值；DelegateRunState.usage 与
+    // enrichResult 用的都是这份累计，而非「最后一轮」。
+    let dispatchUsage: Partial<Usage> | undefined
+
     // T3: escalation shadow events collected during retry
     const escalationShadows: ModelTierShadowEvent[] = []
 
@@ -2493,6 +2566,10 @@ export class DelegationCoordinator {
           const cwd = this.config.cwd ?? workerConfig.cwd
           // Capture session messages from the hands worker for resume persistence.
           let handsSessionMessages: readonly OaiMessage[] | undefined
+          // 本次 hands 会话内（首轮 + 续跑 + 修复）逐轮增长的回种基线；
+          // 初始 = 派发级累计（可能含此前失败尝试的用量），会话结束后整包
+          // 并回 dispatchUsage。
+          let handsPriorUsage: Partial<Usage> | undefined = dispatchUsage
           // 写工的断点此前整个丢掉——runHands 只透传 result/usage，内层
           // WorkerSessionRun.checkpoint 无人接。结果是最容易耗尽预算的一档
           // worker（32 轮的实现+验证）连「可续跑」这句提示都拿不到。
@@ -2531,10 +2608,12 @@ export class DelegationCoordinator {
                 cwd: workerCwd,
                 activeClaims,
                 domainKnowledgeStore: this.config.domainKnowledgeStore,
+                ...(handsPriorUsage ? { priorUsage: handsPriorUsage } : {}),
                 ...(options?.continueSession && handsSessionMessages && handsSessionMessages.length > 0
                   ? { priorMessages: handsSessionMessages }
                   : {}),
               })
+              handsPriorUsage = mergeUsage(handsPriorUsage, sessionRun.usage) ?? handsPriorUsage
               if (typeof sessionRun.session?.getMessages === 'function') {
                 handsSessionMessages = sessionRun.session.getMessages()
               }
@@ -2544,8 +2623,9 @@ export class DelegationCoordinator {
             },
           }))
           this.captureAbortCheckpoint(order.id, handsCheckpoint, handsRun.result)
-          run = { result: handsRun.result, sessionMessages: handsSessionMessages, checkpoint: handsCheckpoint, usage: handsRun.usage, providerName: workerConfig.providerName }
-          this.recordWorkerEpisode(order, handsRun, selected.model)
+          dispatchUsage = mergeUsage(dispatchUsage, handsRun.usage) ?? dispatchUsage
+          run = { result: handsRun.result, sessionMessages: handsSessionMessages, checkpoint: handsCheckpoint, usage: dispatchUsage, providerName: workerConfig.providerName }
+          this.recordWorkerEpisode(order, handsRun, selected.model, dispatchStartedAt)
         } finally {
           if (this.config.sessionRegistry && this.config.sessionId) {
             for (const file of acquiredClaimFiles) {
@@ -2554,12 +2634,16 @@ export class DelegationCoordinator {
           }
         }
       } else {
-        const workerRun = await wrapAbort(this.runWorker(workerConfig))
+        const workerRun = await wrapAbort(this.runWorker({
+          ...workerConfig,
+          ...(dispatchUsage ? { priorUsage: dispatchUsage } : {}),
+        }))
         this.captureAbortCheckpoint(order.id, workerRun.checkpoint, workerRun.result)
+        dispatchUsage = mergeUsage(dispatchUsage, workerRun.usage) ?? dispatchUsage
         const sessionMessages = typeof workerRun.session?.getMessages === 'function'
           ? workerRun.session.getMessages()
           : undefined
-        run = { result: workerRun.result, transcript: workerRun.transcript, sessionMessages, usage: workerRun.usage, providerName: workerConfig.providerName }
+        run = { result: workerRun.result, transcript: workerRun.transcript, sessionMessages, usage: dispatchUsage, providerName: workerConfig.providerName }
         this.registerWorkerArtifacts(order.id)
       }
     } catch (error) {
@@ -2607,6 +2691,7 @@ export class DelegationCoordinator {
                 }
                 const retryCwd = this.config.cwd ?? workerConfig.cwd
                 let retryHandsMessages: readonly OaiMessage[] | undefined
+                let retryHandsPriorUsage: Partial<Usage> | undefined = dispatchUsage
                 // Retry reuses the same order.id, so the fallback session is
                 // already registered by the primary branch above. Re-derive the
                 // worker-scoped store so retry diffs also persist (otherwise the
@@ -2631,10 +2716,12 @@ export class DelegationCoordinator {
                       cwd: workerCwd,
                       activeClaims: workerConfig.activeClaims ?? [],
                       domainKnowledgeStore: this.config.domainKnowledgeStore,
+                      ...(retryHandsPriorUsage ? { priorUsage: retryHandsPriorUsage } : {}),
                       ...(options?.continueSession && retryHandsMessages && retryHandsMessages.length > 0
                         ? { priorMessages: retryHandsMessages }
                         : {}),
                     })
+                    retryHandsPriorUsage = mergeUsage(retryHandsPriorUsage, sessionRun.usage) ?? retryHandsPriorUsage
                     if (typeof sessionRun.session?.getMessages === 'function') {
                       retryHandsMessages = sessionRun.session.getMessages()
                     }
@@ -2642,20 +2729,25 @@ export class DelegationCoordinator {
                     return JSON.stringify(sessionRun.result)
                   },
                 }))
-                run = { result: retryHandsRun.result, sessionMessages: retryHandsMessages, usage: retryHandsRun.usage, providerName: workerConfig.providerName }
-                this.recordWorkerEpisode(order, retryHandsRun, selected.model)
+                dispatchUsage = mergeUsage(dispatchUsage, retryHandsRun.usage) ?? dispatchUsage
+                run = { result: retryHandsRun.result, sessionMessages: retryHandsMessages, usage: dispatchUsage, providerName: workerConfig.providerName }
+                this.recordWorkerEpisode(order, retryHandsRun, selected.model, dispatchStartedAt)
               } finally {
                 if (this.config.sessionRegistry && this.config.sessionId) {
                   for (const f of retryClaimFiles) this.config.sessionRegistry.releaseClaim(this.config.sessionId, f)
                 }
               }
             } else {
-              const workerRun = await wrapAbort(this.runWorker(workerConfig))
+              const workerRun = await wrapAbort(this.runWorker({
+                ...workerConfig,
+                ...(dispatchUsage ? { priorUsage: dispatchUsage } : {}),
+              }))
               this.captureAbortCheckpoint(order.id, workerRun.checkpoint, workerRun.result)
+              dispatchUsage = mergeUsage(dispatchUsage, workerRun.usage) ?? dispatchUsage
               const sessionMessages = typeof workerRun.session?.getMessages === 'function'
                 ? workerRun.session.getMessages()
                 : undefined
-              run = { result: workerRun.result, transcript: workerRun.transcript, sessionMessages, usage: workerRun.usage, providerName: workerConfig.providerName }
+              run = { result: workerRun.result, transcript: workerRun.transcript, sessionMessages, usage: dispatchUsage, providerName: workerConfig.providerName }
             }
             // Retry succeeded — record provider health and exit loop
             this.recordProviderOutcome(selected.model, true)
@@ -2754,6 +2846,7 @@ export class DelegationCoordinator {
                 escalationShadows.push(this.recordEscalation(order, strongCard, msg))
                 const cwd = this.config.cwd ?? upgradedConfig.cwd
                 let retryHandsMessages: readonly OaiMessage[] | undefined
+                let escalateHandsPriorUsage: Partial<Usage> | undefined = dispatchUsage
                 // Escalation retries with the same order.id → fallback session already
                 // registered. Re-derive worker store so the escalated run's diff persists
                 // (parity with primary + retry branches).
@@ -2775,10 +2868,12 @@ export class DelegationCoordinator {
                       cwd: workerCwd,
                       activeClaims: upgradedConfig.activeClaims ?? [],
                       domainKnowledgeStore: this.config.domainKnowledgeStore,
+                      ...(escalateHandsPriorUsage ? { priorUsage: escalateHandsPriorUsage } : {}),
                       ...(options?.continueSession && retryHandsMessages && retryHandsMessages.length > 0
                         ? { priorMessages: retryHandsMessages }
                         : {}),
                     })
+                    escalateHandsPriorUsage = mergeUsage(escalateHandsPriorUsage, sessionRun.usage) ?? escalateHandsPriorUsage
                     if (typeof sessionRun.session?.getMessages === 'function') {
                       retryHandsMessages = sessionRun.session.getMessages()
                     }
@@ -2786,8 +2881,9 @@ export class DelegationCoordinator {
                     return JSON.stringify(sessionRun.result)
                   },
                 }))
-                run = { result: handsRun.result, sessionMessages: retryHandsMessages, usage: handsRun.usage, providerName: upgradedConfig.providerName }
-                this.recordWorkerEpisode(order, handsRun, strongCard.model)
+                dispatchUsage = mergeUsage(dispatchUsage, handsRun.usage) ?? dispatchUsage
+                run = { result: handsRun.result, sessionMessages: retryHandsMessages, usage: dispatchUsage, providerName: upgradedConfig.providerName }
+                this.recordWorkerEpisode(order, handsRun, strongCard.model, dispatchStartedAt)
               } finally {
                 if (this.config.sessionRegistry && this.config.sessionId)
                   for (const f of retryClaimFiles)
@@ -2796,11 +2892,15 @@ export class DelegationCoordinator {
             } else {
               // P1-1: increment quota and write escalation shadow for read-only retry
               escalationShadows.push(this.recordEscalation(order, strongCard, msg))
-              const workerRun = await wrapAbort(this.runWorker(upgradedConfig))
+              const workerRun = await wrapAbort(this.runWorker({
+                ...upgradedConfig,
+                ...(dispatchUsage ? { priorUsage: dispatchUsage } : {}),
+              }))
+              dispatchUsage = mergeUsage(dispatchUsage, workerRun.usage) ?? dispatchUsage
               const sessionMessages = typeof workerRun.session?.getMessages === 'function'
                 ? workerRun.session.getMessages()
                 : undefined
-              run = { result: workerRun.result, transcript: workerRun.transcript, sessionMessages, usage: workerRun.usage, providerName: upgradedConfig.providerName }
+              run = { result: workerRun.result, transcript: workerRun.transcript, sessionMessages, usage: dispatchUsage, providerName: upgradedConfig.providerName }
             }
             // Upgrade succeeded — record provider outcome; circuit recovery for tier-locked profiles
             this.recordProviderOutcome(strongCard.model, true)
@@ -2941,7 +3041,11 @@ export class DelegationCoordinator {
           this.orderControllers.set(order.id, orderController)
           try {
             escalationShadows.push(this.recordEscalation(order, strongCard, `契约失败(${run.result.failureReason})升档重试`))
-            const workerRun = await wrapAbort(this.runWorker(upgradedConfig))
+            const workerRun = await wrapAbort(this.runWorker({
+              ...upgradedConfig,
+              ...(dispatchUsage ? { priorUsage: dispatchUsage } : {}),
+            }))
+            dispatchUsage = mergeUsage(dispatchUsage, workerRun.usage) ?? dispatchUsage
             this.recordProviderOutcome(strongCard.model, true)
             const stillBroken = workerRun.result.status === 'blocked'
               && (workerRun.result.failureReason === 'json_parse' || workerRun.result.failureReason === 'schema_mismatch')
@@ -2953,7 +3057,7 @@ export class DelegationCoordinator {
                 ...run,
                 result: workerRun.result,
                 sessionMessages: escSessionMessages ?? run.sessionMessages,
-                usage: workerRun.usage ?? run.usage,
+                usage: dispatchUsage,
                 providerName: upgradedConfig.providerName,
               }
               selected = strongCard
@@ -3015,7 +3119,7 @@ export class DelegationCoordinator {
 
     // Summary quality gate: expand brief summaries before persisting/returning.
     if (run.sessionMessages && run.sessionMessages.length > 0 && run.result.status === 'passed' && run.result.summary.length < SUMMARY_MIN_LENGTH) {
-      const expanded = await this.maybeExpandSummary(order, workerConfig, mergedSignal, run.result, run.sessionMessages)
+      const expanded = await this.maybeExpandSummary(order, workerConfig, mergedSignal, run.result, run.sessionMessages, dispatchUsage)
       run = { ...run, result: expanded.result, sessionMessages: expanded.sessionMessages }
     }
 
@@ -3144,7 +3248,7 @@ export class DelegationCoordinator {
             authority: r.authority,
             riskTier: r.riskTier,
             sessionTurn: r.sessionTurn,
-            budget: r.budget,
+            budget: isWrite ? this.budgetWithHistory(r) : r.budget,
             modelOverride: r.modelOverride,
             // 瑶光门：batch 路径曾丢弃 tierFloor（只传 modelOverride），护栏席
             // 声明 strong 实际可能跑低档——与单发 delegate() 路径对齐补传。

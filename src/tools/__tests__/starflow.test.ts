@@ -64,6 +64,11 @@ describe('STARFLOW_TOOL', () => {
     assert.match(result.content, /team 波次/)
     assert.match(result.content, /galaxy 攻坚 — 2 个维度/)
     assert.match(result.content, /confirm: true/)
+    // 环境预检（2026-08-18）：确认前必见磁盘余量——makeTool 的 cwd 是真实
+    // tmpdir，探测必出值；提案仍零派发（探针只读）。
+    assert.match(result.content, /── 环境预检（硬约束，评审\/排期前必核）──/)
+    assert.match(result.content, /磁盘（项目卷）：可用 \d+(\.\d+)? GiB/)
+    assert.match(result.content, /状态持久化/)
     assert.match(result.uiContent ?? '', /星流方案/)
   })
 

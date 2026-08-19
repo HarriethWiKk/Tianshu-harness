@@ -9,6 +9,7 @@ import {
   decideHandsContinuation,
   markContinued,
   mergeUsage,
+  subtractUsage,
   type ContinuationInput,
   type HandsContinuationInput,
 } from '../worker-continuation.js'
@@ -209,5 +210,31 @@ describe('mergeUsage', () => {
     assert.deepEqual(mergeUsage(undefined, { input_tokens: 4 }), { input_tokens: 4 })
     assert.deepEqual(mergeUsage({ input_tokens: 4 }, undefined), { input_tokens: 4 })
     assert.equal(mergeUsage(undefined, undefined), undefined)
+  })
+})
+
+describe('subtractUsage（usage-ledger 对齐）', () => {
+  it('从累计值扣除回种份额，得到本轮净增', () => {
+    const total = { input_tokens: 1010, output_tokens: 55, cache_read_input_tokens: 900 }
+    const delta = subtractUsage(total, { input_tokens: 1000, output_tokens: 50 })
+    assert.deepEqual(delta, { input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 900 })
+  })
+
+  it('与 mergeUsage 互逆：seed ⊕ delta 还原累计', () => {
+    const seed = { input_tokens: 1000, output_tokens: 50, cache_creation_input_tokens: 40 }
+    const total = { input_tokens: 2345, output_tokens: 77, cache_creation_input_tokens: 40, cache_read_input_tokens: 2000 }
+    const restored = mergeUsage(seed, subtractUsage(total, seed))
+    assert.deepEqual(restored, total)
+  })
+
+  it('prior 缺席的键保留原值；prior 大于累计时钳 0', () => {
+    assert.deepEqual(
+      subtractUsage({ input_tokens: 5, output_tokens: 2 }, { input_tokens: 10 }),
+      { input_tokens: 0, output_tokens: 2 },
+    )
+  })
+
+  it('total 缺席返回空对象（零账）', () => {
+    assert.deepEqual(subtractUsage(undefined, { input_tokens: 3 }), {})
   })
 })

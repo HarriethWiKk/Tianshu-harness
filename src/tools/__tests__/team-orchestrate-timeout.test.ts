@@ -94,3 +94,18 @@ test('team_orchestrate 工具超时：peek 不消费 plan-store（与 execute �
     consumePlan(sessionId)
   }
 })
+
+// ── 预算发准（2026-08-18）：多文件任务的 shape 预算进外层超时 ──────────────
+
+test('team_orchestrate 工具超时：shape 预算参与 max（当前形态下饱和到 1h 帽）', () => {
+  // 现实：patcher 单波 × tier 1.5 × 续跑 7 ⇒ 任何 ≥343s 的预算都顶到 1h 帽，
+  // shape 前后取值相同。此断言锁定两个不变量：① shape 后预算绝不把外层压低
+  // （max 语义）；② 饱和值恰为 CEIL（shape 进 max 不会越过护栏）。
+  const bigFiles = Array.from({ length: 10 }, (_, i) => `src/f${i}.ts`)
+  const singleBigTask = planJsonOf([{ ...PATCHER_TASK('big', bigFiles) }])
+  const tBig = timeoutOf({ input: { planJson: singleBigTask }, toolUseId: 'tu_shape_1', cwd: '/repo', sessionId: 's_shape_1' })
+  const tSmall = timeoutOf({ input: { planJson: SINGLE_TASK_PLAN }, toolUseId: 'tu_shape_2', cwd: '/repo', sessionId: 's_shape_2' })
+  assert.equal(tBig, TEAM_TIMEOUT_CEIL_MS)
+  assert.equal(tSmall, TEAM_TIMEOUT_CEIL_MS)
+  assert.ok(tBig >= tSmall, 'shape 进 max 只会放宽外层，绝不收紧')
+})

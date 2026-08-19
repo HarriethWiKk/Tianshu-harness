@@ -33,9 +33,22 @@ export interface WorkerEpisode {
   /** Bounded repair rounds consumed (0 or 1). */
   repairCount: number
   timestamp: number
+  /** 预算发准（2026-08-18）：实际用量四件套——同 objective 重派时的预算先验来源。 */
+  actualToolUses?: number
+  /** 墙钟（从 delegateOrder 入口到落定，含排队）——episode 落盘早于
+   *  WorkerResult.durationMs 盖章，故在构建时自算而非读 result。 */
+  durationMs?: number
+  /** 预算耗尽（failureReason ∈ timeout/max_turns）——回馈估值的强信号。 */
+  exhausted?: boolean
+  failureReason?: string
+  usage?: { input: number; output: number }
+  /** 本次派发的预算回声（审计对账：预算 vs 实际）。 */
+  budget?: { maxTurns: number; timeoutMs: number }
 }
 
-function hashObjective(objective: string): string {
+/** sha256(objective) 前 12 位——episode 主行与 worker_actual 索引行共用的
+ *  目标指纹（预算回馈按它前缀查询）。 */
+export function hashObjective(objective: string): string {
   return createHash('sha256').update(objective).digest('hex').slice(0, 12)
 }
 
@@ -51,10 +64,18 @@ export interface BuildWorkerEpisodeInput {
   role: 'hands' | 'brain'
   writeGate?: { report: WorkerWriteGateReport; repairCount: number }
   timestamp?: number
+  /** 预算发准（2026-08-18）：实际用量四件套——缺席 = 旧调用方，字段不写。 */
+  actuals?: {
+    toolUses?: number
+    durationMs?: number
+    usage?: { input: number; output: number }
+    budget?: { maxTurns: number; timeoutMs: number }
+  }
 }
 
 export function buildWorkerEpisode(input: BuildWorkerEpisodeInput): WorkerEpisode {
   const { order, result, writeGate } = input
+  const exhausted = result.failureReason === 'timeout' || result.failureReason === 'max_turns'
   return {
     schemaVersion: 1,
     orderId: order.id,
@@ -71,6 +92,14 @@ export function buildWorkerEpisode(input: BuildWorkerEpisodeInput): WorkerEpisod
     falseGreen: writeGate?.report.falseGreen === true,
     repairCount: writeGate?.repairCount ?? 0,
     timestamp: input.timestamp ?? Date.now(),
+    ...(input.actuals?.toolUses !== undefined ? { actualToolUses: input.actuals.toolUses } : {}),
+    ...(input.actuals?.durationMs !== undefined ? { durationMs: input.actuals.durationMs } : {}),
+    ...(exhausted ? { exhausted: true } : {}),
+    ...(result.failureReason ? { failureReason: result.failureReason } : {}),
+    ...(input.actuals?.usage && (input.actuals.usage.input > 0 || input.actuals.usage.output > 0)
+      ? { usage: input.actuals.usage }
+      : {}),
+    ...(input.actuals?.budget ? { budget: input.actuals.budget } : {}),
   }
 }
 
@@ -84,6 +113,38 @@ export function persistWorkerEpisode(store: WorkerEpisodeStore | undefined | nul
     store.saveBanditState(workerEpisodeKey(episode), JSON.stringify(episode))
   } catch {
     // Episode telemetry must never affect delegation.
+  }
+}
+
+/** 预算回馈的紧凑索引行（预算发准，2026-08-18）。
+ *
+ *  episode 主行的 key 是 sessionId:orderId:timestamp——按 objective 查历史需要
+ *  全量扫描。本行把 objectiveHash 提进 key（`worker_actual:<hash>:<ts>`），前缀
+ *  查询直达；只带预算估值需要的最小字段。episode 主行不动，reward_closure 等
+ *  现有读者零影响。 */
+export interface WorkerActualIndexRow {
+  toolUses: number
+  durationMs: number
+  usage?: { input: number; output: number }
+  budget?: { maxTurns: number; timeoutMs: number }
+  exhausted: boolean
+  status: WorkerResult['status']
+}
+
+export function workerActualKey(objectiveHash: string, timestamp: number): string {
+  return `worker_actual:${objectiveHash}:${timestamp}`
+}
+
+export function persistWorkerActualIndex(
+  store: WorkerEpisodeStore | undefined | null,
+  objectiveHash: string,
+  row: WorkerActualIndexRow,
+): void {
+  if (!store) return
+  try {
+    store.saveBanditState(workerActualKey(objectiveHash, Date.now()), JSON.stringify(row))
+  } catch {
+    // Best-effort: budget feedback must never affect delegation.
   }
 }
 

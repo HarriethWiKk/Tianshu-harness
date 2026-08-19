@@ -34,13 +34,14 @@ class MockIn {
   pause(): this { return this }
 }
 
-function makeApp() {
+function makeApp(rows = 24) {
   const out = new MockOut()
+  out.rows = rows
   const stdin = new MockIn()
   const app = new TuiApp({
     stdout: out as unknown as WriteStream,
     stdin: stdin as unknown as ReadStream,
-    cols: 80, rows: 24, modelName: 'test',
+    cols: 80, rows, modelName: 'test',
   })
   return { app, out, stdin }
 }
@@ -176,6 +177,96 @@ test('command-palette: ↑/↓ 循环选中，Enter 执行回调并关闭', () =
   press('up')                  // 2 → 1
   press('enter')
   assert.equal(executed, 1, 'Enter 执行选中索引 1（↓↓↑ = 1）的命令')
+})
+
+test('command-palette: ↓ past viewport scrolls so the selected command stays visible', () => {
+  // rows=12 → maxItems = 12-5 = 7. 30 commands; 12 downs lands on /n12, past the first page.
+  const { app, out, stdin } = makeApp(12)
+  const commands = Array.from({ length: 30 }, (_, i) => ({
+    label: `/n${String(i).padStart(2, '0')}`,
+  }))
+  app.registerOverlays({ paletteCommands: () => ({ commands, selectedIndex: 0 }) })
+  app.activateOverlay('command-palette')
+  const press = (k: string) => stdin.dataHandler!(SEQ[k] ?? k)
+  const screen = () => stripAnsi(reconstructScreen(out.chunks.join('')))
+
+  assert.ok(screen().includes('/n00'), 'first page shows /n00')
+  assert.ok(!screen().includes('/n12'), 'first page does not show /n12')
+
+  for (let i = 0; i < 12; i++) press('down')
+  const after = screen()
+  assert.ok(after.includes('/n12'), 'selected /n12 visible after scrolling past the viewport')
+  assert.ok(!after.includes('/n00'), 'first command scrolled off')
+})
+
+test('command-palette: ↑ after scrolling moves the cursor without jumping the window', () => {
+  const { app, out, stdin } = makeApp(12)
+  const commands = Array.from({ length: 30 }, (_, i) => ({
+    label: `/n${String(i).padStart(2, '0')}`,
+  }))
+  app.registerOverlays({ paletteCommands: () => ({ commands, selectedIndex: 0 }) })
+  app.activateOverlay('command-palette')
+  const press = (k: string) => stdin.dataHandler!(SEQ[k] ?? k)
+  const screen = () => stripAnsi(reconstructScreen(out.chunks.join('')))
+
+  for (let i = 0; i < 12; i++) press('down') // selected=12, window start=6 (maxItems=7)
+  for (let i = 0; i < 6; i++) press('up')   // selected=6, top of the same window
+  const after = screen()
+  assert.ok(after.includes('/n06'), 'cursor at the top of the scrolled window')
+  assert.ok(!after.includes('/n00'), 'window does not jump back to the first page')
+})
+
+test('command-palette: wrap from last item back to first restores the top of the list', () => {
+  const { app, out, stdin } = makeApp(12)
+  const commands = Array.from({ length: 20 }, (_, i) => ({
+    label: `/w${String(i).padStart(2, '0')}`,
+  }))
+  app.registerOverlays({ paletteCommands: () => ({ commands, selectedIndex: 0 }) })
+  app.activateOverlay('command-palette')
+  const press = (k: string) => stdin.dataHandler!(SEQ[k] ?? k)
+  const screen = () => stripAnsi(reconstructScreen(out.chunks.join('')))
+
+  for (let i = 0; i < 20; i++) press('down') // 20 items: wrap back to 0
+  const after = screen()
+  assert.ok(after.includes('/w00'), 'wrap to start shows the first command')
+  assert.ok(!after.includes('/w19'), 'last command is off-screen after wrap')
+})
+
+test('command-palette: wrap from first item to last shows the end of the list', () => {
+  const { app, out, stdin } = makeApp(12)
+  const commands = Array.from({ length: 20 }, (_, i) => ({
+    label: `/w${String(i).padStart(2, '0')}`,
+  }))
+  app.registerOverlays({ paletteCommands: () => ({ commands, selectedIndex: 0 }) })
+  app.activateOverlay('command-palette')
+  const press = (k: string) => stdin.dataHandler!(SEQ[k] ?? k)
+  const screen = () => stripAnsi(reconstructScreen(out.chunks.join('')))
+
+  press('up')
+  const after = screen()
+  assert.ok(after.includes('/w19'), 'wrap-up shows the last command')
+  assert.ok(!after.includes('/w00'), 'first command is off-screen')
+})
+
+test('command-palette: filtering after scroll resets the window to the top', () => {
+  const { app, out, stdin } = makeApp(12)
+  const commands = Array.from({ length: 30 }, (_, i) => ({
+    label: `/n${String(i).padStart(2, '0')}`,
+  }))
+  const filter = () => {
+    const q = app.getOverlayQuery()
+    return q ? commands.filter(c => c.label.includes(q)) : commands
+  }
+  app.registerOverlays({ paletteCommands: () => ({ commands: filter(), selectedIndex: 0 }) })
+  app.activateOverlay('command-palette')
+  const press = (k: string) => stdin.dataHandler!(SEQ[k] ?? k)
+  const screen = () => stripAnsi(reconstructScreen(out.chunks.join('')))
+
+  for (let i = 0; i < 12; i++) press('down')
+  stdin.dataHandler!('0') // query '0' → /n00, /n10, /n20
+  const after = screen()
+  assert.ok(after.includes('/n00'), 'filter reset shows the first match')
+  assert.ok(!after.includes('/n12'), 'scrolled item is gone after filter')
 })
 
 test('command-palette: ↓ 循环到末再回 0', () => {

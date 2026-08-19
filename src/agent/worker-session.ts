@@ -19,7 +19,7 @@ import {
   type WorkOrder,
   type WorkerResult,
 } from './work-order.js'
-import { STALL_TOOL_CALL_THRESHOLD } from './worker-continuation.js'
+import { STALL_TOOL_CALL_THRESHOLD, subtractUsage } from './worker-continuation.js'
 import { toolArgSummary } from '../tui/tool-label.js'
 import { buildWorkerPrompt, buildWorkerRepairPrompt, buildFinalizationInstruction, workerOrderHasWriteTools } from './worker-prompts.js'
 import { reconcileCapturedWorkerFacts } from './worker-evidence.js'
@@ -142,6 +142,20 @@ export interface WorkerSessionConfig {
    *  sees its previous context. The current objective is appended as a new user
    *  message on top of the history. */
   priorMessages?: readonly import('../api/oai-types.js').OaiMessage[]
+  /** Prior rounds' cumulative token usage for the SAME worker session file
+   *  (usage-ledger alignment, 2026-08-18). Every cross-round re-entry of the
+   *  same dispatch — continuation, retry, escalation, summary expansion —
+   *  reuses the sessionId (same order.id + nonce) and therefore the same
+   *  `<sid>.meta.json` / `<sid>/cache-log.jsonl`. cache-log is append-only and
+   *  records the full lifetime, but meta.tokenUsage is overwritten on every
+   *  message append from the CURRENT SessionContext's totals — a fresh context
+   *  per round rewound meta to the last round only (playtest battle audit:
+   *  worker meta 36M vs cache-log 142M input). Seeding the fresh context via
+   *  addSidePathUsage (not addUsage — that would poison occupancy anchors)
+   *  makes meta monotone and byte-comparable with the cache-log sum. The
+   *  run's returned `usage` stays a DELTA (total − seed) so coordinator-side
+   *  mergeUsage bookkeeping is unchanged. */
+  priorUsage?: Partial<Usage>
   /** Per-dispatch nonce mixed into the worker's session id (see
    *  deriveWorkerSessionId) — batch order ids repeat across delegation runs,
    *  and without the nonce every run appends to the same conversation JSONL.
@@ -815,6 +829,16 @@ async function runWorkerSessionImpl(config: WorkerSessionConfig): Promise<Worker
   const prompt = baseParts.join('\n\n')
 
   const session = new SessionContext()
+  // usage-ledger alignment：先种入前几轮的累计用量，meta 从此单调递增且与
+  // cache-log 的终身合计对账一致。走 addSidePathUsage——它只进 totalUsage，
+  // 不碰 lastRealPromptTokens / tailEstimate / 校准比这些 occupancy 锚点。
+  if (config.priorUsage) session.addSidePathUsage(config.priorUsage)
+  // 对外返回差值（本轮净增）：coordinator / hands-session 用 mergeUsage 逐轮
+  // 累加，透传「种入+本轮」的累计值会把 prior 份额重复计入派发总账。
+  const sessionUsage = (): Usage =>
+    (config.priorUsage
+      ? subtractUsage(session.getTotalUsage(), config.priorUsage)
+      : session.getTotalUsage()) as Usage
   // Session resume: pre-seed the conversation history so the worker continues
   // from its previous context. The new objective is then appended as a fresh
   // user message by agent.run() below.
@@ -939,7 +963,7 @@ async function runWorkerSessionImpl(config: WorkerSessionConfig): Promise<Worker
         result: exhausted,
         transcript,
         session,
-        usage: session.getTotalUsage(),
+        usage: sessionUsage(),
         checkpoint: {
           turnIndex: 0,
           partialResult: latestText.slice(0, 8000),
@@ -993,7 +1017,7 @@ async function runWorkerSessionImpl(config: WorkerSessionConfig): Promise<Worker
             result: abortSalvaged,
             transcript,
             session,
-            usage: session.getTotalUsage(),
+            usage: sessionUsage(),
             checkpoint: abortCheckpoint,
           }
         }
@@ -1012,7 +1036,7 @@ async function runWorkerSessionImpl(config: WorkerSessionConfig): Promise<Worker
           },
           transcript,
           session,
-          usage: session.getTotalUsage(),
+          usage: sessionUsage(),
           checkpoint: abortCheckpoint,
         }
       }
@@ -1033,7 +1057,7 @@ async function runWorkerSessionImpl(config: WorkerSessionConfig): Promise<Worker
           result,
           transcript,
           session,
-          usage: session.getTotalUsage(),
+          usage: sessionUsage(),
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
@@ -1050,7 +1074,7 @@ async function runWorkerSessionImpl(config: WorkerSessionConfig): Promise<Worker
               result: salvaged,
               transcript,
               session,
-              usage: session.getTotalUsage(),
+              usage: sessionUsage(),
             }
           }
           const partialSummary = latestText.slice(0, 300)
@@ -1066,7 +1090,7 @@ async function runWorkerSessionImpl(config: WorkerSessionConfig): Promise<Worker
             },
             transcript,
             session,
-            usage: session.getTotalUsage(),
+            usage: sessionUsage(),
           }
         }
         transcript.repairAttempts++
@@ -1101,7 +1125,7 @@ async function runWorkerSessionImpl(config: WorkerSessionConfig): Promise<Worker
       result: buildBlockedWorkerResult(config.order, 'Worker result parser exited unexpectedly'),
       transcript,
       session,
-      usage: session.getTotalUsage(),
+      usage: sessionUsage(),
     }
   } finally {
     clearTimeout(timer)
@@ -1109,6 +1133,10 @@ async function runWorkerSessionImpl(config: WorkerSessionConfig): Promise<Worker
     if (onParentAbort && config.abortSignal) {
       config.abortSignal.removeEventListener('abort', onParentAbort)
     }
+    // 刷掉 loop 侧 persist 缓存里最后一批 meta 更新（尾轮 tokenUsage 只在
+    // 内存，worker 不走主会话的 shutdown drain）。必须在 wrapper 写终态前
+    // 完成，否则 wrapper 从盘上 merge 到的是缺了尾巴的旧账。
+    try { await agent.drainPersistWrites() } catch { /* best-effort */ }
   }
 }
 
@@ -1148,6 +1176,10 @@ export async function runWorkerSession(config: WorkerSessionConfig): Promise<Wor
       waitingFirstByteMs: run.transcript.waitingFirstByteMs,
       ttftSamples: run.transcript.ttftSamples,
     })
+    // updateMetadata 只进本实例的内存缓存（batch-flush 语义）——这个孤儿实例
+    // 无人再碰，终态会随 GC 丢失（wo_meta 测试在 HEAD 上的失败即此因）。
+    // 显式刷盘收口。
+    await persist.flushSessionBuffer().catch(() => {})
   } catch {
     // meta 写回失败不吞结果——worker 已完成，收尾标注只是可观测性增强。
   }

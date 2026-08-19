@@ -1,10 +1,10 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { resolveBetterSqlite3 } from '../native-resolver.js'
-import { existsSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
+import { resolveBetterSqlite3, tryFetchNativeBinary, isFetchFailureMarkerFresh } from '../native-resolver.js'
+import { existsSync, mkdirSync, writeFileSync, rmSync, copyFileSync, cpSync, readFileSync } from 'node:fs'
 import { pathToFileURL } from 'node:url'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, dirname } from 'node:path'
 
 describe('native-resolver', () => {
   it('returns Database constructor when node_modules has better-sqlite3 (dev mode)', () => {
@@ -123,3 +123,111 @@ describe('native-resolver', () => {
     }
   })
 })
+
+describe('native-resolver 自愈（fetch-native-sqlite 失败标记 + 启动补下载）', () => {
+  const realBinary =
+    existsSync(join(process.cwd(), 'dist', 'native', 'better_sqlite3.node'))
+      ? join(process.cwd(), 'dist', 'native', 'better_sqlite3.node')
+      : join(process.cwd(), 'node_modules', 'better-sqlite3', 'build', 'Release', 'better_sqlite3.node')
+
+  function makeRoot(): string {
+    return join(tmpdir(), `native-heal-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`)
+  }
+
+  /** 伪造安装根：scripts/fetch-native-sqlite.js 为可控桩（成功拷真二进制或落哨兵）。 */
+  function writeStubScript(root: string, mode: 'heal' | 'sentinel' | 'fail') {
+    mkdirSync(join(root, 'scripts'), { recursive: true })
+    const body = mode === 'heal'
+      ? `const {mkdirSync, copyFileSync, writeFileSync} = require('fs')\nmkdirSync(${JSON.stringify(join(root, 'dist', 'native'))}, {recursive: true})\ncopyFileSync(${JSON.stringify(realBinary)}, ${JSON.stringify(join(root, 'dist', 'native', 'better_sqlite3.node'))})\nwriteFileSync(${JSON.stringify(join(root, 'sentinel-ran'))}, process.env.RIVET_FETCH_SKIP_COMPILE ?? 'unset')\n`
+      : mode === 'sentinel'
+        ? `require('fs').writeFileSync(${JSON.stringify(join(root, 'sentinel-ran'))}, process.env.RIVET_FETCH_SKIP_COMPILE ?? 'unset')\n`
+        : `process.exit(1)\n`
+    writeFileSync(join(root, 'scripts', 'fetch-native-sqlite.js'), body)
+  }
+
+  it('isFetchFailureMarkerFresh：新鲜 true / 过期与损坏与缺失 false', () => {
+    const root = makeRoot()
+    mkdirSync(join(root, 'dist', 'native'), { recursive: true })
+    const marker = join(root, 'dist', 'native', '.fetch-failed')
+    try {
+      writeFileSync(marker, JSON.stringify({ ts: Date.now() - 60_000, error: 'x' }))
+      assert.equal(isFetchFailureMarkerFresh(marker), true, '1 分钟前的标记应视为新鲜')
+      writeFileSync(marker, JSON.stringify({ ts: Date.now() - 6 * 60_000, error: 'x' }))
+      assert.equal(isFetchFailureMarkerFresh(marker), false, '6 分钟前的标记应已过期')
+      writeFileSync(marker, '{corrupt json')
+      assert.equal(isFetchFailureMarkerFresh(marker), false, '损坏标记按可重试处理')
+      rmSync(marker, { force: true })
+      assert.equal(isFetchFailureMarkerFresh(marker), false, '缺失标记按可重试处理')
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('tryFetchNativeBinary：缺失时自动跑补下载，成功返回二进制路径', () => {
+    const root = makeRoot()
+    writeStubScript(root, 'heal')
+    try {
+      const healed = tryFetchNativeBinary(pathToFileURL(join(root, 'dist', 'chunk.js')).href)
+      assert.ok(healed && healed.endsWith('better_sqlite3.node'), `应返回补下的二进制路径，实得 ${healed}`)
+      assert.equal(existsSync(healed!), true)
+      assert.equal(readFileSync(join(root, 'sentinel-ran'), 'utf8'), '1', '启动自愈必须以 RIVET_FETCH_SKIP_COMPILE=1 调用（只下载不编译，启动不被数分钟编译卡住）')
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('tryFetchNativeBinary：5 分钟内新鲜失败标记 → 跳过（脚本不执行）', () => {
+    const root = makeRoot()
+    writeStubScript(root, 'sentinel')
+    mkdirSync(join(root, 'dist', 'native'), { recursive: true })
+    writeFileSync(join(root, 'dist', 'native', '.fetch-failed'), JSON.stringify({ ts: Date.now(), error: 'just failed' }))
+    try {
+      const healed = tryFetchNativeBinary(pathToFileURL(join(root, 'dist', 'chunk.js')).href)
+      assert.equal(healed, null, '新鲜标记应跳过自愈')
+      assert.equal(existsSync(join(root, 'sentinel-ran')), false, '跳过时桩脚本不应被执行')
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('tryFetchNativeBinary：过期标记不跳过；脚本失败返回 null 不抛错', () => {
+    const root = makeRoot()
+    writeStubScript(root, 'fail')
+    mkdirSync(join(root, 'dist', 'native'), { recursive: true })
+    writeFileSync(join(root, 'dist', 'native', '.fetch-failed'), JSON.stringify({ ts: Date.now() - 6 * 60_000, error: 'old' }))
+    try {
+      const healed = tryFetchNativeBinary(pathToFileURL(join(root, 'dist', 'chunk.js')).href)
+      assert.equal(healed, null, '桩脚本 exit 1 且无二进制产出 → null（降级语义，不崩）')
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('resolveBetterSqlite3 Path 3 端到端：npm 降级布局（wrapper 无二进制）自愈后返回可用绑定', (t) => {
+    if (!existsSync(realBinary)) { t.skip('本机无 better-sqlite3 二进制（真实依赖未装）'); return }
+    const root = makeRoot()
+    writeStubScript(root, 'heal')
+    // 整包复制 wrapper 但剥离其自带二进制——即「npm 装了 wrapper、原生件缺失」的降级布局
+    const wrapperSrc = join(process.cwd(), 'node_modules', 'better-sqlite3')
+    const wrapperDst = join(root, 'node_modules', 'better-sqlite3')
+    cpSync(wrapperSrc, wrapperDst, { recursive: true, filter: (src) => !src.includes(`${join(wrapperSrc, 'build')}`) })
+    // wrapper require 期无条件加载 bindings（真实 npm 布局平铺在顶层 node_modules）
+    for (const dep of ['bindings', 'file-uri-to-path']) {
+      cpSync(join(process.cwd(), 'node_modules', dep), join(root, 'node_modules', dep), { recursive: true })
+    }
+    mkdirSync(join(root, 'dist'), { recursive: true })
+    writeFileSync(join(root, 'dist', 'chunk.js'), '')
+    try {
+      const db = resolveBetterSqlite3(pathToFileURL(join(root, 'dist', 'chunk.js')).href)
+      assert.ok(db, '自愈成功后应返回绑定构造器')
+      const instance = new db(':memory:')
+      instance.exec('CREATE TABLE t (x INTEGER)')
+      instance.prepare('INSERT INTO t VALUES (?)').run(11)
+      assert.equal((instance.prepare('SELECT x FROM t').get() as { x: number }).x, 11)
+      instance.close()
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+})
+

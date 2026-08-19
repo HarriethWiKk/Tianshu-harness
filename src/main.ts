@@ -48,7 +48,7 @@ import {
   shiftTabPlanToggleHint,
 } from './agent/plan-mode.js'
 import type { ApprovalMode } from './agent/loop-types.js'
-import { statSync } from 'node:fs'
+import { readFileSync, statSync } from 'node:fs'
 import { join as pathJoin } from 'node:path'
 import { formatWelcome } from './tui/format/welcome.js'
 import { HANDOFF_NUDGE_RATIO, formatHandoffNudge } from './tui/handoff.js'
@@ -69,7 +69,7 @@ import { configureSpinnerVerbs, setReducedMotion } from './tui/format/spinner-st
 import { StatusLineRunner } from './tui/statusline.js'
 import { buildVerboseTranscript } from './tui/transcript-verbose.js'
 import { resolveAppPromptInput, registerTuiSlashCommands, approvePlanAndKickoff } from './tui/slash-commands.js'
-import { listPlansSync, rejectPlan } from './plan/plan-store.js'
+import { listPlansSync, readPlanSync, rejectPlan, stripPlanChrome } from './plan/plan-store.js'
 import { resolveAutoApproveMs, shouldArm } from './tui/plan-auto-approve.js'
 import type { PlanPickerEntry } from './tui/format/overlay.js'
 import { isCurrentModelSelection } from './tui/model-picker-selection.js'
@@ -972,24 +972,40 @@ async function main() {
       return []
     }
   }
-  // 审批卡片的计划正文预览：剥 frontmatter 与 Status/Model 留痕行后取前 6 行
-  // 非空行（截 76 列）。读不到计划（已删/盘外）返回 undefined，面板退化为纯标题。
+  // 计划全文预览源（pager 的 plan 分支用）：正式计划 readPlanSync 单文件读，
+  // 草稿 readFileSync 现读（agent 每次写入后翻页/搜索自然刷新）。
+  // 剥 frontmatter 与 Status/Model 留痕行与 excerpt 同口径（stripPlanChrome）。
+  // footerHints 覆盖默认 pager footer——预览没有 verbose/message 可切，q 语义
+  // 是「返回原面板」（有 returnTo 时）。读失败返回错误文案而非 null：指针还
+  // 在却跌回 scrollback 分支是静默偷换内容，宁可明说。
+  const planPreviewContent = (): { content: string; title: string; footerHints: Array<[string, string]> } | null => {
+    const preview = tuiApp.getPlanPreview()
+    if (!preview) return null
+    const back: [string, string] = preview.returnTo ? ['q/Esc', '返回'] : ['q/Esc', '关闭']
+    const footerHints: Array<[string, string]> = [['↑↓/j/k', '滚动'], ['PgUp/PgDn', '翻页'], ['/', '搜索'], back]
+    try {
+      if (preview.draftPath) {
+        const text = readFileSync(pathJoin(ctx!.agent.cwd, preview.draftPath), 'utf-8')
+        if (!text.trim()) return { content: '（草稿还是空的——agent 正在规划，稍后再看）', title: '计划草稿（撰写中）', footerHints }
+        return { content: stripPlanChrome(text).join('\n'), title: '计划草稿（撰写中）', footerHints }
+      }
+      const doc = readPlanSync(ctx!.agent.cwd, preview.slug)
+      if (!doc) return { content: `计划 ${preview.slug} 不存在或已删除。`, title: '计划预览', footerHints }
+      return { content: stripPlanChrome(doc.content).join('\n'), title: `计划预览: 「${doc.title}」· ${doc.slug}`, footerHints }
+    } catch {
+      return { content: `无法读取计划文件（${preview.draftPath ?? preview.slug}）。文件可能已被移动或删除。`, title: '计划预览', footerHints }
+    }
+  }
+  // 审批卡片的计划正文预览：剥 chrome 后取前 6 行非空行（截 76 列）。
+  // 读不到计划（已删/盘外）返回 undefined，面板退化为纯标题。
   const planExcerptFor = (slug: string): string | undefined => {
     try {
       const doc = listPlansSync(ctx!.agent.cwd).find(p => p.slug === slug)
       if (!doc) return undefined
-      const rawLines = doc.content.split('\n')
-      // 仅剥开头一处 frontmatter（--- ... ---），正文中的 --- 分隔线保留。
-      let start = 0
-      if (rawLines[0]?.trim() === '---') {
-        const close = rawLines.findIndex((l, i) => i > 0 && l.trim() === '---')
-        if (close > 0) start = close + 1
-      }
       const out: string[] = []
-      for (const raw of rawLines.slice(start)) {
+      for (const raw of stripPlanChrome(doc.content)) {
         const t = raw.trim()
         if (!t) continue
-        if (t.startsWith('> **Status:') || t.startsWith('> **Model:')) continue
         out.push(t.length > 76 ? `${t.slice(0, 75)}…` : t)
         if (out.length >= 6) break
       }
@@ -1004,6 +1020,13 @@ async function main() {
   tuiApp.registerOverlays({
     // Pager — scrollback 内容 或 当前选中 worker 的 detail（用于 /tasks Enter）
     pagerContent: () => {
+      // 计划全文预览（审批卡/plan-picker 的 v 键、/plan-view）— 排最前：
+      // 预览是显式意图，压过 job/worker/verbose/scrollback 全部默认源。
+      // messages 让 `/` 搜索与 n/N 跳匹配在纯 markdown 上也能工作（同 scrollback 分支口径）。
+      const plan = planPreviewContent()
+      if (plan) {
+        return { content: plan.content, page: 0, title: plan.title, footerHints: plan.footerHints, messages: parseScrollbackTranscript(plan.content) }
+      }
       // Job 日志（/jobs Enter）— 优先于 worker detail
       const jobId = tuiApp.getJobDetailId()
       if (jobId) {
@@ -1286,7 +1309,13 @@ async function main() {
           { id: '__reject_comment__', label: '驳回并填写反馈…', description: '输入反馈后驳回，agent 可继续修订' },
         )
         const recommendedIndex = Math.max(0, entries.findIndex(e => e.recommended))
-        return { title: fullTitle, choices: entries, selectedIndex: recommendedIndex, inputSubMode: tuiApp.getChoicePanelInputState() }
+        return {
+          title: fullTitle,
+          choices: entries,
+          selectedIndex: recommendedIndex,
+          inputSubMode: tuiApp.getChoicePanelInputState(),
+          footerHints: [['↑↓', '选择'], ['Enter', '确认'], ['v', '预览全文'], ['Esc', '取消']],
+        }
       }
       if (tuiApp.choicePanelKind === 'ask-user-question') {
         // ask 面板走 app.ts 的 Tab 化专用渲染器（buildAskPanelData），

@@ -4,6 +4,7 @@ import { aggregationPolicyKinds, aggregationPolicySchema, workOrderKindSchema, t
 import type { ContextClaimStore } from '../context/claim-store.js'
 import type { ClaimProposal } from '../context/claims.js'
 import { DEFAULT_DELEGATE_PROFILE, profileRegistry, delegationToolTimeoutMs } from '../agent/profile-registry.js'
+import { mergeBudgetOverride, shapeWriteBudgetForProfile } from '../agent/budget-shape.js'
 import { starDomainRegistry } from '../agent/star-domain-registry.js'
 import { validatePathSafe } from './path-validate.js'
 import {
@@ -339,7 +340,11 @@ export function createDelegateBatchTool(
         // 嵌套委派透传：sub-worker 活动（coordinator 已盖 parentWorkerId）直通 UI 通道。
         onNestedActivity: params.onWorkerActivity,
         resumeWorkOrderId: t.resume,
-        budget: toBudgetOverride(t),
+        // 预算发准（2026-08-18）：写工按 files 形状定价；显式 budget 逐字段全胜。
+        budget: mergeBudgetOverride(
+          toBudgetOverride(t),
+          shapeWriteBudgetForProfile(t.files, t.profile),
+        ),
         }
       })
 
@@ -483,11 +488,12 @@ export function createDelegateBatchTool(
     // full 5-task batch is not killed by a single-wave budget before its later
     // wave can finish (and salvage partial output) — see delegationToolTimeoutMs.
     timeoutMs: (params) => {
-      const tasks = (params?.input?.tasks as Array<{ profile?: string; timeoutMs?: number }> | undefined) ?? []
+      const tasks = (params?.input?.tasks as Array<{ profile?: string; timeoutMs?: number; files?: string[] }> | undefined) ?? []
       return delegationToolTimeoutMs(
         params?.sessionTurnCount,
         tasks.map(t => t.profile),
-        { taskCount: tasks.length, requestedTimeoutMs: tasks.map(t => t.timeoutMs) },
+        // 预算发准：形状定价后的 timeout 也进 max——外层不得先于内层开枪。
+        { taskCount: tasks.length, requestedTimeoutMs: tasks.map(t => t.timeoutMs ?? shapeWriteBudgetForProfile(t.files, t.profile)?.timeoutMs) },
       )
     },
   }

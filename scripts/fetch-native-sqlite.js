@@ -6,17 +6,22 @@
  * Releases 拉取预编译 .node 文件。中国大陆用户常因 GitHub 不可达导致下载失败，
  * 又缺少编译工具链做 fallback 源码编译 → 静默跳过 → 运行时退化为纯内存模式。
  *
- * 本脚本在 postinstall 时运行，三阶兜底：
+ * 本脚本在 postinstall 时运行，穷尽安装链后才降级（不能随便降级到内存模式）：
  *   1. better-sqlite3 已通过 npm 正常编译安装 → 拷贝到 dist/native/（零开销）
- *   2. 下载失败 → 从国内镜像（npmmirror → kkgithub）拉取预编译 .tar.gz
- *   3. 全部失败 → 打印可操作提示，不阻断安装（optional 语义保留）
+ *   2. 四路预编译镜像（npmmirror registry / npmmirror CDN 直连 / kkgithub /
+ *      GitHub 直连）逐个尝试拉取预编译 .tar.gz
+ *   3. 镜像全败 → npm install better-sqlite3 --no-save 源码编译兜底（走用户
+ *      自己的 registry 配置；有编译工具链的机器此时仍能装上；启动自愈以
+ *      RIVET_FETCH_SKIP_COMPILE=1 调用时跳过本段——编译数分钟，留给
+ *      postinstall/手动重跑，启动路径只做分钟内下载自愈）
+ *   4. 全部失败 → 落 .fetch-failed 标记 + 可操作提示，不阻断安装（optional 语义保留）
  *
  * 与 pack-native.js 的分工：
  *   pack-native.js — 桌面 sidecar 打包期，走 prebuild-install 确保 ABI 匹配
  *   fetch-native-sqlite.js — CLI 用户 postinstall，从镜像快速拉取
  */
 
-import { createWriteStream, existsSync, mkdirSync, copyFileSync, writeFileSync } from 'node:fs'
+import { createWriteStream, existsSync, mkdirSync, copyFileSync, writeFileSync, rmSync } from 'node:fs'
 import { mkdir, unlink } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { dirname, join } from 'node:path'
@@ -65,17 +70,44 @@ try {
 // ── 目标路径 ────────────────────────────────────────────────────────
 const TARGET_DIR = join(repoRoot, 'dist', 'native')
 const TARGET = join(TARGET_DIR, 'better_sqlite3.node')
+const FAILED_MARKER = join(TARGET_DIR, '.fetch-failed')
 const NODE_MODULES_NATIVE = join(
   repoRoot, 'node_modules', 'better-sqlite3', 'build', 'Release', 'better_sqlite3.node',
 )
 
+/**
+ * 失败标记（native-resolver 启动自愈消费）：
+ *   写入——下载链全部失败时落 dist/native/.fetch-failed（{ ts, error }），
+ *         启动自愈见 5 分钟内的新鲜标记即跳过重试，不再每次启动白等下载超时；
+ *   清除——所有成功路径（已有产物/复用 node_modules/下载成功）都清掉陈旧标记。
+ * 静默失败从此有痕迹：用户与自愈逻辑都能看到「上次什么时候、败在哪一步」。
+ */
+function clearFailedMarker() {
+  try {
+    if (existsSync(FAILED_MARKER)) rmSync(FAILED_MARKER, { force: true })
+  } catch { /* 标记清理失败不影响主流程 */ }
+}
+
+function writeFailedMarker(lastError) {
+  try {
+    mkdirSync(TARGET_DIR, { recursive: true })
+    writeFileSync(FAILED_MARKER, JSON.stringify({ ts: Date.now(), error: String(lastError).slice(0, 500) }, null, 2) + '\n')
+  } catch { /* 写不了标记也不阻断——提示文案已在 stdout/stderr */ }
+}
+
 const TARBALL = `better-sqlite3-v${version}-node-v${ABI}-${PLATFORM_TOKEN}-${ARCH_TOKEN}.tar.gz`
 
 // ── 镜像源（按优先级）────────────────────────────────────────────────
+// 四路预编译 + 一路源码编译（stage 4），穷尽后才降级——不能随便降级到内存模式。
 const MIRRORS = [
   {
     name: 'npmmirror',
     url: `https://registry.npmmirror.com/-/binary/better-sqlite3/v${version}/${TARBALL}`,
+  },
+  {
+    // registry 域名故障/被墙但 CDN 可达时的直连兜底（registry 302 的最终目标）
+    name: 'npmmirror-cdn',
+    url: `https://cdn.npmmirror.com/binaries/better-sqlite3/v${version}/${TARBALL}`,
   },
   {
     name: 'kkgithub',
@@ -90,8 +122,9 @@ const MIRRORS = [
 // ── main ────────────────────────────────────────────────────────────
 
 async function main() {
-  // 1. 已有 dist/native 产物 → 跳过
+  // 1. 已有 dist/native 产物 → 跳过（顺带清陈旧失败标记——产物在，标记必过期）
   if (existsSync(TARGET)) {
+    clearFailedMarker()
     console.log('[fetch-native-sqlite] native binary already present, skipping')
     process.exit(0)
   }
@@ -100,6 +133,7 @@ async function main() {
   if (existsSync(NODE_MODULES_NATIVE)) {
     mkdirSync(TARGET_DIR, { recursive: true })
     copyFileSync(NODE_MODULES_NATIVE, TARGET)
+    clearFailedMarker()
     console.log('[fetch-native-sqlite] ✓ native binary found in node_modules, copied to dist/native/')
     process.exit(0)
   }
@@ -107,33 +141,64 @@ async function main() {
   // 3. 从镜像下载
   mkdirSync(TARGET_DIR, { recursive: true })
 
+  let lastError = 'unknown'
   for (const mirror of MIRRORS) {
     try {
       console.log(`[fetch-native-sqlite] trying ${mirror.name}: ${mirror.url}`)
       await downloadAndExtract(mirror.url, TARGET_DIR, mirror.name)
+      clearFailedMarker()
       console.log(`[fetch-native-sqlite] ✓ downloaded from ${mirror.name}`)
       process.exit(0)
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
+      lastError = `${mirror.name}: ${msg}`
       console.warn(`[fetch-native-sqlite] ${mirror.name} failed: ${msg}`)
     }
   }
 
-  // 4. 全部失败 → 打印可操作提示
+  // 4. 预编译全败 → 源码编译兜底（本地 npm install：走用户自己的 registry 配置，
+  //    prebuild-install 再试一轮 GitHub，失败则 node-gyp 编译——有编译工具链的
+  //    机器此时能装上；npm 整体不可达则快速失败）。启动自愈（native-resolver）
+  //    以 RIVET_FETCH_SKIP_COMPILE=1 调本脚本时跳过——编译动辄数分钟，启动路径
+  //    只做分钟内的下载自愈，编译兜底留给 postinstall/手动重跑。
+  if (!process.env.RIVET_FETCH_SKIP_COMPILE) {
+    try {
+      console.log('[fetch-native-sqlite] mirrors exhausted, trying source build via npm install …')
+      execSync(`npm install better-sqlite3@${version} --no-save --no-audit --no-fund`, {
+        cwd: repoRoot,
+        stdio: 'pipe',
+        timeout: 10 * 60_000, // 源码编译 2-5 分钟常见，给足
+      })
+      if (existsSync(NODE_MODULES_NATIVE)) {
+        mkdirSync(TARGET_DIR, { recursive: true })
+        copyFileSync(NODE_MODULES_NATIVE, TARGET)
+        clearFailedMarker()
+        console.log('[fetch-native-sqlite] ✓ source build succeeded, copied to dist/native/')
+        process.exit(0)
+      }
+      lastError = 'npm install: no binary produced'
+    } catch (err) {
+      lastError = `npm install: ${err instanceof Error ? err.message : String(err)}`.slice(0, 400)
+      console.warn(`[fetch-native-sqlite] source build failed: ${lastError}`)
+    }
+  }
+
+  // 5. 全部失败 → 落失败标记（启动自愈 5 分钟内不再重试）+ 可操作提示
+  writeFailedMarker(lastError)
   console.warn('')
   console.warn('⚠ [fetch-native-sqlite] All mirrors failed. better-sqlite3 not available.')
   console.warn('  Session history & cross-session memory will run in memory-only mode.')
   console.warn('')
+  // Fix 指引修正（2026-08-17）：旧的 windows-build-tools（npm 包已废弃多年）+
+  // `npm rebuild better-sqlite3 -g tianshu-tui`（rebuild 不到全局安装包里的
+  // optional dep，语法本身也不通）全部换成本仓库自带的预编译拉取脚本——
+  // 无需任何编译工具链，网络恢复后在安装目录重跑一次即可。
+  console.warn('  Fix: 网络恢复后在安装目录重跑本脚本（含预编译四镜像 + 源码编译兜底）:')
+  console.warn('    npm root -g                 # 找到全局 node_modules 路径')
   if (PLATFORM === 'win32') {
-    console.warn('  Fix (Windows):')
-    console.warn('    1. Install Visual Studio Build Tools: https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio-2022')
-    console.warn('    2. npm rebuild better-sqlite3 -g tianshu-tui')
-  } else if (PLATFORM === 'darwin') {
-    console.warn('  Fix (macOS):')
-    console.warn('    xcode-select --install')
-    console.warn('    npm rebuild better-sqlite3 -g tianshu-tui')
+    console.warn('    cd <该路径>\\tianshu-tui && node scripts\\fetch-native-sqlite.js')
   } else {
-    console.warn('  Fix: npm rebuild better-sqlite3 -g tianshu-tui')
+    console.warn('    cd <该路径>/tianshu-tui && node scripts/fetch-native-sqlite.js')
   }
   process.exit(0)
 }

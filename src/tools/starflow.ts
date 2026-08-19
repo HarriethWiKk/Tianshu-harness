@@ -20,6 +20,7 @@ import {
 } from '../agent/starflow-orchestrator.js'
 import { validateGalaxyDimensionContract } from '../agent/galaxy-contract.js'
 import { buildGalaxyBudgetInputs, isReviewGalaxyDimension } from '../agent/galaxy-budget.js'
+import { probeEnvFacts, formatEnvPrecheckBlock } from '../agent/env-precheck.js'
 import type { Tool, ToolCallParams, ToolResult } from './types.js'
 
 const GLYPH = '🌠'
@@ -106,6 +107,7 @@ function formatProposal(
   dims: StarflowGalaxyDimension[],
   derivedFromDrafts: boolean,
   statePath: string,
+  envBlock = '',
 ): string {
   const lines: string[] = [
     `${GLYPH} 星流执行方案`,
@@ -124,6 +126,11 @@ function formatProposal(
   lines.push(
     '  4. 交付门禁 — 输出交付检查清单，提示调用 deliver_task（硬门禁归 deliver_task）',
     '',
+  )
+  // 环境预检（2026-08-18）：确认前必见——playtest 教训：10GB 构建块确认后才
+  // 发现磁盘只剩 1.3GiB，被迫降级重提。探测失败块缺席，绝不阻断提案。
+  if (envBlock) lines.push(envBlock, '')
+  lines.push(
     `状态持久化：${statePath}（blocked/中断后可用 resume: true 续跑，已过阶段不重跑）`,
     '',
     '调用 starflow({..., confirm: true}) 点火执行。',
@@ -253,7 +260,7 @@ export function createStarflowTool(deps: StarflowToolDeps): Tool {
       // 纯静态方案展示——不调任何子工具（零派发），与 galaxy proposal 同构。
       if (!confirm) {
         return {
-          content: formatProposal(objective, rounds ?? 1, dims, !galaxyDims, starflowStatePath(deps.cwd, objective, params.sessionId)),
+          content: formatProposal(objective, rounds ?? 1, dims, !galaxyDims, starflowStatePath(deps.cwd, objective, params.sessionId), formatEnvPrecheckBlock(probeEnvFacts(deps.cwd))),
           uiContent: `${GLYPH} 星流方案 · ${dims.length >= 2 ? `${dims.length} 维度` : '无攻坚维度'}`,
         }
       }

@@ -81,6 +81,10 @@ export interface PagerData {
   selectedMessageIndex?: number
   /** verbose 层：内容源为完整工具输出的详细转录（`v` 切换） */
   verbose?: boolean
+  /** page 模式 footer 键位提示覆盖（如计划预览：无 verbose/message 可切，
+   *  q 是「返回」而非「关闭」）。search/message 模式有各自的上下文 footer，
+   *  不使用此覆盖。 */
+  footerHints?: Array<[string, string]>
 }
 
 const ANSI_RE = /\x1B\[[0-9;]*[a-zA-Z]/g
@@ -136,7 +140,7 @@ export function renderPager(data: PagerData, width: number, height: number, them
   let effectivePage = Math.min(data.page, totalPages - 1)
   let title: string
   const verboseHint: [string, string] = data.verbose ? ['v', '简略'] : ['v', '详细']
-  let footer = compactHints([['↑↓/j/k', '滚动'], ['PgUp/PgDn', '翻页'], ['/', '搜索'], verboseHint, ['q', '关闭']])
+  let footer = compactHints(data.footerHints ?? [['↑↓/j/k', '滚动'], ['PgUp/PgDn', '翻页'], ['/', '搜索'], verboseHint, ['q', '关闭']])
 
   if (mode === 'search') {
     const current = data.searchCurrent ?? 0
@@ -324,6 +328,23 @@ export interface PaletteData {
   commands: PaletteCommand[]
   selectedIndex: number
   searchText?: string
+  /** Previous viewport start. ↑ moves the cursor inside the window;
+   *  the window only shifts when the selection would leave it. */
+  scrollOffset?: number
+}
+
+/**
+ * Keep `selected` inside a viewport of `maxVisible` rows, given the previous
+ * window start. Matches Codex `ensure_selected_visible`.
+ */
+export function followListWindow(selected: number, count: number, maxVisible: number, scroll = 0): number {
+  if (maxVisible <= 0 || count <= maxVisible) return 0
+  const sel = Math.max(0, Math.min(selected, count - 1))
+  const maxScroll = count - maxVisible
+  let start = Math.max(0, Math.min(scroll, maxScroll))
+  if (sel < start) start = sel
+  else if (sel >= start + maxVisible) start = sel - maxVisible + 1
+  return Math.max(0, Math.min(start, maxScroll))
 }
 
 /**
@@ -339,12 +360,17 @@ export function renderCommandPalette(data: PaletteData, width: number, height: n
     : '命令面板'
   lines.push(formatTitleLeft(title, width, theme))
 
-  const maxItems = height - 5 // border + title + footer + border = 4; +1 safety
-  const visible = data.commands.slice(0, maxItems)
+  const maxItems = Math.max(0, height - 5) // border + title + footer + border = 4; +1 safety
+  const count = data.commands.length
+  const selected = count === 0 ? -1 : Math.max(0, Math.min(data.selectedIndex, count - 1))
+  const scrollOffset = followListWindow(Math.max(0, selected), count, maxItems, data.scrollOffset ?? 0)
+  const visible = data.commands.slice(scrollOffset, scrollOffset + maxItems)
+  const overflowAbove = scrollOffset
+  const overflowBelow = count - scrollOffset - visible.length
 
   for (let i = 0; i < visible.length; i++) {
     const cmd = visible[i]!
-    const isSelected = i === data.selectedIndex
+    const isSelected = scrollOffset + i === selected
     const prefix = isSelected
       ? color(CURSOR, theme.primary, { bold: true })
       : ' '
@@ -368,7 +394,10 @@ export function renderCommandPalette(data: PaletteData, width: number, height: n
     lines.push(padLine('', width, theme))
   }
 
-  lines.push(formatFooter(compactHints([['↑↓', '选择'], ['Enter', '执行'], ['Esc', '取消']]), width, theme, 'subtle'))
+  const hints: [string, string][] = [['↑↓', '选择'], ['Enter', '执行'], ['Esc', '取消']]
+  if (overflowAbove > 0) hints.unshift(['↑', String(overflowAbove)])
+  if (overflowBelow > 0) hints.push(['↓', String(overflowBelow)])
+  lines.push(formatFooter(compactHints(hints), width, theme, 'subtle'))
   lines.push(formatBottomBorder(width, theme, 'subtle'))
 
   return lines
@@ -1303,7 +1332,7 @@ export function renderPlanPicker(data: PlanPickerData, width: number, height: nu
     rowsUsed++
   }
 
-  lines.push(formatFooter(compactHints([['↑↓', '选择'], ['Enter', '批准执行'], ['Esc', '取消']]), width, theme, 'subtle'))
+  lines.push(formatFooter(compactHints([['↑↓', '选择'], ['Enter', '批准执行'], ['v', '预览全文'], ['Esc', '取消']]), width, theme, 'subtle'))
   lines.push(formatBottomBorder(width, theme, 'subtle'))
   return lines
 }

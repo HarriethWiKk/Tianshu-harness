@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, rmSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { writePlan, readPlan, listPlans, listPlansSync, approvePlan, rejectPlan, deletePlan, slugify, stripPlanStatusMarkers, resolvePlanOptionLabel, stripCopiedTitleSuffix, resolvePlanRef, isDraftSlug, type PlanDocument } from '../plan-store.js'
+import { writePlan, readPlan, readPlanSync, stripPlanChrome, listPlans, listPlansSync, approvePlan, rejectPlan, deletePlan, slugify, stripPlanStatusMarkers, resolvePlanOptionLabel, stripCopiedTitleSuffix, resolvePlanRef, isDraftSlug, type PlanDocument } from '../plan-store.js'
 import { checked, checkedAt } from '../../utils/guard.js'
 
 describe('slugify', () => {
@@ -332,5 +332,71 @@ describe('resolvePlanRef', () => {
 
   it('returns none for unmatched input', () => {
     assert.equal(resolvePlanRef(plans, 'nonexistent-plan').kind, 'none')
+  })
+})
+
+describe('readPlanSync', () => {
+  function setup() {
+    const dir = mkdtempSync(join(tmpdir(), 'rivet-plan-test-'))
+    return { dir, cleanup: () => rmSync(dir, { recursive: true, force: true }) }
+  }
+
+  it('reads a written plan synchronously with parsed fields', async () => {
+    const { dir, cleanup } = setup()
+    try {
+      await writePlan(dir, 'sync-plan', '# Sync Plan\n\nBody.', [{ label: 'A', description: 'a' }])
+      const doc = readPlanSync(dir, 'sync-plan')
+      assert.ok(doc, 'readPlanSync 应读到刚写入的计划')
+      assert.equal(doc!.title, 'Sync Plan')
+      assert.equal(doc!.status, 'submitted')
+      assert.deepEqual(doc!.options, [{ label: 'A', description: 'a' }])
+      assert.equal(doc!.path, '.rivet/plans/sync-plan.md')
+    } finally {
+      cleanup()
+    }
+  })
+
+  it('returns null for missing slug', () => {
+    const { dir, cleanup } = setup()
+    try {
+      assert.equal(readPlanSync(dir, 'no-such-plan'), null)
+    } finally {
+      cleanup()
+    }
+  })
+})
+
+describe('stripPlanChrome', () => {
+  it('strips leading frontmatter, Status/Model markers; keeps body separators and blank lines', () => {
+    const content = [
+      '---',
+      'rivet-options: [{"label":"a"}]',
+      '---',
+      '> **Model: deepseek-v4 (strong)**',
+      '',
+      '> **Status: REJECTED — 2026-08-18**',
+      '# Title',
+      '',
+      '正文第一段。',
+      '',
+      '---',
+      '',
+      '第二段（正文分隔线保留）。',
+    ].join('\n')
+    const lines = stripPlanChrome(content)
+    assert.deepEqual(lines, [
+      '',
+      '# Title',
+      '',
+      '正文第一段。',
+      '',
+      '---',
+      '',
+      '第二段（正文分隔线保留）。',
+    ])
+  })
+
+  it('leaves plain content untouched when no chrome exists', () => {
+    assert.deepEqual(stripPlanChrome('# 只有正文\n\nline'), ['# 只有正文', '', 'line'])
   })
 })

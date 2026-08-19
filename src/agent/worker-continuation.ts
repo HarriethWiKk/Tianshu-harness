@@ -184,6 +184,28 @@ export function mergeUsage(
   return merged
 }
 
+/** 从累计值里扣掉已回种的份额（usage-ledger 对齐，2026-08-18）。
+ *
+ *  `runWorkerSession` 以 priorUsage 回种新 SessionContext 后，`getTotalUsage()`
+ *  返回的是「种入 + 本轮」的累计值；对 coordinator / hands-session 这些用
+ *  mergeUsage 逐轮累加的记账方，必须拿**差值**（本轮净增）——直接透传累计值
+ *  会把种入份额重复计入派发总账。字段缺项按 0 计，负差值钳到 0（理论上
+ *  不可能——种入的每个键都先经过 addSidePathUsage 加进了同一累计器）。 */
+export function subtractUsage(
+  total: Usage | Partial<Usage> | undefined,
+  prior: Usage | Partial<Usage> | undefined,
+): Partial<Usage> {
+  const out: Partial<Usage> = {}
+  if (!total) return out
+  for (const key of Object.keys(total) as Array<keyof Usage>) {
+    const t = total[key]
+    if (typeof t !== 'number') continue
+    const p = prior?.[key]
+    out[key] = Math.max(0, t - (typeof p === 'number' ? p : 0))
+  }
+  return out
+}
+
 /** 在续跑产出的结果上留痕，让主控知道这份报告经过几轮才落地。 */
 export function markContinued(result: WorkerResult, attempts: number, reason: 'max_turns' | 'timeout'): WorkerResult {
   const note = `budget-continuation: 首轮因${reason === 'max_turns' ? '轮次' : '时间'}预算耗尽被切断，自动续跑 ${attempts} 次后产出本报告`

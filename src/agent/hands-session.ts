@@ -112,6 +112,9 @@ export interface HandsSessionConfig {
 export interface HandsSessionRun {
   result: WorkerResult
   usage: Partial<Usage>
+  /** 本次 hands 会话（首轮+续跑+修复各轮累计）的工具调用数——预算回馈的实际
+   *  用量信号（预算发准，2026-08-18）。 */
+  toolUses?: number
   /** W4-D1: main-side write-gate outcome, when the gate ran (write workers only). */
   writeGate?: { report: WorkerWriteGateReport; repairCount: number }
 }
@@ -170,11 +173,13 @@ export async function runHandsSession(config: HandsSessionConfig): Promise<Hands
     let turnUsage: Partial<Usage> = {}
     // 首轮之外的 agent 轮次总账——续跑 / 解析修复 / 闸门修复共用，避免叠乘。
     let extraRuns = 0
+    // 预算回馈的实际用量信号：跨轮（首轮/续跑/修复）累计的工具调用数。
+    let toolUses = 0
 
     text = await config.runAgent(buildHandsPrompt(config), {
       onTextDelta: (delta) => { text += delta },
       onThinkingDelta: () => {},
-      onToolUse: () => {},
+      onToolUse: () => { toolUses++ },
       onToolResult: () => {},
       onTurnComplete: (usage) => { turnUsage = usage },
       onError: (err) => { apiError = err.message },
@@ -208,9 +213,11 @@ export async function runHandsSession(config: HandsSessionConfig): Promise<Hands
           text = await config.runAgent(repairPrompt, {
             onTextDelta: (delta) => { text += delta },
             onThinkingDelta: () => {},
-            onToolUse: () => {},
+            onToolUse: () => { toolUses++ },
             onToolResult: () => {},
-            onTurnComplete: (usage) => { turnUsage = usage },
+            // 修复轮的 usage 是增量（runWorker 返回差值）——覆写会丢掉首轮
+            // 及此前修复轮的账，与续跑轮的 mergeUsage 记法保持一致。
+            onTurnComplete: (usage) => { turnUsage = mergeUsage(turnUsage, usage) ?? turnUsage },
             onError: (err) => { apiError = err.message },
             onAbort: () => { apiError = 'aborted' },
             onApprovalRequired: async () => false,
@@ -256,7 +263,7 @@ export async function runHandsSession(config: HandsSessionConfig): Promise<Hands
         continuedText = await config.runAgent(objective, {
           onTextDelta: (delta) => { continuedText += delta },
           onThinkingDelta: () => {},
-          onToolUse: () => {},
+          onToolUse: () => { toolUses++ },
           onToolResult: () => {},
           onTurnComplete: (usage) => { turnUsage = mergeUsage(turnUsage, usage) ?? turnUsage },
           onError: (err) => { apiError = err.message },
@@ -306,9 +313,9 @@ export async function runHandsSession(config: HandsSessionConfig): Promise<Hands
           const repairText = await config.runAgent(buildWorkerVerifyRepairPrompt(config.order, report), {
             onTextDelta: () => {},
             onThinkingDelta: () => {},
-            onToolUse: () => {},
+            onToolUse: () => { toolUses++ },
             onToolResult: () => {},
-            onTurnComplete: (usage) => { turnUsage = usage },
+            onTurnComplete: (usage) => { turnUsage = mergeUsage(turnUsage, usage) ?? turnUsage },
             onError: (err) => { apiError = err.message },
             onAbort: () => { apiError = 'aborted' },
             onApprovalRequired: async () => false,
@@ -353,7 +360,7 @@ export async function runHandsSession(config: HandsSessionConfig): Promise<Hands
       }
     }
 
-    return { result, usage: turnUsage, writeGate }
+    return { result, usage: turnUsage, ...(toolUses > 0 ? { toolUses } : {}), writeGate }
  } finally {
     await config.wtCoordinator.remove(config.order.id)
  }

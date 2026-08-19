@@ -819,3 +819,116 @@ describe('STARFLOW_ITERATION_C_BASELINE_PRECHECK', () => {
     assert.equal(calls.galaxy[0]!.input.autoReview, false)
   })
 })
+
+// ── 波次战报（接口层，2026-08-18）：逐块终态进最终报告，不再翻 state 取证 ───
+
+describe('STARFLOW_ORCHESTRATOR · 波次战报', () => {
+  it('team 波次的 workerRows 进最终报告：失败在前 + 小计行，并落盘 state.teamBlocks', async () => {
+    const { deps, cwd } = makeDeps({
+      team: async () => structuredTeam({
+        workers: { total: 2, passed: 1 },
+        workerRows: [
+          { id: 'tu1-starflow-team-w0:T1', task: 'T1', status: 'passed', summary: 'emitter.cpp 落盘，spirv-val 全绿', changedCount: 3, changedFiles: ['emitter.cpp', 'emitter.h', 'p4_verify.cpp'], diffArtifactId: 'delegate_task:ab12cd34', usage: { input: 12345, output: 4567 }, durationMs: 185_000 },
+          { id: 'tu1-starflow-team-w0:T2', task: 'T2', status: 'blocked', failureReason: 'timeout', summary: 'CMake configure 失败', changedCount: 0 },
+        ],
+      }),
+    })
+    const run = await runStarflow(deps, baseInput())
+    assert.match(run.report, /波次战报/)
+    const lines = run.report.split('\n')
+    const t2 = lines.findIndex(l => l.includes('T2'))
+    const t1 = lines.findIndex(l => l.includes('T1'))
+    assert.ok(t2 >= 0 && t1 >= 0 && t2 < t1, '失败块 T2 必须排在通过块 T1 之前')
+    assert.match(run.report, /w0 T2 ⏸ timeout — CMake configure 失败（0 改动）/)
+    assert.match(run.report, /w0 T1 ✅ emitter\.cpp 落盘.*3 改动\(emitter\.cpp,emitter\.h,p4_verify\.cpp\)/)
+    assert.match(run.report, /diff:delegate_task:ab12cd34/)
+    assert.match(run.report, /12\.3k\/4\.6k tok/)
+    assert.match(run.report, /3m/)
+    assert.match(run.report, /小计：2 块 · ✅1 ⛔0 ⏸1 ⚠0/)
+    // 落盘：state.teamBlocks 随检查点持久（resume/审计可直接读）
+    const saved = JSON.parse(readFileSync(starflowStatePath(cwd, '给项目加登录功能'), 'utf8'))
+    assert.equal(saved.teamBlocks.length, 2)
+    assert.equal(saved.teamBlocks[0].task, 'T1')
+    assert.equal(saved.teamBlocks[0].wave, 0)
+  })
+
+  it('跨波重派去重：同任务后波覆盖前波，战报展示当前真相', async () => {
+    let wave = -1
+    const { deps } = makeDeps({
+      team: async (params) => {
+        wave = (params.input as { fromWave?: number }).fromWave ?? 0
+        if (wave === 0) {
+          return structuredTeam({
+            wave: 0, totalWaves: 2, workers: { total: 2, passed: 1 }, completedWaves: 1, stoppedReason: 'partial',
+            workerRows: [
+              { id: 'w0:T1', task: 'T1', status: 'passed', summary: 'w0 完成', changedCount: 1 },
+              { id: 'w0:T2', task: 'T2', status: 'blocked', failureReason: 'timeout', summary: 'w0 超时', changedCount: 0 },
+            ],
+          })
+        }
+        return structuredTeam({
+          wave: 1, totalWaves: 2, workers: { total: 1, passed: 1 }, completedWaves: 2, stoppedReason: 'completed',
+          workerRows: [{ id: 'w1:T2', task: 'T2', status: 'passed', summary: 'w1 重派通过', changedCount: 2 }],
+        })
+      },
+    })
+    // 波次推进靠文案里的 fromWave 提示——structuredTeam 的 content 是占位文案，
+    // nextWaveOf 会退回 undefined，这里直接验证单波路径下 w0 行的吸收与去重语义
+    // 用两次独立调用模拟（resume 场景）：第一次吸收 w0，第二次（w1）覆盖 T2。
+    const first = await runStarflow(deps, baseInput())
+    const firstRun = await runStarflow(
+      { ...deps, teamTool: fakeTool('team_orchestrate', async () => structuredTeam({ wave: 1, totalWaves: 2, workers: { total: 1, passed: 1 }, workerRows: [{ id: 'w1:T2', task: 'T2', status: 'passed', summary: 'w1 重派通过', changedCount: 2 }] }), []) },
+      { ...baseInput(), resume: true },
+    )
+    const rows = firstRun.state.teamBlocks!
+    const t2 = rows.find(r => r.task === 'T2')!
+    assert.equal(t2.status, 'passed', 'w1 的 T2 必须覆盖 w0 的 blocked')
+    assert.equal(t2.wave, 1)
+    assert.equal(rows.filter(r => r.task === 'T2').length, 1, '同 task 只留一行')
+    assert.match(firstRun.report, /T2 ✅ w1 重派通过/)
+    assert.ok(first.state.teamBlocks!.length >= 1)
+  })
+
+  it('门禁未过的波也吸收战报：blocked 报告置顶失败块', async () => {
+    const { deps } = makeDeps({
+      team: async () => structuredTeam({
+        workers: { total: 2, passed: 0 },
+        workerRows: [
+          { id: 'w0:T1', task: 'T1', status: 'failed', failureReason: 'json_parse', summary: '报告解析失败', changedCount: 0 },
+          { id: 'w0:T2', task: 'T2', status: 'failed', failureReason: 'timeout', summary: '墙钟耗尽', changedCount: 0 },
+        ],
+      }),
+    })
+    const run = await runStarflow(deps, baseInput())
+    assert.equal(run.state.phase, 'team', '整波失败 + 复议上限后停在 team')
+    assert.match(run.report, /波次战报/)
+    assert.match(run.report, /w0 T1 ⛔ json_parse — 报告解析失败/)
+    assert.match(run.report, /小计：2 块 · ✅0 ⛔2/)
+  })
+})
+
+// ── 环境预检（2026-08-18）：磁盘硬约束前移到评审与报告 ─────────────────────
+
+describe('STARFLOW_ENV_PRECHECK', () => {
+  it('councilInput.objective 含环境预检块（磁盘余量 + 必核句）', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'starflow-env-'))
+    const { deps, calls } = makeDeps({ cwd: dir })
+    await runStarflow(deps, baseInput())
+    const objective = calls.council[0]!.input.objective as string
+    assert.match(objective, /── 环境预检（硬约束，评审\/排期前必核）──/)
+    assert.match(objective, /磁盘（项目卷）：可用 \d+(\.\d+)? GiB/)
+    assert.match(objective, /被环境约束降级过的块，重提\/续跑前必须复检/)
+  })
+
+  it('最终报告尾带环境现状页脚（resume 复检通道）', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'starflow-env-footer-'))
+    const { deps } = makeDeps({ cwd: dir })
+    const run = await runStarflow(deps, baseInput())
+    assert.match(run.report, /环境现状：磁盘可用 \d+(\.\d+)? GiB（项目卷）/)
+    // 页脚在报告末段（战报/清单之后）
+    const lines = run.report.split('\n')
+    const footerIdx = lines.findIndex(l => l.includes('环境现状'))
+    assert.ok(footerIdx >= 0 && footerIdx >= lines.length - 6, '页脚应贴近报告尾')
+  })
+
+})

@@ -25,6 +25,8 @@ import { buildPrewarmValue, type PrewarmValue } from './prewarm-file.js'
 import { deserializeUnifiedPlan } from './unified-plan.js'
 import { constraintsFromUnifiedPlan } from './plan-constraints.js'
 import type { PlanWithObligations } from './council/council-obligations.js'
+import type { TeamWorkerRow } from './orchestration-outcome.js'
+import { probeEnvFacts, formatEnvPrecheckBlock, formatEnvFooter } from './env-precheck.js'
 import type { Tool, ToolCallParams, ToolResult } from '../tools/types.js'
 
 // ── 类型 ─────────────────────────────────────────────────────────────────
@@ -65,6 +67,10 @@ export interface StarflowState {
   /** M1：team 阶段已通过的最大波号——blocked/resume 时从此续跑，不重跑
    *  已完成波次（工作树改动与契约已落地）。 */
   completedTeamWaves?: number
+  /** 波次战报（接口层，2026-08-18）：每波逐 worker 终态行，按 task 去重（同任务
+   *  后波覆盖前波——战报展示当前真相，历史在 phase artifact 里）。落盘随状态走，
+   *  resume/blocked 后编排器直接从最终报告读到每块状态，不再翻 state/artifact 取证。 */
+  teamBlocks?: Array<TeamWorkerRow & { wave: number }>
   blockedReason?: string
   updatedAt: number
 }
@@ -500,7 +506,8 @@ function incrementalReviewNote(items: StarflowDraftItem[]): string {
 }
 
 /** councilInput.objective 增强：原始 objective + 基线预检（C，仅首轮）+
- *  增量评审说明（B）。目标文件为空或不适用时对应块自动省略。 */
+ *  环境预检（磁盘硬约束，与 C 同门）+ 增量评审说明（B）。目标文件为空或
+ *  不适用时对应块自动省略。 */
 function augmentCouncilObjective(
   objective: string,
   items: StarflowDraftItem[],
@@ -511,6 +518,10 @@ function augmentCouncilObjective(
   if (opts?.precheck !== false) {
     const precheck = baselinePrecheckBlock(cwd, items.flatMap(i => i.files ?? []))
     if (precheck) parts.push(precheck)
+    // 环境预检（2026-08-18）：磁盘余量等硬约束前移到评审——席位把草稿块的
+    // 构建诉求与余量对勘，降级决策发生在确认前而非波次中途。
+    const env = formatEnvPrecheckBlock(probeEnvFacts(cwd))
+    if (env) parts.push(env)
   }
   const note = incrementalReviewNote(items)
   if (note) parts.push(note)
@@ -627,6 +638,19 @@ function extractPlanJson(content: string): string | undefined {
   return COUNCIL_PLAN_JSON_RE.exec(content)?.[1]?.trim() || undefined
 }
 
+/** 从 team 工具结果的结构化 outcome 里吸收逐 worker 战报行（接口层，2026-08-18）。
+ *  按 task 去重后波覆盖前波（战报=当前真相；逐波历史在 phase artifact）。
+ *  outcome 缺席或无行（假工具/预览）时不动 state——旧行为零变化。 */
+function absorbTeamBlocks(state: StarflowState, result: ToolResult, wave: number): void {
+  const outcome = result.orchestration
+  if (!outcome || typeof outcome !== 'object' || (outcome as { kind?: string }).kind !== 'team') return
+  const rows = (outcome as { workerRows?: TeamWorkerRow[] }).workerRows
+  if (!rows || rows.length === 0) return
+  const merged = new Map((state.teamBlocks ?? []).map(b => [b.task, b]))
+  for (const row of rows) merged.set(row.task, { ...row, wave })
+  state.teamBlocks = [...merged.values()]
+}
+
 // ── 报告 ─────────────────────────────────────────────────────────────────
 
 const PHASE_LABELS: Record<'council' | 'team' | 'galaxy' | 'deliver', string> = {
@@ -641,6 +665,57 @@ function phaseStatusLine(key: 'council' | 'team' | 'galaxy' | 'deliver', record:
   if (!record) return `${label}：… 未执行`
   const icon = record.status === 'passed' ? '✅' : record.status === 'skipped' ? '⏭ 跳过' : '⛔ 受阻'
   return `${label}：${icon}${note ?? ''} — ${record.summary}`
+}
+
+/** 战报行内联上限——超出时只保留未过块（正常 12 块计划的 2 倍余量；
+ *  全量逐波历史在 phase artifact，报告只承担「先看哪块」。 */
+const TEAM_REPORT_ROW_CAP = 24
+
+const WORKER_STATUS_ICON: Record<TeamWorkerRow['status'], string> = {
+  passed: '✅',
+  failed: '⛔',
+  blocked: '⏸',
+  escalated: '⚠',
+}
+
+function fmtTok(n: number): string {
+  return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n)
+}
+
+function fmtDur(ms: number): string {
+  if (ms >= 60_000) return `${Math.round(ms / 60_000)}m`
+  return `${Math.round(ms / 1000)}s`
+}
+
+/** 波次战报段（接口层，2026-08-18）：team 逐块终态进最终报告——编排器不再
+ *  翻 state/artifact 取证。失败在前；小计行给全貌。 */
+function renderTeamBlocks(blocks: ReadonlyArray<TeamWorkerRow & { wave: number }>): string[] {
+  const sorted = [...blocks].sort((a, b) => {
+    const na = a.status === 'passed' ? 1 : 0
+    const nb = b.status === 'passed' ? 1 : 0
+    return na - nb || a.wave - b.wave || a.task.localeCompare(b.task)
+  })
+  const over = sorted.length > TEAM_REPORT_ROW_CAP
+  const shown = over ? sorted.filter(b => b.status !== 'passed').slice(0, TEAM_REPORT_ROW_CAP) : sorted
+  const lines = ['', `波次战报（${blocks.length} 块 · 失败在前；逐波全量在 team phase artifact）：`]
+  for (const b of shown) {
+    const icon = WORKER_STATUS_ICON[b.status] ?? '·'
+    const bits: string[] = []
+    bits.push(`${b.changedCount} 改动${b.changedFiles && b.changedFiles.length > 0 ? `(${b.changedFiles.join(',')})` : ''}`)
+    if (b.diffArtifactId) bits.push(`diff:${b.diffArtifactId}`)
+    if (b.usage) bits.push(`${fmtTok(b.usage.input)}/${fmtTok(b.usage.output)} tok`)
+    if (typeof b.durationMs === 'number') bits.push(fmtDur(b.durationMs))
+    const reason = b.failureReason ? ` ${b.failureReason} —` : b.summary ? '' : ''
+    const summary = b.summary ? ` ${b.summary}` : ''
+    lines.push(`  w${b.wave} ${b.task} ${icon}${reason}${summary}（${bits.join(' · ')}）`)
+  }
+  if (over) {
+    const hidden = sorted.length - shown.length
+    lines.push(`  …另有 ${hidden} 块未内联（已过或超出上限），见 team phase artifact`)
+  }
+  const tally = (s: string): number => blocks.filter(b => b.status === s).length
+  lines.push(`  小计：${blocks.length} 块 · ✅${tally('passed')} ⛔${tally('failed')} ⏸${tally('blocked')} ⚠${tally('escalated')}`)
+  return lines
 }
 
 /** 按受阻阶段给出人话的下一步建议。 */
@@ -664,7 +739,7 @@ function nextStepHint(state: StarflowState): string {
   }
 }
 
-function buildReport(state: StarflowState, teamRetried: boolean): string {
+function buildReport(state: StarflowState, teamRetried: boolean, cwd?: string): string {
   const lines: string[] = [
     `${GLYPH} 星流执行报告 · ${firstLine(state.objective, 80)}`,
     '',
@@ -673,6 +748,9 @@ function buildReport(state: StarflowState, teamRetried: boolean): string {
     phaseStatusLine('galaxy', state.phases.galaxy),
     phaseStatusLine('deliver', state.phases.deliver),
   ]
+  if (state.teamBlocks && state.teamBlocks.length > 0) {
+    lines.push(...renderTeamBlocks(state.teamBlocks))
+  }
   if (state.phase === 'done') {
     lines.push('', '交付检查清单（deliver_task 硬门禁前置自查）：',
       '  - typecheck / 测试已运行并通过（未运行 = 未验证）',
@@ -682,6 +760,12 @@ function buildReport(state: StarflowState, teamRetried: boolean): string {
   } else {
     lines.push('', `⛔ 星流停止于 ${state.phase} 阶段：${state.blockedReason ?? '未知原因'}`,
       '', `下一步建议：${nextStepHint(state)}`)
+  }
+  // 环境预检页脚（2026-08-18）：每次调用（含 resume）带新鲜磁盘余量，压在
+  // 报告最尾——被环境约束降级过的块，续跑时自动复检，不靠用户口述状态变化。
+  if (cwd) {
+    const footer = formatEnvFooter(probeEnvFacts(cwd))
+    if (footer) lines.push('', footer)
   }
   return lines.join('\n')
 }
@@ -724,7 +808,7 @@ export async function runStarflow(deps: StarflowDeps, input: StarflowInput): Pro
   const lease = acquireStarflowLease(deps.cwd, input.objective, state.runId)
   if (!lease) {
     state.blockedReason = 'another Starflow run for this objective is still active; wait for its checkpoint or resume it later'
-    return { state, report: buildReport(state, false), resumed: Boolean(loadedState) }
+    return { state, report: buildReport(state, false, deps.cwd), resumed: Boolean(loadedState) }
   }
 
   try {
@@ -782,7 +866,7 @@ async function runStarflowUnlocked(deps: StarflowDeps, input: StarflowInput, sta
     const elapsedMs = phaseElapsed(phase)
     await checkpoint(phase, { status: 'blocked', summary, at: now(), ...(elapsedMs === undefined ? {} : { elapsedMs }) }, phaseRawContent(phase, rawContent))
     deps.params.onOutput?.(`${GLYPH} 星流 · ${phase} 阶段已保存中断检查点，可用 resume: true 续跑\n`)
-    return { state, report: buildReport(state, teamRetried) }
+    return { state, report: buildReport(state, teamRetried, deps.cwd) }
   }
   const pass = async (
     phase: 'council' | 'team' | 'galaxy' | 'deliver',
@@ -867,6 +951,9 @@ async function runStarflowUnlocked(deps: StarflowDeps, input: StarflowInput, sta
           return block('team', `team 执行中断：${message}`, message)
         }
         rememberPhaseOutput('team', lastResult.content)
+        // 战报行随波吸收；落盘搭 completedTeamWaves 的顺车 saveState（下方），
+        // 门禁未过的波也吸收——失败块正是战报要置顶的东西。
+        absorbTeamBlocks(state, lastResult, fromWave)
         const gate = teamGate(lastResult)
         if (!gate.ok) {
           // 复议上限 1 次：回 council（rounds:2 复议轮）重审契约后再跑 team。
@@ -984,5 +1071,5 @@ async function runStarflowUnlocked(deps: StarflowDeps, input: StarflowInput, sta
     await pass('deliver', 'done', '交付清单已输出，待调用 deliver_task')
   }
 
-  return { state, report: buildReport(state, teamRetried) }
+  return { state, report: buildReport(state, teamRetried, deps.cwd) }
 }

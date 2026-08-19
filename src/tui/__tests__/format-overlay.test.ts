@@ -100,6 +100,93 @@ describe('renderCommandPalette', () => {
     const lines = renderCommandPalette(data, 60, 15, theme)
     assert.ok(lines.some(l => stripAnsi(l).includes('Ctrl+R')))
   })
+
+  // height=15 → maxItems = 15-5 = 10. Keep-in-view must follow selectedIndex
+  // so a selection past the first page stays on screen (Ctrl+P /resume bug).
+  const manyCommands = Array.from({ length: 40 }, (_, i) => ({
+    label: `/c${String(i).padStart(2, '0')}`,
+    description: `d${i}`,
+  }))
+
+  it('first page shows /c00 and not /c20', () => {
+    const lines = renderCommandPalette(
+      { commands: manyCommands, selectedIndex: 0 },
+      60, 15, theme,
+    ).map(stripAnsi)
+    const body = lines.join('\n')
+    assert.ok(body.includes('/c00'), 'first command visible at top')
+    assert.ok(!body.includes('/c20'), 'command past viewport not shown')
+  })
+
+  it('selectedIndex past viewport stays visible and keeps the cursor', () => {
+    const lines = renderCommandPalette(
+      { commands: manyCommands, selectedIndex: 12 },
+      60, 15, theme,
+    ).map(stripAnsi)
+    const selectedLine = lines.find(l => l.includes('/c12'))
+    assert.ok(selectedLine, 'selected /c12 is in the viewport')
+    assert.ok(selectedLine!.includes('>'), 'cursor sits on the selected row')
+    assert.ok(!lines.some(l => l.includes('/c00')), '/c00 scrolled off')
+  })
+
+  it('selectedIndex at the last item pins the window to the end', () => {
+    const lines = renderCommandPalette(
+      { commands: manyCommands, selectedIndex: 39 },
+      60, 15, theme,
+    ).map(stripAnsi)
+    assert.ok(lines.some(l => l.includes('/c39')), 'last command visible')
+    assert.ok(!lines.some(l => l.includes('/c00')), 'first command scrolled off at end')
+  })
+
+  it('footer shows overflow counts when the list is taller than the viewport', () => {
+    const atTop = renderCommandPalette(
+      { commands: manyCommands, selectedIndex: 0 },
+      60, 15, theme,
+    ).map(stripAnsi)
+    const footerTop = atTop[atTop.length - 2]!
+    assert.ok(/↓:\d+/.test(footerTop), `↓:N overflow when more items below, got ${footerTop}`)
+    assert.ok(!/↑:\d+/.test(footerTop), 'no ↑:N overflow at top')
+
+    const atBottom = renderCommandPalette(
+      { commands: manyCommands, selectedIndex: 39 },
+      60, 15, theme,
+    ).map(stripAnsi)
+    const footerBottom = atBottom[atBottom.length - 2]!
+    assert.ok(/↑:\d+/.test(footerBottom), `↑:N overflow when more items above, got ${footerBottom}`)
+    assert.ok(!/↓:\d+/.test(footerBottom), 'no ↓:N overflow at end')
+  })
+
+  it('↑ inside a scrolled viewport keeps the window still', () => {
+    // Window already starts at 10 (items 10..19). selected=12 is inside it, so
+    // ↑ must move the cursor only — not re-pin the selection to the last row.
+    const lines = renderCommandPalette(
+      { commands: manyCommands, selectedIndex: 12, scrollOffset: 10 },
+      60, 15, theme,
+    ).map(stripAnsi)
+    assert.ok(lines.some(l => l.includes('/c10')), 'window stays at previous start')
+    assert.ok(!lines.some(l => l.includes('/c03')), 'does not jump back to pin-to-bottom')
+    const selectedLine = lines.find(l => l.includes('/c12'))
+    assert.ok(selectedLine?.includes('>'), 'cursor stays on /c12')
+    assert.equal(lines.filter(l => l.includes('>')).length, 1, 'exactly one cursor')
+  })
+
+  it('out-of-range selectedIndex still highlights the last command', () => {
+    const lines = renderCommandPalette(
+      { commands: manyCommands, selectedIndex: 99 },
+      60, 15, theme,
+    ).map(stripAnsi)
+    const last = lines.find(l => l.includes('/c39'))
+    assert.ok(last?.includes('>'), 'clamps highlight onto the last item')
+  })
+
+  it('empty command list does not throw and has no cursor', () => {
+    const lines = renderCommandPalette(
+      { commands: [], selectedIndex: 0 },
+      60, 15, theme,
+    ).map(stripAnsi)
+    assert.ok(lines.some(l => l.includes('命令面板')))
+    assert.ok(!lines.some(l => /^\s*>/.test(l) || l.includes('> /') || l.trimStart().startsWith('>')), 'no selection cursor')
+  })
 })
 
 describe('renderChronicle', () => {

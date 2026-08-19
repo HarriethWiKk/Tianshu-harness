@@ -774,3 +774,23 @@ depends: T1
     })
   })
 })
+
+// ── 预算发准（2026-08-18）：写工按 files 形状定价进 request.budget ─────────
+
+describe('teamTasksToDelegationRequests · budget shape', () => {
+  it('写工任务按文件数定价：单文件不发声（走默认），多文件放大', () => {
+    const [single] = teamTasksToDelegationRequests([task('T1', ['src/a.ts'])], 'parent')
+    // 单文件无形状信号——budget 不设，落 work-order 的 48 轮 / patcher 600s 默认
+    assert.equal(single!.budget, undefined)
+    const [multi] = teamTasksToDelegationRequests([
+      task('T2', ['src/a.ts', 'src/b.ts', 'src/c.ts', 'src/d.ts']),
+    ], 'parent')
+    assert.equal(multi!.budget!.maxTurns, 48 + 6 * 3)
+    assert.equal(multi!.budget!.timeoutMs, 600_000 + 45_000 * 3)
+  })
+
+  it('读工任务不定价：budget 为 undefined（行为零变化）', () => {
+    const [read] = teamTasksToDelegationRequests([task('T3', ['src/a.ts'], 'reviewer')], 'parent')
+    assert.equal(read!.budget, undefined)
+  })
+})

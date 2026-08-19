@@ -16,7 +16,47 @@ type WorkerStatus = 'passed' | 'failed' | 'blocked' | 'escalated'
 export interface TeamOutcomeSummarySlice {
   dispatched: number
   waves: readonly unknown[]
-  run?: { results?: ReadonlyArray<{ status: WorkerStatus }> }
+  run?: { results?: ReadonlyArray<TeamOutcomeResultSlice> }
+}
+
+/** buildTeamOutcome 战报行实际读取的 WorkerResult 字段切面（真实 WorkerResult
+ *  是结构超集，TS 结构子类型直接兼容——同本文件的既定模式，不 import work-order）。 */
+export interface TeamOutcomeResultSlice {
+  status: WorkerStatus
+  workOrderId?: string
+  objective?: string
+  failureReason?: string
+  summary?: string
+  changedFiles?: readonly string[]
+  diffArtifactId?: string
+  evidenceStatus?: string
+  usage?: { input_tokens?: number; output_tokens?: number }
+  durationMs?: number
+}
+
+/** 星流战报的单 worker 行（接口层加法，2026-08-18）：把「波次回来了每块怎么样」
+ *  从 packet JSON / artifact 取证提升为一等结构化事实。行粒度刻意紧凑——完整
+ *  findings/risks 仍在 worker_results packet 与 artifact 里，战报只回答「先看哪块」。 */
+export interface TeamWorkerRow {
+  /** workOrderId 原值（`<parentTurnId>:<task>`，parentTurnId 含波次标签）。 */
+  id: string
+  /** workOrderId 尾段任务号（T1/T2/…）——战报行主键，跨波重派去重用。 */
+  task: string
+  status: WorkerStatus
+  failureReason?: string
+  /** summary 首行，≤100 字符。 */
+  summary: string
+  /** objective 首行，≤60 字符（认领「这行是哪块任务」）。 */
+  objective?: string
+  changedCount: number
+  /** 最多 3 个文件名，超出截断（计数见 changedCount）。 */
+  changedFiles?: readonly string[]
+  /** worker diff 在 artifact store 的指针——读改动详情的入口。 */
+  diffArtifactId?: string
+  evidenceStatus?: string
+  /** 派发累计 token（usage-ledger 对齐后的口径：跨续跑/重试单调）。 */
+  usage?: { input: number; output: number }
+  durationMs?: number
 }
 
 /** PlanExecutorRun 的门禁/裁决切面（gate 实际对象多带 wave 字段，结构超集兼容）。 */
@@ -64,6 +104,51 @@ export interface TeamOrchestrationOutcome {
   waveGate?: { passed: boolean; failures: string[] }
   /** review gate 裁决枚举词（'verified' / 'rejected' / …）。 */
   reviewVerdict?: string
+  /** 本波逐 worker 终态行（星流战报的消费者：starflow-orchestrator 的
+   *  buildReport 战报段——编排器不再翻 state/artifact 取证每块状态）。
+   *  失败在前、每行紧凑截断；run 缺席（预览/未派发）不写。上限
+   *  WORKER_ROW_CAP 行，超出截断（超出量本身即异常信号，值得保留失败行优先）。 */
+  workerRows?: TeamWorkerRow[]
+}
+
+/** workerRows 行数上限——超出的保留失败优先的前 N 行（正常波次 ≤12 任务，40 已是
+ *  3 倍余量；再大说明计划本身病态，全量留在 packet/artifact）。 */
+const WORKER_ROW_CAP = 40
+
+function firstLineCap(text: string | undefined, cap: number): string {
+  if (!text) return ''
+  const line = text.split('\n', 1)[0]!.trim()
+  return line.length > cap ? `${line.slice(0, cap - 1)}…` : line
+}
+
+/** workOrderId 尾段任务号（`<parentTurnId>:T1` → `T1`）；无冒号回退原值。 */
+function taskOf(workOrderId: string): string {
+  const idx = workOrderId.lastIndexOf(':')
+  return idx >= 0 && idx < workOrderId.length - 1 ? workOrderId.slice(idx + 1) : workOrderId
+}
+
+function buildWorkerRows(results: ReadonlyArray<TeamOutcomeResultSlice>): TeamWorkerRow[] {
+  const rows = results.map(r => ({
+    id: r.workOrderId ?? '',
+    task: taskOf(r.workOrderId ?? ''),
+    status: r.status,
+    ...(r.failureReason ? { failureReason: r.failureReason } : {}),
+    summary: firstLineCap(r.summary, 100),
+    ...(r.objective ? { objective: firstLineCap(r.objective, 60) } : {}),
+    changedCount: r.changedFiles?.length ?? 0,
+    ...(r.changedFiles && r.changedFiles.length > 0
+      ? { changedFiles: r.changedFiles.slice(0, 3).map(f => f.split('/').pop() ?? f) }
+      : {}),
+    ...(r.diffArtifactId ? { diffArtifactId: r.diffArtifactId } : {}),
+    ...(r.evidenceStatus ? { evidenceStatus: r.evidenceStatus } : {}),
+    ...(r.usage && (typeof r.usage.input_tokens === 'number' || typeof r.usage.output_tokens === 'number')
+      ? { usage: { input: r.usage.input_tokens ?? 0, output: r.usage.output_tokens ?? 0 } }
+      : {}),
+    ...(typeof r.durationMs === 'number' ? { durationMs: r.durationMs } : {}),
+  }))
+  // 失败在前（buildPrimaryWorkerPacket 同序）：战报的第一职责是把「先看哪块」置顶。
+  rows.sort((a, b) => (a.status === 'passed' ? 1 : 0) - (b.status === 'passed' ? 1 : 0))
+  return rows.length > WORKER_ROW_CAP ? rows.slice(0, WORKER_ROW_CAP) : rows
 }
 
 /** council 工具（council_convene）回给上游编排器的结构化事实。
@@ -163,5 +248,6 @@ export function buildTeamOutcome(
     ...(hasRun ? { completedWaves: allFailed ? fromWave : fromWave + 1, stoppedReason: stoppedReason! } : {}),
     ...(run.gate ? { waveGate: { passed: run.gate.passed, failures: run.gate.failures } } : {}),
     ...(run.reviewVerdict ? { reviewVerdict: run.reviewVerdict } : {}),
+    ...(total > 0 ? { workerRows: buildWorkerRows(results) } : {}),
   }
 }

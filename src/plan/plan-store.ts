@@ -257,6 +257,52 @@ export async function readPlan(
   }
 }
 
+/**
+ * 同步读单个计划。供 TUI 渲染 provider（渲染路径不能 await）与
+ * readPlanSync 场景使用；语义与 readPlan 一致，仅换 *Sync fs API。
+ */
+export function readPlanSync(cwd: string, slug: string): PlanDocument | null {
+  const filePath = planFilePath(cwd, slug)
+  try {
+    const content = readFileSync(filePath, 'utf-8')
+    const s = statSync(filePath)
+    const provenance = parsePlanModel(content)
+    return {
+      slug,
+      title: extractTitle(content),
+      content,
+      path: join(PLANS_DIR, `${slug}.md`),
+      createdAt: s.birthtime,
+      status: parsePlanStatus(content),
+      options: parsePlanOptions(content),
+      ...(provenance ? { model: provenance.model, modelTier: provenance.tier } : {}),
+    }
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 剥掉计划文件里的非正文「chrome」行，返回正文行数组：开头一处
+ * frontmatter（--- ... ---，正文中的 --- 分隔线保留）与 `> **Status:`/
+ * `> **Model:` 留痕行。审批卡 excerpt 与 pager 全文预览共用此口径。
+ */
+export function stripPlanChrome(content: string): string[] {
+  const rawLines = content.split('\n')
+  let start = 0
+  if (rawLines[0]?.trim() === '---') {
+    const close = rawLines.findIndex((l, i) => i > 0 && l.trim() === '---')
+    if (close > 0) start = close + 1
+  }
+  const out: string[] = []
+  for (const raw of rawLines.slice(start)) {
+    const t = raw.trim()
+    if (t.startsWith('> **Status:') || t.startsWith('> **Model:')) continue
+    out.push(raw)
+  }
+  return out
+}
+
 /** 列出所有计划 */
 export async function listPlans(cwd: string): Promise<PlanDocument[]> {
   const dir = plansRoot(cwd)

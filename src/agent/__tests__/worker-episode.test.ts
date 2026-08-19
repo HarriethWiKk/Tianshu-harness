@@ -178,3 +178,85 @@ describe('worker-episode (W4-D2/D3)', () => {
     assert.equal(falseGreen.falseGreen, true)
   })
 })
+
+// ── 预算发准（2026-08-18）：实际用量四件套 + worker_actual 索引行 ───────────
+
+describe('buildWorkerEpisode · actuals（预算回馈备料）', () => {
+  it('actuals 四件套全进 episode；exhausted 由 failureReason 推导', () => {
+    const episode = buildWorkerEpisode({
+      order: order(),
+      result: result({ status: 'blocked', failureReason: 'timeout' }),
+      sessionId: 's1',
+      model: 'm1',
+      role: 'hands',
+      actuals: {
+        toolUses: 37,
+        durationMs: 612_000,
+        usage: { input: 900_000, output: 12_000 },
+        budget: { maxTurns: 48, timeoutMs: 600_000 },
+      },
+    })
+    assert.equal(episode.actualToolUses, 37)
+    assert.equal(episode.durationMs, 612_000)
+    assert.deepEqual(episode.usage, { input: 900_000, output: 12_000 })
+    assert.deepEqual(episode.budget, { maxTurns: 48, timeoutMs: 600_000 })
+    assert.equal(episode.exhausted, true)
+    assert.equal(episode.failureReason, 'timeout')
+  })
+
+  it('max_turns 同样标记 exhausted；非耗尽不写 exhausted 字段', () => {
+    const exhausted = buildWorkerEpisode({
+      order: order(), result: result({ failureReason: 'max_turns' }),
+      sessionId: 's1', model: 'm1', role: 'hands', actuals: { toolUses: 50 },
+    })
+    assert.equal(exhausted.exhausted, true)
+    const normal = buildWorkerEpisode({
+      order: order(), result: result(),
+      sessionId: 's1', model: 'm1', role: 'hands', actuals: { toolUses: 10 },
+    })
+    assert.equal('exhausted' in normal, false)
+  })
+
+  it('actuals 缺席 = 旧调用方：新字段全不写（schema 向后兼容）', () => {
+    const episode = buildWorkerEpisode({
+      order: order(), result: result(),
+      sessionId: 's1', model: 'm1', role: 'hands',
+    })
+    assert.equal('actualToolUses' in episode, false)
+    assert.equal('durationMs' in episode, false)
+    assert.equal('usage' in episode, false)
+    assert.equal('budget' in episode, false)
+  })
+})
+
+describe('persistWorkerActualIndex（objectiveHash 进 key 的紧凑索引行）', () => {
+  it('写入 worker_actual:<hash>:<ts>，前缀可查、字段完整', async () => {
+    const { persistWorkerActualIndex, buildWorkerEpisode } = await import('../worker-episode.js')
+    const saved: Array<{ kind: string; json: string }> = []
+    const store = { saveBanditState: (kind: string, json: string) => { saved.push({ kind, json }) } }
+    const episode = buildWorkerEpisode({
+      order: order(), result: result({ failureReason: 'timeout' }),
+      sessionId: 's1', model: 'm1', role: 'hands',
+      actuals: { toolUses: 37, durationMs: 612_000 },
+    })
+    persistWorkerActualIndex(store, episode.objectiveHash, {
+      toolUses: 37, durationMs: 612_000,
+      usage: { input: 900_000, output: 12_000 },
+      budget: { maxTurns: 48, timeoutMs: 600_000 },
+      exhausted: true, status: 'blocked',
+    })
+    assert.equal(saved.length, 1)
+    assert.match(saved[0]!.kind, new RegExp(`^worker_actual:${episode.objectiveHash}:\\d+$`))
+    const row = JSON.parse(saved[0]!.json)
+    assert.equal(row.toolUses, 37)
+    assert.equal(row.exhausted, true)
+    assert.equal(row.budget.maxTurns, 48)
+  })
+
+  it('store 缺席/抛错静默——预算回馈绝不影响派发', async () => {
+    const { persistWorkerActualIndex } = await import('../worker-episode.js')
+    persistWorkerActualIndex(null, 'abc', { toolUses: 1, durationMs: 1, exhausted: false, status: 'passed' })
+    const throwing = { saveBanditState: () => { throw new Error('db down') } }
+    persistWorkerActualIndex(throwing, 'abc', { toolUses: 1, durationMs: 1, exhausted: false, status: 'passed' })
+  })
+})

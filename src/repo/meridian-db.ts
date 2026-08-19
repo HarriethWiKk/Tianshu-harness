@@ -201,9 +201,11 @@ export class MeridianDb {
         // Packaged sidecar with a broken native bundle: fail loud, never degrade.
         if ((err as { code?: string })?.code === 'ESQLITE_BUNDLE_BROKEN') throw err
         const reason = err instanceof Error ? err.message : String(err)
+        // 指引修正（2026-08-17，同 session-registry）：废弃的 windows-build-tools
+        // 与语法不通的 npm rebuild 换成本仓自带的预编译拉取脚本。
         const hint = process.platform === 'win32'
-          ? 'Run: npm install -g windows-build-tools (as admin), then: npm rebuild better-sqlite3 -g tianshu-tui'
-          : 'Run: npm rebuild better-sqlite3 -g tianshu-tui'
+          ? 'Run: cd "$(npm root -g)\\tianshu-tui" && node scripts\\fetch-native-sqlite.js'
+          : 'Run: cd "$(npm root -g)/tianshu-tui" && node scripts/fetch-native-sqlite.js'
         console.warn(`⚠ better-sqlite3 not available. Code index (MeridianDb) disabled — repo symbol search & cross-file analysis will be unavailable. Reason: ${reason}\n  Fix: ${hint}`)
         this._available = false
         this.conn = createNullDb()
@@ -829,7 +831,11 @@ const MERIDIAN_SCHEMA_VERSION = 2
  */
 function migrateToV1(db: any): void {
   try {
-    if (((db.pragma('user_version', { simple: true }) as number) ?? 0) >= MERIDIAN_SCHEMA_VERSION) return
+    // Literal `1` on purpose — the guard and the write must both target v1.
+    // Referencing MERIDIAN_SCHEMA_VERSION here made v1 migration rerun on
+    // higher-version DBs AND stamp user_version straight to the latest number,
+    // which swallowed every later migration (v2 never ran: its guard saw 2).
+    if (((db.pragma('user_version', { simple: true }) as number) ?? 0) >= 1) return
     const tx = db.transaction(() => {
       // Absolute-path file rows: POSIX '/...' and Windows 'C:\...' / 'C:/...'
       db.prepare("DELETE FROM files WHERE substr(path, 1, 1) = '/' OR (substr(path, 2, 1) = ':' AND path GLOB '[A-Za-z]:*')").run()
@@ -837,7 +843,7 @@ function migrateToV1(db: any): void {
       db.prepare("DELETE FROM symbols WHERE substr(file_path, 1, 1) = '/' OR (substr(file_path, 2, 1) = ':' AND file_path GLOB '[A-Za-z]:*')").run()
       // Dangling imports edges: kind='imports' whose target is not a known file
       db.prepare("DELETE FROM edges WHERE kind = 'imports' AND NOT EXISTS (SELECT 1 FROM files f WHERE edges.target_id = f.path || ':*:0')").run()
-      db.pragma('user_version = ' + MERIDIAN_SCHEMA_VERSION)
+      db.pragma('user_version = 1')
     })
     tx()
   } catch {
@@ -849,16 +855,22 @@ function migrateToV1(db: any): void {
  * One-shot migration to schema v2: purge expired telemetry rows — append-only
  * p3_state event kinds (unique-per-write kind strings stamp sessionId+timestamp,
  * so the UPSERT never hits and the table grows without bound), access_log and
- * sensorimotor_log. State kinds (fixed keys: bandit:*, p3:*, teamPlanCache:*)
- * are whitelisted and preserved. The user_version guard runs this exactly once;
- * cleanupExpiredRows then keeps the window enforced afterwards.
+ * sensorimotor_log. State kinds (fixed keys: bandit:*, p3:*, team_plan_cache:*,
+ * tool_pattern_miner) are whitelisted and preserved. The user_version guard
+ * runs this exactly once; cleanupExpiredRows then keeps the window enforced
+ * afterwards.
  */
 function migrateToV2(db: any): void {
   try {
-    if (((db.pragma('user_version', { simple: true }) as number) ?? 0) >= MERIDIAN_SCHEMA_VERSION) return
+    // Guard must be the literal 2, not MERIDIAN_SCHEMA_VERSION: when this
+    // migration was written the shared-constant guard was already consumed by
+    // migrateToV1 (it stamped user_version=2 first), making this body dead
+    // code — the VACUUM never ran. If a v3 migration is added later, change
+    // this guard to 3 (and keep migrateToV1's at 1).
+    if (((db.pragma('user_version', { simple: true }) as number) ?? 0) >= 2) return
     const tx = db.transaction(() => {
       purgeExpiredRows(db)
-      db.pragma('user_version = ' + MERIDIAN_SCHEMA_VERSION)
+      db.pragma('user_version = 2')
     })
     tx()
     // One-time cost after the purge: reclaim file holes. Best-effort — a busy
@@ -874,10 +886,17 @@ function migrateToV2(db: any): void {
 
 /** Delete telemetry rows past their retention window. Idempotent. */
 function purgeExpiredRows(db: any): void {
-  // Append-only p3_state event rows; state kinds are a fixed-key whitelist.
+  // Append-only p3_state event rows; state kinds (fixed keys) are whitelisted
+  // and preserved: bandit:*, p3:*, team_plan_cache:* (cross-session plan
+  // cache) and the fixed tool_pattern_miner snapshot. Underscores are LIKE
+  // wildcards, hence ESCAPE — and the old camelCase 'teamPlanCache:%' never
+  // matched the real 'team_plan_cache:' keys (underscore is a literal in the
+  // value), silently putting the plan cache into the 30-day deletion window.
   db.prepare(`DELETE FROM p3_state
     WHERE updated_at < datetime('now', ?)
-      AND kind NOT LIKE 'bandit:%' AND kind NOT LIKE 'p3:%' AND kind NOT LIKE 'teamPlanCache:%'`).run(`-${P3_EVENT_RETENTION_DAYS} days`)
+      AND kind NOT LIKE 'bandit:%' AND kind NOT LIKE 'p3:%'
+      AND kind NOT LIKE 'team\\_plan\\_cache:%' ESCAPE '\\'
+      AND kind <> 'tool_pattern_miner'`).run(`-${P3_EVENT_RETENTION_DAYS} days`)
   db.prepare(`DELETE FROM access_log WHERE accessed_at < datetime('now', ?)`).run(`-${LOG_RETENTION_DAYS} days`)
   db.prepare(`DELETE FROM sensorimotor_log WHERE created_at < datetime('now', ?)`).run(`-${LOG_RETENTION_DAYS} days`)
 }

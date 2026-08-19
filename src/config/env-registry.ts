@@ -918,6 +918,18 @@ export const ENV_REGISTRY: EnvRegistryEntry[] = [
     description: '',
   },
   {
+    name: 'RIVET_WORKER_BUDGET_SHAPE',
+    defaultHint: '',
+    files: ['agent/budget-shape.ts', 'tools/team-orchestrator.ts', 'tools/delegate-task.ts', 'tools/delegate-batch.ts'],
+    description: '=0 关闭写工预算的文件形状定价（48 轮/600s flat 默认回归）',
+  },
+  {
+    name: 'RIVET_WORKER_BUDGET_HISTORY',
+    defaultHint: '',
+    files: ['agent/budget-shape.ts', 'agent/coordinator.ts'],
+    description: '=0 关闭写工预算的历史实际用量地板（同 objective 的 worker_actual 样本不再抬升预算）',
+  },
+  {
     name: 'RIVET_WORKER_WRITE_GATE',
     defaultHint: '',
     files: ['agent/worker-write-gate.ts', 'agent/__tests__/hands-session.test.ts'],

@@ -136,9 +136,13 @@ export class SessionRegistry {
       if ((err as { code?: string })?.code === 'ESQLITE_BUNDLE_BROKEN') throw err
       // Distinguish "library missing" from "schema execution failed"
       if (err instanceof Error && err.message?.includes('better-sqlite3')) {
+        // 指引修正（2026-08-17）：旧的 windows-build-tools（废弃）+ `npm rebuild
+        // better-sqlite3 -g tianshu-tui`（rebuild 不到、语法不通）换成本仓自带的
+        // 预编译拉取脚本——npm 安装包含 scripts/fetch-native-sqlite.js，网络恢复后
+        // 在安装目录重跑即可，无需编译工具链。
         const hint = process.platform === 'win32'
-          ? 'Run: npm install -g windows-build-tools (as admin), then: npm rebuild better-sqlite3 -g tianshu-tui'
-          : 'Run: npm rebuild better-sqlite3 -g tianshu-tui'
+          ? 'Run: cd "$(npm root -g)\\tianshu-tui" && node scripts\\fetch-native-sqlite.js'
+          : 'Run: cd "$(npm root -g)/tianshu-tui" && node scripts/fetch-native-sqlite.js'
         console.warn(`⚠ better-sqlite3 not available. Session history & cross-session memory will NOT persist (in-memory only, lost on exit). Reason: ${(err as Error).message}\n  Fix: ${hint}`)
       } else {
         console.error('Session registry schema failed:', err)

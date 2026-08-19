@@ -231,6 +231,9 @@ export interface SlashHandlerContext {
   /** `/btw` 侧问：开浮层并流式作答。问答只活在浮层里，不进对话历史。
    *  未注入（headless / 测试）时 `/btw` 打印提示而非静默失败。 */
   askSideQuestion?: (question: string) => void
+  /** `/plan-view` 计划全文预览（全屏 pager，q 返回）：slug 指正式计划，
+   *  draftPath 指撰写中的活动草稿（相对 cwd）。未注入时打印提示。 */
+  openPlanPreview?: (opts: { slug?: string; draftPath?: string }) => void
   /** 设置 choice-panel 类型（effort / permission），供选择面板渲染器读取。 */
   setChoicePanelKind?: (kind: 'effort' | 'permission') => void
   surfacePop?: () => void
@@ -1959,6 +1962,56 @@ const TUI_SLASH_COMMANDS: readonly TuiSlashCommandDef[] = [
         })
         pushStatic(createLogEntry({ type: 'system', content: `Plans (.rivet/plans/):\n\n${lines.join('\n')}\n\nUse /plan-approve <slug> to approve, /plan-reject <slug> to reject.` }))
       }
+      setIsStreaming(false)
+      return true
+    },
+  },
+  {
+    name: '/plan-view',
+    immediate: true,
+    async handler(ctx) {
+      const { parts, pushStatic, setIsStreaming } = ctx
+      const cwd = ctx.agent.cwd
+      const notify = (content: string, isError?: boolean) =>
+        pushStatic(createLogEntry({ type: 'system', content, isError }))
+      const rawArg = parts.slice(1).join(' ').trim()
+      const plans = await listPlans(cwd)
+
+      // ── Explicit arg: resolve tolerantly (same ref parsing as /plan-approve) ──
+      if (rawArg) {
+        const resolution = resolvePlanRef(plans, stripCopiedTitleSuffix(rawArg))
+        if (resolution.kind !== 'match') {
+          const hint = resolution.kind === 'ambiguous'
+            ? `\n\nAmbiguous prefix, matches: ${resolution.slugs.join(', ')}`
+            : ''
+          notify(`Plan not found: "${rawArg}".${hint}\n\nUse /plan-list to see available plans.`, true)
+          setIsStreaming(false)
+          return true
+        }
+        if (ctx.openPlanPreview) ctx.openPlanPreview({ slug: resolution.plan.slug })
+        else notify('Plan preview is only available in the TUI.', true)
+        setIsStreaming(false)
+        return true
+      }
+
+      // ── No arg: single pending plan first, else the active draft while writing ──
+      const submitted = plans.filter(p => p.status === 'submitted')
+      if (submitted.length === 1) {
+        if (ctx.openPlanPreview) ctx.openPlanPreview({ slug: submitted[0]!.slug })
+        else notify('Plan preview is only available in the TUI.', true)
+        setIsStreaming(false)
+        return true
+      }
+      const draftPath = ctx.agent.activePlanFilePath
+      if (submitted.length === 0 && draftPath) {
+        if (ctx.openPlanPreview) ctx.openPlanPreview({ draftPath })
+        else notify('Plan preview is only available in the TUI.', true)
+        setIsStreaming(false)
+        return true
+      }
+      notify(submitted.length > 1
+        ? `Multiple submitted plans:\n\n${submitted.map(p => `  /plan-view ${p.slug}`).join('\n')}`
+        : 'Nothing to preview yet. Use /plan-mode to enter plan mode, or /plan-view <slug> after submitting.')
       setIsStreaming(false)
       return true
     },
@@ -3798,6 +3851,10 @@ export function registerTuiSlashCommands(app: TuiApp, ctx: BootstrapContext): vo
       reviewGateRef: ctx.refs.reviewGateRef,
       surfacePush: (id: string) => { app.activateOverlay(id) },
       askSideQuestion: (question: string) => { app.askSideQuestion(question) },
+      openPlanPreview: (opts) => {
+        if (opts.draftPath) app.openPlanPreview('', undefined, opts.draftPath)
+        else if (opts.slug) app.openPlanPreview(opts.slug)
+      },
       setChoicePanelKind: (kind) => { app.choicePanelKind = kind },
       surfacePop: () => { app.deactivateOverlay() },
       setReasoningEffort: (effort) => { ctx.agent.setReasoningEffort(effort) },

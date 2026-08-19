@@ -109,6 +109,7 @@ export function getPaletteCommands(): PaletteCommand[] {
     { name: '/plan-mode', description: '切换计划编写模式（只读，只允许写计划文件）。再次执行退出' },
     { name: '/ask', description: '切换 Ask 模式（纯问答，不碰文件）。想问问题不想被改代码时用，再次执行退出' },
     { name: '/plan-list', description: '列出待审批的计划文档' },
+    { name: '/plan-view', description: '预览计划文档全文（固定高度翻页；无参=唯一待审批，否则撰写中草稿）', argsHint: '[slug]' },
     { name: '/plan-approve', description: '审批计划并开始执行（可指定选项）', argsHint: '<slug> [option]' },
     { name: '/plan-reject', description: '驳回计划并附反馈让 agent 修改', argsHint: '<slug> <反馈>' },
     { name: '/plan-close', description: '预览或应用计划收尾（归档/标记完成）' },

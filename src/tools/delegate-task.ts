@@ -3,6 +3,7 @@ import type { CoordinatorRun, DelegationRequest } from '../agent/coordinator.js'
 import type { ContextClaimStore } from '../context/claim-store.js'
 import type { ClaimProposal } from '../context/claims.js'
 import { DEFAULT_DELEGATE_PROFILE, profileRegistry, delegationToolTimeoutMs } from '../agent/profile-registry.js'
+import { mergeBudgetOverride, shapeWriteBudgetForProfile } from '../agent/budget-shape.js'
 import { formatWorkerResultDigest } from '../agent/worker-result-digest.js'
 import { formatWorkerIdentity } from '../tui/format/profile-labels.js'
 import { starDomainRegistry } from '../agent/star-domain-registry.js'
@@ -206,7 +207,11 @@ export function createDelegateTaskTool(
           // （coordinator 已盖 parentWorkerId）直通同一条 UI 通道。
           onNestedActivity: params.onWorkerActivity,
           resumeWorkOrderId: parsed.data.resume,
-          budget: toBudgetOverride(parsed.data),
+          // 预算发准（2026-08-18）：写工按 files 形状定价；模型显式 budget 逐字段全胜。
+          budget: mergeBudgetOverride(
+            toBudgetOverride(parsed.data),
+            shapeWriteBudgetForProfile(parsed.data.files, parsed.data.profile ?? DEFAULT_DELEGATE_PROFILE),
+          ),
         }, params.abortSignal, (orderId) => { dispatchedOrderId = orderId })
 
         // T4: finish flushes any coalesced tail before the terminal event and
@@ -319,7 +324,11 @@ export function createDelegateTaskTool(
     timeoutMs: (params) => delegationToolTimeoutMs(
       params?.sessionTurnCount,
       [params?.input?.profile as string | undefined],
-      { requestedTimeoutMs: [params?.input?.timeoutMs as number | undefined] },
+      // 预算发准：形状定价后的 timeout 也进 max——外层不得先于内层开枪。
+      { requestedTimeoutMs: [
+        params?.input?.timeoutMs as number | undefined,
+        shapeWriteBudgetForProfile(params?.input?.files as string[] | undefined, params?.input?.profile as string | undefined)?.timeoutMs,
+      ] },
     ),
   }
 }

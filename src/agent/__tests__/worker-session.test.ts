@@ -1,5 +1,8 @@
 import { describe, it, mock } from 'node:test'
 import assert from 'node:assert/strict'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import type { StreamCallbacks } from '../../api/stream-client.js'
 import type { StreamClient } from '../../api/stream-client.js'
 import type { ContentBlock } from '../../api/types.js'
@@ -1158,6 +1161,65 @@ describe('worker long-tool keepalive（P0-3：tool_use→tool_result 静默窗�
       )
     } finally {
       __setToolKeepaliveMs(30_000)
+    }
+  })
+})
+
+describe('runWorkerSession · priorUsage 回种（usage-ledger 对齐）', () => {
+  it('续跑轮回种前轮用量：meta 单调递增到派发累计，返回值保持本轮净增', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'rivet-prior-usage-'))
+    const prevHome = process.env.RIVET_HOME
+    const prevSessionDir = process.env.RIVET_SESSION_DIR
+    process.env.RIVET_HOME = home
+    delete process.env.RIVET_SESSION_DIR
+    try {
+      const order = createReadOnlyWorkOrder({
+        id: 'wo_seed',
+        parentTurnId: 'turn_1',
+        kind: 'code_search',
+        profile: 'code_scout',
+        objective: 'Verify priorUsage seeding across continuation rounds.',
+        scope: {},
+      })
+      const base = {
+        order,
+        client: clientFromTexts([validPacket('wo_seed')]),
+        promptEngine: makePromptEngine(),
+        toolRegistry: new ToolRegistry(),
+        cwd: '/repo',
+        maxTurns: 2,
+        contextWindow: 1_000_000,
+        compact: { enabled: false, autoThreshold: 800_000, autoFloor: 500_000, model: 'flash' },
+        finalizeReport: false,
+      }
+      // 首轮：无回种。返回净增；meta 记下首轮量。
+      const round1 = await runWorkerSession(base)
+      assert.ok(round1.usage.input_tokens > 0, 'mock client 每次调用报 10 input，首轮必须有量')
+      // 每次读取都用全新实例——metaStore 有内存缓存，复用实例会读到旧快照。
+      const readMeta = () => new SessionPersist(deriveWorkerSessionId(order.id), '/repo').loadMetadata()
+      const meta1 = readMeta()
+      assert.ok(meta1?.tokenUsage, '首轮应写 tokenUsage')
+      const meta1Prompt = meta1!.tokenUsage!.prompt
+
+      // 续跑轮：priorUsage = 首轮净增（coordinator 的 dispatchUsage 语义）。
+      // 同一 orderId + 默认 nonce → 同一 meta 文件；回种后 meta.prompt 应叠加而非回零。
+      const round2 = await runWorkerSession({ ...base, priorUsage: round1.usage })
+      const meta2 = readMeta()
+      const meta2Prompt = meta2!.tokenUsage!.prompt
+
+      assert.equal(
+        meta2Prompt,
+        meta1Prompt + round2.usage.input_tokens,
+        'meta.prompt 应为 回种(首轮) + 本轮净增，而非回零重计',
+      )
+      assert.ok(meta2Prompt > meta1Prompt, 'meta 必须单调递增')
+      assert.equal(round2.usage.input_tokens, round1.usage.input_tokens, '同形 worker 两轮净增应相等')
+      assert.equal(meta2!.status, 'completed', 'wrapper 终态应落盘（收尾 flush）')
+    } finally {
+      if (prevHome === undefined) delete process.env.RIVET_HOME
+      else process.env.RIVET_HOME = prevHome
+      if (prevSessionDir !== undefined) process.env.RIVET_SESSION_DIR = prevSessionDir
+      rmSync(home, { recursive: true, force: true })
     }
   })
 })

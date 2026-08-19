@@ -9,6 +9,7 @@ import { parseTeamTasks, type TeamTask } from '../agent/team-plan.js'
 import { formatSealStatus, verifyPlanSeal, type SealedUnifiedPlan } from '../agent/council/council-seal.js'
 import { clearPlan, consumePlan, getStoredPlan, storePlan } from '../agent/plan-store.js'
 import { profileRegistry } from '../agent/profile-registry.js'
+import { shapeWriteBudgetForProfile } from '../agent/budget-shape.js'
 import { progressiveTimeout, WORKER_EXIT_GRACE_MS } from '../agent/timeout-ladder.js'
 import { MAX_BUDGET_CONTINUATIONS } from '../agent/worker-continuation.js'
 import { buildTeamPanelModel, encodeTeamPanelModel } from '../tui/team-panel-model.js'
@@ -101,6 +102,13 @@ export function teamOrchestrateTimeoutMs(params?: ToolCallParams): number {
     for (const t of tasks) {
       const pb = t.profile ? profileRegistry.get(t.profile)?.defaultTimeoutMs : undefined
       if (pb && pb > maxProfileBudget) maxProfileBudget = pb
+    }
+    // 预算发准（2026-08-18）：任务形状定价后的单 worker 预算也进 max——否则
+    // 多文件任务的 shape timeout 超过这里取到的 flat profile 默认，外层会先
+    // 于内层开枪（正是该函数当初要修的缺陷形态）。
+    for (const t of tasks) {
+      const shaped = shapeWriteBudgetForProfile(t.files, t.profile)
+      if (shaped && shaped.timeoutMs > maxProfileBudget) maxProfileBudget = shaped.timeoutMs
     }
     budget = maxProfileBudget > 0 ? maxProfileBudget : progressiveTimeout(params?.sessionTurnCount)
     waves = groupTeamTasks(tasks).length

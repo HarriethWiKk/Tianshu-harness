@@ -110,7 +110,7 @@ import { parseMissionDraft, shouldPreviewContract, formatContractPreview, type M
 import { truncateToDisplayWidth, displayWidth, ambiguousWideEnabled } from '../width.js'
 import { boxCharsFor, boxInnerWidth } from '../box-chars.js'
 import { appendHistoryAsync, nextHistoryAfterSubmit } from '../history.js'
-import { renderPager, renderStarmap, renderCommandPalette, renderChronicle, renderTasks, renderDomainPicker, renderDomainGenesisCard, genesisCardMaxScroll, renderModelPicker, renderThemePicker, renderChoicePanel, renderPlanPicker, renderConnect, renderInitFlow } from '../format/overlay.js'
+import { renderPager, renderStarmap, renderCommandPalette, followListWindow, renderChronicle, renderTasks, renderDomainPicker, renderDomainGenesisCard, genesisCardMaxScroll, renderModelPicker, renderThemePicker, renderChoicePanel, renderPlanPicker, renderConnect, renderInitFlow } from '../format/overlay.js'
 import type { PagerData, StarmapData, PaletteData, ChronicleData, TasksData, TasksGroup, TasksWorkerRow, DomainPickerData, ModelPickerData, ThemePickerData, ChoicePanelData, PlanPickerData, ChoiceEntry, ConnectOverlayData, InitOverlayData } from '../format/overlay.js'
 import { ConnectFlow, DIY_PENDING_KEY_REF, type ConnectCommit, type ConnectProviderRef, type ConnectStepResult } from '../connect-flow.js'
 import { VisionOnboardingFlow, type VisionCandidate, type VisionOnboardingRequest, type VisionOnboardingResult } from '../vision-onboarding-flow.js'
@@ -480,12 +480,20 @@ export class TuiApp {
   /**
    * ESC 回填资格：仅用户主动中断（ESC/Ctrl+C，非 watchdog/convergence 守护）
    * 开启的收尾窗口才置位。settle 时若 steer 队列仍有排队指引且输入框为空，
-   * 把排队内容拉回输入框交还用户（Claude Code 风格，见 notifyRunSettled）。
+   * 把排队内容拉回输入框交还用户（仅用户主动 ESC；自然结束走自动发出）。
    */
   private abortSteerBackfill = false
-  /** 守护中断（watchdog/convergence）pending 标志：settle 时消费，用于区分
-   *  「run 自然结束」与「守护中断自动续跑」——后者不回填排队队列。 */
+  /** 守护中断 pending 标志：settle 时消费，用于区分「run 自然结束」与
+   *  「守护中断」——后者不回填排队队列（watchdog 自动续跑 / convergence
+   *   引导键入 continue，队列留待提交归并，见 queue-lane.test.ts）。 */
   private guardianAbortPending = false
+  /**
+   * handleTurnComplete 在飞计数。isFinal 先 await flush，agent.run() 的 finally
+   * 会抢先 notifyRunSettled；此时不能立刻开新 run，否则会冲掉尚未 finalize 的
+   * writer。settle 只置 pendingQueueDispatch，等 complete 收尾后再发出。
+   */
+  private turnCompleteInFlight = 0
+  private pendingQueueDispatch = false
   /**
    * 查询 agent 是否仍有未 settle 的 run（main.ts 注入 → `ctx.agent.isRunning()`）。
    *
@@ -609,6 +617,13 @@ export class TuiApp {
   pendingPlanApproval: PlanSubmittedInfo | undefined = undefined
   /** 待审批计划正文预览摘要（开面板时一次性提取；随面板关闭/重开更新）。 */
   planApprovalExcerpt: string | undefined = undefined
+  /**
+   * 计划全文预览（复用 pager overlay，仿 jobDetail 指针）：
+   * slug 指正式计划（pager provider 用 readPlanSync 读盘）；draftPath 指
+   * 撰写中的活动草稿（/plan-view 无参时进入，每帧现读、随 agent 写入刷新）。
+   * returnTo 记录退出 pager 后回哪个面板（审批卡 / plan-picker）。
+   */
+  private planPreview: { slug: string; draftPath?: string; returnTo?: 'approval' | 'plan-picker' } | null = null
   /** /handoff 登记的归档任务：交接 turn 完成（isFinal）后把项目内 .rivet/HANDOFF.md
    *  拷贝归档到会话目录 <id>.handoff.md（loadPrevHandoff 注入管线认的位置）。 */
   pendingHandoffCopy: { src: string; dest: string; sinceMs: number } | undefined = undefined
@@ -1159,7 +1174,8 @@ export class TuiApp {
             this.exitOverlayCore()
             this.workerDetailWorkerId = null
             this.jobDetailId = null
-            this.renderLive()
+            // 计划预览返回时 core 已重开面板，renderLive 会写坏 alt screen。
+            if (!this.overlay.isActive()) this.renderLive()
             return
           }
           // worker 视图优先于中断：Esc 先退出视图，不 abort 主 agent
@@ -1178,7 +1194,7 @@ export class TuiApp {
             this.exitOverlayCore()
             this.workerDetailWorkerId = null
             this.jobDetailId = null
-            this.renderLive()
+            if (!this.overlay.isActive()) this.renderLive()
           } else if (this.viewingWorkerId) {
             // worker 视图优先于中断：Esc 先退出视图，不 abort 主 agent
             this.exitWorkerView()
@@ -1390,10 +1406,8 @@ export class TuiApp {
       },
       onIntentNote: (intent) => this.handleIntentNote(intent),
       onAutonomyCheckpoint: (info) => this.handleAutonomyCheckpoint(info),
-      // 工具边界只注入紧急意图（halt=now / redirect=next）：普通消息（later：
-      // guidance/question/augment/ack）留在队列等 run 结束后回填输入框、由用户
-      // 再次 Enter 确认发送——与「⏳ 已排队」文案一致（此前无过滤 drain 会把
-      // 排队中的普通消息自动注入给 AI，界面显示排队、实际已发出，是撒谎）。
+      // 工具边界只注入紧急意图（halt=now / redirect=next）：普通消息（later）
+      // 留在队列，等本轮结束后自动作为下一轮发出——不混进当前轮 [User guidance]。
       onSteerDrain: () => this.steerBuffer.drain('next'),
       onDelegationActivity: (activity) => this.handleDelegationActivity(activity),
     }
@@ -1702,17 +1716,17 @@ export class TuiApp {
     const pending = this.pendingSubmitAfterAbort
     if (!pending) {
       // 无补发消息的 settle：
-      //  - 用户主动 ESC 的收尾回填（Claude Code 风格）；
-      //  - run 自然结束（isFinal 已复位 busy）同样回填——AI 输出期间排队的普通
-      //    消息不再在工具边界自动注入（onSteerDrain 只 drain 紧急意图），run
-      //    结束即交还用户确认（再次 Enter 发送），与 ESC 路径同语义；
-      //  - 守护中断（watchdog/convergence）自动续跑：guardian 时不回填，队列
-      //    保留等续跑 run 结束后的 settle 再回填，或下次提交归并。
+      //  - 用户主动 ESC：回填输入框交还编辑（不自动发出）；
+      //  - run 自然结束：排队内容自动作为下一轮发出（Claude Code 队列）；
+      //  - 守护中断（watchdog/convergence）自动续跑：不消费队列——续跑在同一个
+      //    agent.run 内完成（notifyRunSettled 只在 finally 调一次），队列留待
+      //    下次提交归并（onSubmit 前 drain）。
       // 有补发消息时新 run 即将发起，队列随它在工具边界 drain，不动。
       if (backfill) {
         this.backfillSteerToInput()
-      } else if (!guardian && !this.agentBusy) {
-        this.backfillSteerToInput()
+      } else if (!guardian) {
+        this.pendingQueueDispatch = true
+        this.flushPendingQueueDispatch()
       }
       return
     }
@@ -1730,8 +1744,7 @@ export class TuiApp {
   }
 
   /**
-   * ESC settle 回填（Claude Code 风格）：run 已终结，steer 队列再没有活跃
-   * run 能在工具边界 drain 它——把排队指引按序拼回输入框，交还用户改发/重发。
+   * ESC settle：run 已终结，把排队指引按序拼回输入框，交还用户改发/重发。
    * 输入框已有草稿则不动（不抢用户正在敲的内容），队列留待下次提交归并。
    * 消费用 getPendingEntries()+clear() 而非 drain()：drain 会把文本包进
    * [User guidance] 注入格式，这里要的是原文（契约见 esc-abort-steer-preserve 测试）。
@@ -1749,6 +1762,36 @@ export class TuiApp {
       })
       this.state.committedCount++
     })
+    this.renderLive()
+  }
+
+  /**
+   * 自然结束 settle：把队列头部一条作为新 run 发出（气泡在入队时已 commit）。
+   * 多条 FIFO 留在 buffer，等这一轮再 settle。输入框有草稿则不动，避免抢输入。
+   *
+   * 必须等 handleTurnComplete 收尾且 TUI 已 idle：isFinal 的 await flush
+   * 与 agent.run() finally 存在竞态，中途开新 run 会冲掉 writer/renderer。
+   */
+  private flushPendingQueueDispatch(): void {
+    if (!this.pendingQueueDispatch) return
+    if (this.turnCompleteInFlight > 0) return
+    if (this.agentBusy) return
+    this.pendingQueueDispatch = false
+    this.dispatchQueuedAfterSettle()
+  }
+
+  private dispatchQueuedAfterSettle(): void {
+    if (this.inputLine.value.trim().length > 0) return
+    const text = this.steerBuffer.shift()
+    if (!text) return
+    this.blockWriter.discard()
+    this.streamRenderer.reset()
+    this.streamRenderController.assistantHeaderDone = false
+    this.agentBusy = true
+    this.todosWrittenThisRun = false
+    this.state.turnStartMs = Date.now()
+    this.streamRenderController.lastActivityMs = Date.now()
+    this.onSubmitCallback?.(text)
     this.renderLive()
   }
 
@@ -1874,6 +1917,10 @@ export class TuiApp {
     this.live.clear()
     // 清理 Ctrl+X leader 状态，防止 overlay 内的按键误触 side panel toggle
     this.clearSidePanelLeader()
+    // 激活非 pager 的 overlay 即结束计划预览态：preview pager 被直接切走
+    //（如 Ctrl+P 开面板）时指针必须失效，否则后续 pager 打开仍被
+    // pagerContent 的 plan 分支劫持。
+    if (id !== 'pager') this.planPreview = null
 
     switch (id) {
       case 'pager':
@@ -1967,6 +2014,8 @@ export class TuiApp {
     this.input.setEscapeImmediate(false)
     const wasActive = this.overlay.isActive()
     if (!wasActive) return
+    const closingId = this.overlay.activeId()
+    const preview = this.planPreview
     this.suppressCommitRender = true
     try {
       this.overlay.deactivate()
@@ -1985,6 +2034,21 @@ export class TuiApp {
         void pump.then(finish, finish)
       }
     }
+    // 计划预览返回：从 plan preview pager 退出不是「关闭面板」而是「暂离查看
+    // 全文」——按 returnTo 回原面板（审批卡 / plan-picker）而非落回主屏。
+    // pendingPlanApproval 已被消费（如 Goal 倒计时自动批准）则正常退出。
+    // 此处消费指针防泄漏（后续 pager 打开不再劫持 pagerContent）。
+    if (closingId === 'pager' && preview) {
+      this.planPreview = null
+      if (preview.returnTo === 'approval' && this.pendingPlanApproval) {
+        this.openPlanApprovalPanel(this.pendingPlanApproval, this.planApprovalExcerpt)
+        return
+      }
+      if (preview.returnTo === 'plan-picker') {
+        this.activateOverlay('plan-picker')
+        return
+      }
+    }
   }
 
   /** 停用 overlay */
@@ -1992,6 +2056,9 @@ export class TuiApp {
     // 统一收口：suppress 窗口让回放只写 scrollback，最后由本方法
     // 统一 renderLive 画唯一帧，避免两层框体叠影。
     this.exitOverlayCore()
+    // 计划预览返回路径：exitOverlayCore 已按 returnTo 重开面板（choice-panel /
+    // plan-picker），此处不得再做主屏恢复——写主屏会污染 alt screen。
+    if (this.overlay.isActive()) return
     // 记录焦点回归时间：Ctrl+V 剪贴板图片防抖窗口起点
     this.lastInputFocusAt = Date.now()
     this.workerDetailWorkerId = null
@@ -2059,6 +2126,27 @@ export class TuiApp {
     this.choicePanelInputBuffer = ''
     this.choicePanelInputFor = undefined
     this.activateOverlay('choice-panel')
+  }
+
+  /** 当前 pager 是否在预览某个计划文档（pagerContent provider 分支用；
+   *  returnTo 供 provider 选择 footer 文案——q 是「返回」还是「关闭」）。 */
+  getPlanPreview(): { slug: string; draftPath?: string; returnTo?: 'approval' | 'plan-picker' } | null {
+    return this.planPreview
+  }
+
+  /** 打开计划全文预览——复用 pager overlay（固定每页 height-4 行、PgUp/PgDn 翻页）。 */
+  openPlanPreview(slug: string, returnTo?: 'approval' | 'plan-picker', draftPath?: string): void {
+    this.planPreview = { slug, ...(draftPath ? { draftPath } : {}), ...(returnTo ? { returnTo } : {}) }
+    // pagerContent 的 detail 指针互斥：plan 分支排最前，但清掉旧指针防歧义。
+    this.workerDetailWorkerId = null
+    this.jobDetailId = null
+    const nav = this.overlayController.nav()
+    nav.pagerPage = 0
+    nav.pagerMode = 'page'
+    nav.pagerSearchQuery = ''
+    nav.pagerSearchCurrent = 0
+    nav.pagerSelectedMessage = 0
+    this.activateOverlay('pager')
   }
 
   /** 打开用户问题选项选择面板（ask_user_question）— 支持多题分页 + 多选。 */
@@ -3339,7 +3427,7 @@ export class TuiApp {
         this.overlay.rerender()
         return true
       }
-      if (c === 'm' && messages.length > 0) {
+      if (c === 'm' && messages.length > 0 && !this.planPreview) {
         nav.pagerMode = 'message'
         // Select the message nearest to the current page start
         const pageSize = Math.max(1, this.rows - 4)
@@ -3361,8 +3449,11 @@ export class TuiApp {
         this.overlay.rerender()
         return true
       }
-      // verbose 层：切换完整工具输出视图（内容源改变 → 回到首页）
+      // verbose 层：切换完整工具输出视图（内容源改变 → 回到首页）。
+      // 计划预览态无 verbose/message 可切（内容是纯 markdown，provider 的
+      // plan 分支排最前，翻了状态也只污染 nav）——吞掉按键防困惑。
       if (c === 'v') {
+        if (this.planPreview) return true
         nav.pagerVerbose = !nav.pagerVerbose
         nav.pagerPage = 0
         nav.pagerSelectedMessage = 0
@@ -3564,6 +3655,13 @@ export class TuiApp {
       }
       if (key.name === 'up') {
         if (count > 0) { this.overlayController.nav().planPickerIndex = (cur - 1 + count) % count; this.overlay.rerender() }
+        return true
+      }
+      // v 暂离到全屏 pager 看选中计划全文（Enter 直接批准看不了正文），
+      // q/Esc 返回 picker。
+      if (c === 'v' && count > 0) {
+        const entry = this.overlayController.getData()?.planPickerData?.().entries[cur]
+        if (entry) { this.openPlanPreview(entry.slug, 'plan-picker'); return true }
         return true
       }
       if (key.name === 'return') {
@@ -3795,6 +3893,12 @@ export class TuiApp {
       }
       if (key.name === 'up') {
         if (choices.length > 0) { this.overlayController.nav().choicePanelIndex = (cur - 1 + choices.length) % choices.length; this.overlay.rerender() }
+        return true
+      }
+      // 计划审批卡：v 暂离到全屏 pager 看计划全文（q/Esc 返回审批卡，
+      // 倒计时状态不丢）。仅 select 子模式——驳回反馈输入中 v 是普通字符。
+      if (c === 'v' && this.choicePanelKind === 'plan-approval' && this.choicePanelSubMode === 'select' && this.pendingPlanApproval) {
+        this.openPlanPreview(this.pendingPlanApproval.slug, 'approval')
         return true
       }
       // 数字键快选（1-9 → 第 N 个条目）：桥接老用户「输数字」的肌肉记忆，
@@ -5201,6 +5305,8 @@ export class TuiApp {
   }
 
   private async handleTurnComplete(usage: Partial<Usage>, turnNumber: number, isFinal: boolean): Promise<void> {
+    this.turnCompleteInFlight++
+    try {
     this.state.turnNumber = turnNumber
 
     // A completed turn (even intermediate) is forward progress: the stream
@@ -5280,6 +5386,10 @@ export class TuiApp {
       this.setPhase('waiting')
       this.writeBatcher.flushNow()
     }
+    } finally {
+      this.turnCompleteInFlight--
+      this.flushPendingQueueDispatch()
+    }
   }
 
   /**
@@ -5330,6 +5440,7 @@ export class TuiApp {
         trailingNewline: true,
       })
     })
+    this.flushPendingQueueDispatch()
   }
 
   /**
@@ -5504,12 +5615,17 @@ export class TuiApp {
     // 只在 agent 确实还有 in-flight run 时才开这个窗口——没有探针（测试/非 TUI
     // 宿主）或 run 已结束时不开，提交照常走。
     this.abortSettling = this.agentRunningProbe?.() === true
-    // ESC 回填资格只随用户主动中断开启：守护中断（watchdog/convergence）会
-    // 自动续跑，排队指引应留在队列里等 drain，不该被拉回输入框。
+    // ESC 回填资格只随用户主动中断开启：守护中断（watchdog 自动续跑 /
+    // convergence 用户键入 continue）均不回填——排队消息留待下次提交归并
+    //（/queue 语义，b73da5b67 契约：queue-lane.test.ts「convergence settle
+    // 不回填」）。回填会破坏续跑流程：convergence 引导用户键入 continue，
+    // 归并在提交时把排队消息拼进前部并计数提示；回填后 Enter 发送的将是
+    // 排队消息而非 continue。
     this.abortSteerBackfill =
       this.abortSettling && !reason?.startsWith('watchdog') && !reason?.startsWith('convergence')
     // 守护中断标志：notifyRunSettled 消费——自然结束（isFinal）的回填逻辑
-    // 不得误伤守护中断（自动续跑时把排队消息拉回输入框会打断续跑流程）。
+    // 不得误伤守护中断（watchdog 自动续跑 / convergence 键入 continue 续跑
+    // 时把排队消息拉回输入框会打断续跑流程，队列留待提交归并）。
     // ?? false：reason 可选（undefined）时 startsWith 短路出 undefined。
     this.guardianAbortPending =
       (this.abortSettling && (reason?.startsWith('watchdog') || reason?.startsWith('convergence'))) ?? false
@@ -5673,8 +5789,13 @@ export class TuiApp {
   /**
    * 动态区高度预算（display rows）。renderLive 把动态段垫高/截断到恰好该值。
    *
-   * 活动期与空闲期同口径：取「出现过的最大动态高度」，封顶 `ACTIVITY_ROWS_CAP`，
-   * 只涨不缩。live region 总高度单调不降，输入框屏幕坐标于是稳定。
+   * 高水位记的是 **live region 总高度**（动态 + chrome），不是只记动态段。
+   * slash 提示、权限行、todo 面板都在 chrome：只钉动态段时，chrome 一关总高度
+   * 就掉，输入框上跳——用户看到「有时贴底、有时又浮起来」。chrome 关掉后用
+   * 动态垫行补差额，总高度只涨不缩，输入框屏幕坐标才稳。
+   *
+   * 封顶 `liveMaxRowsFor`（与 LiveEngine.maxRows 同口径）。不再额外减 2：
+   * 那 2 行会在 visor 贴满时变成输入框底下的黑洞。
    *
    * 高度一旦缩小，相对定位下就是输入框上跳——`clearForCommit` 按旧高度擦到屏末，
    * 写回的 commit 正文 + 新 region 填不满，差额留成屏底黑洞。而空闲期动态内容
@@ -5683,7 +5804,7 @@ export class TuiApp {
    * 之间往返一次。反过来空闲期按 ceiling 恒垫满（更早的实现）也只是把这一跳挪到
    * 下一轮提交时刻，同样弹，且把刚提交的正文顶出可视区。
    *
-   * 代价：稳态下输入框上方保留「本会话用过的最大动态高度」那么多空白，它是下一轮
+   * 代价：稳态下输入框上方保留「本会话用过的最大 live 高度」那么多空白，它是下一轮
    * 的预留位——内容到来时原地填入、输入框不动，正是定高视口要买的东西。不跳与
    * 空白是同一件事的两面：高度恒定 ⟺ 空白 = 峰值 − 当前内容，两者都要就只能把
    * 峰值本身压小（进行中工具卡每个占「标题 + 末 3 行输出」，并发几个就二十行）。
@@ -5697,20 +5818,18 @@ export class TuiApp {
    */
   private getDynamicBudget(chromeRows: number, dynamicRows: number): number {
     if (this.state.phase === 'idle' && this.state.turnNumber === 0) return 0
-    const terminalRows = this.rows || 24
-    const raw = terminalRows - chromeRows - 2
-    // 上界 = min(不超屏, liveMaxRows - chromeRows)，与 LiveEngine 同口径。
-    const ceiling = Math.max(0, Math.min(raw, liveMaxRowsFor(terminalRows) - chromeRows))
-    this.dynamicRowsHighWater = Math.min(ceiling, Math.max(this.dynamicRowsHighWater, dynamicRows))
-    return this.dynamicRowsHighWater
+    const cap = liveMaxRowsFor(this.rows || 24)
+    const total = dynamicRows + chromeRows
+    this.liveRowsHighWater = Math.min(cap, Math.max(this.liveRowsHighWater, total))
+    return Math.max(0, this.liveRowsHighWater - chromeRows)
   }
 
   /**
-   * 动态段高水位（display rows），跨轮保留。曾在 `setPhase('idle')` 归零以免
-   * 「一次长 thinking 把之后每轮都垫高」，但归零即高度回缩，而回缩就是输入框
-   * 上跳——空白换稳定是这里刻意做的取舍，上限见 `ACTIVITY_ROWS_CAP`。
+   * live region 总高度高水位（display rows = 动态 + chrome），跨轮保留。
+   * 曾在 `setPhase('idle')` 归零以免「一次长 thinking 把之后每轮都垫高」，
+   * 但归零即高度回缩，而回缩就是输入框上跳——空白换稳定是这里刻意做的取舍。
    */
-  private dynamicRowsHighWater = 0
+  private liveRowsHighWater = 0
 
   /**
    * @file 节点 exists 诊断（按输入值缓存——同值不重复 existsSync）。
@@ -5990,25 +6109,7 @@ export class TuiApp {
       lines.push({ text: line })
     }
 
-    // 2b. 队列预览：⏳ 已排队: "最后一条前 60 字符"（↑ 取回编辑）。
-    //     全宽反色条（CC 对标）：排队 prompt 是「已提交但未生效」的用户输入，
-    //     单行 muted 提示存在感不足，容易被误认为已丢失。
-    //
-    //     「已排队」只在真有活跃 run 时才成立——steer 队列靠工具边界 drain，没有
-    //     活跃 run 就永远注入不了。此时仍显示「已排队」是界面在撒谎，用户会以为
-    //     消息已送达而一直等。无 run 时如实说它还没发出，并给出可操作的下一步。
-    if (this.steerBuffer.hasPending()) {
-      const pending = this.steerBuffer.getPending()
-      const last = pending[pending.length - 1]!
-      const preview = last.length > 60 ? `${last.slice(0, 60)}…` : last
-      const more = pending.length > 1 ? `（+${pending.length - 1} 条）` : ''
-      const deliverable = this.agentBusy && !this.isAgentRunSettling()
-      lines.push({
-        text: this.clampLine(deliverable
-          ? this.renderBanner(`⏳ 已排队: "${preview}"${more} · ↑ 取回编辑`, this.theme.secondary)
-          : this.renderBanner(`⏸ 未发出: "${preview}"${more} · 回车随下条一并发送 · ↑ 取回编辑`, this.theme.warning)),
-      })
-    }
+    // 2b. 队列预览已下移到输入框 chrome（贴底，不夹在 thinking/工具卡之间）。
 
     // 2b2. 活动源归一：fleet / council / team / todo 四源投影到 ActivityStore，
     //      经 formatActivityBand 输出 chrome 段统一 band（替代之前散落三处的 push）。
@@ -6466,6 +6567,21 @@ export class TuiApp {
         lines.push({ text: this.clampLine(color('tab to cycle', this.theme.dim)) })
       }
 
+      // ⏳ 已排队：贴在输入框顶边正上方（chrome），不放进动态段——否则会夹在
+      // thinking / 工具卡之间随输出上漂。多条时 footer 显示 +N。
+      if (this.steerBuffer.hasPending()) {
+        const next = this.steerBuffer.getPendingEntries()[0]!
+        const pendingCount = this.steerBuffer.getPending().length
+        const preview = next.text.length > 60 ? `${next.text.slice(0, 60)}…` : next.text
+        const more = pendingCount > 1 ? `（+${pendingCount - 1} 条）` : ''
+        const deliverable = this.agentBusy && !this.isAgentRunSettling()
+        lines.push({
+          text: this.clampLine(deliverable
+            ? this.renderBanner(`⏳ 已排队: "${preview}"${more} · ↑ 取回编辑`, this.theme.secondary)
+            : this.renderBanner(`⏸ 未发出: "${preview}"${more} · 将在本轮结束后自动发出 · ↑ 取回编辑`, this.theme.warning)),
+        })
+      }
+
       // 输入框：chrome 段最后一行（滚动到底时贴屏幕底部，Claude Code 风格）。
       lines.push({ text: topBorder })
       if (vimNormalMode) {
@@ -6490,9 +6606,9 @@ export class TuiApp {
       lines = lines.slice(chromeStart)
       chromeStart = 0
     } else {
-      // ── 活动期定高视口：动态段恒定占位（不足垫空行、超出截最旧行），
-      //    live region 总高度逐帧不变 → 输入框在 thinking/streaming 全程钉在原位。
-      //    空闲期 budget=0 原样返回，塌回自然流。度量与 LiveEngine.rowsForLine 同口径。
+      // ── 定高视口：动态段垫到「总高度高水位 − chrome」，slash/todo 等 chrome
+      //    关掉后垫行补上，输入框不上跳。turn 0 仍 budget=0（欢迎屏不撑空白）。
+      //    度量与 LiveEngine.rowsForLine 同口径。
       let chromeRows = 0
       for (let i = chromeStart; i < lines.length; i++) {
         chromeRows += this.displayRowsFor(lines[i]!.text, cols)
@@ -6901,11 +7017,19 @@ export class TuiApp {
       },
     })
 
-    // Command palette — selectedIndex 由 overlayNav 注入
+    // Command palette — selectedIndex / scrollOffset 由 overlayNav 注入，渲染时跟随选中项
     this.overlay.register('command-palette', {
       render: (_w, _h) => {
         const data = overlayData?.paletteCommands?.() ?? { commands: [], selectedIndex: 0 }
-        return renderCommandPalette({ ...data, selectedIndex: this.overlayController.nav().paletteIndex, searchText: this.overlayController.getQuery() || data.searchText }, this.columns, this.rows, this.theme)
+        const nav = this.overlayController.nav()
+        const maxItems = Math.max(0, this.rows - 5)
+        nav.paletteScroll = followListWindow(nav.paletteIndex, data.commands.length, maxItems, nav.paletteScroll)
+        return renderCommandPalette({
+          ...data,
+          selectedIndex: nav.paletteIndex,
+          scrollOffset: nav.paletteScroll,
+          searchText: this.overlayController.getQuery() || data.searchText,
+        }, this.columns, this.rows, this.theme)
       },
     })
 

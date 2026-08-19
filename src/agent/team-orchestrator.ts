@@ -1,6 +1,7 @@
 import type { CoordinatorRun, DelegationRequest } from './coordinator.js'
 import type { AggregationPolicy } from './work-order.js'
 import { dependencyId } from './work-order.js'
+import { shapeWriteBudgetForProfile } from './budget-shape.js'
 import { deriveAuthority } from './star-domain.js'
 import { debugLog } from '../utils/debug.js'
 import { parseTeamTaskDrafts, parseTeamTasks, buildUnifiedTeamPlan, hasOverlappingFiles, type TeamTaskDraft, type TeamTask, type UnifiedTeamPlan } from './team-plan.js'
@@ -157,6 +158,9 @@ export function teamTasksToDelegationRequests(tasks: TeamTaskDraft[], parentTurn
       kind: task.kind,
       profile: task.profile,
       scope: { files: task.files },
+      // 预算发准（2026-08-18）：写工按目标文件数定价，替代 flat 48 轮/600s——
+      // 读工 profile 返回 undefined，行为零变化。
+      budget: shapeWriteBudgetForProfile(task.files, task.profile),
       dependencies: deps,
       authority: taskAuthority(task),
       riskTier: 'riskTier' in task ? (task as TeamTask).riskTier : undefined,
@@ -190,6 +194,7 @@ function waveToRequests(wave: TeamWave, taskMap: Map<string, TeamTask>, parentTu
         kind: task.kind,
         profile: task.profile,
         scope: { files: task.files },
+        budget: shapeWriteBudgetForProfile(task.files, task.profile),
         dependencies: deps,
         authority: taskAuthority(task),
         riskTier: task.riskTier,

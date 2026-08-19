@@ -50,6 +50,7 @@ test('run 缺席（未派发/预览）：workers.total === 0，不带 waveGate/r
   // 预览/未派发：无整体执行状态可谈，两个新字段也不写。
   assert.equal('completedWaves' in outcome, false)
   assert.equal('stoppedReason' in outcome, false)
+  assert.equal('workerRows' in outcome, false, '预览/未派发无结果行')
 })
 
 test('两个 worker 一过一败：workers = { total: 2, passed: 1 }', () => {
@@ -134,4 +135,69 @@ test('整体 stop reason：波间硬门禁未过 → wave-gate（有 run 才写�
   const outcome = buildTeamOutcome(summary, 0, { gate })
   assert.equal(outcome.stoppedReason, 'wave-gate')
   assert.equal(outcome.completedWaves, 1)
+})
+
+// ── workerRows 战报行（星流战报，2026-08-18）────────────────────────────
+
+test('workerRows：失败在前、task 取尾段、字段截断与压缩', () => {
+  const summary = mkSummary({
+    dispatched: 3,
+    run: mkRun([
+      mkResult({
+        workOrderId: 'tu1-starflow-team-w0:T1',
+        status: 'passed',
+        summary: 'emitter.cpp 落盘，spirv-val 全绿',
+        objective: 'SPIR-V 生成器主入口 AST 直出',
+        changedFiles: ['src/spirv/emitter.cpp', 'src/spirv/emitter.h', 'tests/p4_verify.cpp', 'extra.txt'],
+        diffArtifactId: 'delegate_task:ab12cd34',
+        usage: { input_tokens: 12_345, output_tokens: 4_567 },
+        durationMs: 185_000,
+      }),
+      mkResult({
+        workOrderId: 'tu1-starflow-team-w0:T2',
+        status: 'blocked',
+        failureReason: 'timeout',
+        summary: `${'CMake configure 失败：'.repeat(30)}`,
+      }),
+    ]),
+  })
+  const outcome = buildTeamOutcome(summary, 0, {})
+  const rows = outcome.workerRows!
+  assert.equal(rows.length, 2)
+  // 失败在前（同序稳定性交给输入顺序）
+  assert.equal(rows[0]!.status, 'blocked')
+  assert.equal(rows[1]!.status, 'passed')
+  // task 尾段提取
+  assert.equal(rows[0]!.task, 'T2')
+  assert.equal(rows[1]!.task, 'T1')
+  // summary 截断 ≤100
+  assert.ok(rows[0]!.summary.length <= 100)
+  assert.ok(rows[0]!.summary.endsWith('…'))
+  // changedFiles 最多 3 个文件名（basename），计数单独给
+  assert.equal(rows[1]!.changedCount, 4)
+  assert.deepEqual(rows[1]!.changedFiles, ['emitter.cpp', 'emitter.h', 'p4_verify.cpp'])
+  // usage/duration 原样进 row
+  assert.deepEqual(rows[1]!.usage, { input: 12_345, output: 4_567 })
+  assert.equal(rows[1]!.durationMs, 185_000)
+  assert.equal(rows[1]!.diffArtifactId, 'delegate_task:ab12cd34')
+})
+
+test('workerRows：行数超上限截断，保失败优先的前 40 行', () => {
+  const many: WorkerResult[] = Array.from({ length: 50 }, (_, i) =>
+    mkResult({ workOrderId: `w:T${i}`, status: i < 10 ? 'failed' : 'passed' }))
+  const summary = mkSummary({ dispatched: 50, run: mkRun(many) })
+  const rows = buildTeamOutcome(summary, 0, {}).workerRows!
+  assert.equal(rows.length, 40)
+  // 截断保住的是失败行 + 靠前的通过行
+  assert.equal(rows.filter(r => r.status === 'failed').length, 10)
+})
+
+test('workerRows：无 usage/duration/changedFiles 的极简结果只带必填字段', () => {
+  const summary = mkSummary({ dispatched: 1, run: mkRun([mkResult({ workOrderId: 'w:T9' })]) })
+  const rows = buildTeamOutcome(summary, 0, {}).workerRows!
+  assert.equal(rows.length, 1)
+  assert.equal(rows[0]!.task, 'T9')
+  assert.equal(rows[0]!.changedCount, 0)
+  assert.equal('usage' in rows[0]!, false)
+  assert.equal('durationMs' in rows[0]!, false)
 })
